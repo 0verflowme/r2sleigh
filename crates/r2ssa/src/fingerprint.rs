@@ -14,7 +14,7 @@ use r2il::{MemoryOrdering, SpaceId};
 /// Version of the byte-level semantic fingerprint contract.
 ///
 /// Bump this whenever a tag or field encoding below changes.
-pub const SSA_SEMANTIC_FINGERPRINT_SCHEMA_VERSION: u32 = 4;
+pub const SSA_SEMANTIC_FINGERPRINT_SCHEMA_VERSION: u32 = 6;
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -282,6 +282,7 @@ fn hash_op(writer: &mut FingerprintWriter, op: &SSAOp) {
         Call { .. } => writer.tag(48),
         CallInd { .. } => writer.tag(49),
         CallDefine { .. } => writer.tag(50),
+        CallRestore { .. } => writer.tag(84),
         Return { .. } => writer.tag(51),
         FloatAdd { .. } => writer.tag(52),
         FloatSub { .. } => writer.tag(53),
@@ -482,6 +483,12 @@ enum CanonicalObjectKindKey {
     EscapedUnknown {
         space: (u8, u32),
     },
+    Pointee {
+        space: (u8, u32),
+        base: Box<CanonicalObjectKindKey>,
+        offset: i64,
+        size: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -540,6 +547,29 @@ fn canonical_object_kind_key(
         ObjectKind::EscapedUnknown { space } => CanonicalObjectKindKey::EscapedUnknown {
             space: space_key(*space),
         },
+        ObjectKind::Pointee {
+            space,
+            base,
+            offset,
+            size,
+        } => {
+            // The base is an object too, so its key is this same function on
+            // it; a chain that does not resolve is keyed as escaped rather
+            // than dropped, so the fingerprint stays total.
+            let base_key = artifact
+                .objects()
+                .object(*base)
+                .map(|fact| canonical_object_kind_key(artifact, &fact.kind, inst_ids))
+                .unwrap_or(CanonicalObjectKindKey::EscapedUnknown {
+                    space: space_key(*space),
+                });
+            CanonicalObjectKindKey::Pointee {
+                space: space_key(*space),
+                base: Box::new(base_key),
+                offset: *offset,
+                size: *size,
+            }
+        }
     }
 }
 
@@ -641,6 +671,19 @@ fn hash_object_kind(writer: &mut FingerprintWriter, kind: &CanonicalObjectKindKe
             writer.tag(6);
             writer.tag(u16::from(space.0));
             writer.u32(space.1);
+        }
+        CanonicalObjectKindKey::Pointee {
+            space,
+            base,
+            offset,
+            size,
+        } => {
+            writer.tag(7);
+            writer.tag(u16::from(space.0));
+            writer.u32(space.1);
+            hash_object_kind(writer, base);
+            writer.i64(*offset);
+            writer.u32(*size);
         }
     }
 }
@@ -1298,6 +1341,7 @@ enum CanonicalAssumptionBindingKey {
         value: CanonicalAssumptionValueKey,
     },
     Register {
+        storage: CanonicalStorageId,
         value_id: u32,
         bits: u32,
         scope: u16,
@@ -1312,23 +1356,6 @@ enum CanonicalAssumptionBindingKey {
         provenance: u16,
         value: CanonicalAssumptionValueKey,
     },
-}
-
-fn canonical_register_binding_value(
-    artifact: &SsaArtifact,
-    value_ids: &BTreeMap<ValueId, u32>,
-    binding_name: &str,
-) -> u32 {
-    artifact
-        .graph()
-        .values
-        .iter()
-        .find(|value| {
-            value.var.version == 0 && value.var.is_register() && value.var.name == binding_name
-        })
-        .and_then(|value| value_ids.get(&value.id))
-        .copied()
-        .unwrap_or(u32::MAX)
 }
 
 fn hash_assumption_binding(
@@ -1355,6 +1382,7 @@ fn hash_assumption_binding(
             hash_assumption_value(writer, value);
         }
         CanonicalAssumptionBindingKey::Register {
+            storage,
             value_id,
             bits,
             scope,
@@ -1362,6 +1390,7 @@ fn hash_assumption_binding(
             value,
         } => {
             writer.tag(2);
+            hash_storage(writer, Some(*storage));
             writer.u32(*value_id);
             writer.u32(*bits);
             writer.tag(*scope);
@@ -1396,6 +1425,7 @@ enum CanonicalTypeHintKey {
         provenance: u16,
     },
     Register {
+        storage: CanonicalStorageId,
         value_id: u32,
         bits: u32,
         ty: String,
@@ -1427,6 +1457,7 @@ fn hash_type_hint(writer: &mut FingerprintWriter, hint: &CanonicalTypeHintKey) {
             writer.tag(*provenance);
         }
         CanonicalTypeHintKey::Register {
+            storage,
             value_id,
             bits,
             ty,
@@ -1434,6 +1465,7 @@ fn hash_type_hint(writer: &mut FingerprintWriter, hint: &CanonicalTypeHintKey) {
             provenance,
         } => {
             writer.tag(2);
+            hash_storage(writer, Some(*storage));
             writer.u32(*value_id);
             writer.u32(*bits);
             writer.string(ty);
@@ -1560,15 +1592,19 @@ fn hash_assumption_conditioned_semantics(
                     provenance,
                     value,
                 },
-                PreparedAssumptionBindingKind::Register { name, bits, .. } => {
-                    CanonicalAssumptionBindingKey::Register {
-                        value_id: canonical_register_binding_value(artifact, value_ids, name),
-                        bits: *bits,
-                        scope,
-                        provenance,
-                        value,
-                    }
-                }
+                PreparedAssumptionBindingKind::Register {
+                    storage,
+                    value: bound_value,
+                    bits,
+                    ..
+                } => CanonicalAssumptionBindingKey::Register {
+                    storage: *storage,
+                    value_id: value_ids.get(bound_value).copied().unwrap_or(u32::MAX),
+                    bits: *bits,
+                    scope,
+                    provenance,
+                    value,
+                },
                 PreparedAssumptionBindingKind::StackSlot {
                     base,
                     offset,
@@ -1602,15 +1638,19 @@ fn hash_assumption_conditioned_semantics(
             let scope = assumption_scope_tag(&binding.assumption.scope);
             let provenance = assumption_provenance_tag(&binding.assumption.provenance);
             match &binding.binding {
-                PreparedAssumptionBindingKind::Register { name, bits, .. } => {
-                    Some(CanonicalTypeHintKey::Register {
-                        value_id: canonical_register_binding_value(artifact, value_ids, name),
-                        bits: *bits,
-                        ty: ty.clone(),
-                        scope,
-                        provenance,
-                    })
-                }
+                PreparedAssumptionBindingKind::Register {
+                    storage,
+                    value: bound_value,
+                    bits,
+                    ..
+                } => Some(CanonicalTypeHintKey::Register {
+                    storage: *storage,
+                    value_id: value_ids.get(bound_value).copied().unwrap_or(u32::MAX),
+                    bits: *bits,
+                    ty: ty.clone(),
+                    scope,
+                    provenance,
+                }),
                 PreparedAssumptionBindingKind::StackSlot {
                     base,
                     offset,
@@ -1823,8 +1863,9 @@ mod tests {
     use crate::{
         AnalysisAssumption, AssumptionProvenance, AssumptionScope, AssumptionSet,
         AssumptionSubject, AssumptionValue, CanonicalStorageId, CanonicalStorageSpace, SSAOp,
-        SourceFunctionInterface, SourceFunctionReturn, SourceStackAllocationContract,
-        SourceStackGrowth, SourceStackSlotSpec, SsaArtifact, StackAddressBase,
+        SourceFunctionInterface, SourceFunctionReturn, SourceMachineRoles,
+        SourceStackAllocationContract, SourceStackGrowth, SourceStackSlotSpec, SsaArtifact,
+        StackAddressBase,
     };
 
     fn constant(value: u64) -> Varnode {
@@ -2357,17 +2398,25 @@ mod tests {
         .and_then(|interface| interface.with_return_address_storage(register_storage(24)))
         .and_then(|interface| interface.with_stack_pointer_storage(register_storage(0)))
         .and_then(|interface| interface.with_frame_pointer_storage(frame_pointer))
-        .and_then(|interface| {
-            interface.with_stack_allocation_contract(
-                SourceStackAllocationContract::with_implicit_active_sp_bytes(
-                    SourceStackGrowth::LowerAddresses,
-                    implicit_active_sp_bytes,
-                ),
-            )
-        })
         .expect("coherent exact frame interface");
-        SsaArtifact::for_decompile_with_interface(&blocks, Some(&arch), interface)
-            .expect("framed relation artifact")
+        let roles = SourceMachineRoles::new(Some(register_storage(24)), Some(register_storage(0)))
+            .and_then(|roles| {
+                roles.with_stack_allocation_contract(
+                    SourceStackAllocationContract::with_implicit_active_sp_bytes(
+                        SourceStackGrowth::LowerAddresses,
+                        implicit_active_sp_bytes,
+                    ),
+                )
+            })
+            .expect("coherent exact machine roles");
+        SsaArtifact::for_decompile_with_interfaces_and_machine_roles(
+            &blocks,
+            Some(&arch),
+            Some(interface),
+            roles,
+            Vec::new(),
+        )
+        .expect("framed relation artifact")
     }
 
     #[test]
@@ -2377,10 +2426,18 @@ mod tests {
         assert_eq!(first.graph().blocks, second.graph().blocks);
         assert_eq!(first.graph().insts, second.graph().insts);
         assert_eq!(first.graph().values, second.graph().values);
-        assert_ne!(
+        // The two describe the same geometry, and now say so. Both compute
+        // their frame register from the stack pointer, and both store at the
+        // same entry-relative addresses; the only difference is which register
+        // the interface calls the frame pointer. That declaration used to move
+        // every object, because a slot's position was recorded against
+        // whichever register named it. In one coordinate it moves nothing.
+        assert_eq!(
             first.objects().entry_stack_roots,
             second.objects().entry_stack_roots
         );
+        // The declaration is still part of what the function is, so the
+        // semantic fingerprint continues to separate them.
         assert_ne!(
             stable_ssa_semantic_fingerprint(&first),
             stable_ssa_semantic_fingerprint(&second)
@@ -2403,7 +2460,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_fingerprint_schema_is_v4() {
-        assert_eq!(SSA_SEMANTIC_FINGERPRINT_SCHEMA_VERSION, 4);
+    fn semantic_fingerprint_schema_is_v6() {
+        assert_eq!(SSA_SEMANTIC_FINGERPRINT_SCHEMA_VERSION, 6);
     }
 }

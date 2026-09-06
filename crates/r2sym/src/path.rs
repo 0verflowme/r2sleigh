@@ -7,27 +7,16 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use r2ssa::{AbiProfile, BlockTerminator, SSAOp, SsaArtifact, observe_call_arguments};
+use r2ssa::{BlockTerminator, SSAOp, SsaArtifact};
 use z3::Context;
 
-use crate::backward::DerivedCallSummaryView;
-use crate::constraints::FinalConstraintGraph;
 use crate::control::{SymExecutionControl, SymExecutionStopReason};
 use crate::executor::SymExecutor;
 use crate::loops::{self, ExactLoopFoldEvidence, ExactLoopRecurrenceEvidence, LoopSummaryKind};
-use crate::sim::{
-    CallConv, DerivedFunctionSummary, PreparedFunctionScope, evaluate_derived_summary_guidance,
-};
 use crate::solver::SymSolver;
-use crate::spec::ExplorationSpec;
 use crate::state::{ExecutionPc, ExitStatus, RuntimeBlockReason, SymState};
-use crate::tactics::{
-    SolveTacticConfig, constrain_exact_fold_inputs, constrain_exact_recurrence_candidate,
-    tactic_candidates_for_constraint_graph,
-};
 
 const TARGET_DISTANCE_CACHE_LIMIT: usize = 128;
 const EXACT_RUNTIME_LOOP_MAX_ITERS: u64 = 4096;
@@ -161,8 +150,14 @@ pub struct ExploreConfig {
     pub max_completed_paths: Option<usize>,
     /// Maximum execution depth per path.
     pub max_depth: usize,
-    /// Timeout for the entire exploration.
-    pub timeout: Option<Duration>,
+    /// Worklist steps the exploration may take before it stops.
+    ///
+    /// This replaced a wall-clock timeout. Elapsed time is not a property of
+    /// the program being analysed, so the same binary explored a different
+    /// amount on a loaded machine and rendered different C between runs.
+    pub max_steps: Option<u64>,
+    /// Deterministic solver resource limit handed to each query.
+    pub solver_rlimit: Option<u32>,
     /// Exploration strategy.
     pub strategy: ExploreStrategy,
     /// Whether to prune infeasible paths early.
@@ -179,7 +174,8 @@ impl Default for ExploreConfig {
             max_states: 1000,
             max_completed_paths: None,
             max_depth: 100,
-            timeout: Some(Duration::from_secs(60)),
+            max_steps: Some(200_000),
+            solver_rlimit: Some(8_000_000),
             strategy: ExploreStrategy::Dfs,
             prune_infeasible: true,
             merge_states: false,
@@ -268,8 +264,6 @@ pub struct SolvedPath {
     pub final_pc: u64,
     /// Path constraints that were satisfied.
     pub num_constraints: usize,
-    /// Optional provenance when the candidate was produced by a solve tactic.
-    pub generation: Option<SolvedPathGeneration>,
 }
 
 /// Public model assignments that should be surfaced to users.
@@ -355,37 +349,6 @@ fn public_solution_register_is_visible(name: &str) -> bool {
     public_solution_symbol_is_visible(name)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SolvedPathGenerationKind {
-    ExactRecurrenceConstraintTactic,
-    MitmConstraintTactic,
-    DomainConstraintTactic,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SolvedPathGeneration {
-    pub kind: SolvedPathGenerationKind,
-    pub reason: String,
-    pub constrained_bytes: usize,
-}
-
-/// Result of a spec-driven exploration run.
-#[derive(Debug, Default)]
-pub struct SpecExploreResult<'ctx> {
-    /// Feasible paths that matched a find predicate.
-    pub found_paths: Vec<PathResult<'ctx>>,
-    /// Number of states pruned by avoid predicates.
-    pub avoided_states: usize,
-    /// Number of states pruned as infeasible.
-    pub unsat_states: usize,
-    /// Number of states that ended in an execution error.
-    pub errored_states: usize,
-    /// Number of completed states that did not hit a find predicate.
-    pub completed_states: usize,
-    /// Non-fatal diagnostics gathered during execution.
-    pub diagnostics: Vec<String>,
-}
-
 /// Path explorer for symbolic execution.
 pub struct PathExplorer<'ctx> {
     /// The Z3 context.
@@ -400,16 +363,10 @@ pub struct PathExplorer<'ctx> {
     stats: ExploreStats,
     /// Whether query helpers should prioritize states closer to their target.
     target_guided_queries: bool,
-    /// Whether target-guided queries may first route through exception-dispatch bridge sites.
-    exception_bridge_guidance_enabled: bool,
     /// Whether unsupported runtime loop summaries may produce residual states.
     residual_runtime_loop_summaries_enabled: bool,
-    /// Derived helper summaries registered for direct-call targets.
-    derived_call_summaries: HashMap<u64, RegisteredDerivedCallSummary<'ctx>>,
     /// Cached reverse-distance maps keyed by (function entry, target address).
     target_distance_cache: TargetDistanceCache,
-    /// Candidate-generation tactics used during model extraction.
-    solve_tactic_config: SolveTacticConfig,
     /// Cooperative control shared with executor and solver worklists.
     execution: SymExecutionControl,
 }
@@ -445,10 +402,6 @@ pub struct ExploreStats {
     pub target_guided_reorders: usize,
     /// Number of states dropped because their PC cannot reach the target in the CFG.
     pub target_pruned_cfg_unreachable: usize,
-    /// Number of states dropped because an exact helper summary had no satisfiable case.
-    pub target_pruned_summary_contradiction: usize,
-    /// Number of target-guided states whose ranking/pruning used derived summary metadata.
-    pub target_summary_rank_hits: usize,
     /// Number of states that reached the target PC but were unsatisfiable.
     pub target_match_unsat: usize,
     /// Number of states blocked by a missing exception handler.
@@ -481,33 +434,11 @@ pub struct ExploreStats {
     pub runtime_loop_budget_residuals: usize,
 }
 
-#[derive(Clone)]
-struct RegisteredDerivedCallSummary<'ctx> {
-    summary: Rc<DerivedFunctionSummary<'ctx>>,
-    callconv: CallConv,
-}
-
-#[derive(Clone, Default)]
-struct BlockSummaryRank {
-    has_summary: bool,
-    has_exact_summary: bool,
-    min_case_count: usize,
-}
-
 struct TargetGuidanceContext {
     target_addr: u64,
     distances: HashMap<u64, usize>,
     reachable_blocks: HashSet<u64>,
-    call_targets_by_block: HashMap<u64, Vec<u64>>,
-    block_summary_rank: HashMap<u64, BlockSummaryRank>,
     allow_cross_function_states: bool,
-}
-
-#[derive(Clone, Copy, Default)]
-struct StateSummaryGuidance {
-    summary_hits: usize,
-    min_feasible_cases: usize,
-    contradictory: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -667,18 +598,7 @@ impl<'ctx> StateWorklist<'ctx> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TargetGuidedQueueEntry {
-    rank: (
-        usize,
-        usize,
-        usize,
-        usize,
-        usize,
-        usize,
-        usize,
-        usize,
-        usize,
-        usize,
-    ),
+    rank: (usize, usize, usize, usize, usize, usize, usize),
     id: usize,
 }
 
@@ -720,12 +640,6 @@ enum DriverMode<'ctx> {
         avoid_set: HashSet<u64>,
         found: Option<PathResult<'ctx>>,
     },
-    Spec {
-        find_set: HashSet<u64>,
-        avoid_set: HashSet<u64>,
-        max_finds: usize,
-        result: SpecExploreResult<'ctx>,
-    },
 }
 
 impl<'ctx> DriverMode<'ctx> {
@@ -736,34 +650,6 @@ impl<'ctx> DriverMode<'ctx> {
         match self {
             DriverMode::Explore { results } => results.len() >= limit,
             _ => false,
-        }
-    }
-
-    fn on_timeout(&mut self) -> bool {
-        if let DriverMode::Spec { result, .. } = self {
-            result.diagnostics.push("exploration timed out".to_string());
-        }
-        true
-    }
-
-    fn on_max_states(&mut self) -> bool {
-        if let DriverMode::Spec { result, .. } = self {
-            result
-                .diagnostics
-                .push("exploration stopped at max_states budget".to_string());
-        }
-        true
-    }
-
-    fn on_execution_stop(&mut self, reason: SymExecutionStopReason) {
-        if let DriverMode::Spec { result, .. } = self {
-            result.diagnostics.push(reason.to_string());
-        }
-    }
-
-    fn on_unsat_pruned(&mut self) {
-        if let DriverMode::Spec { result, .. } = self {
-            result.unsat_states += 1;
         }
     }
 
@@ -818,33 +704,6 @@ impl<'ctx> DriverMode<'ctx> {
                     DriverAction::Continue(Box::new(state))
                 }
             }
-            DriverMode::Spec {
-                find_set,
-                avoid_set,
-                max_finds,
-                result,
-            } => {
-                if explorer.state_hits_any_target(&state, avoid_set) {
-                    result.avoided_states += 1;
-                    return DriverAction::Skip;
-                }
-                if explorer.state_hits_any_target(&state, find_set) {
-                    if explorer.solver.is_sat(&state) {
-                        explorer.record_depth(state.depth);
-                        explorer.stats.paths_completed += 1;
-                        result.found_paths.push(PathResult::new(state, true));
-                        if result.found_paths.len() >= *max_finds {
-                            return DriverAction::Finish;
-                        }
-                    } else {
-                        explorer.stats.paths_pruned += 1;
-                        result.unsat_states += 1;
-                    }
-                    DriverAction::Skip
-                } else {
-                    DriverAction::Continue(Box::new(state))
-                }
-            }
         }
     }
 
@@ -879,11 +738,6 @@ impl<'ctx> DriverMode<'ctx> {
                     DriverAction::Skip
                 }
             }
-            DriverMode::Spec { result, .. } => {
-                explorer.stats.paths_max_depth += 1;
-                result.completed_states += 1;
-                DriverAction::Skip
-            }
         }
     }
 
@@ -915,14 +769,6 @@ impl<'ctx> DriverMode<'ctx> {
                     DriverAction::Skip
                 }
             }
-            DriverMode::Spec { result, .. } => {
-                result
-                    .diagnostics
-                    .push(format!("no SSA block at 0x{block_addr:x}"));
-                result.completed_states += 1;
-                explorer.stats.paths_completed += 1;
-                DriverAction::Skip
-            }
         }
     }
 
@@ -930,7 +776,6 @@ impl<'ctx> DriverMode<'ctx> {
         &mut self,
         explorer: &mut PathExplorer<'ctx>,
         state: SymState<'ctx>,
-        block_addr: u64,
         max_completed_paths: Option<usize>,
     ) -> DriverAction<'ctx> {
         explorer.record_runtime_exit_status(&state.exit_status);
@@ -947,19 +792,6 @@ impl<'ctx> DriverMode<'ctx> {
             DriverMode::FindFirst { .. }
             | DriverMode::FindAll { .. }
             | DriverMode::Avoid { .. } => {}
-            DriverMode::Spec { result, .. } => {
-                explorer.stats.paths_completed += 1;
-                result.diagnostics.push(format!(
-                    "state terminated at 0x{:x} with {:?}",
-                    block_addr, state.exit_status
-                ));
-                match &state.exit_status {
-                    Some(ExitStatus::Error(_)) | Some(ExitStatus::RuntimeBlocked(_)) => {
-                        result.errored_states += 1
-                    }
-                    _ => result.completed_states += 1,
-                }
-            }
         }
         DriverAction::Skip
     }
@@ -968,7 +800,6 @@ impl<'ctx> DriverMode<'ctx> {
         &mut self,
         explorer: &mut PathExplorer<'ctx>,
         mut state: SymState<'ctx>,
-        block_addr: u64,
         error: String,
         max_completed_paths: Option<usize>,
     ) -> DriverAction<'ctx> {
@@ -985,36 +816,9 @@ impl<'ctx> DriverMode<'ctx> {
             DriverMode::FindAll { .. } => {
                 explorer.stats.paths_completed += 1;
             }
-            DriverMode::Spec { result, .. } => {
-                explorer.stats.paths_completed += 1;
-                result.errored_states += 1;
-                result
-                    .diagnostics
-                    .push(format!("execution error at 0x{block_addr:x}: {error}"));
-            }
             DriverMode::FindFirst { .. } | DriverMode::Avoid { .. } => {}
         }
         DriverAction::Skip
-    }
-
-    fn allow_enqueue(&mut self, state: &SymState<'ctx>) -> bool {
-        match self {
-            DriverMode::Avoid { .. } => true,
-            DriverMode::Spec {
-                avoid_set, result, ..
-            } => {
-                let static_pc = state.effective_static_pc();
-                if avoid_set.contains(&state.pc())
-                    || static_pc.is_some_and(|pc| avoid_set.contains(&pc))
-                {
-                    result.avoided_states += 1;
-                    false
-                } else {
-                    true
-                }
-            }
-            _ => true,
-        }
     }
 }
 
@@ -1124,7 +928,6 @@ impl<'ctx> PathExplorer<'ctx> {
     fn runtime_continuation_candidate_targets(
         &self,
         root: &SsaArtifact,
-        scope: Option<&PreparedFunctionScope>,
         state: &SymState<'ctx>,
     ) -> Vec<u64> {
         let mut candidates = BTreeSet::new();
@@ -1136,11 +939,6 @@ impl<'ctx> PathExplorer<'ctx> {
             }
         };
         collect(root);
-        if let Some(scope) = scope {
-            for function in scope.functions().values() {
-                collect(&function.prepared);
-            }
-        }
         candidates
             .into_iter()
             .take(SYMBOLIC_CONTINUATION_MAX_TARGETS)
@@ -1150,7 +948,6 @@ impl<'ctx> PathExplorer<'ctx> {
     fn fork_symbolic_exception_resume_targets(
         &mut self,
         root: &SsaArtifact,
-        scope: Option<&PreparedFunctionScope>,
         state: &SymState<'ctx>,
     ) -> Vec<SymState<'ctx>> {
         if !matches!(
@@ -1173,7 +970,7 @@ impl<'ctx> PathExplorer<'ctx> {
         }
 
         let mut resumed = Vec::new();
-        let candidates = self.runtime_continuation_candidate_targets(root, scope, state);
+        let candidates = self.runtime_continuation_candidate_targets(root, state);
         let candidates_checked = candidates.len();
         for candidate in candidates {
             let candidate_value = crate::SymValue::concrete(candidate, rip.bits());
@@ -1201,97 +998,17 @@ impl<'ctx> PathExplorer<'ctx> {
         resumed
     }
 
-    fn resolve_scope_function<'a>(
-        &self,
-        root: &'a SsaArtifact,
-        scope: Option<&'a PreparedFunctionScope>,
-        pc: u64,
-    ) -> Option<&'a SsaArtifact> {
-        if root.get_block(pc).is_some() {
-            return Some(root);
-        }
-        scope
-            .and_then(|scope| scope.function_containing_block(pc))
-            .map(|function| function.prepared.as_ref())
-    }
-
-    fn exception_bridge_guidance_target(
-        &mut self,
-        root: &SsaArtifact,
-        scope: Option<&PreparedFunctionScope>,
-        target_addr: u64,
-    ) -> Option<u64> {
-        if !self.exception_bridge_guidance_enabled {
-            return None;
-        }
-        let scope = scope?;
-        let target_func = self.resolve_scope_function(root, Some(scope), target_addr);
-        if target_func.is_some_and(|target_func| target_func.entry == root.entry) {
-            let distances = self.target_distance_map(root, target_addr);
-            if distances.contains_key(&root.entry) {
-                return None;
-            }
-        }
-
-        let observations = observe_call_arguments(root, &AbiProfile::windows_x64());
-        let mut registration_sites = Vec::new();
-        let mut raise_sites = Vec::new();
-
-        for (call_id, call) in &root.call_sites().by_id {
-            let Some(target) = root.resolved_call_target(call) else {
-                continue;
-            };
-            match self.executor.call_hook_tag(target) {
-                Some(crate::executor::CallHookTag::WindowsAddVectoredExceptionHandler) => {
-                    if observations.contains_key(call_id) {
-                        if let Some((block_addr, _)) = root.inst_op_site(call.at) {
-                            registration_sites.push(block_addr);
-                        } else {
-                            registration_sites.push(0);
-                        }
-                    }
-                }
-                Some(crate::executor::CallHookTag::WindowsRaiseException) => {
-                    if let Some((block_addr, _)) = root.inst_op_site(call.at) {
-                        raise_sites.push(block_addr);
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        raise_sites.sort_unstable();
-        raise_sites.dedup();
-        registration_sites.sort_unstable();
-        registration_sites.dedup();
-
-        if raise_sites.is_empty() || registration_sites.is_empty() {
-            return None;
-        }
-
-        raise_sites.into_iter().next()
-    }
-
-    pub(crate) fn exception_bridge_target_in_scope(
-        &mut self,
-        root: &SsaArtifact,
-        scope: Option<&PreparedFunctionScope>,
-        target_addr: u64,
-    ) -> Option<u64> {
-        self.exception_bridge_guidance_target(root, scope, target_addr)
-    }
-
-    pub(crate) fn advance_current_block_in_scope(
+    #[cfg(test)]
+    pub(crate) fn advance_current_block(
         &mut self,
         func: &SsaArtifact,
-        scope: Option<&PreparedFunctionScope>,
         mut state: SymState<'ctx>,
     ) -> Result<Vec<SymState<'ctx>>, String> {
         let mut active_states = Vec::new();
         if let Some(dispatched) = self.dispatch_runtime_breakpoint(&mut state) {
             active_states.push(dispatched);
         }
-        let Some(block) = self.resolve_block(func, scope, &mut state) else {
+        let Some(block) = self.resolve_block(func, &mut state) else {
             let missing_pc = state.pc();
             self.record_runtime_missing_block(&state, missing_pc);
             return Err(format!("missing block at 0x{missing_pc:x}"));
@@ -1342,15 +1059,13 @@ impl<'ctx> PathExplorer<'ctx> {
     fn resolve_block<'a>(
         &self,
         func: &'a SsaArtifact,
-        scope: Option<&'a PreparedFunctionScope>,
         state: &mut SymState<'ctx>,
     ) -> Option<ResolvedBlock<'a>> {
         match state.execution_pc() {
             ExecutionPc::Static => {
-                let scope_func = self.resolve_scope_function(func, scope, state.pc())?;
-                let block = scope_func.get_block(state.pc())?;
+                let block = func.get_block(state.pc())?;
                 Some(ResolvedBlock {
-                    func: scope_func,
+                    func,
                     block,
                     static_addr: state.pc(),
                     runtime_addr: state.pc(),
@@ -1362,10 +1077,9 @@ impl<'ctx> PathExplorer<'ctx> {
                 if candidates.as_slice() != [static_addr] {
                     return None;
                 }
-                let scope_func = self.resolve_scope_function(func, scope, static_addr)?;
-                let block = scope_func.get_block(static_addr)?;
+                let block = func.get_block(static_addr)?;
                 Some(ResolvedBlock {
-                    func: scope_func,
+                    func,
                     block,
                     static_addr,
                     runtime_addr: state.pc(),
@@ -1374,13 +1088,7 @@ impl<'ctx> PathExplorer<'ctx> {
             }
             ExecutionPc::UnresolvedIndirect => {
                 let runtime_pc = state.pc();
-                let static_candidate = self
-                    .resolve_scope_function(func, scope, runtime_pc)
-                    .and_then(|candidate| {
-                        candidate
-                            .get_block(runtime_pc)
-                            .map(|block| (candidate, block))
-                    });
+                let static_candidate = func.get_block(runtime_pc);
                 let (runtime_region_present, runtime_candidates) =
                     state.runtime_execution_candidates(runtime_pc);
                 if runtime_region_present && runtime_candidates.len() != 1 {
@@ -1389,10 +1097,10 @@ impl<'ctx> PathExplorer<'ctx> {
                 let runtime_static = runtime_candidates.first().copied();
                 match (static_candidate, runtime_static) {
                     (Some(_), Some(_)) => None,
-                    (Some((scope_func, block)), None) => {
+                    (Some(block), None) => {
                         state.bind_static_execution_pc();
                         Some(ResolvedBlock {
-                            func: scope_func,
+                            func,
                             block,
                             static_addr: runtime_pc,
                             runtime_addr: runtime_pc,
@@ -1400,11 +1108,10 @@ impl<'ctx> PathExplorer<'ctx> {
                         })
                     }
                     (None, Some(static_addr)) => {
-                        let scope_func = self.resolve_scope_function(func, scope, static_addr)?;
-                        let block = scope_func.get_block(static_addr)?;
+                        let block = func.get_block(static_addr)?;
                         state.bind_runtime_execution_pc(static_addr);
                         Some(ResolvedBlock {
-                            func: scope_func,
+                            func,
                             block,
                             static_addr,
                             runtime_addr: runtime_pc,
@@ -1447,7 +1154,6 @@ impl<'ctx> PathExplorer<'ctx> {
     fn summarize_runtime_breakpoint_loop(
         &mut self,
         root: &SsaArtifact,
-        scope: Option<&PreparedFunctionScope>,
         block_func: &SsaArtifact,
         block: &r2ssa::FunctionSSABlock,
         state: &SymState<'ctx>,
@@ -1455,7 +1161,7 @@ impl<'ctx> PathExplorer<'ctx> {
         let branch = loops::runtime_counter_threshold_branch(block)?;
         if !self.residual_runtime_loop_summaries_enabled
             && let Some(exact) =
-                self.exact_runtime_breakpoint_loop_runahead(root, scope, block, state, &branch)
+                self.exact_runtime_breakpoint_loop_runahead(root, block, state, &branch)
         {
             let summary = loops::bounded_exact_summary(block.addr, &branch, 0, exact);
             self.stats.runtime_breakpoint_loop_exact_summaries += 1;
@@ -1594,7 +1300,6 @@ impl<'ctx> PathExplorer<'ctx> {
     fn exact_runtime_breakpoint_loop_runahead(
         &mut self,
         root: &SsaArtifact,
-        scope: Option<&PreparedFunctionScope>,
         block: &r2ssa::FunctionSSABlock,
         state: &SymState<'ctx>,
         branch: &loops::RuntimeLoopBranch,
@@ -1608,7 +1313,7 @@ impl<'ctx> PathExplorer<'ctx> {
         }
         let mut target_probe = state.fork();
         target_probe.set_static_execution_pc(branch.target);
-        if self.resolve_block(root, scope, &mut target_probe).is_none() {
+        if self.resolve_block(root, &mut target_probe).is_none() {
             debug_target_guidance_log(&format!(
                 "runtime_loop_exact_skip block=0x{:x} reason=missing_target target=0x{:x}",
                 block.addr, branch.target
@@ -1673,7 +1378,7 @@ impl<'ctx> PathExplorer<'ctx> {
                     return None;
                 }
             }
-            let Some(resolved) = self.resolve_block(root, scope, &mut runahead) else {
+            let Some(resolved) = self.resolve_block(root, &mut runahead) else {
                 debug_target_guidance_log(&format!(
                     "runtime_loop_exact_skip block=0x{:x} reason=missing_block static_pc=0x{:x} runtime_pc=0x{:x}",
                     block.addr,
@@ -1724,7 +1429,6 @@ impl<'ctx> PathExplorer<'ctx> {
     fn direct_call_fork_targets(
         &self,
         root: &SsaArtifact,
-        scope: Option<&PreparedFunctionScope>,
         block: &r2ssa::FunctionSSABlock,
     ) -> Option<HashSet<u64>> {
         let targets = block
@@ -1735,7 +1439,7 @@ impl<'ctx> PathExplorer<'ctx> {
                 _ => None,
             })
             .filter(|target| self.executor.call_hook_tag(*target).is_none())
-            .filter(|target| self.resolve_scope_function(root, scope, *target).is_some())
+            .filter(|target| root.get_block(*target).is_some())
             .collect::<HashSet<_>>();
         (!targets.is_empty()).then_some(targets)
     }
@@ -1772,8 +1476,8 @@ impl<'ctx> PathExplorer<'ctx> {
         config: ExploreConfig,
         execution: SymExecutionControl,
     ) -> Self {
-        let solver = if let Some(timeout) = config.timeout {
-            SymSolver::with_timeout_and_control(ctx, timeout, execution.clone())
+        let solver = if let Some(rlimit) = config.solver_rlimit {
+            SymSolver::with_rlimit_and_control(ctx, rlimit, execution.clone())
         } else {
             SymSolver::with_execution_control(ctx, execution.clone())
         };
@@ -1785,11 +1489,8 @@ impl<'ctx> PathExplorer<'ctx> {
             config,
             stats: ExploreStats::default(),
             target_guided_queries: false,
-            exception_bridge_guidance_enabled: true,
             residual_runtime_loop_summaries_enabled: true,
-            derived_call_summaries: HashMap::new(),
             target_distance_cache: TargetDistanceCache::new(),
-            solve_tactic_config: SolveTacticConfig::default(),
             execution,
         }
     }
@@ -1804,64 +1505,9 @@ impl<'ctx> PathExplorer<'ctx> {
         &self.stats
     }
 
-    pub fn set_solve_tactic_config(&mut self, config: SolveTacticConfig) {
-        self.solve_tactic_config = config;
-    }
-
-    pub fn solve_tactic_config(&self) -> &SolveTacticConfig {
-        &self.solve_tactic_config
-    }
-
-    pub(crate) fn with_isolated_stats<T>(
-        &mut self,
-        f: impl FnOnce(&mut Self) -> T,
-    ) -> (T, ExploreStats) {
-        let previous = std::mem::take(&mut self.stats);
-        let result = f(self);
-        let isolated = std::mem::take(&mut self.stats);
-        self.stats = previous;
-        (result, isolated)
-    }
-
     /// Get the solver for additional queries.
     pub fn solver(&self) -> &SymSolver<'ctx> {
         &self.solver
-    }
-
-    pub(crate) fn with_prune_infeasible<T>(
-        &mut self,
-        prune_infeasible: bool,
-        f: impl FnOnce(&mut Self) -> T,
-    ) -> T {
-        let previous = self.config.prune_infeasible;
-        self.config.prune_infeasible = prune_infeasible;
-        let result = f(self);
-        self.config.prune_infeasible = previous;
-        result
-    }
-
-    pub(crate) fn with_exception_bridge_guidance<T>(
-        &mut self,
-        enabled: bool,
-        f: impl FnOnce(&mut Self) -> T,
-    ) -> T {
-        let previous = self.exception_bridge_guidance_enabled;
-        self.exception_bridge_guidance_enabled = enabled;
-        let result = f(self);
-        self.exception_bridge_guidance_enabled = previous;
-        result
-    }
-
-    pub(crate) fn with_residual_runtime_loop_summaries<T>(
-        &mut self,
-        enabled: bool,
-        f: impl FnOnce(&mut Self) -> T,
-    ) -> T {
-        let previous = self.residual_runtime_loop_summaries_enabled;
-        self.residual_runtime_loop_summaries_enabled = enabled;
-        let result = f(self);
-        self.residual_runtime_loop_summaries_enabled = previous;
-        result
     }
 
     /// Enable target-guided ordering for query-only helpers.
@@ -1879,7 +1525,6 @@ impl<'ctx> PathExplorer<'ctx> {
     where
         F: Fn(&mut SymState<'ctx>) -> crate::executor::CallHookResult + 'ctx,
     {
-        self.derived_call_summaries.remove(&addr);
         self.executor
             .register_call_hook(addr, move |state| Ok(hook(state)));
     }
@@ -1892,39 +1537,8 @@ impl<'ctx> PathExplorer<'ctx> {
     ) where
         F: Fn(&mut SymState<'ctx>) -> crate::executor::CallHookResult + 'ctx,
     {
-        self.derived_call_summaries.remove(&addr);
         self.executor
             .register_tagged_call_hook(addr, tag, move |state| Ok(hook(state)));
-    }
-
-    pub(crate) fn register_derived_call_hook<F>(
-        &mut self,
-        addr: u64,
-        summary: Rc<DerivedFunctionSummary<'ctx>>,
-        callconv: CallConv,
-        hook: F,
-    ) where
-        F: Fn(&mut SymState<'ctx>) -> crate::executor::CallHookResult + 'ctx,
-    {
-        self.derived_call_summaries
-            .insert(addr, RegisteredDerivedCallSummary { summary, callconv });
-        self.executor
-            .register_call_hook(addr, move |state| Ok(hook(state)));
-    }
-
-    pub(crate) fn derived_call_summary_views(&self) -> HashMap<u64, DerivedCallSummaryView<'ctx>> {
-        self.derived_call_summaries
-            .iter()
-            .map(|(addr, registered)| {
-                (
-                    *addr,
-                    DerivedCallSummaryView {
-                        summary: registered.summary.clone(),
-                        callconv: registered.callconv.clone(),
-                    },
-                )
-            })
-            .collect()
     }
 
     /// Solve a path's constraints and extract concrete values.
@@ -1991,83 +1605,6 @@ impl<'ctx> PathExplorer<'ctx> {
         Some(solved)
     }
 
-    /// Solve a path after applying constraint-graph tactics and exact input-domain tactics.
-    pub fn solve_path_with_constraint_graph_tactics(
-        &self,
-        path: &PathResult<'ctx>,
-        graph: &FinalConstraintGraph,
-        recurrences: &[ExactLoopRecurrenceEvidence],
-    ) -> Option<SolvedPath> {
-        if !path.feasible || !self.solve_tactic_config.enabled {
-            return None;
-        }
-        let folds = loops::exact_fold_evidence_from_recurrences(recurrences);
-
-        if !graph.is_empty() {
-            for candidate in tactic_candidates_for_constraint_graph(
-                graph,
-                Some(&path.state),
-                &self.solve_tactic_config,
-            ) {
-                let mut state = path.state.fork();
-                let report = constrain_exact_recurrence_candidate(
-                    &mut state,
-                    &candidate.recurrence,
-                    &candidate.bytes,
-                );
-                if report.constrained_bytes == 0 {
-                    continue;
-                }
-                let constrained_path = PathResult {
-                    state,
-                    exit_status: path.exit_status.clone(),
-                    depth: path.depth,
-                    feasible: path.feasible,
-                };
-                if let Some(mut solution) = self.solve_path(&constrained_path) {
-                    solution.generation = Some(SolvedPathGeneration {
-                        kind: if candidate.used_mitm {
-                            SolvedPathGenerationKind::MitmConstraintTactic
-                        } else {
-                            SolvedPathGenerationKind::ExactRecurrenceConstraintTactic
-                        },
-                        reason: candidate.reason,
-                        constrained_bytes: report.constrained_bytes,
-                    });
-                    return Some(solution);
-                }
-            }
-        }
-
-        for domain in &self.solve_tactic_config.preferred_domains {
-            let mut state = path.state.fork();
-            let report = constrain_exact_fold_inputs(
-                &mut state,
-                &folds,
-                domain,
-                self.solve_tactic_config.max_constrained_bytes,
-            );
-            if report.constrained_bytes == 0 {
-                continue;
-            }
-            let constrained_path = PathResult {
-                state,
-                exit_status: path.exit_status.clone(),
-                depth: path.depth,
-                feasible: path.feasible,
-            };
-            if let Some(mut solution) = self.solve_path(&constrained_path) {
-                solution.generation = Some(SolvedPathGeneration {
-                    kind: SolvedPathGenerationKind::DomainConstraintTactic,
-                    reason: "exact fold input-domain constraint".to_string(),
-                    constrained_bytes: report.constrained_bytes,
-                });
-                return Some(solution);
-            }
-        }
-        None
-    }
-
     /// Solve all feasible paths and return concrete solutions.
     pub fn solve_all_paths(&self, paths: &[PathResult<'ctx>]) -> Vec<Option<SolvedPath>> {
         paths.iter().map(|p| self.solve_path(p)).collect()
@@ -2091,7 +1628,7 @@ impl<'ctx> PathExplorer<'ctx> {
         self.budget_exhausted() || self.execution_stop_reason().is_some()
     }
 
-    fn poll_execution(&mut self, mode: &mut DriverMode<'ctx>) -> bool {
+    fn poll_execution(&mut self) -> bool {
         let Some(reason) = self
             .execution
             .stop_reason()
@@ -2100,7 +1637,6 @@ impl<'ctx> PathExplorer<'ctx> {
             return true;
         };
         self.stats.execution_stop = Some(reason);
-        mode.on_execution_stop(reason);
         false
     }
 
@@ -2177,19 +1713,19 @@ impl<'ctx> PathExplorer<'ctx> {
         keep_state.then_some(state)
     }
 
-    fn drive_in_scope(
+    fn drive(
         &mut self,
         func: &SsaArtifact,
-        scope: Option<&PreparedFunctionScope>,
         initial_state: SymState<'ctx>,
         mode: &mut DriverMode<'ctx>,
     ) {
         let start_time = Instant::now();
+        let mut steps_taken: u64 = 0;
         let mut worklist = StateWorklist::new(self.config.strategy);
         worklist.push(initial_state);
 
         'worklist: while let Some(mut state) = worklist.pop_next() {
-            if !self.poll_execution(mode) {
+            if !self.poll_execution() {
                 break;
             }
             if self.config.merge_states
@@ -2200,16 +1736,16 @@ impl<'ctx> PathExplorer<'ctx> {
                     .expect("worklist returned a merge-compatible state");
             }
 
-            if let Some(timeout) = self.config.timeout
-                && start_time.elapsed() > timeout
-                && mode.on_timeout()
+            steps_taken += 1;
+            if let Some(max_steps) = self.config.max_steps
+                && steps_taken > max_steps
             {
                 self.stats.timed_out = true;
                 break;
             }
 
             if matches!(state.execution_pc(), ExecutionPc::UnresolvedIndirect) {
-                let _ = self.resolve_block(func, scope, &mut state);
+                let _ = self.resolve_block(func, &mut state);
             }
             match mode.on_state_popped(self, state) {
                 DriverAction::Continue(next_state) => state = *next_state,
@@ -2217,7 +1753,7 @@ impl<'ctx> PathExplorer<'ctx> {
                 DriverAction::Finish => break,
             }
 
-            if self.stats.states_explored >= self.config.max_states && mode.on_max_states() {
+            if self.stats.states_explored >= self.config.max_states {
                 self.stats.max_states_exhausted = true;
                 break;
             }
@@ -2234,19 +1770,17 @@ impl<'ctx> PathExplorer<'ctx> {
 
             if self.config.prune_infeasible && !self.solver.is_sat(&state) {
                 self.stats.paths_pruned += 1;
-                mode.on_unsat_pruned();
                 continue;
             }
 
             let inline_start_depth = state.depth;
             let mut revisit_current_state = false;
             loop {
-                if !self.poll_execution(mode) {
+                if !self.poll_execution() {
                     break 'worklist;
                 }
-                if let Some(timeout) = self.config.timeout
-                    && start_time.elapsed() > timeout
-                    && mode.on_timeout()
+                if let Some(max_steps) = self.config.max_steps
+                    && steps_taken > max_steps
                 {
                     self.stats.timed_out = true;
                     break 'worklist;
@@ -2254,7 +1788,7 @@ impl<'ctx> PathExplorer<'ctx> {
 
                 if std::mem::take(&mut revisit_current_state) {
                     if matches!(state.execution_pc(), ExecutionPc::UnresolvedIndirect) {
-                        let _ = self.resolve_block(func, scope, &mut state);
+                        let _ = self.resolve_block(func, &mut state);
                     }
                     match mode.on_state_popped(self, state) {
                         DriverAction::Continue(next_state) => state = *next_state,
@@ -2263,7 +1797,7 @@ impl<'ctx> PathExplorer<'ctx> {
                     }
                 }
 
-                let Some(block) = self.resolve_block(func, scope, &mut state) else {
+                let Some(block) = self.resolve_block(func, &mut state) else {
                     let missing_pc = state.pc();
                     match mode.on_missing_block(
                         self,
@@ -2275,7 +1809,6 @@ impl<'ctx> PathExplorer<'ctx> {
                         DriverAction::Continue(_) | DriverAction::Skip => continue 'worklist,
                     }
                 };
-                let block_addr = block.runtime_addr;
                 let block_static_addr = block.static_addr;
                 let block_func = block.func;
                 let transfer_generation_before_block = state.control_transfer_generation();
@@ -2287,9 +1820,8 @@ impl<'ctx> PathExplorer<'ctx> {
                         for mut forked in forked_states {
                             self.remap_state_pc_after_block(&mut forked, block);
                             block.record_predecessor(&mut forked);
-                            if mode.allow_enqueue(&forked)
-                                && let Some(forked) =
-                                    self.prune_subsumed_same_pc_state(&mut worklist, forked)
+                            if let Some(forked) =
+                                self.prune_subsumed_same_pc_state(&mut worklist, forked)
                             {
                                 worklist.push(forked);
                             }
@@ -2306,25 +1838,22 @@ impl<'ctx> PathExplorer<'ctx> {
                                 block,
                                 transfer_generation_before_block,
                             );
-                            if mode.allow_enqueue(&state) {
-                                let can_inline_continue = !had_forks
-                                    && state.depth.saturating_sub(inline_start_depth)
-                                        < self.max_inline_runahead_depth_delta();
-                                if can_inline_continue {
-                                    revisit_current_state = true;
-                                    continue;
-                                }
-                                if let Some(state) =
-                                    self.prune_subsumed_same_pc_state(&mut worklist, state)
-                                {
-                                    worklist.push(state);
-                                }
+                            let can_inline_continue = !had_forks
+                                && state.depth.saturating_sub(inline_start_depth)
+                                    < self.max_inline_runahead_depth_delta();
+                            if can_inline_continue {
+                                revisit_current_state = true;
+                                continue;
+                            }
+                            if let Some(state) =
+                                self.prune_subsumed_same_pc_state(&mut worklist, state)
+                            {
+                                worklist.push(state);
                             }
                         } else {
                             match mode.on_terminated_state(
                                 self,
                                 state,
-                                block_addr,
                                 self.config.max_completed_paths,
                             ) {
                                 DriverAction::Finish => break 'worklist,
@@ -2338,7 +1867,6 @@ impl<'ctx> PathExplorer<'ctx> {
                     Err(e) => match mode.on_execute_error(
                         self,
                         state,
-                        block_addr,
                         e.to_string(),
                         self.config.max_completed_paths,
                     ) {
@@ -2360,45 +1888,11 @@ impl<'ctx> PathExplorer<'ctx> {
     ) -> TargetGuidanceContext {
         let distances = self.target_distance_map(func, target_addr);
         let reachable_blocks = distances.keys().copied().collect::<HashSet<_>>();
-        let mut call_targets_by_block: HashMap<u64, Vec<u64>> = HashMap::new();
-        let mut block_summary_rank: HashMap<u64, BlockSummaryRank> = HashMap::new();
-
-        for call in func.call_sites().by_id.values() {
-            let Some(target) = func.resolved_call_target(call) else {
-                continue;
-            };
-            let Some((block_addr, _)) = func.inst_op_site(call.at) else {
-                continue;
-            };
-            call_targets_by_block
-                .entry(block_addr)
-                .or_default()
-                .push(target);
-
-            let Some(binding) = self.derived_call_summaries.get(&target) else {
-                continue;
-            };
-            let entry = block_summary_rank
-                .entry(block_addr)
-                .or_insert_with(|| BlockSummaryRank {
-                    has_summary: false,
-                    has_exact_summary: false,
-                    min_case_count: usize::MAX,
-                });
-            entry.has_summary = true;
-            entry.has_exact_summary |= matches!(
-                binding.summary.completion,
-                crate::sim::DerivedSummaryCompletion::Exact
-            );
-            entry.min_case_count = entry.min_case_count.min(binding.summary.cases.len());
-        }
 
         TargetGuidanceContext {
             target_addr,
             distances,
             reachable_blocks,
-            call_targets_by_block,
-            block_summary_rank,
             allow_cross_function_states,
         }
     }
@@ -2412,54 +1906,6 @@ impl<'ctx> PathExplorer<'ctx> {
             .saturating_add(state.symbolic_inputs().len())
             .saturating_add(state.symbolic_memory().len())
             .saturating_add(state.symbolic_fd_inputs().len())
-    }
-
-    fn state_summary_guidance(
-        &self,
-        guidance: &TargetGuidanceContext,
-        state: &SymState<'ctx>,
-    ) -> StateSummaryGuidance {
-        let Some(static_pc) = self.effective_static_pc(state) else {
-            return StateSummaryGuidance::default();
-        };
-        let Some(targets) = guidance.call_targets_by_block.get(&static_pc) else {
-            return StateSummaryGuidance::default();
-        };
-
-        let mut result = StateSummaryGuidance {
-            summary_hits: 0,
-            min_feasible_cases: usize::MAX,
-            contradictory: false,
-        };
-
-        for target in targets {
-            let Some(binding) = self.derived_call_summaries.get(target) else {
-                continue;
-            };
-            let summary_guidance = evaluate_derived_summary_guidance(
-                state,
-                &binding.summary,
-                &binding.callconv,
-                &self.solver,
-            );
-            if !summary_guidance.summary_known {
-                continue;
-            }
-            result.summary_hits += 1;
-            result.min_feasible_cases = result
-                .min_feasible_cases
-                .min(summary_guidance.feasible_cases.max(1));
-            if summary_guidance.contradictory {
-                result.contradictory = true;
-                break;
-            }
-        }
-
-        if result.summary_hits == 0 {
-            StateSummaryGuidance::default()
-        } else {
-            result
-        }
     }
 
     fn target_enqueue_allowed(
@@ -2492,14 +1938,6 @@ impl<'ctx> PathExplorer<'ctx> {
             return false;
         }
 
-        let summary_guidance = self.state_summary_guidance(guidance, state);
-        if summary_guidance.summary_hits > 0 {
-            self.stats.target_summary_rank_hits += 1;
-        }
-        if summary_guidance.contradictory {
-            self.stats.target_pruned_summary_contradiction += 1;
-            return false;
-        }
         true
     }
 
@@ -2508,10 +1946,9 @@ impl<'ctx> PathExplorer<'ctx> {
         worklist: &mut StateWorklist<'ctx>,
         target_heap: &mut BinaryHeap<Reverse<TargetGuidedQueueEntry>>,
         guidance: &TargetGuidanceContext,
-        mode: &mut DriverMode<'ctx>,
         state: SymState<'ctx>,
     ) {
-        if !mode.allow_enqueue(&state) || !self.target_enqueue_allowed(guidance, &state) {
+        if !self.target_enqueue_allowed(guidance, &state) {
             return;
         }
         let Some(state) = self.prune_subsumed_same_pc_state(worklist, state) else {
@@ -2526,16 +1963,16 @@ impl<'ctx> PathExplorer<'ctx> {
         }
     }
 
-    fn drive_target_guided_in_scope(
+    fn drive_target_guided(
         &mut self,
         func: &SsaArtifact,
-        scope: Option<&PreparedFunctionScope>,
         initial_state: SymState<'ctx>,
         mode: &mut DriverMode<'ctx>,
         target_addr: u64,
         allow_cross_function_states: bool,
     ) {
         let start_time = Instant::now();
+        let mut steps_taken: u64 = 0;
         let mut worklist = StateWorklist::new(self.config.strategy);
         let mut target_heap: BinaryHeap<Reverse<TargetGuidedQueueEntry>> = BinaryHeap::new();
         let guidance = self.target_guidance_context(func, target_addr, allow_cross_function_states);
@@ -2554,7 +1991,7 @@ impl<'ctx> PathExplorer<'ctx> {
         'worklist: while let Some((mut state, reordered)) =
             self.pop_target_guided_state(&mut worklist, &mut target_heap)
         {
-            if !self.poll_execution(mode) {
+            if !self.poll_execution() {
                 break;
             }
             if reordered {
@@ -2568,16 +2005,16 @@ impl<'ctx> PathExplorer<'ctx> {
                     .expect("worklist returned a merge-compatible state");
             }
 
-            if let Some(timeout) = self.config.timeout
-                && start_time.elapsed() > timeout
-                && mode.on_timeout()
+            steps_taken += 1;
+            if let Some(max_steps) = self.config.max_steps
+                && steps_taken > max_steps
             {
                 self.stats.timed_out = true;
                 break;
             }
 
             if matches!(state.execution_pc(), ExecutionPc::UnresolvedIndirect) {
-                let _ = self.resolve_block(func, scope, &mut state);
+                let _ = self.resolve_block(func, &mut state);
             }
             match mode.on_state_popped(self, state) {
                 DriverAction::Continue(next_state) => state = *next_state,
@@ -2585,7 +2022,7 @@ impl<'ctx> PathExplorer<'ctx> {
                 DriverAction::Finish => break,
             }
 
-            if self.stats.states_explored >= self.config.max_states && mode.on_max_states() {
+            if self.stats.states_explored >= self.config.max_states {
                 self.stats.max_states_exhausted = true;
                 break;
             }
@@ -2617,20 +2054,18 @@ impl<'ctx> PathExplorer<'ctx> {
                     state.depth,
                     state.num_constraints(),
                 ));
-                mode.on_unsat_pruned();
                 continue;
             }
 
             let inline_start_depth = state.depth;
             let mut revisit_current_state = false;
             loop {
-                if !self.poll_execution(mode) {
+                if !self.poll_execution() {
                     break 'worklist;
                 }
                 let mut had_runtime_dispatch = false;
-                if let Some(timeout) = self.config.timeout
-                    && start_time.elapsed() > timeout
-                    && mode.on_timeout()
+                if let Some(max_steps) = self.config.max_steps
+                    && steps_taken > max_steps
                 {
                     self.stats.timed_out = true;
                     break 'worklist;
@@ -2638,7 +2073,7 @@ impl<'ctx> PathExplorer<'ctx> {
 
                 if std::mem::take(&mut revisit_current_state) {
                     if matches!(state.execution_pc(), ExecutionPc::UnresolvedIndirect) {
-                        let _ = self.resolve_block(func, scope, &mut state);
+                        let _ = self.resolve_block(func, &mut state);
                     }
                     match mode.on_state_popped(self, state) {
                         DriverAction::Continue(next_state) => state = *next_state,
@@ -2653,7 +2088,6 @@ impl<'ctx> PathExplorer<'ctx> {
                         &mut worklist,
                         &mut target_heap,
                         &guidance,
-                        mode,
                         dispatched,
                     );
                 }
@@ -2662,7 +2096,7 @@ impl<'ctx> PathExplorer<'ctx> {
                     continue 'worklist;
                 }
 
-                let Some(block) = self.resolve_block(func, scope, &mut state) else {
+                let Some(block) = self.resolve_block(func, &mut state) else {
                     let missing_pc = state.pc();
                     match mode.on_missing_block(
                         self,
@@ -2687,24 +2121,19 @@ impl<'ctx> PathExplorer<'ctx> {
                     state.num_constraints(),
                 ));
 
-                if let Some(summarized) = self.summarize_runtime_breakpoint_loop(
-                    func,
-                    scope,
-                    block_func,
-                    block.block,
-                    &state,
-                ) {
+                if let Some(summarized) =
+                    self.summarize_runtime_breakpoint_loop(func, block_func, block.block, &state)
+                {
                     self.enqueue_target_guided_state(
                         &mut worklist,
                         &mut target_heap,
                         &guidance,
-                        mode,
                         summarized,
                     );
                     continue 'worklist;
                 }
 
-                let direct_call_targets = self.direct_call_fork_targets(func, scope, block.block);
+                let direct_call_targets = self.direct_call_fork_targets(func, block.block);
                 if let Some(targets) = direct_call_targets.as_ref() {
                     let mut targets = targets.iter().copied().collect::<Vec<_>>();
                     targets.sort_unstable();
@@ -2742,7 +2171,6 @@ impl<'ctx> PathExplorer<'ctx> {
                                 &mut worklist,
                                 &mut target_heap,
                                 &guidance,
-                                mode,
                                 forked,
                             );
                         }
@@ -2758,9 +2186,7 @@ impl<'ctx> PathExplorer<'ctx> {
                                 block,
                                 transfer_generation_before_block,
                             );
-                            if mode.allow_enqueue(&state)
-                                && self.target_enqueue_allowed(&guidance, &state)
-                            {
+                            if self.target_enqueue_allowed(&guidance, &state) {
                                 let can_inline_continue = !had_forks
                                     && !had_runtime_dispatch
                                     && state.depth.saturating_sub(inline_start_depth)
@@ -2782,15 +2208,13 @@ impl<'ctx> PathExplorer<'ctx> {
                                 }
                             }
                         } else {
-                            let resumed =
-                                self.fork_symbolic_exception_resume_targets(func, scope, &state);
+                            let resumed = self.fork_symbolic_exception_resume_targets(func, &state);
                             if !resumed.is_empty() {
                                 for resumed_state in resumed {
                                     self.enqueue_target_guided_state(
                                         &mut worklist,
                                         &mut target_heap,
                                         &guidance,
-                                        mode,
                                         resumed_state,
                                     );
                                 }
@@ -2799,7 +2223,6 @@ impl<'ctx> PathExplorer<'ctx> {
                             match mode.on_terminated_state(
                                 self,
                                 state,
-                                block_addr,
                                 self.config.max_completed_paths,
                             ) {
                                 DriverAction::Finish => break 'worklist,
@@ -2813,7 +2236,6 @@ impl<'ctx> PathExplorer<'ctx> {
                     Err(e) => match mode.on_execute_error(
                         self,
                         state,
-                        block_addr,
                         e.to_string(),
                         self.config.max_completed_paths,
                     ) {
@@ -2898,18 +2320,7 @@ impl<'ctx> PathExplorer<'ctx> {
         state: &SymState<'ctx>,
         id: usize,
         guidance: &TargetGuidanceContext,
-    ) -> (
-        usize,
-        usize,
-        usize,
-        usize,
-        usize,
-        usize,
-        usize,
-        usize,
-        usize,
-        usize,
-    ) {
+    ) -> (usize, usize, usize, usize, usize, usize, usize) {
         let static_pc = self.effective_static_pc(state);
         let reachable = static_pc.is_some_and(|pc| guidance.reachable_blocks.contains(&pc));
         let runtime_continuation_bridge = state.pending_exception().is_some()
@@ -2930,24 +2341,9 @@ impl<'ctx> PathExplorer<'ctx> {
         } else {
             usize::MAX
         };
-        let summary_rank = guidance
-            .block_summary_rank
-            .get(&static_pc.unwrap_or(u64::MAX))
-            .cloned()
-            .unwrap_or_default();
-        let summary_known_penalty = usize::from(!summary_rank.has_summary);
-        let summary_exact_penalty = usize::from(!summary_rank.has_exact_summary);
-        let summary_case_rank = if summary_rank.has_summary {
-            summary_rank.min_case_count
-        } else {
-            usize::MAX
-        };
         (
             reachability_penalty,
             distance,
-            summary_known_penalty,
-            summary_exact_penalty,
-            summary_case_rank,
             runtime_walk_penalty,
             self.symbolic_fanout_proxy(state),
             state.num_constraints(),
@@ -2962,23 +2358,13 @@ impl<'ctx> PathExplorer<'ctx> {
         func: &SsaArtifact,
         initial_state: SymState<'ctx>,
     ) -> Vec<PathResult<'ctx>> {
-        self.explore_in_scope(func, None, initial_state)
-    }
-
-    pub fn explore_in_scope(
-        &mut self,
-        func: &SsaArtifact,
-        scope: Option<&PreparedFunctionScope>,
-        initial_state: SymState<'ctx>,
-    ) -> Vec<PathResult<'ctx>> {
-        let scope = scope.and_then(|scope| scope.exact_for_artifact(func));
         if self.config.max_completed_paths == Some(0) {
             return Vec::new();
         }
         let mut mode = DriverMode::Explore {
             results: Vec::new(),
         };
-        self.drive_in_scope(func, scope, initial_state, &mut mode);
+        self.drive(func, initial_state, &mut mode);
         match mode {
             DriverMode::Explore { results } => results,
             _ => unreachable!("explore should always use explore mode"),
@@ -3004,65 +2390,19 @@ impl<'ctx> PathExplorer<'ctx> {
         initial_state: SymState<'ctx>,
         target_addr: u64,
     ) -> Option<PathResult<'ctx>> {
-        self.find_path_to_in_scope(func, None, initial_state, target_addr)
-    }
-
-    pub fn find_path_to_in_scope(
-        &mut self,
-        func: &SsaArtifact,
-        scope: Option<&PreparedFunctionScope>,
-        initial_state: SymState<'ctx>,
-        target_addr: u64,
-    ) -> Option<PathResult<'ctx>> {
-        let scope = scope.and_then(|scope| scope.exact_for_artifact(func));
-        self.find_path_to_in_scope_with_feasibility(func, scope, initial_state, target_addr, true)
-    }
-
-    fn find_path_to_in_scope_with_feasibility(
-        &mut self,
-        func: &SsaArtifact,
-        scope: Option<&PreparedFunctionScope>,
-        initial_state: SymState<'ctx>,
-        target_addr: u64,
-        require_feasible: bool,
-    ) -> Option<PathResult<'ctx>> {
         let mut mode = DriverMode::FindFirst {
             target_addr,
-            require_feasible,
+            require_feasible: true,
             found: None,
         };
-        let bridge_target = self.exception_bridge_guidance_target(func, scope, target_addr);
-        let guidance_target = bridge_target.unwrap_or(target_addr);
-        let guidance_func = if bridge_target.is_some() {
-            Some(func)
-        } else {
-            self.resolve_scope_function(func, scope, target_addr)
-        };
-        let allow_cross_function_states = bridge_target.is_none()
-            && guidance_func.is_some_and(|guidance_func| guidance_func.entry != func.entry);
         debug_target_guidance_log(&format!(
-            "search_setup target=0x{:x} bridge={} guidance_entry={} target_guided={} cross={}",
-            target_addr,
-            bridge_target
-                .map(|target| format!("0x{target:x}"))
-                .unwrap_or_else(|| "none".to_string()),
-            guidance_func
-                .map(|function| format!("0x{:x}", function.entry))
-                .unwrap_or_else(|| "none".to_string()),
-            self.target_guided_queries,
-            allow_cross_function_states,
+            "search_setup target=0x{:x} target_guided={}",
+            target_addr, self.target_guided_queries,
         ));
-        if self.target_guided_queries && guidance_func.is_some() {
-            self.drive_target_guided_in_scope(
-                guidance_func.unwrap_or(func),
-                scope,
-                initial_state,
-                &mut mode,
-                guidance_target,
-                allow_cross_function_states,
-            );
+        if self.target_guided_queries && func.get_block(target_addr).is_some() {
+            self.drive_target_guided(func, initial_state, &mut mode, target_addr, false);
         } else {
-            self.drive_in_scope(func, scope, initial_state, &mut mode);
+            self.drive(func, initial_state, &mut mode);
         }
         match mode {
             DriverMode::FindFirst { found, .. } => found,
@@ -3077,42 +2417,15 @@ impl<'ctx> PathExplorer<'ctx> {
         initial_state: SymState<'ctx>,
         target_addr: u64,
     ) -> Vec<PathResult<'ctx>> {
-        self.find_paths_to_in_scope(func, None, initial_state, target_addr)
-    }
-
-    pub fn find_paths_to_in_scope(
-        &mut self,
-        func: &SsaArtifact,
-        scope: Option<&PreparedFunctionScope>,
-        initial_state: SymState<'ctx>,
-        target_addr: u64,
-    ) -> Vec<PathResult<'ctx>> {
-        let scope = scope.and_then(|scope| scope.exact_for_artifact(func));
         let mut mode = DriverMode::FindAll {
             target_addr,
             require_feasible: true,
             matches: Vec::new(),
         };
-        let bridge_target = self.exception_bridge_guidance_target(func, scope, target_addr);
-        let guidance_target = bridge_target.unwrap_or(target_addr);
-        let guidance_func = if bridge_target.is_some() {
-            Some(func)
+        if self.target_guided_queries && func.get_block(target_addr).is_some() {
+            self.drive_target_guided(func, initial_state, &mut mode, target_addr, false);
         } else {
-            self.resolve_scope_function(func, scope, target_addr)
-        };
-        let allow_cross_function_states = bridge_target.is_none()
-            && guidance_func.is_some_and(|guidance_func| guidance_func.entry != func.entry);
-        if self.target_guided_queries && guidance_func.is_some() {
-            self.drive_target_guided_in_scope(
-                guidance_func.unwrap_or(func),
-                scope,
-                initial_state,
-                &mut mode,
-                guidance_target,
-                allow_cross_function_states,
-            );
-        } else {
-            self.drive_in_scope(func, scope, initial_state, &mut mode);
+            self.drive(func, initial_state, &mut mode);
         }
         match mode {
             DriverMode::FindAll { matches, .. } => matches,
@@ -3131,30 +2444,10 @@ impl<'ctx> PathExplorer<'ctx> {
             avoid_set: avoid_addrs.iter().copied().collect(),
             found: None,
         };
-        self.drive_in_scope(func, None, initial_state, &mut mode);
+        self.drive(func, initial_state, &mut mode);
         match mode {
             DriverMode::Avoid { found, .. } => found,
             _ => unreachable!("find_path_avoiding should always use avoid mode"),
-        }
-    }
-
-    /// Run a typed exploration specification.
-    pub fn run_spec(
-        &mut self,
-        func: &SsaArtifact,
-        initial_state: SymState<'ctx>,
-        spec: &ExplorationSpec,
-    ) -> Result<SpecExploreResult<'ctx>, String> {
-        let mut mode = DriverMode::Spec {
-            find_set: spec.find_addresses()?.into_iter().collect(),
-            avoid_set: spec.avoid_addresses()?.into_iter().collect(),
-            max_finds: spec.max_finds(),
-            result: SpecExploreResult::default(),
-        };
-        self.drive_in_scope(func, None, initial_state, &mut mode);
-        match mode {
-            DriverMode::Spec { result, .. } => Ok(result),
-            _ => unreachable!("run_spec should always use spec mode"),
         }
     }
 }
@@ -3162,18 +2455,12 @@ impl<'ctx> PathExplorer<'ctx> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::rc::Rc;
-    use std::sync::Arc;
 
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
-    use r2ssa::{InterprocFunctionId, SsaArtifact};
+    use r2ssa::SsaArtifact;
     use z3::ast::BV;
 
     use crate::SymValue;
-    use crate::executor::CallHookResult;
-    use crate::sim::{
-        CallConv, DerivedFunctionSummary, DerivedSummaryCase, DerivedSummaryCompletion,
-    };
 
     const RAX: u64 = 0;
     const RDI: u64 = 56;
@@ -3204,15 +2491,15 @@ mod tests {
             crate::SymExecutionControl::with_cancellation(cancellation),
         );
         let function = terminal_test_function();
-        let summary = explorer.summarize_function(&function, SymState::new(&ctx, function.entry));
+        explorer.explore(&function, SymState::new(&ctx, function.entry));
 
-        assert_eq!(summary.completion, crate::QueryCompletion::Cancelled);
+        let stats = explorer.stats();
         assert_eq!(
-            summary.stats.execution_stop,
+            stats.execution_stop,
             Some(crate::SymExecutionStopReason::Cancelled)
         );
-        assert!(!summary.stats.timed_out);
-        assert!(!summary.stats.max_states_exhausted);
+        assert!(!stats.timed_out);
+        assert!(!stats.max_states_exhausted);
     }
 
     #[test]
@@ -3226,15 +2513,15 @@ mod tests {
             crate::SymExecutionControl::with_deadline(deadline),
         );
         let function = terminal_test_function();
-        let summary = explorer.summarize_function(&function, SymState::new(&ctx, function.entry));
+        explorer.explore(&function, SymState::new(&ctx, function.entry));
 
-        assert_eq!(summary.completion, crate::QueryCompletion::DeadlineExceeded);
+        let stats = explorer.stats();
         assert_eq!(
-            summary.stats.execution_stop,
+            stats.execution_stop,
             Some(crate::SymExecutionStopReason::DeadlineExceeded)
         );
-        assert!(!summary.stats.timed_out);
-        assert!(!summary.stats.max_states_exhausted);
+        assert!(!stats.timed_out);
+        assert!(!stats.max_states_exhausted);
     }
 
     #[test]
@@ -3246,11 +2533,11 @@ mod tests {
         };
         let mut explorer = PathExplorer::with_config(&ctx, config);
         let function = terminal_test_function();
-        let summary = explorer.summarize_function(&function, SymState::new(&ctx, function.entry));
+        explorer.explore(&function, SymState::new(&ctx, function.entry));
 
-        assert_eq!(summary.completion, crate::QueryCompletion::BudgetExhausted);
-        assert!(summary.stats.max_states_exhausted);
-        assert_eq!(summary.stats.execution_stop, None);
+        let stats = explorer.stats();
+        assert!(stats.max_states_exhausted);
+        assert_eq!(stats.execution_stop, None);
     }
     const TMP0: u64 = 0x80;
     const TMP1: u64 = 0x88;
@@ -3274,15 +2561,6 @@ mod tests {
         }
     }
 
-    fn make_ram(addr: u64, size: u32) -> Varnode {
-        Varnode {
-            space: SpaceId::Ram,
-            offset: addr,
-            size,
-            meta: None,
-        }
-    }
-
     fn make_x86_64_arch() -> ArchSpec {
         let mut arch = ArchSpec::new("x86-64");
         arch.addr_size = 8;
@@ -3290,6 +2568,8 @@ mod tests {
         arch.add_register(RegisterDef::new("EAX", RAX, 4));
         arch.add_register(RegisterDef::new("RAX", RAX, 8));
         arch.add_register(RegisterDef::new("RDI", RDI, 8));
+        arch.add_register(RegisterDef::new("RSP", 0xa0, 8));
+        arch.add_register(RegisterDef::new("RIP", 0xa8, 8));
         arch
     }
 
@@ -3387,7 +2667,7 @@ mod tests {
         .expect("symbolic function");
         let mut explorer = PathExplorer::new(&ctx);
         let states = explorer
-            .advance_current_block_in_scope(&func, None, SymState::new(&ctx, 0x1000))
+            .advance_current_block(&func, SymState::new(&ctx, 0x1000))
             .expect("same-address branch execution");
         assert_eq!(states.len(), 1);
         assert_eq!(states[0].pc(), 0x1000);
@@ -3407,8 +2687,6 @@ mod tests {
             target_addr: 0x2000,
             distances: HashMap::from([(0x1000, 2), (0x2000, 0), (0x3000, 1)]),
             reachable_blocks: HashSet::from([0x1000, 0x2000, 0x3000]),
-            call_targets_by_block: HashMap::new(),
-            block_summary_rank: HashMap::new(),
             allow_cross_function_states: false,
         };
 
@@ -3724,72 +3002,6 @@ mod tests {
     }
 
     #[test]
-    fn test_target_guided_prunes_exact_summary_contradiction() {
-        let ctx = Context::thread_local();
-        let arch = make_x86_64_arch();
-        let blocks = vec![
-            R2ILBlock {
-                addr: 0x1000,
-                size: 4,
-                ops: vec![R2ILOp::Call {
-                    target: make_const(0x2000, 8),
-                }],
-                switch_info: None,
-                op_metadata: Default::default(),
-            },
-            R2ILBlock {
-                addr: 0x1004,
-                size: 4,
-                ops: vec![R2ILOp::Branch {
-                    target: make_const(0x1010, 8),
-                }],
-                switch_info: None,
-                op_metadata: Default::default(),
-            },
-            R2ILBlock {
-                addr: 0x1010,
-                size: 4,
-                ops: vec![R2ILOp::Copy {
-                    dst: make_reg(TMP0, 1),
-                    src: make_const(1, 1),
-                }],
-                switch_info: None,
-                op_metadata: Default::default(),
-            },
-        ];
-        let func = SsaArtifact::for_symbolic(&blocks, Some(&arch)).expect("symbolic function");
-
-        let mut explorer = PathExplorer::new(&ctx);
-        explorer.set_target_guided_queries(true);
-
-        let arg0 = SymValue::new_symbolic(&ctx, "summary_arg0", 64);
-        let guard = arg0.to_bv(&ctx).eq(BV::from_u64(1, 64));
-        let summary = Rc::new(DerivedFunctionSummary {
-            id: InterprocFunctionId(0x2000),
-            name: Some("contradict_helper".to_string()),
-            arg_count_hint: 1,
-            arg_symbols: vec![(0, arg0)],
-            memory_inputs: Vec::new(),
-            cases: vec![DerivedSummaryCase {
-                guard,
-                return_value: None,
-                memory_writes: Vec::new(),
-            }],
-            completion: DerivedSummaryCompletion::Exact,
-        });
-        explorer.register_derived_call_hook(0x2000, summary, CallConv::x86_64_sysv(), |_state| {
-            CallHookResult::Fallthrough
-        });
-
-        let mut state = SymState::new(&ctx, 0x1000);
-        state.set_register("RDI_0", SymValue::concrete(2, 64));
-
-        let paths = explorer.find_paths_to(&func, state, 0x1010);
-        assert!(paths.is_empty(), "contradictory exact summary should prune");
-        assert_eq!(explorer.stats().target_pruned_summary_contradiction, 1);
-    }
-
-    #[test]
     fn test_runtime_alias_region_becomes_queryable() {
         let ctx = Context::thread_local();
         let blocks = vec![
@@ -3882,6 +3094,16 @@ mod tests {
         let ctx = Context::thread_local();
         let blocks = vec![
             R2ILBlock {
+                addr: 0x0ffc,
+                size: 4,
+                ops: vec![R2ILOp::CBranch {
+                    target: make_const(0x3000, 8),
+                    cond: make_reg(RAX, 1),
+                }],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
                 addr: 0x1000,
                 size: 4,
                 ops: vec![
@@ -3893,6 +3115,13 @@ mod tests {
                         target: make_const(0x1020, 8),
                     },
                 ],
+                switch_info: None,
+                op_metadata: Default::default(),
+            },
+            R2ILBlock {
+                addr: 0x1020,
+                size: 1,
+                ops: vec![R2ILOp::Nop],
                 switch_info: None,
                 op_metadata: Default::default(),
             },
@@ -3911,34 +3140,8 @@ mod tests {
                 switch_info: None,
                 op_metadata: Default::default(),
             },
-            R2ILBlock {
-                addr: 0x1020,
-                size: 1,
-                ops: vec![R2ILOp::Nop],
-                switch_info: None,
-                op_metadata: Default::default(),
-            },
         ];
-        let func = Arc::new(SsaArtifact::for_symbolic(&blocks, None).expect("symbolic function"));
-        let runtime_source = Arc::new(
-            SsaArtifact::for_symbolic(&[blocks[1].clone()], None).expect("runtime source function"),
-        );
-        let scope = crate::PreparedFunctionScope::new(
-            0x1000,
-            vec![
-                crate::ScopedPreparedFunction {
-                    id: InterprocFunctionId(0x1000),
-                    name: Some("root".to_string()),
-                    prepared: Arc::clone(&func),
-                },
-                crate::ScopedPreparedFunction {
-                    id: InterprocFunctionId(0x3000),
-                    name: Some("runtime_source".to_string()),
-                    prepared: runtime_source,
-                },
-            ],
-        )
-        .expect("scope");
+        let func = SsaArtifact::for_symbolic(&blocks, None).expect("symbolic function");
         let join = func.get_block(0x1020).expect("join block");
         let phi = join.phis.first().expect("join Phi");
         assert!(
@@ -3966,7 +3169,7 @@ mod tests {
 
         let mut explorer = PathExplorer::new(&ctx);
         let mut after_source = explorer
-            .advance_current_block_in_scope(&func, None, state)
+            .advance_current_block(&func, state)
             .expect("static source block execution");
         let state = after_source.pop().expect("active join state");
         assert!(matches!(
@@ -3977,7 +3180,7 @@ mod tests {
         ));
 
         let mut after_join = explorer
-            .advance_current_block_in_scope(&func, None, state)
+            .advance_current_block(&func, state)
             .expect("join execution");
         let state = after_join.pop().expect("active post-join state");
         assert_eq!(
@@ -4002,7 +3205,7 @@ mod tests {
 
         let mut runtime_explorer = PathExplorer::new(&ctx);
         let mut after_runtime_source = runtime_explorer
-            .advance_current_block_in_scope(&func, Some(&scope), runtime_state)
+            .advance_current_block(&func, runtime_state)
             .expect("runtime alias source block execution");
         let mut runtime_state = after_runtime_source
             .pop()
@@ -4025,7 +3228,7 @@ mod tests {
         );
 
         let mut after_runtime_join = runtime_explorer
-            .advance_current_block_in_scope(&func, Some(&scope), runtime_state)
+            .advance_current_block(&func, runtime_state)
             .expect("runtime-selected join execution");
         let runtime_state = after_runtime_join
             .pop()
@@ -4041,54 +3244,56 @@ mod tests {
     #[test]
     fn unresolved_indirect_pc_requires_one_exact_domain_candidate() {
         let ctx = Context::thread_local();
-        let static_func = Arc::new(
-            SsaArtifact::for_symbolic(
-                &[R2ILBlock {
+        let static_func = SsaArtifact::for_symbolic(
+            &[R2ILBlock {
+                addr: 0x1000,
+                size: 1,
+                ops: vec![R2ILOp::Nop],
+                switch_info: None,
+                op_metadata: Default::default(),
+            }],
+            None,
+        )
+        .expect("static function");
+        let runtime_source = SsaArtifact::for_symbolic(
+            &[R2ILBlock {
+                addr: 0x3000,
+                size: 1,
+                ops: vec![R2ILOp::Nop],
+                switch_info: None,
+                op_metadata: Default::default(),
+            }],
+            None,
+        )
+        .expect("runtime source function");
+        let ambiguous_func = SsaArtifact::for_symbolic(
+            &[
+                R2ILBlock {
                     addr: 0x1000,
                     size: 1,
-                    ops: vec![R2ILOp::Nop],
+                    ops: vec![R2ILOp::Branch {
+                        target: make_const(0x3000, 8),
+                    }],
                     switch_info: None,
                     op_metadata: Default::default(),
-                }],
-                None,
-            )
-            .expect("static function"),
-        );
-        let runtime_source = Arc::new(
-            SsaArtifact::for_symbolic(
-                &[R2ILBlock {
+                },
+                R2ILBlock {
                     addr: 0x3000,
                     size: 1,
                     ops: vec![R2ILOp::Nop],
                     switch_info: None,
                     op_metadata: Default::default(),
-                }],
-                None,
-            )
-            .expect("runtime source function"),
-        );
-        let scope = crate::PreparedFunctionScope::new(
-            0x1000,
-            vec![
-                crate::ScopedPreparedFunction {
-                    id: InterprocFunctionId(0x1000),
-                    name: Some("static".to_string()),
-                    prepared: Arc::clone(&static_func),
-                },
-                crate::ScopedPreparedFunction {
-                    id: InterprocFunctionId(0x3000),
-                    name: Some("runtime_source".to_string()),
-                    prepared: Arc::clone(&runtime_source),
                 },
             ],
+            None,
         )
-        .expect("scope");
+        .expect("function with both candidate blocks");
 
         let mut static_only = SymState::new(&ctx, 0x2000);
         static_only.set_unresolved_indirect_execution_pc(0x1000);
         let mut explorer = PathExplorer::new(&ctx);
         let states = explorer
-            .advance_current_block_in_scope(&static_func, None, static_only)
+            .advance_current_block(&static_func, static_only)
             .expect("one static candidate should resolve");
         assert!(matches!(
             states[0].predecessor(),
@@ -4109,7 +3314,7 @@ mod tests {
         );
         runtime_only.set_unresolved_indirect_execution_pc(0x1000);
         let states = explorer
-            .advance_current_block_in_scope(&runtime_source, None, runtime_only)
+            .advance_current_block(&runtime_source, runtime_only)
             .expect("one runtime candidate should resolve");
         assert!(matches!(
             states[0].predecessor(),
@@ -4132,7 +3337,7 @@ mod tests {
         ambiguous.set_unresolved_indirect_execution_pc(0x1000);
         assert!(
             explorer
-                .advance_current_block_in_scope(&static_func, Some(&scope), ambiguous)
+                .advance_current_block(&ambiguous_func, ambiguous)
                 .is_err(),
             "static and runtime candidates must be refused as ambiguous"
         );
@@ -4142,7 +3347,7 @@ mod tests {
         unmapped.set_unresolved_indirect_execution_pc(0x1000);
         assert!(
             explorer
-                .advance_current_block_in_scope(&static_func, None, unmapped)
+                .advance_current_block(&static_func, unmapped)
                 .is_err(),
             "runtime membership without an exact source mapping must be refused"
         );
@@ -4175,114 +3380,6 @@ mod tests {
             loops::concrete_state_var_at_block_entry(&state, &block, &counter),
             Some(0),
             "loop summaries must read the incoming phi source, not a stale phi destination"
-        );
-    }
-
-    #[test]
-    fn test_target_guided_follows_scoped_direct_call_thunk() {
-        let ctx = Context::thread_local();
-        let arch = make_x86_64_arch();
-        let root_blocks = vec![R2ILBlock {
-            addr: 0x1000,
-            size: 4,
-            ops: vec![
-                R2ILOp::Call {
-                    target: make_const(0x2000, 8),
-                },
-                R2ILOp::Return {
-                    target: make_const(0, 8),
-                },
-            ],
-            switch_info: None,
-            op_metadata: Default::default(),
-        }];
-        let thunk_blocks = vec![
-            R2ILBlock {
-                addr: 0x2000,
-                size: 4,
-                ops: vec![R2ILOp::Branch {
-                    target: make_const(0x3000, 8),
-                }],
-                switch_info: None,
-                op_metadata: Default::default(),
-            },
-            R2ILBlock {
-                addr: 0x3000,
-                size: 1,
-                ops: vec![R2ILOp::Return {
-                    target: make_const(0, 8),
-                }],
-                switch_info: None,
-                op_metadata: Default::default(),
-            },
-        ];
-        let root =
-            Arc::new(SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic"));
-        let thunk = Arc::new(
-            SsaArtifact::for_symbolic(&thunk_blocks, Some(&arch)).expect("thunk symbolic"),
-        );
-        let scope = crate::PreparedFunctionScope::new(
-            0x1000,
-            vec![
-                crate::ScopedPreparedFunction {
-                    id: InterprocFunctionId(0x1000),
-                    name: Some("root".to_string()),
-                    prepared: Arc::clone(&root),
-                },
-                crate::ScopedPreparedFunction {
-                    id: InterprocFunctionId(0x2000),
-                    name: Some("thunk".to_string()),
-                    prepared: Arc::clone(&thunk),
-                },
-            ],
-        )
-        .expect("scope");
-
-        let mut explorer = PathExplorer::new(&ctx);
-        explorer.set_target_guided_queries(true);
-        let found = explorer.find_path_to_in_scope(
-            &root,
-            Some(&scope),
-            SymState::new(&ctx, 0x1000),
-            0x3000,
-        );
-
-        assert!(
-            found.is_some(),
-            "target-guided queries should follow direct calls into scoped thunk/helper blocks"
-        );
-        assert_eq!(found.unwrap().final_pc(), 0x3000);
-
-        let foreign_root = Arc::new(
-            SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("foreign root symbolic"),
-        );
-        let foreign_scope = crate::PreparedFunctionScope::new(
-            0x1000,
-            vec![
-                crate::ScopedPreparedFunction {
-                    id: InterprocFunctionId(0x1000),
-                    name: Some("foreign_root".to_string()),
-                    prepared: foreign_root,
-                },
-                crate::ScopedPreparedFunction {
-                    id: InterprocFunctionId(0x2000),
-                    name: Some("foreign_thunk".to_string()),
-                    prepared: thunk,
-                },
-            ],
-        )
-        .expect("self-consistent foreign scope");
-        let mut foreign_explorer = PathExplorer::new(&ctx);
-        foreign_explorer.set_target_guided_queries(true);
-        let foreign = foreign_explorer.find_path_to_in_scope(
-            &root,
-            Some(&foreign_scope),
-            SymState::new(&ctx, 0x1000),
-            0x3000,
-        );
-        assert!(
-            foreign.is_none(),
-            "same-content foreign root authority must not authorize helper execution"
         );
     }
 
@@ -4474,8 +3571,6 @@ mod tests {
             target_addr: 0x1000,
             distances: HashMap::from([(0x1000, 0)]),
             reachable_blocks: HashSet::from([0x1000]),
-            call_targets_by_block: HashMap::new(),
-            block_summary_rank: HashMap::new(),
             allow_cross_function_states: false,
         };
         let (_, context_addr) = {
@@ -4505,8 +3600,6 @@ mod tests {
             target_addr: 0x2004,
             distances: HashMap::from([(0x2004, 0)]),
             reachable_blocks: HashSet::from([0x2004]),
-            call_targets_by_block: HashMap::new(),
-            block_summary_rank: HashMap::new(),
             allow_cross_function_states: false,
         };
         let mut state = SymState::new(&ctx, 0x6000_0000);
@@ -4564,603 +3657,6 @@ mod tests {
                 )
                 .as_concrete(),
             Some(0x1004)
-        );
-    }
-
-    #[test]
-    fn test_exception_handler_target_guidance_uses_raise_site_bridge() {
-        let ctx = Context::thread_local();
-        let mut arch = make_x86_64_arch();
-        arch.add_register(RegisterDef::new("RCX", 0x80, 8));
-        arch.add_register(RegisterDef::new("RDX", 0x88, 8));
-        arch.add_register(RegisterDef::new("R8", 0x90, 8));
-        arch.add_register(RegisterDef::new("R9", 0x98, 8));
-
-        let root_blocks = vec![
-            R2ILBlock {
-                addr: 0x1000,
-                size: 4,
-                switch_info: None,
-                op_metadata: Default::default(),
-                ops: vec![
-                    R2ILOp::Copy {
-                        dst: make_reg(0x80, 8),
-                        src: make_const(1, 8),
-                    },
-                    R2ILOp::Copy {
-                        dst: make_reg(0x88, 8),
-                        src: make_const(0x2000, 8),
-                    },
-                    R2ILOp::Call {
-                        target: make_const(0x5000, 8),
-                    },
-                    R2ILOp::Branch {
-                        target: make_const(0x1010, 8),
-                    },
-                ],
-            },
-            R2ILBlock {
-                addr: 0x1010,
-                size: 4,
-                switch_info: None,
-                op_metadata: Default::default(),
-                ops: vec![
-                    R2ILOp::Copy {
-                        dst: make_reg(0x80, 8),
-                        src: make_const(0x8000_0004, 8),
-                    },
-                    R2ILOp::Copy {
-                        dst: make_reg(0x88, 8),
-                        src: make_const(0, 8),
-                    },
-                    R2ILOp::Copy {
-                        dst: make_reg(0x90, 8),
-                        src: make_const(0, 8),
-                    },
-                    R2ILOp::Copy {
-                        dst: make_reg(0x98, 8),
-                        src: make_const(0, 8),
-                    },
-                    R2ILOp::Call {
-                        target: make_const(0x5008, 8),
-                    },
-                    R2ILOp::Return {
-                        target: make_const(0, 8),
-                    },
-                ],
-            },
-        ];
-        let handler_blocks = vec![R2ILBlock {
-            addr: 0x2000,
-            size: 1,
-            switch_info: None,
-            op_metadata: Default::default(),
-            ops: vec![R2ILOp::Return {
-                target: make_const(0, 8),
-            }],
-        }];
-        let root =
-            Arc::new(SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic"));
-        let handler = Arc::new(
-            SsaArtifact::for_symbolic(&handler_blocks, Some(&arch)).expect("handler symbolic"),
-        );
-        let scope = crate::PreparedFunctionScope::new(
-            0x1000,
-            vec![
-                crate::ScopedPreparedFunction {
-                    id: InterprocFunctionId(0x1000),
-                    name: Some("root".to_string()),
-                    prepared: Arc::clone(&root),
-                },
-                crate::ScopedPreparedFunction {
-                    id: InterprocFunctionId(0x2000),
-                    name: Some("handler".to_string()),
-                    prepared: handler,
-                },
-            ],
-        )
-        .expect("scope");
-
-        let mut explorer = PathExplorer::new(&ctx);
-        explorer.register_tagged_call_hook(
-            0x5000,
-            crate::executor::CallHookTag::WindowsAddVectoredExceptionHandler,
-            |_| CallHookResult::Fallthrough,
-        );
-        explorer.register_tagged_call_hook(
-            0x5008,
-            crate::executor::CallHookTag::WindowsRaiseException,
-            |_| CallHookResult::Fallthrough,
-        );
-
-        assert_eq!(
-            explorer.exception_bridge_guidance_target(&root, Some(&scope), 0x2000),
-            Some(0x1010)
-        );
-    }
-
-    #[test]
-    fn test_runtime_target_guidance_uses_raise_site_bridge() {
-        let ctx = Context::thread_local();
-        let mut arch = make_x86_64_arch();
-        arch.add_register(RegisterDef::new("RCX", 0x80, 8));
-        arch.add_register(RegisterDef::new("RDX", 0x88, 8));
-        arch.add_register(RegisterDef::new("R8", 0x90, 8));
-        arch.add_register(RegisterDef::new("R9", 0x98, 8));
-
-        let root_blocks = vec![
-            R2ILBlock {
-                addr: 0x1000,
-                size: 4,
-                switch_info: None,
-                op_metadata: Default::default(),
-                ops: vec![
-                    R2ILOp::Copy {
-                        dst: make_reg(0x80, 8),
-                        src: make_const(1, 8),
-                    },
-                    R2ILOp::Copy {
-                        dst: make_reg(0x88, 8),
-                        src: make_const(0x2000, 8),
-                    },
-                    R2ILOp::Call {
-                        target: make_const(0x5000, 8),
-                    },
-                    R2ILOp::Branch {
-                        target: make_const(0x1010, 8),
-                    },
-                ],
-            },
-            R2ILBlock {
-                addr: 0x1010,
-                size: 4,
-                switch_info: None,
-                op_metadata: Default::default(),
-                ops: vec![
-                    R2ILOp::Copy {
-                        dst: make_reg(0x80, 8),
-                        src: make_const(0x8000_0004, 8),
-                    },
-                    R2ILOp::Copy {
-                        dst: make_reg(0x88, 8),
-                        src: make_const(0, 8),
-                    },
-                    R2ILOp::Copy {
-                        dst: make_reg(0x90, 8),
-                        src: make_const(0, 8),
-                    },
-                    R2ILOp::Copy {
-                        dst: make_reg(0x98, 8),
-                        src: make_const(0, 8),
-                    },
-                    R2ILOp::Call {
-                        target: make_const(0x5008, 8),
-                    },
-                    R2ILOp::Return {
-                        target: make_const(0, 8),
-                    },
-                ],
-            },
-        ];
-        let handler_blocks = vec![R2ILBlock {
-            addr: 0x2000,
-            size: 1,
-            switch_info: None,
-            op_metadata: Default::default(),
-            ops: vec![R2ILOp::Return {
-                target: make_const(0, 8),
-            }],
-        }];
-        let root =
-            Arc::new(SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic"));
-        let handler = Arc::new(
-            SsaArtifact::for_symbolic(&handler_blocks, Some(&arch)).expect("handler symbolic"),
-        );
-        let scope = crate::PreparedFunctionScope::new(
-            0x1000,
-            vec![
-                crate::ScopedPreparedFunction {
-                    id: InterprocFunctionId(0x1000),
-                    name: Some("root".to_string()),
-                    prepared: Arc::clone(&root),
-                },
-                crate::ScopedPreparedFunction {
-                    id: InterprocFunctionId(0x2000),
-                    name: Some("handler".to_string()),
-                    prepared: handler,
-                },
-            ],
-        )
-        .expect("scope");
-
-        let mut explorer = PathExplorer::new(&ctx);
-        explorer.register_tagged_call_hook(
-            0x5000,
-            crate::executor::CallHookTag::WindowsAddVectoredExceptionHandler,
-            |_| CallHookResult::Fallthrough,
-        );
-        explorer.register_tagged_call_hook(
-            0x5008,
-            crate::executor::CallHookTag::WindowsRaiseException,
-            |_| CallHookResult::Fallthrough,
-        );
-
-        assert_eq!(
-            explorer.exception_bridge_guidance_target(&root, Some(&scope), 0x7000),
-            Some(0x1010)
-        );
-    }
-
-    #[test]
-    fn test_cfg_unreachable_local_target_uses_raise_site_bridge() {
-        let ctx = Context::thread_local();
-        let mut arch = make_x86_64_arch();
-        arch.add_register(RegisterDef::new("RCX", 0x80, 8));
-        arch.add_register(RegisterDef::new("RDX", 0x88, 8));
-        arch.add_register(RegisterDef::new("R8", 0x90, 8));
-        arch.add_register(RegisterDef::new("R9", 0x98, 8));
-
-        let root_blocks = vec![
-            R2ILBlock {
-                addr: 0x1000,
-                size: 4,
-                switch_info: None,
-                op_metadata: Default::default(),
-                ops: vec![
-                    R2ILOp::Copy {
-                        dst: make_reg(0x80, 8),
-                        src: make_const(1, 8),
-                    },
-                    R2ILOp::Copy {
-                        dst: make_reg(0x88, 8),
-                        src: make_const(0x2000, 8),
-                    },
-                    R2ILOp::Call {
-                        target: make_const(0x5000, 8),
-                    },
-                    R2ILOp::Branch {
-                        target: make_const(0x1010, 8),
-                    },
-                ],
-            },
-            R2ILBlock {
-                addr: 0x1010,
-                size: 4,
-                switch_info: None,
-                op_metadata: Default::default(),
-                ops: vec![
-                    R2ILOp::Copy {
-                        dst: make_reg(0x80, 8),
-                        src: make_const(0x8000_0004, 8),
-                    },
-                    R2ILOp::Copy {
-                        dst: make_reg(0x88, 8),
-                        src: make_const(0, 8),
-                    },
-                    R2ILOp::Copy {
-                        dst: make_reg(0x90, 8),
-                        src: make_const(0, 8),
-                    },
-                    R2ILOp::Copy {
-                        dst: make_reg(0x98, 8),
-                        src: make_const(0, 8),
-                    },
-                    R2ILOp::Call {
-                        target: make_const(0x5008, 8),
-                    },
-                    R2ILOp::Return {
-                        target: make_const(0, 8),
-                    },
-                ],
-            },
-            R2ILBlock {
-                addr: 0x1020,
-                size: 1,
-                switch_info: None,
-                op_metadata: Default::default(),
-                ops: vec![R2ILOp::Return {
-                    target: make_const(0, 8),
-                }],
-            },
-        ];
-        let handler_blocks = vec![R2ILBlock {
-            addr: 0x2000,
-            size: 1,
-            switch_info: None,
-            op_metadata: Default::default(),
-            ops: vec![R2ILOp::Return {
-                target: make_const(0, 8),
-            }],
-        }];
-        let root =
-            Arc::new(SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic"));
-        let handler = Arc::new(
-            SsaArtifact::for_symbolic(&handler_blocks, Some(&arch)).expect("handler symbolic"),
-        );
-        let scope = crate::PreparedFunctionScope::new(
-            0x1000,
-            vec![
-                crate::ScopedPreparedFunction {
-                    id: InterprocFunctionId(0x1000),
-                    name: Some("root".to_string()),
-                    prepared: Arc::clone(&root),
-                },
-                crate::ScopedPreparedFunction {
-                    id: InterprocFunctionId(0x2000),
-                    name: Some("handler".to_string()),
-                    prepared: handler,
-                },
-            ],
-        )
-        .expect("scope");
-
-        let mut explorer = PathExplorer::new(&ctx);
-        explorer.register_tagged_call_hook(
-            0x5000,
-            crate::executor::CallHookTag::WindowsAddVectoredExceptionHandler,
-            |_| CallHookResult::Fallthrough,
-        );
-        explorer.register_tagged_call_hook(
-            0x5008,
-            crate::executor::CallHookTag::WindowsRaiseException,
-            |_| CallHookResult::Fallthrough,
-        );
-
-        assert_eq!(
-            explorer.exception_bridge_guidance_target(&root, Some(&scope), 0x1020),
-            Some(0x1010)
-        );
-    }
-
-    #[test]
-    fn test_import_mediated_exception_calls_use_raise_site_bridge() {
-        let ctx = Context::thread_local();
-        let mut arch = make_x86_64_arch();
-        arch.add_register(RegisterDef::new("RCX", 0x80, 8));
-        arch.add_register(RegisterDef::new("RDX", 0x88, 8));
-        arch.add_register(RegisterDef::new("R8", 0x90, 8));
-        arch.add_register(RegisterDef::new("R9", 0x98, 8));
-
-        let addveh_target = Varnode {
-            space: SpaceId::Unique,
-            offset: 0x500,
-            size: 8,
-            meta: None,
-        };
-        let raise_target = Varnode {
-            space: SpaceId::Unique,
-            offset: 0x508,
-            size: 8,
-            meta: None,
-        };
-        let root_blocks = vec![
-            R2ILBlock {
-                addr: 0x1000,
-                size: 4,
-                switch_info: None,
-                op_metadata: Default::default(),
-                ops: vec![
-                    R2ILOp::Copy {
-                        dst: make_reg(0x80, 8),
-                        src: make_const(1, 8),
-                    },
-                    R2ILOp::Copy {
-                        dst: make_reg(0x88, 8),
-                        src: make_const(0x2000, 8),
-                    },
-                    R2ILOp::Copy {
-                        dst: addveh_target.clone(),
-                        src: make_ram(0x5000, 8),
-                    },
-                    R2ILOp::CallInd {
-                        target: addveh_target,
-                    },
-                    R2ILOp::Branch {
-                        target: make_const(0x1010, 8),
-                    },
-                ],
-            },
-            R2ILBlock {
-                addr: 0x1010,
-                size: 4,
-                switch_info: None,
-                op_metadata: Default::default(),
-                ops: vec![
-                    R2ILOp::Copy {
-                        dst: make_reg(0x80, 8),
-                        src: make_const(0x8000_0004, 8),
-                    },
-                    R2ILOp::Copy {
-                        dst: make_reg(0x88, 8),
-                        src: make_const(0, 8),
-                    },
-                    R2ILOp::Copy {
-                        dst: make_reg(0x90, 8),
-                        src: make_const(0, 8),
-                    },
-                    R2ILOp::Copy {
-                        dst: make_reg(0x98, 8),
-                        src: make_const(0, 8),
-                    },
-                    R2ILOp::Copy {
-                        dst: raise_target.clone(),
-                        src: make_ram(0x5008, 8),
-                    },
-                    R2ILOp::CallInd {
-                        target: raise_target,
-                    },
-                    R2ILOp::Return {
-                        target: make_const(0, 8),
-                    },
-                ],
-            },
-        ];
-        let handler_blocks = vec![R2ILBlock {
-            addr: 0x2000,
-            size: 1,
-            switch_info: None,
-            op_metadata: Default::default(),
-            ops: vec![R2ILOp::Return {
-                target: make_const(0, 8),
-            }],
-        }];
-        let root =
-            Arc::new(SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic"));
-        let handler = Arc::new(
-            SsaArtifact::for_symbolic(&handler_blocks, Some(&arch)).expect("handler symbolic"),
-        );
-        let scope = crate::PreparedFunctionScope::new(
-            0x1000,
-            vec![
-                crate::ScopedPreparedFunction {
-                    id: InterprocFunctionId(0x1000),
-                    name: Some("root".to_string()),
-                    prepared: Arc::clone(&root),
-                },
-                crate::ScopedPreparedFunction {
-                    id: InterprocFunctionId(0x2000),
-                    name: Some("handler".to_string()),
-                    prepared: handler,
-                },
-            ],
-        )
-        .expect("scope");
-
-        let mut explorer = PathExplorer::new(&ctx);
-        explorer.register_tagged_call_hook(
-            0x5000,
-            crate::executor::CallHookTag::WindowsAddVectoredExceptionHandler,
-            |_| CallHookResult::Fallthrough,
-        );
-        explorer.register_tagged_call_hook(
-            0x5008,
-            crate::executor::CallHookTag::WindowsRaiseException,
-            |_| CallHookResult::Fallthrough,
-        );
-
-        assert_eq!(
-            explorer.exception_bridge_guidance_target(&root, Some(&scope), 0x2000),
-            Some(0x1010)
-        );
-    }
-
-    #[test]
-    fn test_import_mediated_bridge_works_with_installed_runtime_hooks() {
-        let ctx = Context::thread_local();
-        let mut arch = make_x86_64_arch();
-        arch.add_register(RegisterDef::new("RCX", 0x80, 8));
-        arch.add_register(RegisterDef::new("RDX", 0x88, 8));
-        arch.add_register(RegisterDef::new("R8", 0x90, 8));
-        arch.add_register(RegisterDef::new("R9", 0x98, 8));
-
-        let addveh_target = Varnode {
-            space: SpaceId::Unique,
-            offset: 0x520,
-            size: 8,
-            meta: None,
-        };
-        let raise_target = Varnode {
-            space: SpaceId::Unique,
-            offset: 0x528,
-            size: 8,
-            meta: None,
-        };
-        let root_blocks = vec![
-            R2ILBlock {
-                addr: 0x1000,
-                size: 4,
-                switch_info: None,
-                op_metadata: Default::default(),
-                ops: vec![
-                    R2ILOp::Copy {
-                        dst: make_reg(0x80, 8),
-                        src: make_const(1, 8),
-                    },
-                    R2ILOp::Copy {
-                        dst: make_reg(0x88, 8),
-                        src: make_const(0x2000, 8),
-                    },
-                    R2ILOp::Copy {
-                        dst: addveh_target.clone(),
-                        src: make_ram(0x1400a6010, 8),
-                    },
-                    R2ILOp::CallInd {
-                        target: addveh_target,
-                    },
-                    R2ILOp::Branch {
-                        target: make_const(0x1010, 8),
-                    },
-                ],
-            },
-            R2ILBlock {
-                addr: 0x1010,
-                size: 4,
-                switch_info: None,
-                op_metadata: Default::default(),
-                ops: vec![
-                    R2ILOp::Copy {
-                        dst: make_reg(0x80, 8),
-                        src: make_const(0x8000_0004, 8),
-                    },
-                    R2ILOp::Copy {
-                        dst: make_reg(0x88, 8),
-                        src: make_const(0, 8),
-                    },
-                    R2ILOp::Copy {
-                        dst: make_reg(0x90, 8),
-                        src: make_const(0, 8),
-                    },
-                    R2ILOp::Copy {
-                        dst: make_reg(0x98, 8),
-                        src: make_const(0, 8),
-                    },
-                    R2ILOp::Copy {
-                        dst: raise_target.clone(),
-                        src: make_ram(0x1400a6000, 8),
-                    },
-                    R2ILOp::CallInd {
-                        target: raise_target,
-                    },
-                    R2ILOp::Return {
-                        target: make_const(0, 8),
-                    },
-                ],
-            },
-        ];
-        let root =
-            Arc::new(SsaArtifact::for_symbolic(&root_blocks, Some(&arch)).expect("root symbolic"));
-        let scope = crate::PreparedFunctionScope::new(
-            0x1000,
-            vec![crate::ScopedPreparedFunction {
-                id: InterprocFunctionId(0x1000),
-                name: Some("root".to_string()),
-                prepared: Arc::clone(&root),
-            }],
-        )
-        .expect("scope");
-
-        let mut explorer = PathExplorer::new(&ctx);
-        let symbol_map = HashMap::from([
-            (
-                0x1400a6010,
-                "sym.imp.KERNEL32.dll_AddVectoredExceptionHandler".to_string(),
-            ),
-            (
-                0x1400a6000,
-                "sym.imp.KERNEL32.dll_RaiseException".to_string(),
-            ),
-        ]);
-        crate::install_runtime_hooks_for_scope(
-            &mut explorer,
-            &root,
-            &scope,
-            Some(&arch),
-            &symbol_map,
-        );
-
-        assert_eq!(
-            explorer.exception_bridge_guidance_target(&root, Some(&scope), 0x7000),
-            Some(0x1010)
         );
     }
 }

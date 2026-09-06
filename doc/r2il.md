@@ -275,6 +275,11 @@ Structural checks include:
    - at least one address space and exactly one default space
    - unique space IDs and names
    - registers have non-zero size and unique names
+   - an empty `register_projections` table means source geometry is unavailable
+   - a non-empty projection table is strictly sorted and covers every unique declared register storage exactly once
+   - bound projections in one laminar overlap component share its unique declared maximal carrier and one byte orientation
+   - partial-overlap components refuse as a whole, and other unprovable geometry carries a typed refusal
+   - write effects are not register geometry; they remain instruction-owned P-code/SSA facts
 
 Validation is aggregated: all discovered issues are returned in one
 `ValidationError` instead of failing at the first problem.
@@ -432,8 +437,8 @@ Optional overrides:
 Behavior notes:
 
 1. `mixed` and `custom` are metadata-level only for now; deep execution semantics are deferred.
-2. The sole `.r2il` representation is identified by `R2PSTC06`:
-   - the wire layout is `R2PSTC06 || payload_length_u64_le || postcard(ArchSpec)`
+2. The sole `.r2il` representation is identified by `R2PSTC07`:
+   - the wire layout is `R2PSTC07 || payload_length_u64_le || postcard(ArchSpec)`
    - the loader requires an exact payload length and no trailing bytes
    - no independent version field or compatibility decoder exists
    - older versions and alternate encodings are rejected
@@ -520,7 +525,7 @@ r2il types derive `serde::Serialize` and `serde::Deserialize`. The standard
 serialization formats are:
 
 - **JSON** (`serde_json`) -- for plugin output and debugging
-- **postcard** -- for the sole compact `R2PSTC06` binary storage representation
+- **postcard** -- for the sole compact `R2PSTC07` binary storage representation
 
 The plugin command `a:sla.json` outputs the R2ILBlock for the current
 instruction as JSON.
@@ -528,7 +533,7 @@ instruction as JSON.
 Compatibility Guarantees
 ------------------------
 
-1. The reader accepts exactly the `R2PSTC06` postcard representation.
+1. The reader accepts exactly the `R2PSTC07` postcard representation.
 2. The writer always emits that representation; older artifacts must be regenerated from their source authority.
 3. Instruction exporter action/format compatibility is strict:
    - `lift`: `json`, `text`, `esil`, `r2cmd`
@@ -539,5 +544,5 @@ Compatibility Guarantees
 
 Versioning policy:
 
-1. The sole binary identity is `R2PSTC06` with a checked payload length.
+1. The sole binary identity is `R2PSTC07` with a checked payload length.
 2. Any other discriminator or encoding is rejected.

@@ -5,30 +5,20 @@ use serde::{Deserialize, Serialize};
 
 use super::claims::SemanticClaimSummary;
 use super::plan::{
-    ArtifactBuildPlan, DecompilePlan, QueryPlan, TargetQueryExecutionRoute, TargetQueryPlan,
-    TargetQueryRoutePlan, TypePlan, derive_artifact_build_plan, derive_decompile_plan,
-    derive_query_plan, derive_target_query_plan, derive_target_query_route_plan, derive_type_plan,
+    ArtifactBuildPlan, DecompilePlan, QueryPlan, TargetQueryPlan, TargetQueryRoutePlan, TypePlan,
+    derive_artifact_build_plan, derive_decompile_plan, derive_query_plan, derive_target_query_plan,
+    derive_target_query_route_plan, derive_type_plan,
 };
 use super::region::{
     ArtifactGranularity, ExecutionModel, NativeArtifactBody, RefinementStage,
     SemanticArtifactDiagnostics, SemanticRegion, SemanticTargetConditionSource, VmArtifactBody,
 };
 use super::vm::InterpreterKind;
-use crate::sim::PreparedFunctionScope;
-
-#[derive(Debug, Clone)]
-pub(crate) struct TargetQueryRouteInput<'a> {
-    pub(crate) route: TargetQueryRoutePlan,
-    pub(crate) condition_source: Option<SemanticTargetConditionSource<'a>>,
-    pub(crate) memory_terms: Vec<&'a crate::backward::BackwardMemoryCondition>,
-    pub(crate) allow_exact_proof: bool,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SliceClass {
     Wrapper,
     Worker,
-    RecursiveGroup,
     InterpreterSwitch,
     InterpreterIndirect,
     GenericLarge,
@@ -38,10 +28,10 @@ pub enum SliceClass {
 pub enum ResidualReason {
     MissingArch,
     LargeCfg,
-    SummaryBudgetExhausted,
-    SccBudgetExhausted,
     InterpreterRequiresStepSummary,
 }
+
+pub const SEMANTIC_ARTIFACT_SCHEMA_VERSION: u32 = 14;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum SemanticConfidence {
@@ -428,7 +418,6 @@ pub struct SemanticArtifact {
 #[derive(Debug, Clone, Default)]
 struct SemanticArtifactProvenance {
     interproc: Vec<PreparedInterprocSummarySet>,
-    scopes: Vec<PreparedFunctionScope>,
 }
 
 impl PartialEq for SemanticArtifact {
@@ -470,15 +459,6 @@ impl SemanticArtifact {
             .then_some(artifact)
     }
 
-    pub(crate) fn new_with_scope_provenance(
-        prepared: Arc<SsaArtifact>,
-        report: SemanticArtifactReport,
-        scope: &PreparedFunctionScope,
-    ) -> Option<Self> {
-        let mut artifact = Self::new(prepared, report)?;
-        artifact.retain_scope_provenance(scope).then_some(artifact)
-    }
-
     pub fn normalized(mut self) -> Self {
         self.report = self.report.normalized();
         self
@@ -502,21 +482,7 @@ impl SemanticArtifact {
 
     #[cfg(test)]
     pub(crate) fn has_helper_provenance(&self) -> bool {
-        !self.provenance.interproc.is_empty() || !self.provenance.scopes.is_empty()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn retains_helper_provenance_owner(&self, owner: &Arc<SsaArtifact>) -> bool {
-        self.provenance.interproc.iter().any(|summaries| {
-            summaries.owners().values().any(|candidate| {
-                !Arc::ptr_eq(candidate, &self.prepared) && Arc::ptr_eq(candidate, owner)
-            })
-        }) || self.provenance.scopes.iter().any(|scope| {
-            scope.functions().values().any(|function| {
-                !Arc::ptr_eq(&function.prepared, &self.prepared)
-                    && Arc::ptr_eq(&function.prepared, owner)
-            })
-        })
+        !self.provenance.interproc.is_empty()
     }
 
     pub(crate) fn retain_interproc_provenance(
@@ -536,27 +502,6 @@ impl SemanticArtifact {
             .any(|retained| same_interproc_owners(retained, summaries))
         {
             self.provenance.interproc.push(summaries.clone());
-        }
-        true
-    }
-
-    pub(crate) fn retain_scope_provenance(&mut self, scope: &PreparedFunctionScope) -> bool {
-        let Some(root) = scope.root() else {
-            return false;
-        };
-        if !Arc::ptr_eq(&root.prepared, &self.prepared) {
-            return false;
-        }
-        if scope.helper_functions().next().is_none() {
-            return true;
-        }
-        if !self
-            .provenance
-            .scopes
-            .iter()
-            .any(|retained| same_scope_owners(retained, scope))
-        {
-            self.provenance.scopes.push(scope.clone());
         }
         true
     }
@@ -581,7 +526,7 @@ fn interproc_summary_uses_owned_helper(summaries: &PreparedInterprocSummarySet) 
         };
         for callee in &summary.direct_callees {
             let callee = InterprocFunctionId(*callee);
-            if callee != root && summaries.owner(callee).is_some() {
+            if callee != root && summaries.has_body(callee) {
                 return true;
             }
             pending.push(callee);
@@ -602,34 +547,7 @@ fn same_interproc_owners(
         })
 }
 
-fn same_scope_owners(left: &PreparedFunctionScope, right: &PreparedFunctionScope) -> bool {
-    left.root_id() == right.root_id()
-        && left.functions().len() == right.functions().len()
-        && left.functions().iter().all(|(id, function)| {
-            right
-                .functions()
-                .get(id)
-                .is_some_and(|candidate| Arc::ptr_eq(&function.prepared, &candidate.prepared))
-        })
-}
-
 impl SemanticArtifactReport {
-    fn downgrade_query_route_to_residual(
-        route: TargetQueryRoutePlan,
-        reason: impl Into<String>,
-    ) -> TargetQueryRoutePlan {
-        let mut reasons = match route.execution {
-            TargetQueryExecutionRoute::ResidualOnly { reasons } => reasons,
-            TargetQueryExecutionRoute::Refuse { reason } => vec![reason],
-            _ => Vec::new(),
-        };
-        reasons.push(reason.into());
-        TargetQueryRoutePlan {
-            target_plan: route.target_plan,
-            execution: TargetQueryExecutionRoute::ResidualOnly { reasons },
-        }
-    }
-
     fn has_native_semantics(&self) -> bool {
         self.native_body()
             .is_some_and(|body| !body.regions.is_empty() || body.has_summary_islands())
@@ -714,36 +632,6 @@ impl SemanticArtifactReport {
         )
     }
 
-    pub(crate) fn target_query_route_input<'a>(
-        &'a self,
-        target_addr: u64,
-        assumption_conflicted: bool,
-    ) -> TargetQueryRouteInput<'a> {
-        let mut route = self.target_query_route_plan(target_addr);
-        let canonical_source = self.target_condition_source(target_addr, false);
-        let memory_terms = self
-            .authoritative_memory_region_for_target(target_addr)
-            .map(|region| region.actionable_memory_terms_for_target(target_addr))
-            .unwrap_or_default();
-        if assumption_conflicted {
-            route = Self::downgrade_query_route_to_residual(route, "assumption conflict");
-        }
-        if self.target_has_ambiguous_sources(target_addr) {
-            route = Self::downgrade_query_route_to_residual(
-                route,
-                "conflicting target guidance sources",
-            );
-        }
-        let allow_exact_proof =
-            !assumption_conflicted && !self.target_has_ambiguous_sources(target_addr);
-        TargetQueryRouteInput {
-            route,
-            condition_source: canonical_source,
-            memory_terms,
-            allow_exact_proof,
-        }
-    }
-
     pub fn type_plan(&self) -> TypePlan {
         derive_type_plan(
             self.stage,
@@ -768,7 +656,9 @@ impl SemanticArtifactReport {
     pub fn native_body(&self) -> Option<&NativeArtifactBody> {
         match &self.body {
             SemanticArtifactBody::Native(body) => Some(body),
-            SemanticArtifactBody::Vm(_) => None,
+            // A VM function's native regions are the same regions any other function
+            // would have, so a consumer asking for them gets them.
+            SemanticArtifactBody::Vm(body) => body.native.as_deref(),
         }
     }
 
@@ -977,7 +867,6 @@ mod tests {
         SemanticEvidenceCoverage, SemanticEvidenceProvenance, SemanticEvidenceReason,
         SemanticEvidenceSoundness, SliceClass,
     };
-    use crate::sim::DerivedSummaryDiagnostics;
     use crate::{
         ArtifactGranularity, ExecutionModel, NativeArtifactBody, NativeFunctionSummary,
         RefinementStage,
@@ -1003,8 +892,6 @@ mod tests {
                     role_identity: None,
                     closure_functions: 0,
                     helper_functions: 0,
-                    derived_summaries: 0,
-                    derived_diagnostics: DerivedSummaryDiagnostics::default(),
                     region_summaries: Vec::new(),
                     worker_summaries: Vec::new(),
                 },
@@ -1130,8 +1017,6 @@ mod tests {
             residuals in proptest::collection::vec(prop_oneof![
                 Just(ResidualReason::MissingArch),
                 Just(ResidualReason::LargeCfg),
-                Just(ResidualReason::SummaryBudgetExhausted),
-                Just(ResidualReason::SccBudgetExhausted),
                 Just(ResidualReason::InterpreterRequiresStepSummary),
             ], 0..8),
             ambiguous in proptest::collection::vec(any::<u64>(), 0..8),

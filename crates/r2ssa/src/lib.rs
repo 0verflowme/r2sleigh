@@ -16,35 +16,49 @@
 //! - [`taint`]: Taint analysis on SSA def-use chains
 //! - [`var`]: SSA variable representation
 
-pub mod abi;
-pub mod address;
-pub mod aggregate_access;
-pub mod assumption;
+pub(crate) mod abi;
+pub(crate) mod address;
+pub(crate) mod aggregate_access;
+pub(crate) mod assumption;
 pub mod block;
 pub mod cfg;
-pub mod control;
-pub mod data_ref;
-pub mod defuse;
+pub(crate) mod control;
+pub(crate) mod data_ref;
+pub(crate) mod deadphi;
+pub(crate) mod defuse;
 pub mod domtree;
-pub mod execution;
-pub mod fingerprint;
+pub(crate) mod execution;
+pub(crate) mod fingerprint;
 pub mod function;
 pub mod graph;
+pub(crate) mod indirect;
+pub(crate) mod integrity;
 pub mod interproc;
-pub mod machine;
-pub mod machine_context;
+pub mod ledger;
+pub(crate) mod liveout;
+pub(crate) mod machine;
+pub(crate) mod machine_context;
+pub(crate) mod mirror;
 mod naming;
-pub mod obligation;
-pub mod op;
-pub mod optimize;
-pub mod phi;
-pub mod rename;
-pub mod semantic;
+pub(crate) mod obligation;
+pub(crate) mod op;
+pub(crate) mod optimize;
+pub(crate) mod phi;
+pub(crate) mod printf;
+pub mod proven;
+pub(crate) mod reaching_rules;
+pub mod recover_interface;
+pub(crate) mod rename;
+pub(crate) mod semantic;
+pub mod span;
 pub mod taint;
-pub mod var;
+pub(crate) mod var;
 
 pub use abi::AbiProfile;
-pub use address::{AddressProvenanceFacts, AffineAddressTerm, ParameterAddressExpression};
+pub use address::{
+    AddressProvenanceFacts, AffineAddressTerm, ParameterAddressExpression,
+    PointeeAddressExpression, PointeeStep,
+};
 pub use aggregate_access::{
     AGGREGATE_ACCESS_PROJECTION_SCHEMA_VERSION, AggregateAccessBinding, AggregateAccessProjection,
     AggregateAccessProjectionFacts, AggregateElementIndexProjection,
@@ -60,7 +74,7 @@ pub use control::{
     SsaWorkControl,
 };
 pub use data_ref::{
-    DataRefFact, DataRefKind, data_refs_from_blocks, data_refs_from_ssa_with_op_sources,
+    DataRefFact, DataRefKind, data_refs_from_artifact_with_op_sources, data_refs_from_blocks,
     parse_const_value,
 };
 pub use defuse::{
@@ -74,43 +88,51 @@ pub use execution::{
 pub use fingerprint::{SSA_SEMANTIC_FINGERPRINT_SCHEMA_VERSION, stable_ssa_semantic_fingerprint};
 pub use function::{
     CFGRiskSummary, DecompilePrepFacts, DefRef, DefSite, FunctionPrepareMode,
-    GenuineNativeInstructionSpan, PhiNode, SSABlock as FunctionSSABlock, SSAFunction, SourceRef,
-    SourceSite, SsaArtifact, SsaArtifactAuthority, SsaArtifactProvenanceKind, StackAddressBase,
-    StackAddressRoot, SwitchInfo, TrustedSsaArtifact,
+    GenuineNativeInstructionSpan, PhiNode, RegisterFamilyInfo, RegisterFamilySlot,
+    SSABlock as FunctionSSABlock, SSAFunction, SourceRef, SourceSite, SsaArtifact,
+    SsaArtifactAuthority, SsaArtifactProvenanceKind, StackAddressBase, StackAddressRoot,
+    SwitchInfo, TrustedSsaArtifact, family_slot_contains,
 };
 pub use graph::{
     BlockId, GraphBlock, GraphInst, GraphValue, InstId, InstPayload, SsaGraph, UseSite, ValueId,
 };
+pub use integrity::{ScalarWidthRule, SsaIntegrityError, SsaValueSite, validate_ssa_function};
 pub use interproc::{
     CallArgObservation, FunctionSemanticLinkage, FunctionSemanticSummary, InterprocFunctionId,
     InterprocFunctionInput, InterprocSolveConfig, InterprocSummaryDiagnostics, InterprocSummarySet,
-    PreparedInterprocFunctionInput, PreparedInterprocSummaryError, PreparedInterprocSummarySet,
-    SummaryAllocationEffect, SummaryArgEffect, SummaryAtomicEffect, SummaryAtomicOp,
-    SummaryAtomicOrdering, SummaryLifetimeEffect, SummaryLifetimeOp, SummaryMemoryEffect,
-    SummaryMemoryEffectKind, SummaryMemoryLocation, SummaryMemoryRange, SummaryMemoryRegion,
-    SummaryReturnRelation, SummarySyncEffect, SummarySyncOp, SummaryTransferEffect,
-    SummaryTransferLength, observe_call_arguments, solve_interproc_summary_set,
-    solve_prepared_interproc_summary_set,
+    PreparedCalleeSummary, PreparedInterprocFunctionInput, PreparedInterprocSummaryError,
+    PreparedInterprocSummarySet, SummaryAllocationEffect, SummaryArgEffect, SummaryAtomicEffect,
+    SummaryAtomicOp, SummaryAtomicOrdering, SummaryLifetimeEffect, SummaryLifetimeOp,
+    SummaryMemoryEffect, SummaryMemoryEffectKind, SummaryMemoryLocation, SummaryMemoryRange,
+    SummaryMemoryRegion, SummaryReturnRelation, SummarySyncEffect, SummarySyncOp,
+    SummaryTransferEffect, SummaryTransferLength, observe_call_arguments,
+    solve_interproc_summary_set, solve_prepared_interproc_summary_set,
+    solve_prepared_interproc_summary_set_from_callee_summaries,
 };
 pub use machine::{
     MachineAddressProvenance, MachineAddressSpace, MachineArithmeticFlagOp, MachineArithmeticMode,
     MachineArithmeticOp, MachineBitVector, MachineBitwiseOp, MachineBooleanOp, MachineBuildError,
-    MachineCastKind, MachineComparisonOp, MachineEntity, MachineExpr, MachineExprArena,
-    MachineExprId, MachineExprKind, MachineFunction, MachineOvershiftBehavior, MachineProjection,
-    MachineProjectionFailure, MachineShiftKind, MachineSignedness, MachineStackBase, MachineType,
-    MachineValueBinding, MachineValueUse, machine_address_provenance,
+    MachineCastKind, MachineComparisonOp, MachineDirectValueGeometry, MachineEntity, MachineExpr,
+    MachineExprArena, MachineExprId, MachineExprKind, MachineFunction, MachineOvershiftBehavior,
+    MachineProjection, MachineProjectionFailure, MachineRegisterValueGeometry, MachineShiftKind,
+    MachineSignedness, MachineStackBase, MachineType, MachineUseConversion, MachineUseDisposition,
+    MachineUseRefusal, MachineUseSlice, MachineValueBinding, MachineValueGeometryDisposition,
+    MachineValueGeometryRefusal, MachineValueUse, MachineWriteDisposition, MachineWriteProjection,
+    MachineWriteRefusal, MachineZeroDivisorBehavior, machine_address_provenance,
 };
 pub use machine_context::{
     MACHINE_CONTEXT_SCHEMA_VERSION, MachineAbiModel, MachineAbiRegisterSlot,
     MachineArchitectureFamily, MachineMemoryEndianness, MachineMemoryModel, MachineMemorySpace,
-    SOURCE_CALL_SITE_INTERFACE_SCHEMA_VERSION, SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION,
-    SOURCE_TYPE_GRAPH_SCHEMA_VERSION, SourceAbiParameterSpec, SourceAggregateLayout,
-    SourceAggregateMember, SourceCallArgumentSpec, SourceCallResult, SourceCallSiteIdentity,
-    SourceCallSiteInterface, SourceCallSiteInterfaceError, SourceCarrierKind,
-    SourceCarrierProjection, SourceFunctionInterface, SourceFunctionInterfaceError,
-    SourceFunctionReturn, SourceLogicalValue, SourceMachineContext, SourceStackAllocationContract,
-    SourceStackGrowth, SourceStackSlotRole, SourceStackSlotSpec, SourceType, SourceTypeGraph,
-    SourceTypeGraphError, SourceTypeKind,
+    MachineRegisterGeometryState, SOURCE_CALL_SITE_INTERFACE_SCHEMA_VERSION,
+    SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION, SOURCE_TYPE_GRAPH_SCHEMA_VERSION, SourceAbiClass,
+    SourceAbiParameterSpec, SourceAggregateLayout, SourceAggregateMember, SourceCallArgumentSpec,
+    SourceCallResult, SourceCallSiteIdentity, SourceCallSiteInterface,
+    SourceCallSiteInterfaceError, SourceCarrierKind, SourceCarrierProjection,
+    SourceConventionSlots, SourceFunctionInterface, SourceFunctionInterfaceError,
+    SourceFunctionReturn, SourceLogicalValue, SourceMachineContext, SourceMachineRoles,
+    SourceMachineRolesError, SourceStackAllocationContract, SourceStackGrowth, SourceStackSlotRole,
+    SourceStackSlotSpec, SourceType, SourceTypeGraph, SourceTypeGraphError, SourceTypeKind,
+    SourceVariadicArgumentCountRule,
 };
 pub use obligation::{
     CanonicalInstructionId, CanonicalInstructionSite, ObligationCoverageReport,
@@ -129,23 +151,29 @@ pub use r2source::{OwnedFunctionSnapshot, RADARE_FUNCTION_SNAPSHOT_SCHEMA_VERSIO
 pub use semantic::{
     BlockAssumption, CallArgumentCertificate, CallArgumentLocation, CallBoundarySlot,
     CallBoundaryValueFact, CallMemoryEffect, CallResultCertificate, CallResultValueRelation,
-    SourceCallArgumentFact, SourceCallArgumentValue,
-    CallSiteFact, CallSiteFacts, CallSiteId, CallsiteCertificate, CompareKind, CompareProvenance,
-    ControlDomain, ControlDomainFacts, ControlDomainId, ControlGuard, GlobalObjectKey,
-    IfRegionCertificate, LoopCarrierEdgeValue, LoopCarrierFact, LoopCarrierUpdateFact,
-    LoopCertificate, LoopId, MemoryAccessCertificate, MemoryDefFact, MemoryLocation,
+    CallSiteFact, CallSiteFacts, CallSiteId, CallSiteTransfer, CalleeStackAllocationCertificate,
+    CallsiteCertificate, CompareKind, CompareProvenance, ControlDomain, ControlDomainFacts,
+    ControlDomainId, ControlGuard, ForLoopCertificate, GlobalObjectKey, IfRegionCertificate,
+    InductionFact, InductionStep, LoopCarrierEdgeValue, LoopCarrierFact, LoopCarrierMemberFact,
+    LoopCarrierMemberRole, LoopCarrierUpdateFact, LoopCertificate, LoopId,
+    MachineReturnControlCertificate, MemoryAccessCertificate, MemoryDefFact, MemoryLocation,
     MemoryObjectKey, MemoryPhiFact, MemorySSAFacts, MemoryUseFact, MemoryVersion, ObjectFact,
     ObjectId, ObjectKind, ObjectModel, ObjectSpaceId, ParameterObjectKey, PredicateFact,
     PredicateFacts, PredicateId, PreparedAssumptionBinding, PreparedAssumptionBindingKind,
     PreparedFunctionCertificates, PreparedFunctionFacts, PreparedProofFailure, ProofNodeId,
-    RelativeMemoryAddress, ReturnCarrier, ReturnValueCertificate,
+    RelativeMemoryAddress, ReturnCarrier, ReturnValueCertificate, ReturnValueOverlay,
     SOURCE_RETURN_REGISTER_COMPOSITION_SCHEMA_VERSION, SemanticId, SourceBoundaryFacts,
-    SourceCallBoundaryFact, SourceFormalParameterFact, SourceReturnAddressFact,
-    SourceReturnBoundaryFact, SourceReturnRegisterCompositionFact,
-    SourceReturnRegisterDefinitionFact, SourceReturnRegisterOverlayFact,
-    SourceReturnStackPointerFact, StackObjectKey, StackSlotCertificate, StructuredAccessId,
-    StructuredDataflowFacts, StructuredLoopFact, StructuredLoopKind, StructuredMemoryAccessFact,
+    SourceCallArgumentFact, SourceCallArgumentValue, SourceCallBoundaryFact,
+    SourceFormalParameterFact, SourceReturnAddressFact, SourceReturnBoundaryFact,
+    SourceReturnRegisterCompositionFact, SourceReturnRegisterDefinitionFact,
+    SourceReturnRegisterOverlayFact, SourceReturnStackPointerFact, StackArrayElementCertificate,
+    StackArrayElementIndex, StackArrayLayoutCertificate, StackArrayLayoutDisposition,
+    StackArrayLayoutRefusal, StackFrameRoundTripCertificate, StackGeometryCertificate,
+    StackObjectKey, StackSlotCertificate, StructuredAccessId, StructuredDataflowFacts,
+    StructuredLoopFact, StructuredLoopKind, StructuredMemoryAccessFact,
     StructuredRecursiveCallFact, SwitchCertificate, SwitchPredicateFact, ValueOwner,
+    VariadicCallsiteArgumentCountEvidence, VariadicCallsiteArgumentCountRefusal,
+    VariadicCallsiteArgumentCountSource,
 };
 pub use taint::{DefaultTaintPolicy, TaintAnalysis, TaintLabel, TaintPolicy, TaintResult};
 pub use var::{CanonicalStorageId, CanonicalStorageSpace, SSAVar, SSAVarNameKind};

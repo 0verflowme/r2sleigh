@@ -1,8 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
-use r2ssa::{DecompilePrepFacts, SSABlock, SSAOp, SSAVar, SSAVarNameKind, StackAddressBase};
+use r2ssa::{
+    DecompilePrepFacts, SSABlock, SSAOp, SSAVar, SSAVarNameKind, SsaArtifact, StackAddressBase,
+};
 
-use crate::facts::parse_type_like_spec;
+use crate::parse_c_type_like;
 use crate::signature_infer::RecoveredSignatureParam;
 use crate::writeback::RecoveredVariable;
 
@@ -172,51 +174,41 @@ const GENERIC_STACK_BASES: &[&str] = &["sp", "fp", "bp", "s0", "x2", "x8", "rbp"
 const GENERIC_FRAME_BASES: &[&str] = &["fp", "bp", "s0", "x8", "rbp"];
 
 pub fn recover_vars_arch_profile(
-    arch_name: Option<&str>,
+    architecture: r2ssa::MachineArchitectureFamily,
 ) -> (ArgAliasMap, BaseRegList, BaseRegList) {
-    let Some(arch_name) = arch_name else {
-        return (&[], GENERIC_STACK_BASES, GENERIC_FRAME_BASES);
-    };
+    use r2ssa::MachineArchitectureFamily;
 
-    let arch_name = arch_name.to_ascii_lowercase();
-    if arch_name.contains("x86") {
-        return (X86_ARG_REGS, X86_STACK_BASES, X86_FRAME_BASES);
+    match architecture {
+        MachineArchitectureFamily::X86 => (&[], X86_STACK_BASES, X86_FRAME_BASES),
+        MachineArchitectureFamily::X86_64 => (X86_ARG_REGS, X86_STACK_BASES, X86_FRAME_BASES),
+        MachineArchitectureFamily::Arm => (ARM32_ARG_REGS, ARM32_STACK_BASES, ARM32_FRAME_BASES),
+        MachineArchitectureFamily::AArch64 => {
+            (ARM64_ARG_REGS, ARM64_STACK_BASES, ARM64_FRAME_BASES)
+        }
+        MachineArchitectureFamily::RiscV32 | MachineArchitectureFamily::RiscV64 => {
+            (RISCV_ARG_REGS, RISCV_STACK_BASES, RISCV_FRAME_BASES)
+        }
+        MachineArchitectureFamily::Mips32 | MachineArchitectureFamily::Mips64 => {
+            (MIPS_ARG_REGS, MIPS_STACK_BASES, MIPS_FRAME_BASES)
+        }
+        MachineArchitectureFamily::PowerPc32
+        | MachineArchitectureFamily::PowerPc64
+        | MachineArchitectureFamily::Unknown => (&[], GENERIC_STACK_BASES, GENERIC_FRAME_BASES),
     }
-    if arch_name.contains("aarch64") || arch_name.contains("arm64") {
-        return (ARM64_ARG_REGS, ARM64_STACK_BASES, ARM64_FRAME_BASES);
-    }
-    if arch_name == "arm" || arch_name.starts_with("armv") {
-        return (ARM32_ARG_REGS, ARM32_STACK_BASES, ARM32_FRAME_BASES);
-    }
-    if arch_name.contains("riscv") || arch_name.starts_with("rv") {
-        return (RISCV_ARG_REGS, RISCV_STACK_BASES, RISCV_FRAME_BASES);
-    }
-    if arch_name.contains("mips") {
-        return (MIPS_ARG_REGS, MIPS_STACK_BASES, MIPS_FRAME_BASES);
-    }
-
-    (&[], GENERIC_STACK_BASES, GENERIC_FRAME_BASES)
 }
 
-fn arch_is_x86_64_sysv_like(arch_name: Option<&str>) -> bool {
-    let Some(arch_name) = arch_name else {
-        return false;
-    };
-    let arch_name = arch_name.to_ascii_lowercase();
-    arch_name.contains("x86-64")
-        || arch_name.contains("x86_64")
-        || arch_name.contains("amd64")
-        || (arch_name.contains("x86") && arch_name.contains("64"))
+fn arch_is_x86_64_sysv_like(architecture: r2ssa::MachineArchitectureFamily) -> bool {
+    matches!(architecture, r2ssa::MachineArchitectureFamily::X86_64)
 }
 
 fn incoming_stack_arg_index(
-    arch_name: Option<&str>,
+    architecture: r2ssa::MachineArchitectureFamily,
     base: &SSAVar,
     offset: i64,
     ptr_bits: u32,
     arg_reg_count: usize,
 ) -> Option<usize> {
-    if !arch_is_x86_64_sysv_like(arch_name)
+    if !arch_is_x86_64_sysv_like(architecture)
         || base.version != 0
         || !base.name.eq_ignore_ascii_case("rsp")
         || ptr_bits != 64
@@ -234,12 +226,12 @@ fn stack_addr_temp(op: &SSAOp, stack_bases: BaseRegList) -> Option<(&SSAVar, &SS
     match op {
         SSAOp::IntAdd { dst, a, b } => {
             if stack_bases.contains(&a.name.to_ascii_lowercase().as_str())
-                && let Some(offset) = parse_const_value(&b.name)
+                && let Some(offset) = b.constant_bits()
             {
                 return Some((dst, a, offset as i64));
             }
             if stack_bases.contains(&b.name.to_ascii_lowercase().as_str())
-                && let Some(offset) = parse_const_value(&a.name)
+                && let Some(offset) = a.constant_bits()
             {
                 return Some((dst, b, offset as i64));
             }
@@ -247,7 +239,7 @@ fn stack_addr_temp(op: &SSAOp, stack_bases: BaseRegList) -> Option<(&SSAVar, &SS
         }
         SSAOp::IntSub { dst, a, b } => {
             if stack_bases.contains(&a.name.to_ascii_lowercase().as_str())
-                && let Some(offset) = parse_const_value(&b.name)
+                && let Some(offset) = b.constant_bits()
             {
                 return Some((dst, a, -(offset as i64)));
             }
@@ -257,14 +249,14 @@ fn stack_addr_temp(op: &SSAOp, stack_bases: BaseRegList) -> Option<(&SSAVar, &SS
     }
 }
 
-fn incoming_stack_arg_addr_temp<'a>(
-    op: &'a SSAOp,
-    arch_name: Option<&str>,
+fn incoming_stack_arg_addr_temp(
+    op: &SSAOp,
+    architecture: r2ssa::MachineArchitectureFamily,
     ptr_bits: u32,
     arg_reg_count: usize,
-) -> Option<(&'a SSAVar, &'a SSAVar, i64)> {
+) -> Option<(&SSAVar, &SSAVar, i64)> {
     let (dst, base, offset) = stack_addr_temp(op, &["rsp"])?;
-    if incoming_stack_arg_index(arch_name, base, offset, ptr_bits, arg_reg_count).is_some() {
+    if incoming_stack_arg_index(architecture, base, offset, ptr_bits, arg_reg_count).is_some() {
         Some((dst, base, offset))
     } else {
         None
@@ -281,12 +273,60 @@ pub fn size_to_type(size: u32) -> String {
     }
 }
 
+/// A key that identifies one SSA variable across its width views.
+///
+/// This deliberately does *not* include `size`. The maps it keys pool the
+/// register's width views on purpose -- arm64 evidence has to flow between
+/// `x0` and `w0`, and the x86 low-carrier tests fail immediately if it cannot.
+///
+/// It does now include `rename_disambiguator`, which it dropped before. That
+/// field exists, by its own documentation, to separate "two exact source
+/// storages that project to the same display name and width", so leaving it out
+/// made the key collide on precisely the case it had been added to prevent, and
+/// `DefUseInfo` carried the resulting ambiguity at runtime as an
+/// `Option<usize>` meaning "the key collided". Width views of one register
+/// share a disambiguator, so pooling still works.
 pub fn ssa_var_key(var: &SSAVar) -> String {
-    format!("{}_{}", var.name.to_ascii_lowercase(), var.version)
+    format!(
+        "{}_{}_{}",
+        var.name.to_ascii_lowercase(),
+        var.version,
+        var.rename_disambiguator()
+    )
 }
 
 pub fn ssa_var_block_key(block_addr: u64, var: &SSAVar) -> String {
     format!("{}@{block_addr:x}", ssa_var_key(var))
+}
+
+/// Whether a key names the given register family at the given version.
+///
+/// This lives beside `ssa_var_key` because it takes the key apart, and a
+/// builder and a parser that disagree about a format are the same defect twice.
+/// It used to be a `rsplit_once('_')` in `signature_infer`, which silently began
+/// reading the disambiguator as the version the moment the key gained a field.
+/// The variable name a key was built from.
+pub fn ssa_var_key_name(key: &str) -> Option<&str> {
+    let mut parts = key.rsplitn(3, '_');
+    parts.next()?;
+    parts.next()?;
+    parts.next()
+}
+
+pub fn ssa_var_key_matches_register_family_version(key: &str, family: &str, version: u32) -> bool {
+    // Built as `name_version_disambiguator`, and a name may itself contain
+    // underscores, so the three fields are taken from the right.
+    let mut parts = key.rsplitn(3, '_');
+    let Some(_disambiguator) = parts.next() else {
+        return false;
+    };
+    let Some(version_str) = parts.next() else {
+        return false;
+    };
+    let Some(name) = parts.next() else {
+        return false;
+    };
+    version_str.parse::<u32>().ok() == Some(version) && scalar_register_family_key(name) == family
 }
 
 pub fn scalar_register_family_key(name: &str) -> String {
@@ -342,14 +382,17 @@ pub fn merge_type_hint(hints: &mut HashMap<String, TypeHint>, key: String, incom
 pub fn collect_signature_type_evidence_context(
     ssa_blocks: &[SSABlock],
 ) -> SignatureTypeEvidenceContext {
-    collect_signature_type_evidence_context_with_arch(ssa_blocks, None)
+    collect_signature_type_evidence_context_with_arch(
+        ssa_blocks,
+        r2ssa::MachineArchitectureFamily::Unknown,
+    )
 }
 
 pub fn collect_signature_type_evidence_context_with_arch(
     ssa_blocks: &[SSABlock],
-    arch_name: Option<&str>,
+    architecture: r2ssa::MachineArchitectureFamily,
 ) -> SignatureTypeEvidenceContext {
-    let (_, stack_bases, _) = recover_vars_arch_profile(arch_name);
+    let (_, stack_bases, _) = recover_vars_arch_profile(architecture);
     let pointer_vars = infer_pointer_var_keys_from_ssa(ssa_blocks, stack_bases);
     let pointer_pointee_width_bytes =
         infer_pointer_pointee_width_bytes(ssa_blocks, &pointer_vars, stack_bases);
@@ -371,20 +414,20 @@ pub fn collect_signature_type_evidence_context_with_arch(
 
 pub fn recover_signature_params_from_ssa(
     ssa_blocks: &[SSABlock],
-    arch_name: Option<&str>,
+    architecture: r2ssa::MachineArchitectureFamily,
     metadata_reg_type_hints: &HashMap<String, TypeHint>,
     semantic_metadata_enabled: bool,
     ptr_bits: u32,
 ) -> Vec<RecoveredSignatureParam> {
-    let (arg_regs, _, _) = recover_vars_arch_profile(arch_name);
+    let (arg_regs, _, _) = recover_vars_arch_profile(architecture);
     if arg_regs.is_empty() {
         return Vec::new();
     }
 
     let signature_evidence =
-        collect_signature_type_evidence_context_with_arch(ssa_blocks, arch_name);
+        collect_signature_type_evidence_context_with_arch(ssa_blocks, architecture);
     let (usage_reg_type_hints, _pointer_var_keys) =
-        infer_usage_register_type_hints(ssa_blocks, arch_name);
+        infer_usage_register_type_hints(ssa_blocks, architecture);
     let empty_metadata_hints = HashMap::new();
     let enabled_metadata_hints = if semantic_metadata_enabled {
         metadata_reg_type_hints
@@ -405,7 +448,7 @@ pub fn recover_signature_params_from_ssa(
             match op {
                 SSAOp::IntAdd { .. } | SSAOp::IntSub { .. } => {
                     if let Some((dst, base, offset)) =
-                        incoming_stack_arg_addr_temp(op, arch_name, ptr_bits, arg_regs.len())
+                        incoming_stack_arg_addr_temp(op, architecture, ptr_bits, arg_regs.len())
                     {
                         let dst_key = ssa_var_block_key(block.addr, dst);
                         stack_addr_temps.insert(dst_key, (base.clone(), offset));
@@ -420,7 +463,7 @@ pub fn recover_signature_params_from_ssa(
                     if !control_return_targets.contains(&ssa_var_key(dst))
                         && let Some((base, offset)) = stack_addr_temps.get(&addr_key)
                         && let Some(index) = incoming_stack_arg_index(
-                            arch_name,
+                            architecture,
                             base,
                             *offset,
                             ptr_bits,
@@ -435,7 +478,7 @@ pub fn recover_signature_params_from_ssa(
                                 None
                             };
                         let initial_ty = hinted_type
-                            .and_then(|ty| parse_type_like_spec(ty, ptr_bits))
+                            .and_then(|ty| parse_c_type_like(ty, ptr_bits))
                             .unwrap_or_else(|| size_to_neutral_int_type_like(dst.size));
                         params.push(RecoveredSignatureParam {
                             name: format!("arg{index}"),
@@ -487,18 +530,15 @@ pub fn recover_signature_params_from_ssa(
 }
 
 fn prepared_formal_parameters(prepared: &r2ssa::SsaArtifact) -> BTreeMap<usize, SSAVar> {
-    let Some(facts) = prepared.decompile_prep_facts() else {
-        return BTreeMap::new();
-    };
     let mut parameters = BTreeMap::<usize, SSAVar>::new();
-    for (var, index) in &facts.formal_parameters {
-        let replace = parameters.get(index).is_none_or(|current| {
-            (var.version != 0, &var.name, var.size)
-                < (current.version != 0, &current.name, current.size)
-        });
-        if replace {
-            parameters.insert(*index, var.clone());
+    for (index, fact) in &prepared.facts().boundaries.parameters {
+        if fact.index != *index {
+            continue;
         }
+        let Some(var) = prepared.value_var(fact.value) else {
+            continue;
+        };
+        parameters.insert(*index as usize, var.clone());
     }
     parameters
 }
@@ -507,14 +547,11 @@ pub(crate) fn recover_signature_params_from_prepared_ssa(
     prepared: &r2ssa::SsaArtifact,
     ptr_bits: u32,
 ) -> Vec<RecoveredSignatureParam> {
-    let blocks = prepared.local_ssa_blocks();
-    let evidence = collect_signature_type_evidence_context(&blocks);
-
     prepared_formal_parameters(prepared)
         .into_iter()
         .map(|(index, var)| {
             let initial_ty = if source_parameter_is_logical_pointer(prepared, index, ptr_bits)
-                || evidence.pointer_vars.contains(&ssa_var_key(&var))
+                || source_parameter_has_certified_memory_use(prepared, index)
             {
                 crate::CTypeLike::Pointer(Box::new(crate::CTypeLike::Void))
             } else {
@@ -543,7 +580,7 @@ fn source_parameter_is_logical_pointer(
     ptr_bits: u32,
 ) -> bool {
     let context = prepared.machine_context();
-    if !context.abi_model().is_available() || !context.abi_model().is_coherent() {
+    if !context.abi_model().is_available() {
         return false;
     }
     let Some(interface) = context.function_interface() else {
@@ -555,13 +592,18 @@ fn source_parameter_is_logical_pointer(
     else {
         return false;
     };
-    let Some(parameter) = interface.parameters().get(index) else {
+    let Some(parameter) = prepared
+        .facts()
+        .boundaries
+        .parameters
+        .get(&u32::try_from(index).unwrap_or(u32::MAX))
+    else {
         return false;
     };
-    if parameter.index() as usize != index {
+    if parameter.index as usize != index {
         return false;
     }
-    let Some(logical_value) = interface.parameter_logical_values().get(index) else {
+    let Some(logical_value) = parameter.logical_value else {
         return false;
     };
     graph
@@ -572,8 +614,30 @@ fn source_parameter_is_logical_pointer(
         })
 }
 
-pub(crate) fn prepared_arch_name(prepared: &r2ssa::SsaArtifact) -> Option<&'static str> {
-    match prepared.machine_context().architecture_family() {
+fn source_parameter_has_certified_memory_use(prepared: &r2ssa::SsaArtifact, index: usize) -> bool {
+    prepared
+        .certificates()
+        .memory_accesses
+        .values()
+        .filter(|access| {
+            access.space == r2il::SpaceId::Ram
+                && prepared
+                    .machine_context()
+                    .memory_space_at(access.block_addr, access.op_index)
+                    == Some(access.space)
+        })
+        .any(|access| {
+            prepared
+                .addresses()
+                .parameter_expression(access.address)
+                .is_some_and(|address| address.parameter == index)
+        })
+}
+
+pub(crate) fn architecture_family_name(
+    architecture: r2ssa::MachineArchitectureFamily,
+) -> Option<&'static str> {
+    match architecture {
         r2ssa::MachineArchitectureFamily::X86 => Some("x86"),
         r2ssa::MachineArchitectureFamily::X86_64 => Some("x86-64"),
         r2ssa::MachineArchitectureFamily::Arm => Some("arm"),
@@ -586,6 +650,10 @@ pub(crate) fn prepared_arch_name(prepared: &r2ssa::SsaArtifact) -> Option<&'stat
         r2ssa::MachineArchitectureFamily::PowerPc64 => Some("powerpc64"),
         r2ssa::MachineArchitectureFamily::Unknown => None,
     }
+}
+
+pub(crate) fn prepared_arch_display_name(prepared: &r2ssa::SsaArtifact) -> Option<&'static str> {
+    architecture_family_name(prepared.machine_context().architecture_family())
 }
 
 fn prepared_register_name(prepared: &r2ssa::SsaArtifact, index: usize) -> Option<String> {
@@ -672,14 +740,14 @@ pub(crate) fn recover_vars_from_prepared_ssa(
 
 pub fn recover_vars_from_ssa(
     ssa_blocks: &[SSABlock],
-    arch_name: Option<&str>,
+    architecture: r2ssa::MachineArchitectureFamily,
     metadata_reg_type_hints: &HashMap<String, TypeHint>,
     semantic_metadata_enabled: bool,
 ) -> Vec<RecoveredVariable> {
     recover_vars_from_ssa_with_prep_facts(
         ssa_blocks,
         None,
-        arch_name,
+        architecture,
         metadata_reg_type_hints,
         semantic_metadata_enabled,
     )
@@ -688,23 +756,23 @@ pub fn recover_vars_from_ssa(
 pub fn recover_vars_from_ssa_with_prep_facts(
     ssa_blocks: &[SSABlock],
     prep_facts: Option<&DecompilePrepFacts>,
-    arch_name: Option<&str>,
+    architecture: r2ssa::MachineArchitectureFamily,
     metadata_reg_type_hints: &HashMap<String, TypeHint>,
     semantic_metadata_enabled: bool,
 ) -> Vec<RecoveredVariable> {
     let mut vars = Vec::new();
     let mut seen_slots: HashMap<(bool, i64), usize> = HashMap::new();
     let mut seen_arg_regs: HashSet<String> = HashSet::new();
-    let (arg_regs, stack_bases, frame_bases) = recover_vars_arch_profile(arch_name);
-    let ptr_bits = if arch_is_x86_64_sysv_like(arch_name) {
+    let (arg_regs, stack_bases, frame_bases) = recover_vars_arch_profile(architecture);
+    let ptr_bits = if arch_is_x86_64_sysv_like(architecture) {
         64
     } else {
         0
     };
     let signature_evidence =
-        collect_signature_type_evidence_context_with_arch(ssa_blocks, arch_name);
+        collect_signature_type_evidence_context_with_arch(ssa_blocks, architecture);
     let (usage_reg_type_hints, pointer_var_keys) =
-        infer_usage_register_type_hints(ssa_blocks, arch_name);
+        infer_usage_register_type_hints(ssa_blocks, architecture);
     let empty_metadata_hints = HashMap::new();
     let enabled_metadata_hints = if semantic_metadata_enabled {
         metadata_reg_type_hints
@@ -756,7 +824,7 @@ pub fn recover_vars_from_ssa_with_prep_facts(
                             StackVarRecoveryHint {
                                 type_override,
                                 stack_arg_index: incoming_stack_arg_index(
-                                    arch_name,
+                                    architecture,
                                     base,
                                     *offset,
                                     ptr_bits,
@@ -789,7 +857,7 @@ pub fn recover_vars_from_ssa_with_prep_facts(
                             StackVarRecoveryHint {
                                 type_override,
                                 stack_arg_index: incoming_stack_arg_index(
-                                    arch_name,
+                                    architecture,
                                     base,
                                     *offset,
                                     ptr_bits,
@@ -870,37 +938,13 @@ fn incoming_hint_should_replace(current: &TypeHint, incoming: &TypeHint) -> bool
     incoming.rank > current.rank || (incoming.rank == current.rank && incoming.ty < current.ty)
 }
 
-fn parse_const_value(name: &str) -> Option<u64> {
-    let val_str = name
-        .strip_prefix("const:")
-        .or_else(|| name.strip_prefix("CONST:"))?;
-    let val_str = val_str.split('_').next().unwrap_or(val_str);
-    if let Some(hex) = val_str
-        .strip_prefix("0x")
-        .or_else(|| val_str.strip_prefix("0X"))
-    {
-        return u64::from_str_radix(hex, 16).ok();
-    }
-    if let Some(dec) = val_str
-        .strip_prefix("0d")
-        .or_else(|| val_str.strip_prefix("0D"))
-    {
-        return dec.parse::<u64>().ok();
-    }
-    if val_str.chars().all(|c| c.is_ascii_hexdigit()) {
-        return u64::from_str_radix(val_str, 16).ok();
-    }
-    val_str.parse::<u64>().ok()
-}
-
 fn ssa_var_is_const(var: &SSAVar) -> bool {
-    parse_const_value(&var.name).is_some()
+    var.constant_bits().is_some()
 }
 
 pub(crate) fn ssa_var_is_register_like(var: &SSAVar) -> bool {
-    let lower = var.name.to_ascii_lowercase();
     matches!(
-        SSAVarNameKind::classify(&lower),
+        var.name_kind(),
         SSAVarNameKind::RegisterAlias | SSAVarNameKind::Ordinary
     )
 }
@@ -923,17 +967,11 @@ fn strongest_hint_for_aliases(
 }
 
 fn width_hint_key_matches_family(key: &str, family: &str) -> bool {
-    let Some((name, _version)) = key.rsplit_once('_') else {
-        return false;
-    };
-    scalar_register_family_key(name) == family
+    ssa_var_key_name(key).is_some_and(|name| scalar_register_family_key(name) == family)
 }
 
 fn width_hint_key_matches_family_version(key: &str, family: &str, version: u32) -> bool {
-    let Some((name, version_str)) = key.rsplit_once('_') else {
-        return false;
-    };
-    version_str.parse::<u32>().ok() == Some(version) && scalar_register_family_key(name) == family
+    ssa_var_key_matches_register_family_version(key, family, version)
 }
 
 fn recovered_arg_family_width_hint(
@@ -977,7 +1015,7 @@ fn recovered_arg_type_hint(
     if let Some(hint) = best_hint.as_ref()
         && hint.rank == TypeHintRank::Pointer
     {
-        let parsed = parse_type_like_spec(&hint.ty, ptr_bits)?;
+        let parsed = parse_c_type_like(&hint.ty, ptr_bits)?;
         if let Some(width) = signature_evidence.and_then(|evidence| {
             evidence
                 .pointer_pointee_width_bytes
@@ -1017,7 +1055,7 @@ fn recovered_arg_type_hint(
 }
 
 fn explicit_arg_type_hint(hint: &str, src: &SSAVar, ptr_bits: u32) -> Option<RecoveredArgTypeHint> {
-    match parse_type_like_spec(hint, ptr_bits) {
+    match parse_c_type_like(hint, ptr_bits) {
         Some(crate::CTypeLike::Int {
             bits, signedness, ..
         }) if bits > src.size.saturating_mul(8) => Some(RecoveredArgTypeHint {
@@ -1075,10 +1113,14 @@ fn add_stack_var(
     } = hint;
     let slot_key = (is_frame_base, offset);
     if let Some(existing_idx) = seen_slots.get(&slot_key).copied() {
+        // A second hint for a slot that is already typed demotes it to the
+        // opaque pointer, because the two disagree and neither is proven. The
+        // comparison is on the types rather than on the spellings, so radare2
+        // writing `void*` reaches the same conclusion as `void *`.
         if let Some(override_ty) = type_override
-            && override_ty == "void *"
+            && crate::parse_c_type_like(&override_ty, 64).is_some_and(|ty| ty.is_void_pointer())
             && let Some(existing) = vars.get_mut(existing_idx)
-            && existing.var_type != "void *"
+            && !existing.recovered_type_is_void_pointer()
         {
             existing.var_type = override_ty;
         }
@@ -1361,7 +1403,7 @@ fn infer_index_like_var_keys(ssa_blocks: &[SSABlock]) -> HashSet<String> {
                         }
                     }
                     SSAOp::IntLeft { dst, a, b } => {
-                        let shift_amount = parse_const_value(&b.name).unwrap_or(u64::MAX);
+                        let shift_amount = b.constant_bits().unwrap_or(u64::MAX);
                         if (index_like.contains(&ssa_var_key(a)) && ssa_var_is_const(b))
                             || shift_amount <= 6
                         {
@@ -1394,8 +1436,8 @@ fn infer_pointer_var_keys_from_ssa(
                 SSAOp::IntAdd { dst, a, b } | SSAOp::IntSub { dst, a, b } => {
                     let a_is_stack = ssa_var_is_stack_base(a, stack_bases);
                     let b_is_stack = ssa_var_is_stack_base(b, stack_bases);
-                    let a_const = parse_const_value(&a.name);
-                    let b_const = parse_const_value(&b.name);
+                    let a_const = a.constant_bits();
+                    let b_const = b.constant_bits();
 
                     if a_is_stack && b_const.is_some() {
                         let raw = b_const.unwrap_or(0);
@@ -1617,9 +1659,9 @@ fn infer_pointer_pointee_width_bytes(
             match op {
                 SSAOp::IntAdd { dst, a, b } => {
                     let (base, offset) = if ssa_var_is_stack_base(a, stack_bases) {
-                        (a, parse_const_value(&b.name).map(|value| value as i64))
+                        (a, b.constant_bits().map(|value| value as i64))
                     } else if ssa_var_is_stack_base(b, stack_bases) {
-                        (b, parse_const_value(&a.name).map(|value| value as i64))
+                        (b, a.constant_bits().map(|value| value as i64))
                     } else {
                         continue;
                     };
@@ -1631,7 +1673,7 @@ fn infer_pointer_pointee_width_bytes(
                     }
                 }
                 SSAOp::IntSub { dst, a, b } if ssa_var_is_stack_base(a, stack_bases) => {
-                    if let Some(offset) = parse_const_value(&b.name) {
+                    if let Some(offset) = b.constant_bits() {
                         stack_addr_slots.insert(
                             ssa_var_block_key(block.addr, dst),
                             format!("{}:{}", a.name.to_ascii_lowercase(), -(offset as i64)),
@@ -1659,13 +1701,11 @@ fn infer_pointer_pointee_width_bytes(
                     }
                 }
                 SSAOp::IntAdd { dst, a, b } | SSAOp::IntSub { dst, a, b } => {
-                    let b_is_nonzero_const =
-                        parse_const_value(&b.name).is_some_and(|value| value != 0);
+                    let b_is_nonzero_const = b.constant_bits().is_some_and(|value| value != 0);
                     if !ssa_var_is_stack_base(a, stack_bases) && !b_is_nonzero_const {
                         add_pointer_pointee_flow_edge(&mut adjacency, pointer_vars, dst, a);
                     }
-                    let a_is_nonzero_const =
-                        parse_const_value(&a.name).is_some_and(|value| value != 0);
+                    let a_is_nonzero_const = a.constant_bits().is_some_and(|value| value != 0);
                     if !ssa_var_is_stack_base(b, stack_bases)
                         && !a_is_nonzero_const
                         && !matches!(op, SSAOp::IntSub { .. })
@@ -2071,9 +2111,9 @@ fn infer_scalar_var_evidence_from_ssa(
 
 fn infer_usage_register_type_hints(
     ssa_blocks: &[SSABlock],
-    arch_name: Option<&str>,
+    architecture: r2ssa::MachineArchitectureFamily,
 ) -> (HashMap<String, TypeHint>, HashSet<String>) {
-    let (_, stack_bases, _) = recover_vars_arch_profile(arch_name);
+    let (_, stack_bases, _) = recover_vars_arch_profile(architecture);
     let pointer_vars = infer_pointer_var_keys_from_ssa(ssa_blocks, stack_bases);
     let mut hints = HashMap::new();
 
@@ -2098,6 +2138,49 @@ fn infer_usage_register_type_hints(
     }
 
     (hints, pointer_vars)
+}
+
+/// What the source calls the member at each offset of this function's
+/// aggregates.
+///
+/// A binary that carried debug info already said what its struct fields are
+/// called, and the access projections keep that beside the access that
+/// reached them. Without it a field is named after its offset, so something
+/// the source calls `next` prints as `f_10`.
+///
+/// The projections are read only under the identity they were sealed with,
+/// and an offset two aggregates disagree about is dropped rather than
+/// guessed.
+pub fn source_field_names(prepared: &SsaArtifact) -> HashMap<u64, String> {
+    let Some(interface) = prepared.machine_context().function_interface() else {
+        return HashMap::new();
+    };
+    let Some(projections) = prepared
+        .aggregate_accesses()
+        .projections_for_revision(interface.revision_identity())
+    else {
+        return HashMap::new();
+    };
+    let mut names: HashMap<u64, String> = HashMap::new();
+    let mut disputed = HashSet::new();
+    for projection in projections.values() {
+        if projection.member_name.is_empty() {
+            continue;
+        }
+        match names.get(&projection.byte_offset) {
+            Some(existing) if existing.as_str() != &*projection.member_name => {
+                disputed.insert(projection.byte_offset);
+            }
+            Some(_) => {}
+            None => {
+                names.insert(projection.byte_offset, projection.member_name.to_string());
+            }
+        }
+    }
+    for offset in disputed {
+        names.remove(&offset);
+    }
+    names
 }
 
 #[cfg(test)]
@@ -2246,6 +2329,19 @@ mod tests {
     }
 
     #[test]
+    fn x86_argument_profile_is_selected_by_typed_machine_family() {
+        let (x86_args, x86_stack, _) =
+            recover_vars_arch_profile(r2ssa::MachineArchitectureFamily::X86);
+        let (x86_64_args, x86_64_stack, _) =
+            recover_vars_arch_profile(r2ssa::MachineArchitectureFamily::X86_64);
+
+        assert!(x86_args.is_empty());
+        assert_eq!(x86_stack, X86_STACK_BASES);
+        assert_eq!(x86_64_args, X86_ARG_REGS);
+        assert_eq!(x86_64_stack, X86_STACK_BASES);
+    }
+
+    #[test]
     fn register_like_filter_rejects_non_register_ssa_names() {
         let cases = [
             ("rax", true),
@@ -2268,6 +2364,33 @@ mod tests {
     }
 
     #[test]
+    fn constant_spelling_cannot_authorize_stack_address_recovery() {
+        let dst = SSAVar::new("tmp:address", 1, 8);
+        let base = SSAVar::new("rsp", 0, 8);
+        let spoofed = SSAOp::IntAdd {
+            dst: dst.clone(),
+            a: base.clone(),
+            b: SSAVar::new("const:8", 0, 8),
+        };
+        let certified = SSAOp::IntAdd {
+            dst,
+            a: base.clone(),
+            b: SSAVar::constant(8, 8),
+        };
+
+        assert!(!ssa_var_is_const(&SSAVar::new(
+            "const:ffffffffffffffff",
+            0,
+            8
+        )));
+        assert!(stack_addr_temp(&spoofed, &["rsp"]).is_none());
+        assert_eq!(
+            stack_addr_temp(&certified, &["rsp"]),
+            Some((certified.dst().expect("destination"), &base, 8))
+        );
+    }
+
+    #[test]
     fn recovered_signature_params_follow_x86_64_arch_profile() {
         let block = SSABlock {
             addr: 0x401000,
@@ -2278,8 +2401,13 @@ mod tests {
             }],
         };
 
-        let params =
-            recover_signature_params_from_ssa(&[block], Some("x86-64"), &HashMap::new(), true, 64);
+        let params = recover_signature_params_from_ssa(
+            &[block],
+            r2ssa::MachineArchitectureFamily::X86_64,
+            &HashMap::new(),
+            true,
+            64,
+        );
 
         assert_eq!(params.len(), 1);
         assert_eq!(params[0].name, "arg0");
@@ -2309,7 +2437,13 @@ mod tests {
                 .expect("unsigned metadata hint"),
         )]);
 
-        let params = recover_signature_params_from_ssa(&[block], Some("x86-64"), &hints, true, 64);
+        let params = recover_signature_params_from_ssa(
+            &[block],
+            r2ssa::MachineArchitectureFamily::X86_64,
+            &hints,
+            true,
+            64,
+        );
 
         assert_eq!(
             params[0].initial_ty,
@@ -2337,14 +2471,14 @@ mod tests {
                 SSAOp::IntMult {
                     dst: SSAVar::new("RDX", 2, 8),
                     a: SSAVar::new("RDX", 1, 8),
-                    b: SSAVar::new("const:38", 0, 8),
+                    b: SSAVar::constant(0x38, 8),
                 },
             ],
         };
 
         let params = recover_signature_params_from_ssa(
             std::slice::from_ref(&block),
-            Some("x86-64"),
+            r2ssa::MachineArchitectureFamily::X86_64,
             &HashMap::new(),
             true,
             64,
@@ -2361,7 +2495,12 @@ mod tests {
             }
         );
 
-        let vars = recover_vars_from_ssa(&[block], Some("x86-64"), &HashMap::new(), true);
+        let vars = recover_vars_from_ssa(
+            &[block],
+            r2ssa::MachineArchitectureFamily::X86_64,
+            &HashMap::new(),
+            true,
+        );
         let var = vars
             .iter()
             .find(|var| var.name == "arg2")
@@ -2424,7 +2563,7 @@ mod tests {
 
             let params = recover_signature_params_from_ssa(
                 &[block],
-                Some("x86-64"),
+                r2ssa::MachineArchitectureFamily::X86_64,
                 &HashMap::new(),
                 false,
                 64,
@@ -2469,8 +2608,13 @@ mod tests {
             ],
         };
 
-        let params =
-            recover_signature_params_from_ssa(&[block], Some("x86-64"), &HashMap::new(), false, 64);
+        let params = recover_signature_params_from_ssa(
+            &[block],
+            r2ssa::MachineArchitectureFamily::X86_64,
+            &HashMap::new(),
+            false,
+            64,
+        );
         let first = params
             .iter()
             .find(|param| param.arg_index == 0)
@@ -2492,7 +2636,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("tmp:sp8", 1, 8),
                     a: SSAVar::new("rsp", 0, 8),
-                    b: SSAVar::new("const:0x8", 0, 8),
+                    b: SSAVar::constant(8, 8),
                 },
                 SSAOp::Load {
                     dst: SSAVar::new("tmp:stack_arg", 1, 8),
@@ -2502,8 +2646,13 @@ mod tests {
             ],
         };
 
-        let params =
-            recover_signature_params_from_ssa(&[block], Some("x86-64"), &HashMap::new(), true, 64);
+        let params = recover_signature_params_from_ssa(
+            &[block],
+            r2ssa::MachineArchitectureFamily::X86_64,
+            &HashMap::new(),
+            true,
+            64,
+        );
 
         assert_eq!(params.len(), 2);
         assert_eq!(params[0].name, "arg0");
@@ -2554,14 +2703,14 @@ mod tests {
         let custom = block_for_space(r2il::SpaceId::Custom(7));
         let ram_params = recover_signature_params_from_ssa(
             std::slice::from_ref(&ram),
-            Some("x86-64"),
+            r2ssa::MachineArchitectureFamily::X86_64,
             &HashMap::new(),
             true,
             64,
         );
         let custom_params = recover_signature_params_from_ssa(
             std::slice::from_ref(&custom),
-            Some("x86-64"),
+            r2ssa::MachineArchitectureFamily::X86_64,
             &HashMap::new(),
             true,
             64,
@@ -2569,8 +2718,18 @@ mod tests {
         assert!(ram_params.iter().any(|param| param.arg_index == 6));
         assert!(!custom_params.iter().any(|param| param.arg_index == 6));
 
-        let ram_vars = recover_vars_from_ssa(&[ram], Some("x86-64"), &HashMap::new(), true);
-        let custom_vars = recover_vars_from_ssa(&[custom], Some("x86-64"), &HashMap::new(), true);
+        let ram_vars = recover_vars_from_ssa(
+            &[ram],
+            r2ssa::MachineArchitectureFamily::X86_64,
+            &HashMap::new(),
+            true,
+        );
+        let custom_vars = recover_vars_from_ssa(
+            &[custom],
+            r2ssa::MachineArchitectureFamily::X86_64,
+            &HashMap::new(),
+            true,
+        );
         assert!(ram_vars.iter().any(|var| var.kind == "s" && var.delta == 8));
         assert!(
             ram_vars
@@ -2621,7 +2780,7 @@ mod tests {
         let param_type_for_space = |space| {
             recover_signature_params_from_ssa(
                 &blocks_for_space(space),
-                Some("x86-64"),
+                r2ssa::MachineArchitectureFamily::X86_64,
                 &HashMap::new(),
                 false,
                 64,
@@ -2651,7 +2810,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("tmp:home", 1, 8),
                     a: SSAVar::new("rbp", 1, 8),
-                    b: SSAVar::new("const:fffffffffffffff8", 0, 8),
+                    b: SSAVar::constant(0xffff_ffff_ffff_fff8, 8),
                 },
                 SSAOp::Copy {
                     dst: SSAVar::new("tmp:saved_arg", 1, 8),
@@ -2671,7 +2830,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("tmp:home_reload", 1, 8),
                     a: SSAVar::new("rbp", 1, 8),
-                    b: SSAVar::new("const:fffffffffffffff8", 0, 8),
+                    b: SSAVar::constant(0xffff_ffff_ffff_fff8, 8),
                 },
                 SSAOp::Load {
                     dst: SSAVar::new("tmp:base", 1, 8),
@@ -2689,7 +2848,7 @@ mod tests {
                 SSAOp::IntMult {
                     dst: SSAVar::new("tmp:scaled", 1, 8),
                     a: SSAVar::new("rcx", 2, 8),
-                    b: SSAVar::new("const:4", 0, 8),
+                    b: SSAVar::constant(4, 8),
                 },
                 SSAOp::IntAdd {
                     dst: SSAVar::new("tmp:element", 1, 8),
@@ -2706,7 +2865,7 @@ mod tests {
 
         let params = recover_signature_params_from_ssa(
             &[entry, body],
-            Some("x86-64"),
+            r2ssa::MachineArchitectureFamily::X86_64,
             &HashMap::new(),
             false,
             64,
@@ -2754,11 +2913,26 @@ mod tests {
             ],
         };
 
-        let evidence = collect_signature_type_evidence_context_with_arch(&[block], Some("aarch64"));
+        let evidence = collect_signature_type_evidence_context_with_arch(
+            &[block],
+            r2ssa::MachineArchitectureFamily::AArch64,
+        );
 
-        assert!(evidence.pointer_vars.contains("x9_2"));
-        assert!(!evidence.pointer_vars.contains("x9_1"));
-        assert!(!evidence.pointer_vars.contains("x1_0"));
+        assert!(
+            evidence
+                .pointer_vars
+                .contains(&ssa_var_key(&SSAVar::new("X9", 2, 8)))
+        );
+        assert!(
+            !evidence
+                .pointer_vars
+                .contains(&ssa_var_key(&SSAVar::new("X9", 1, 8)))
+        );
+        assert!(
+            !evidence
+                .pointer_vars
+                .contains(&ssa_var_key(&SSAVar::new("X1", 0, 8)))
+        );
     }
 
     #[test]
@@ -2793,10 +2967,22 @@ mod tests {
             ],
         };
 
-        let evidence = collect_signature_type_evidence_context_with_arch(&[block], Some("aarch64"));
+        let evidence = collect_signature_type_evidence_context_with_arch(
+            &[block],
+            r2ssa::MachineArchitectureFamily::AArch64,
+        );
 
-        assert!(evidence.pointer_vars.contains("x0_0"));
-        assert_eq!(evidence.pointer_pointee_width_bytes.get("x0_0"), Some(&4));
+        assert!(
+            evidence
+                .pointer_vars
+                .contains(&ssa_var_key(&SSAVar::new("X0", 0, 8)))
+        );
+        assert_eq!(
+            evidence
+                .pointer_pointee_width_bytes
+                .get(&ssa_var_key(&SSAVar::new("X0", 0, 8))),
+            Some(&4)
+        );
     }
 
     #[test]
@@ -2860,11 +3046,19 @@ mod tests {
             ],
         };
 
-        let evidence =
-            collect_signature_type_evidence_context_with_arch(&[entry, body], Some("aarch64"));
-        assert!(evidence.pointer_vars.contains("x0_0"));
+        let evidence = collect_signature_type_evidence_context_with_arch(
+            &[entry, body],
+            r2ssa::MachineArchitectureFamily::AArch64,
+        );
+        assert!(
+            evidence
+                .pointer_vars
+                .contains(&ssa_var_key(&SSAVar::new("X0", 0, 8)))
+        );
         assert_eq!(
-            evidence.pointer_pointee_width_bytes.get("x0_0"),
+            evidence
+                .pointer_pointee_width_bytes
+                .get(&ssa_var_key(&SSAVar::new("X0", 0, 8))),
             Some(&4),
             "pointer_vars={:?} pointee_widths={:?}",
             evidence.pointer_vars,
@@ -2881,7 +3075,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("tmp:sp8", 1, 8),
                     a: SSAVar::new("rsp", 0, 8),
-                    b: SSAVar::new("const:0x8", 0, 8),
+                    b: SSAVar::constant(8, 8),
                 },
                 SSAOp::Load {
                     dst: SSAVar::new("tmp:stack_arg", 1, 8),
@@ -2891,7 +3085,12 @@ mod tests {
             ],
         };
 
-        let vars = recover_vars_from_ssa(&[block], Some("x86-64"), &HashMap::new(), true);
+        let vars = recover_vars_from_ssa(
+            &[block],
+            r2ssa::MachineArchitectureFamily::X86_64,
+            &HashMap::new(),
+            true,
+        );
         let stack_arg = vars
             .iter()
             .find(|var| var.kind == "s" && var.delta == 8)
@@ -2937,7 +3136,7 @@ mod tests {
         let vars = recover_vars_from_ssa_with_prep_facts(
             &[block],
             Some(&prep_facts),
-            Some("aarch64"),
+            r2ssa::MachineArchitectureFamily::AArch64,
             &HashMap::new(),
             true,
         );
@@ -2960,7 +3159,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("rsp", 2, 8),
                     a: SSAVar::new("rsp", 1, 8),
-                    b: SSAVar::new("const:0x8", 0, 8),
+                    b: SSAVar::constant(8, 8),
                 },
                 SSAOp::Load {
                     dst: SSAVar::new("rip", 1, 8),
@@ -2973,7 +3172,12 @@ mod tests {
             ],
         };
 
-        let vars = recover_vars_from_ssa(&[block], Some("x86-64"), &HashMap::new(), true);
+        let vars = recover_vars_from_ssa(
+            &[block],
+            r2ssa::MachineArchitectureFamily::X86_64,
+            &HashMap::new(),
+            true,
+        );
 
         assert!(vars.iter().all(|var| !var.isarg));
         assert!(vars.iter().all(|var| var.delta != 8));
@@ -2987,7 +3191,7 @@ mod tests {
             ops: vec![
                 SSAOp::IntSub {
                     dst: SSAVar::new("tmp:not_stack", 1, 8),
-                    a: SSAVar::new("const:0x20", 0, 8),
+                    a: SSAVar::constant(0x20, 8),
                     b: SSAVar::new("rsp", 0, 8),
                 },
                 SSAOp::Load {
@@ -2998,7 +3202,12 @@ mod tests {
             ],
         };
 
-        let vars = recover_vars_from_ssa(&[block], Some("x86-64"), &HashMap::new(), true);
+        let vars = recover_vars_from_ssa(
+            &[block],
+            r2ssa::MachineArchitectureFamily::X86_64,
+            &HashMap::new(),
+            true,
+        );
 
         assert!(vars.is_empty());
     }
@@ -3014,8 +3223,13 @@ mod tests {
             }],
         };
 
-        let params =
-            recover_signature_params_from_ssa(&[block], Some("aarch64"), &HashMap::new(), true, 64);
+        let params = recover_signature_params_from_ssa(
+            &[block],
+            r2ssa::MachineArchitectureFamily::AArch64,
+            &HashMap::new(),
+            true,
+            64,
+        );
 
         assert_eq!(params.len(), 1);
         assert_eq!(params[0].name, "arg1");

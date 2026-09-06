@@ -6,23 +6,40 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::cfg::CFG;
-use crate::control::{SsaExecutionStopReason, SsaWorkControl, UncheckedSsaWorkControl};
+use crate::control::{SsaExecutionStopReason, SsaWorkControl};
 use crate::domtree::DomTree;
-use crate::naming::{RegisterNameMap, varnode_to_name};
+use crate::naming::RegisterNameMap;
 use crate::op::SSAOp;
-use crate::phi::PhiPlacement;
+use crate::phi::{DefinitionSitesByIdentity, PhiPlacement, RenameIdentity};
 use crate::var::{CanonicalStorageId, SSAVar};
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RenameProjection {
+    name: String,
+    size: u32,
+}
+
+impl From<&RenameIdentity> for RenameProjection {
+    fn from(identity: &RenameIdentity) -> Self {
+        Self {
+            name: identity.name.clone(),
+            size: identity.size,
+        }
+    }
+}
 
 /// Context for SSA renaming.
 #[derive(Debug)]
 pub struct RenameContext {
-    /// Stack of versions for each variable name.
+    /// Stack of versions for each exact semantic-name/width/storage identity.
     /// The top of the stack is the current version.
-    stacks: HashMap<String, Vec<u32>>,
-    /// Counter for generating new versions.
-    counters: HashMap<String, u32>,
-    /// Variable sizes.
-    sizes: HashMap<String, u32>,
+    stacks: HashMap<RenameIdentity, Vec<u32>>,
+    /// Collision-free version namespace for the user-facing SSAVar projection.
+    counters: HashMap<RenameProjection, u32>,
+    /// Dense deterministic discriminator for exact identities whose public
+    /// name/width projection is otherwise identical.
+    disambiguators: HashMap<RenameIdentity, u32>,
+    next_disambiguator: HashMap<RenameProjection, u32>,
 }
 
 /// Decompiler-safe call boundary policy.
@@ -30,6 +47,22 @@ pub struct RenameContext {
 pub struct CallBoundaryConfig {
     /// Registers that must receive a fresh SSA definition after a call.
     pub defined_regs: Vec<CallBoundaryDef>,
+    /// The carrier the callee puts back where it found it.
+    ///
+    /// A call instruction's own p-code carries the whole architectural cost of
+    /// transferring control: on x86-64 that is `RSP = RSP - 8` and the store of
+    /// the return address, on AArch64 a write to the link register and nothing
+    /// on the stack. Whatever it spends, the callee's return refunds -- but the
+    /// callee is not part of this function, so nothing in the lifted body
+    /// refunds it, and the caller's stack pointer drifts by one return-address
+    /// slot at every call it makes. Two calls, sixteen bytes; three,
+    /// twenty-four. Every stack offset taken after the first call then names
+    /// the wrong slot, which is worse than naming none.
+    ///
+    /// The convention is what states the refund, so this carries a storage only
+    /// where the source stated it. `None` leaves the drift visible rather than
+    /// correcting it on a guess.
+    pub stack_pointer_restored_by_callee: Option<CanonicalStorageId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,85 +77,86 @@ impl RenameContext {
         Self {
             stacks: HashMap::new(),
             counters: HashMap::new(),
-            sizes: HashMap::new(),
+            disambiguators: HashMap::new(),
+            next_disambiguator: HashMap::new(),
         }
     }
 
-    /// Initialize a variable with a given size.
-    pub fn init_var(&mut self, name: &str, size: u32) {
-        self.sizes.insert(name.to_string(), size);
+    /// Initialize one exact rename identity.
+    pub fn init_identity(&mut self, identity: RenameIdentity) {
+        let projection = RenameProjection::from(&identity);
+        if !self.disambiguators.contains_key(&identity) {
+            let next = self
+                .next_disambiguator
+                .entry(projection.clone())
+                .or_insert(0);
+            self.disambiguators.insert(identity.clone(), *next);
+            *next = next.checked_add(1).expect("rename discriminator exhausted");
+        }
         // Start with version 0 on the stack (representing "undefined" or function entry)
         self.stacks
-            .entry(name.to_string())
+            .entry(identity.clone())
             .or_insert_with(|| vec![0]);
-        self.counters.entry(name.to_string()).or_insert(0);
+        self.counters.entry(projection).or_insert(0);
     }
 
     /// Get the current version of a variable (for reading).
-    pub fn current_version(&self, name: &str) -> u32 {
+    pub fn current_version(&self, identity: &RenameIdentity) -> u32 {
         self.stacks
-            .get(name)
+            .get(identity)
             .and_then(|stack| stack.last().copied())
             .unwrap_or(0)
     }
 
     /// Generate a new version of a variable (for writing).
-    pub fn new_version(&mut self, name: &str) -> u32 {
-        let counter = self.counters.entry(name.to_string()).or_insert(0);
+    pub fn new_version(&mut self, identity: &RenameIdentity) -> u32 {
+        let counter = self
+            .counters
+            .entry(RenameProjection::from(identity))
+            .or_insert(0);
         *counter += 1;
         let version = *counter;
         self.stacks
-            .entry(name.to_string())
+            .entry(identity.clone())
             .or_default()
             .push(version);
         version
     }
 
     /// Pop a version from a variable's stack (when leaving a block's scope).
-    pub fn pop_version(&mut self, name: &str) {
-        if let Some(stack) = self.stacks.get_mut(name) {
+    pub fn pop_version(&mut self, identity: &RenameIdentity) {
+        if let Some(stack) = self.stacks.get_mut(identity) {
             stack.pop();
         }
     }
 
-    /// Get the size of a variable.
-    pub fn get_size(&self, name: &str) -> u32 {
-        self.sizes.get(name).copied().unwrap_or(8)
+    /// Create an SSAVar for reading one exact rename identity.
+    pub fn read_var(&self, identity: &RenameIdentity) -> SSAVar {
+        self.var_at(identity, self.current_version(identity))
     }
 
-    fn has_size(&self, name: &str) -> bool {
-        self.sizes.contains_key(name)
+    fn var_at(&self, identity: &RenameIdentity, version: u32) -> SSAVar {
+        identity.as_var(
+            version,
+            self.disambiguators.get(identity).copied().unwrap_or(0),
+        )
     }
 
-    /// Create an SSAVar for reading a variable.
-    pub fn read_var(&self, name: &str) -> SSAVar {
-        let version = self.current_version(name);
-        let size = self.get_size(name);
-        SSAVar::new(name, version, size)
+    /// Create an SSAVar for writing one exact rename identity.
+    pub fn write_var(&mut self, identity: &RenameIdentity) -> SSAVar {
+        let disambiguator = self.disambiguators.get(identity).copied().unwrap_or(0);
+        identity.as_var(self.new_version(identity), disambiguator)
     }
 
-    /// Create an SSAVar for reading a variable, using the IL varnode width if
-    /// the name has not been defined in this function.
-    pub fn read_var_with_size(&self, name: &str, fallback_size: u32) -> SSAVar {
-        let version = self.current_version(name);
-        let size = self.sizes.get(name).copied().unwrap_or(fallback_size);
-        SSAVar::new(name, version, size)
-    }
-
-    /// Create an SSAVar for writing a variable (generates new version).
-    pub fn write_var(&mut self, name: &str) -> SSAVar {
-        let version = self.new_version(name);
-        let size = self.get_size(name);
-        SSAVar::new(name, version, size)
-    }
-
-    /// Find initialized variable names that match a register name ignoring case.
-    pub fn matching_var_names_ci(&self, name: &str) -> Vec<String> {
+    /// Find initialized identities with this register spelling and exact width.
+    pub fn matching_identities_ci(&self, name: &str, size: u32) -> Vec<RenameIdentity> {
         let needle = name.to_ascii_lowercase();
-        let mut matches: Vec<String> = self
-            .sizes
+        let mut matches: Vec<RenameIdentity> = self
+            .stacks
             .keys()
-            .filter(|candidate| candidate.to_ascii_lowercase() == needle)
+            .filter(|candidate| {
+                candidate.size == size && candidate.name.to_ascii_lowercase() == needle
+            })
             .cloned()
             .collect();
         matches.sort_unstable();
@@ -143,8 +177,6 @@ pub struct RenamedFunction {
     pub blocks: HashMap<u64, Vec<SSAOp>>,
     /// Block addresses in order.
     pub block_order: Vec<u64>,
-    /// Entry block address.
-    pub entry: u64,
     /// Lifted storage provenance for SSA values.
     ///
     /// This map is populated directly from source varnodes while renaming. A
@@ -157,72 +189,14 @@ pub struct RenamedFunction {
 
 impl RenamedFunction {
     /// Create a new empty renamed function.
-    pub fn new(entry: u64) -> Self {
+    pub fn new() -> Self {
         Self {
             blocks: HashMap::new(),
             block_order: Vec::new(),
-            entry,
             canonical_storage_by_var: BTreeMap::new(),
             ambiguous_storage_vars: BTreeSet::new(),
         }
     }
-
-    /// Get the SSA operations for a block.
-    pub fn get_block(&self, addr: u64) -> &[SSAOp] {
-        self.blocks.get(&addr).map(|v| v.as_slice()).unwrap_or(&[])
-    }
-}
-
-/// Perform SSA renaming on a CFG.
-///
-/// This is the main entry point for the renaming algorithm.
-pub fn rename_function(
-    cfg: &CFG,
-    domtree: &DomTree,
-    phi_placement: &PhiPlacement,
-    var_sizes: &HashMap<String, u32>,
-) -> RenamedFunction {
-    rename_function_with_names(cfg, domtree, phi_placement, var_sizes, None)
-}
-
-/// Perform SSA renaming on a CFG with optional register names.
-pub fn rename_function_with_names(
-    cfg: &CFG,
-    domtree: &DomTree,
-    phi_placement: &PhiPlacement,
-    var_sizes: &HashMap<String, u32>,
-    reg_names: Option<&RegisterNameMap>,
-) -> RenamedFunction {
-    rename_function_with_names_and_call_boundaries(
-        cfg,
-        domtree,
-        phi_placement,
-        var_sizes,
-        reg_names,
-        None,
-    )
-}
-
-/// Perform SSA renaming on a CFG with optional register names and decompiler-safe call
-/// boundaries.
-pub fn rename_function_with_names_and_call_boundaries(
-    cfg: &CFG,
-    domtree: &DomTree,
-    phi_placement: &PhiPlacement,
-    var_sizes: &HashMap<String, u32>,
-    reg_names: Option<&RegisterNameMap>,
-    call_boundaries: Option<&CallBoundaryConfig>,
-) -> RenamedFunction {
-    rename_function_with_names_and_call_boundaries_and_control(
-        cfg,
-        domtree,
-        phi_placement,
-        var_sizes,
-        reg_names,
-        call_boundaries,
-        &UncheckedSsaWorkControl,
-    )
-    .expect("unchecked SSA renaming cannot stop")
 }
 
 /// Perform SSA renaming while polling its block and operation worklists.
@@ -231,23 +205,19 @@ pub fn rename_function_with_names_and_call_boundaries_and_control<C: SsaWorkCont
     cfg: &CFG,
     domtree: &DomTree,
     phi_placement: &PhiPlacement,
-    var_sizes: &HashMap<String, u32>,
+    definitions: &DefinitionSitesByIdentity,
     reg_names: Option<&RegisterNameMap>,
     call_boundaries: Option<&CallBoundaryConfig>,
     control: &C,
 ) -> Result<RenamedFunction, SsaExecutionStopReason> {
     control.poll()?;
     let mut ctx = RenameContext::new();
-    let mut result = RenamedFunction::new(cfg.entry);
+    let mut result = RenamedFunction::new();
 
     // Initialize all variables
-    let mut initialized_vars: Vec<(&String, &u32)> = var_sizes.iter().collect();
-    initialized_vars.sort_unstable_by(|(lhs_name, lhs_size), (rhs_name, rhs_size)| {
-        lhs_name.cmp(rhs_name).then(lhs_size.cmp(rhs_size))
-    });
-    for (name, &size) in initialized_vars {
+    for identity in definitions.keys() {
         control.poll()?;
-        ctx.init_var(name, size);
+        ctx.init_identity(identity.clone());
     }
 
     // Also initialize variables from phi nodes
@@ -257,9 +227,15 @@ pub fn rename_function_with_names_and_call_boundaries_and_control<C: SsaWorkCont
         control.poll()?;
         for phi in phi_placement.get_phis(block_addr) {
             control.poll()?;
-            ctx.init_var(&phi.var_name, phi.var_size);
+            ctx.init_identity(phi.identity.clone());
         }
     }
+
+    // The convention names the carrier a call leaves alone; renaming needs the
+    // identity that carrier was lifted as.
+    let stack_pointer_identity = call_boundaries
+        .and_then(|boundary| boundary.stack_pointer_restored_by_callee)
+        .and_then(|storage| sole_identity_on_storage(definitions, storage));
 
     // Get block order (reverse postorder for dominator tree traversal)
     result.block_order = cfg.reverse_postorder();
@@ -280,10 +256,10 @@ pub fn rename_function_with_names_and_call_boundaries_and_control<C: SsaWorkCont
             let sources: Vec<SSAVar> = phi
                 .predecessors
                 .iter()
-                .map(|_| SSAVar::new(&phi.var_name, 0, phi.var_size))
+                .map(|_| ctx.var_at(&phi.identity, 0))
                 .collect();
             block_ops.push(SSAOp::Phi {
-                dst: SSAVar::new(&phi.var_name, 0, phi.var_size),
+                dst: ctx.var_at(&phi.identity, 0),
                 sources,
             });
         }
@@ -299,11 +275,29 @@ pub fn rename_function_with_names_and_call_boundaries_and_control<C: SsaWorkCont
         &mut result,
         reg_names,
         call_boundaries,
+        stack_pointer_identity.as_ref(),
         control,
     )?;
 
     control.poll()?;
     Ok(result)
+}
+
+/// The one identity lifted onto this exact storage, when there is exactly one.
+///
+/// Storage is the structural identity and the name beside it is presentation.
+/// Two identities sharing a storage means the lift disagreed with itself about
+/// what that location is; restoring one of them would assert the callee wrote
+/// through a location it may not have, so this declines instead.
+fn sole_identity_on_storage(
+    definitions: &DefinitionSitesByIdentity,
+    storage: CanonicalStorageId,
+) -> Option<RenameIdentity> {
+    let mut matches = definitions
+        .keys()
+        .filter(|identity| identity.storage == storage);
+    let identity = matches.next()?;
+    matches.next().is_none().then(|| identity.clone())
 }
 
 /// Rename a block and its dominated descendants.
@@ -317,11 +311,12 @@ fn rename_block<C: SsaWorkControl + ?Sized>(
     result: &mut RenamedFunction,
     reg_names: Option<&RegisterNameMap>,
     call_boundaries: Option<&CallBoundaryConfig>,
+    stack_pointer_identity: Option<&RenameIdentity>,
     control: &C,
 ) -> Result<(), SsaExecutionStopReason> {
     // An exit frame keeps each block's definitions live until all dominated
     // children have been renamed, matching the recursive traversal's scope.
-    let mut stack: Vec<(u64, Option<Vec<String>>)> = vec![(block_addr, None)];
+    let mut stack: Vec<(u64, Option<Vec<RenameIdentity>>)> = vec![(block_addr, None)];
     while let Some((block_addr, exit_defs)) = stack.pop() {
         control.poll()?;
         if let Some(defined_vars) = exit_defs {
@@ -332,7 +327,7 @@ fn rename_block<C: SsaWorkControl + ?Sized>(
         }
 
         // Track variables defined in this block for cleanup.
-        let mut defined_vars: Vec<String> = Vec::new();
+        let mut defined_vars: Vec<RenameIdentity> = Vec::new();
 
         // 1. Rename phi node destinations.
         let phis = phi_placement.get_phis(block_addr);
@@ -342,7 +337,7 @@ fn rename_block<C: SsaWorkControl + ?Sized>(
             .expect("preinitialized block");
         for (phi_idx, phi) in phis.iter().enumerate() {
             control.poll()?;
-            let dst = ctx.write_var(&phi.var_name);
+            let dst = ctx.write_var(&phi.identity);
             if let Some(storage) = phi.storage {
                 record_canonical_storage(
                     &mut result.canonical_storage_by_var,
@@ -351,7 +346,7 @@ fn rename_block<C: SsaWorkControl + ?Sized>(
                     storage,
                 );
             }
-            defined_vars.push(phi.var_name.clone());
+            defined_vars.push(phi.identity.clone());
 
             // Update the precreated placeholder so predecessor-edge propagation can land
             // before or after the merge block is renamed.
@@ -365,7 +360,7 @@ fn rename_block<C: SsaWorkControl + ?Sized>(
                         *sources = phi
                             .predecessors
                             .iter()
-                            .map(|_| SSAVar::new(&phi.var_name, 0, phi.var_size))
+                            .map(|_| ctx.var_at(&phi.identity, 0))
                             .collect();
                     }
                 }
@@ -373,7 +368,7 @@ fn rename_block<C: SsaWorkControl + ?Sized>(
                     let sources: Vec<SSAVar> = phi
                         .predecessors
                         .iter()
-                        .map(|_| SSAVar::new(&phi.var_name, 0, phi.var_size))
+                        .map(|_| ctx.var_at(&phi.identity, 0))
                         .collect();
                     block_ops.insert(phi_idx, SSAOp::Phi { dst, sources });
                 }
@@ -382,8 +377,21 @@ fn rename_block<C: SsaWorkControl + ?Sized>(
 
         // 2. Rename operations in the block.
         if let Some(block) = cfg.get_block(block_addr) {
-            for op in &block.ops {
+            // The carrier as the call instruction found it, before that
+            // instruction's own p-code spent anything transferring control.
+            // Restoring to this needs no per-architecture quantity: whatever
+            // the machine moved is exactly what the callee brings back.
+            let mut instruction_addr: Option<u64> = None;
+            let mut carrier_entering_instruction: Option<SSAVar> = None;
+            for (op_idx, op) in block.ops.iter().enumerate() {
                 control.poll()?;
+                if let Some(identity) = stack_pointer_identity {
+                    let op_addr = block.op_instruction_addr(op_idx);
+                    if op_addr.is_some() && op_addr != instruction_addr {
+                        instruction_addr = op_addr;
+                        carrier_entering_instruction = Some(ctx.read_var(identity));
+                    }
+                }
                 let renamed_op = rename_op(op, ctx, &mut defined_vars, reg_names);
                 record_renamed_op_storage(op, &renamed_op, result);
                 result.blocks.get_mut(&block_addr).unwrap().push(renamed_op);
@@ -407,6 +415,39 @@ fn rename_block<C: SsaWorkControl + ?Sized>(
                             storage,
                         );
                     }
+                }
+
+                // After the clobbers, not before them: the run of `CallDefine`
+                // directly following a call is how a result is found, and an
+                // operation in the middle of it ends that run early.
+                if matches!(op, r2il::R2ILOp::Call { .. } | r2il::R2ILOp::CallInd { .. })
+                    && let (Some(identity), Some(entering)) = (
+                        stack_pointer_identity,
+                        carrier_entering_instruction.as_ref(),
+                    )
+                    && ctx.read_var(identity) != *entering
+                {
+                    // Only where this instruction moved the carrier. An
+                    // AArch64 `bl` writes the link register and leaves the
+                    // stack alone, so there is nothing to bring back; defining
+                    // the carrier anyway would add a definition to a block that
+                    // has none, which phi placement was computed without.
+                    let dst = ctx.write_var(identity);
+                    defined_vars.push(identity.clone());
+                    result
+                        .blocks
+                        .get_mut(&block_addr)
+                        .unwrap()
+                        .push(SSAOp::CallRestore {
+                            dst: dst.clone(),
+                            src: entering.clone(),
+                        });
+                    record_canonical_storage(
+                        &mut result.canonical_storage_by_var,
+                        &mut result.ambiguous_storage_vars,
+                        &dst,
+                        identity.storage,
+                    );
                 }
             }
         }
@@ -478,7 +519,7 @@ fn append_call_boundary_defs(
     blocks: &mut HashMap<u64, Vec<SSAOp>>,
     block_addr: u64,
     ctx: &mut RenameContext,
-    defined_vars: &mut Vec<String>,
+    defined_vars: &mut Vec<RenameIdentity>,
     call_boundaries: &CallBoundaryConfig,
     reg_names: Option<&RegisterNameMap>,
 ) -> Vec<(SSAVar, CanonicalStorageId)> {
@@ -488,41 +529,35 @@ fn append_call_boundary_defs(
     let mut retained = Vec::new();
 
     for reg in &call_boundaries.defined_regs {
-        let mut actual_names: BTreeSet<String> =
-            ctx.matching_var_names_ci(&reg.name).into_iter().collect();
-        if actual_names.is_empty()
+        let mut actual_identities: BTreeSet<RenameIdentity> = ctx
+            .matching_identities_ci(&reg.name, reg.size)
+            .into_iter()
+            .collect();
+        if actual_identities.is_empty()
             && let Some(reg_names) = reg_names
         {
-            for ((_, size), candidate) in reg_names {
+            for ((offset, size), candidate) in reg_names {
                 if *size == reg.size && candidate.eq_ignore_ascii_case(&reg.name) {
-                    actual_names.insert(candidate.clone());
+                    actual_identities.insert(RenameIdentity::new(
+                        candidate,
+                        CanonicalStorageId {
+                            space: crate::CanonicalStorageSpace::Register,
+                            offset: *offset,
+                            size: *size,
+                        },
+                    ));
                 }
             }
         }
-        if actual_names.is_empty() {
-            ctx.init_var(&reg.name, reg.size);
-            actual_names.insert(reg.name.clone());
+        if actual_identities.is_empty() {
+            actual_identities.insert(RenameIdentity::synthetic(&reg.name, reg.size));
         }
-        for actual_name in actual_names {
-            if !ctx.has_size(&actual_name) {
-                ctx.init_var(&actual_name, reg.size);
-            }
-            let dst = ctx.write_var(&actual_name);
-            defined_vars.push(actual_name);
-            if let Some(storage) = reg_names.and_then(|names| {
-                let mut storages = names
-                    .iter()
-                    .filter(|((_, size), name)| {
-                        *size == reg.size && name.eq_ignore_ascii_case(&dst.name)
-                    })
-                    .map(|((offset, size), _)| CanonicalStorageId {
-                        space: crate::CanonicalStorageSpace::Register,
-                        offset: *offset,
-                        size: *size,
-                    });
-                let storage = storages.next()?;
-                storages.next().is_none().then_some(storage)
-            }) {
+        for identity in actual_identities {
+            let storage = identity.storage;
+            ctx.init_identity(identity.clone());
+            let dst = ctx.write_var(&identity);
+            defined_vars.push(identity);
+            if matches!(storage.space, crate::CanonicalStorageSpace::Register) {
                 retained.push((dst.clone(), storage));
             }
             block_ops.push(SSAOp::CallDefine { dst });
@@ -556,7 +591,7 @@ fn fill_phi_sources(
     let incoming = phis
         .iter()
         .map(|phi| {
-            let source = ctx.read_var(&phi.var_name);
+            let source = ctx.read_var(&phi.identity);
             if let Some(storage) = phi.storage
                 && storage.size == source.size
             {
@@ -588,10 +623,22 @@ fn fill_phi_sources(
 }
 
 /// Rename a single r2il operation to an SSA operation.
+fn write_varnode(
+    varnode: &r2il::Varnode,
+    ctx: &mut RenameContext,
+    defined_vars: &mut Vec<RenameIdentity>,
+    reg_names: Option<&RegisterNameMap>,
+) -> SSAVar {
+    let identity = RenameIdentity::from_varnode(varnode, reg_names);
+    let renamed = ctx.write_var(&identity);
+    defined_vars.push(identity);
+    renamed
+}
+
 fn rename_op(
     op: &r2il::R2ILOp,
     ctx: &mut RenameContext,
-    defined_vars: &mut Vec<String>,
+    defined_vars: &mut Vec<RenameIdentity>,
     reg_names: Option<&RegisterNameMap>,
 ) -> SSAOp {
     use r2il::R2ILOp::*;
@@ -599,9 +646,7 @@ fn rename_op(
     match op {
         Copy { dst, src } => {
             let src_ssa = read_varnode(src, ctx, reg_names);
-            let dst_name = varnode_to_name(dst, reg_names);
-            let dst_ssa = ctx.write_var(&dst_name);
-            defined_vars.push(dst_name);
+            let dst_ssa = write_varnode(dst, ctx, defined_vars, reg_names);
             SSAOp::Copy {
                 dst: dst_ssa,
                 src: src_ssa,
@@ -610,9 +655,7 @@ fn rename_op(
 
         Load { dst, addr, space } => {
             let addr_ssa = read_varnode(addr, ctx, reg_names);
-            let dst_name = varnode_to_name(dst, reg_names);
-            let dst_ssa = ctx.write_var(&dst_name);
-            defined_vars.push(dst_name);
+            let dst_ssa = write_varnode(dst, ctx, defined_vars, reg_names);
             SSAOp::Load {
                 dst: dst_ssa,
                 addr: addr_ssa,
@@ -639,9 +682,7 @@ fn rename_op(
             ordering,
         } => {
             let addr_ssa = read_varnode(addr, ctx, reg_names);
-            let dst_name = varnode_to_name(dst, reg_names);
-            let dst_ssa = ctx.write_var(&dst_name);
-            defined_vars.push(dst_name);
+            let dst_ssa = write_varnode(dst, ctx, defined_vars, reg_names);
             SSAOp::LoadLinked {
                 dst: dst_ssa,
                 addr: addr_ssa,
@@ -658,12 +699,9 @@ fn rename_op(
         } => {
             let addr_ssa = read_varnode(addr, ctx, reg_names);
             let val_ssa = read_varnode(val, ctx, reg_names);
-            let result_ssa = result.as_ref().map(|r| {
-                let name = varnode_to_name(r, reg_names);
-                let ssa = ctx.write_var(&name);
-                defined_vars.push(name);
-                ssa
-            });
+            let result_ssa = result
+                .as_ref()
+                .map(|r| write_varnode(r, ctx, defined_vars, reg_names));
             SSAOp::StoreConditional {
                 result: result_ssa,
                 addr: addr_ssa,
@@ -683,9 +721,7 @@ fn rename_op(
             let addr_ssa = read_varnode(addr, ctx, reg_names);
             let expected_ssa = read_varnode(expected, ctx, reg_names);
             let replacement_ssa = read_varnode(replacement, ctx, reg_names);
-            let dst_name = varnode_to_name(dst, reg_names);
-            let dst_ssa = ctx.write_var(&dst_name);
-            defined_vars.push(dst_name);
+            let dst_ssa = write_varnode(dst, ctx, defined_vars, reg_names);
             SSAOp::AtomicCAS {
                 dst: dst_ssa,
                 space: *space,
@@ -704,9 +740,7 @@ fn rename_op(
         } => {
             let addr_ssa = read_varnode(addr, ctx, reg_names);
             let guard_ssa = read_varnode(guard, ctx, reg_names);
-            let dst_name = varnode_to_name(dst, reg_names);
-            let dst_ssa = ctx.write_var(&dst_name);
-            defined_vars.push(dst_name);
+            let dst_ssa = write_varnode(dst, ctx, defined_vars, reg_names);
             SSAOp::LoadGuarded {
                 dst: dst_ssa,
                 addr: addr_ssa,
@@ -1043,9 +1077,7 @@ fn rename_op(
         Piece { dst, hi, lo } => {
             let hi_ssa = read_varnode(hi, ctx, reg_names);
             let lo_ssa = read_varnode(lo, ctx, reg_names);
-            let dst_name = varnode_to_name(dst, reg_names);
-            let dst_ssa = ctx.write_var(&dst_name);
-            defined_vars.push(dst_name);
+            let dst_ssa = write_varnode(dst, ctx, defined_vars, reg_names);
             SSAOp::Piece {
                 dst: dst_ssa,
                 hi: hi_ssa,
@@ -1055,9 +1087,7 @@ fn rename_op(
 
         Subpiece { dst, src, offset } => {
             let src_ssa = read_varnode(src, ctx, reg_names);
-            let dst_name = varnode_to_name(dst, reg_names);
-            let dst_ssa = ctx.write_var(&dst_name);
-            defined_vars.push(dst_name);
+            let dst_ssa = write_varnode(dst, ctx, defined_vars, reg_names);
             SSAOp::Subpiece {
                 dst: dst_ssa,
                 src: src_ssa,
@@ -1219,9 +1249,7 @@ fn rename_op(
         Breakpoint => SSAOp::Breakpoint,
 
         CpuId { dst } => {
-            let dst_name = varnode_to_name(dst, reg_names);
-            let dst_ssa = ctx.write_var(&dst_name);
-            defined_vars.push(dst_name);
+            let dst_ssa = write_varnode(dst, ctx, defined_vars, reg_names);
             SSAOp::CpuId { dst: dst_ssa }
         }
 
@@ -1234,12 +1262,9 @@ fn rename_op(
                 .iter()
                 .map(|v| read_varnode(v, ctx, reg_names))
                 .collect();
-            let output_ssa = output.as_ref().map(|v| {
-                let name = varnode_to_name(v, reg_names);
-                let ssa = ctx.write_var(&name);
-                defined_vars.push(name);
-                ssa
-            });
+            let output_ssa = output
+                .as_ref()
+                .map(|v| write_varnode(v, ctx, defined_vars, reg_names));
             SSAOp::CallOther {
                 output: output_ssa,
                 userop: *userop,
@@ -1252,9 +1277,7 @@ fn rename_op(
                 .iter()
                 .map(|v| read_varnode(v, ctx, reg_names))
                 .collect();
-            let dst_name = varnode_to_name(dst, reg_names);
-            let dst_ssa = ctx.write_var(&dst_name);
-            defined_vars.push(dst_name);
+            let dst_ssa = write_varnode(dst, ctx, defined_vars, reg_names);
             SSAOp::Phi {
                 dst: dst_ssa,
                 sources: inputs_ssa,
@@ -1268,9 +1291,7 @@ fn rename_op(
         } => {
             // Indirect is used for aliasing - treat as a copy for SSA purposes
             let src_ssa = read_varnode(src, ctx, reg_names);
-            let dst_name = varnode_to_name(dst, reg_names);
-            let dst_ssa = ctx.write_var(&dst_name);
-            defined_vars.push(dst_name);
+            let dst_ssa = write_varnode(dst, ctx, defined_vars, reg_names);
             SSAOp::Copy {
                 dst: dst_ssa,
                 src: src_ssa,
@@ -1285,9 +1306,7 @@ fn rename_op(
         } => {
             let base_ssa = read_varnode(base, ctx, reg_names);
             let index_ssa = read_varnode(index, ctx, reg_names);
-            let dst_name = varnode_to_name(dst, reg_names);
-            let dst_ssa = ctx.write_var(&dst_name);
-            defined_vars.push(dst_name);
+            let dst_ssa = write_varnode(dst, ctx, defined_vars, reg_names);
             SSAOp::PtrAdd {
                 dst: dst_ssa,
                 base: base_ssa,
@@ -1304,9 +1323,7 @@ fn rename_op(
         } => {
             let base_ssa = read_varnode(base, ctx, reg_names);
             let index_ssa = read_varnode(index, ctx, reg_names);
-            let dst_name = varnode_to_name(dst, reg_names);
-            let dst_ssa = ctx.write_var(&dst_name);
-            defined_vars.push(dst_name);
+            let dst_ssa = write_varnode(dst, ctx, defined_vars, reg_names);
             SSAOp::PtrSub {
                 dst: dst_ssa,
                 base: base_ssa,
@@ -1322,9 +1339,7 @@ fn rename_op(
         } => {
             let seg_ssa = read_varnode(segment, ctx, reg_names);
             let off_ssa = read_varnode(offset, ctx, reg_names);
-            let dst_name = varnode_to_name(dst, reg_names);
-            let dst_ssa = ctx.write_var(&dst_name);
-            defined_vars.push(dst_name);
+            let dst_ssa = write_varnode(dst, ctx, defined_vars, reg_names);
             SSAOp::SegmentOp {
                 dst: dst_ssa,
                 segment: seg_ssa,
@@ -1334,9 +1349,7 @@ fn rename_op(
 
         New { dst, src } => {
             let src_ssa = read_varnode(src, ctx, reg_names);
-            let dst_name = varnode_to_name(dst, reg_names);
-            let dst_ssa = ctx.write_var(&dst_name);
-            defined_vars.push(dst_name);
+            let dst_ssa = write_varnode(dst, ctx, defined_vars, reg_names);
             SSAOp::New {
                 dst: dst_ssa,
                 src: src_ssa,
@@ -1350,9 +1363,7 @@ fn rename_op(
         Extract { dst, src, position } => {
             let src_ssa = read_varnode(src, ctx, reg_names);
             let pos_ssa = read_varnode(position, ctx, reg_names);
-            let dst_name = varnode_to_name(dst, reg_names);
-            let dst_ssa = ctx.write_var(&dst_name);
-            defined_vars.push(dst_name);
+            let dst_ssa = write_varnode(dst, ctx, defined_vars, reg_names);
             SSAOp::Extract {
                 dst: dst_ssa,
                 src: src_ssa,
@@ -1369,9 +1380,7 @@ fn rename_op(
             let src_ssa = read_varnode(src, ctx, reg_names);
             let val_ssa = read_varnode(value, ctx, reg_names);
             let pos_ssa = read_varnode(position, ctx, reg_names);
-            let dst_name = varnode_to_name(dst, reg_names);
-            let dst_ssa = ctx.write_var(&dst_name);
-            defined_vars.push(dst_name);
+            let dst_ssa = write_varnode(dst, ctx, defined_vars, reg_names);
             SSAOp::Insert {
                 dst: dst_ssa,
                 src: src_ssa,
@@ -1389,9 +1398,7 @@ fn rename_op(
             let cond_ssa = read_varnode(cond, ctx, reg_names);
             let true_ssa = read_varnode(if_true, ctx, reg_names);
             let false_ssa = read_varnode(if_false, ctx, reg_names);
-            let dst_name = varnode_to_name(dst, reg_names);
-            let dst_ssa = ctx.write_var(&dst_name);
-            defined_vars.push(dst_name);
+            let dst_ssa = write_varnode(dst, ctx, defined_vars, reg_names);
             SSAOp::Select {
                 dst: dst_ssa,
                 cond: cond_ssa,
@@ -1408,7 +1415,7 @@ fn rename_binary_op<F>(
     src1: &r2il::Varnode,
     src2: &r2il::Varnode,
     ctx: &mut RenameContext,
-    defined_vars: &mut Vec<String>,
+    defined_vars: &mut Vec<RenameIdentity>,
     reg_names: Option<&RegisterNameMap>,
     f: F,
 ) -> SSAOp
@@ -1417,9 +1424,7 @@ where
 {
     let src1_ssa = read_varnode(src1, ctx, reg_names);
     let src2_ssa = read_varnode(src2, ctx, reg_names);
-    let dst_name = varnode_to_name(dst, reg_names);
-    let dst_ssa = ctx.write_var(&dst_name);
-    defined_vars.push(dst_name);
+    let dst_ssa = write_varnode(dst, ctx, defined_vars, reg_names);
     f(dst_ssa, src1_ssa, src2_ssa)
 }
 
@@ -1428,7 +1433,7 @@ fn rename_unary_op<F>(
     dst: &r2il::Varnode,
     src: &r2il::Varnode,
     ctx: &mut RenameContext,
-    defined_vars: &mut Vec<String>,
+    defined_vars: &mut Vec<RenameIdentity>,
     reg_names: Option<&RegisterNameMap>,
     f: F,
 ) -> SSAOp
@@ -1436,9 +1441,7 @@ where
     F: FnOnce(SSAVar, SSAVar) -> SSAOp,
 {
     let src_ssa = read_varnode(src, ctx, reg_names);
-    let dst_name = varnode_to_name(dst, reg_names);
-    let dst_ssa = ctx.write_var(&dst_name);
-    defined_vars.push(dst_name);
+    let dst_ssa = write_varnode(dst, ctx, defined_vars, reg_names);
     f(dst_ssa, src_ssa)
 }
 
@@ -1456,8 +1459,8 @@ fn read_varnode(
             SSAVar::constant(vn.offset, vn.size)
         }
         _ => {
-            let name = varnode_to_name(vn, reg_names);
-            ctx.read_var_with_size(&name, vn.size)
+            let identity = RenameIdentity::from_varnode(vn, reg_names);
+            ctx.read_var(&identity)
         }
     }
 }
@@ -1465,9 +1468,8 @@ fn read_varnode(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cfg::CFG;
-    use crate::phi::{collect_defs_from_cfg, collect_defs_from_cfg_with_names};
-    use r2il::{R2ILBlock, R2ILOp, SpaceId, Varnode};
+
+    use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
 
     fn make_const(val: u64, size: u32) -> Varnode {
         Varnode {
@@ -1487,220 +1489,39 @@ mod tests {
         }
     }
 
-    fn make_ram(addr: u64, size: u32) -> Varnode {
+    fn make_unique(offset: u64, size: u32) -> Varnode {
         Varnode {
-            space: SpaceId::Ram,
-            offset: addr,
+            space: SpaceId::Unique,
+            offset,
             size,
             meta: None,
         }
     }
 
     #[test]
-    fn test_rename_linear() {
-        // Linear CFG with two writes to same register
-        let blocks = vec![
-            R2ILBlock {
-                addr: 0x1000,
-                size: 4,
-                ops: vec![
-                    R2ILOp::Copy {
-                        dst: make_reg(0, 8),
-                        src: make_const(1, 8),
-                    },
-                    R2ILOp::Copy {
-                        dst: make_reg(0, 8),
-                        src: make_const(2, 8),
-                    },
-                ],
-                switch_info: None,
-                op_metadata: Default::default(),
-            },
-            R2ILBlock {
-                addr: 0x1004,
-                size: 4,
-                ops: vec![R2ILOp::Return {
-                    target: make_ram(0, 8),
-                }],
-                switch_info: None,
-                op_metadata: Default::default(),
-            },
-        ];
-
-        let cfg = CFG::from_blocks(&blocks).unwrap();
-        let domtree = DomTree::compute(&cfg);
-        let (defs, var_sizes) = collect_defs_from_cfg(&cfg);
-        let phi_placement = PhiPlacement::compute(&cfg, &domtree, &defs, &var_sizes);
-        let result = rename_function(&cfg, &domtree, &phi_placement, &var_sizes);
-
-        // Check that versions are assigned correctly
-        let block_ops = result.get_block(0x1000);
-        assert_eq!(block_ops.len(), 2);
-
-        // First copy should produce reg:0 v1
-        if let SSAOp::Copy { dst, .. } = &block_ops[0] {
-            assert_eq!(dst.version, 1);
-        } else {
-            panic!("Expected Copy op");
-        }
-
-        // Second copy should produce reg:0 v2
-        if let SSAOp::Copy { dst, .. } = &block_ops[1] {
-            assert_eq!(dst.version, 2);
-        } else {
-            panic!("Expected Copy op");
-        }
-    }
-
-    #[test]
-    fn test_rename_with_phi() {
-        // Diamond CFG with phi
-        let blocks = vec![
-            R2ILBlock {
-                addr: 0x1000,
-                size: 4,
-                ops: vec![R2ILOp::CBranch {
-                    target: make_const(0x1008, 8),
-                    cond: make_const(1, 1),
-                }],
-                switch_info: None,
-                op_metadata: Default::default(),
-            },
-            R2ILBlock {
-                addr: 0x1004,
-                size: 4,
-                ops: vec![
-                    R2ILOp::Copy {
-                        dst: make_reg(0, 8),
-                        src: make_const(1, 8),
-                    },
-                    R2ILOp::Branch {
-                        target: make_const(0x100c, 8),
-                    },
-                ],
-                switch_info: None,
-                op_metadata: Default::default(),
-            },
-            R2ILBlock {
-                addr: 0x1008,
-                size: 4,
-                ops: vec![R2ILOp::Copy {
-                    dst: make_reg(0, 8),
-                    src: make_const(2, 8),
-                }],
-                switch_info: None,
-                op_metadata: Default::default(),
-            },
-            R2ILBlock {
-                addr: 0x100c,
-                size: 4,
-                ops: vec![R2ILOp::Return {
-                    target: make_ram(0, 8),
-                }],
-                switch_info: None,
-                op_metadata: Default::default(),
-            },
-        ];
-
-        let cfg = CFG::from_blocks(&blocks).unwrap();
-        let domtree = DomTree::compute(&cfg);
-        let (defs, var_sizes) = collect_defs_from_cfg(&cfg);
-        let phi_placement = PhiPlacement::compute(&cfg, &domtree, &defs, &var_sizes);
-        let result = rename_function(&cfg, &domtree, &phi_placement, &var_sizes);
-
-        // Check that merge block has a phi
-        let merge_ops = result.get_block(0x100c);
-        assert!(!merge_ops.is_empty());
-
-        // First op should be a phi
-        if let SSAOp::Phi { dst, sources } = &merge_ops[0] {
-            assert_eq!(dst.name, "reg:0");
-            assert_eq!(sources.len(), 2);
-            assert_eq!(sources[0].name, "reg:0");
-            assert_eq!(sources[1].name, "reg:0");
-            assert_eq!(sources[0].version, 1);
-            assert_eq!(sources[1].version, 2);
-        } else {
-            panic!("Expected Phi op, got {:?}", merge_ops[0]);
-        }
-    }
-
-    #[test]
-    fn phi_live_in_source_retains_lifted_storage() {
-        let blocks = vec![
-            R2ILBlock {
-                addr: 0x1000,
-                size: 4,
-                ops: vec![R2ILOp::CBranch {
-                    target: make_const(0x1008, 8),
-                    cond: make_const(1, 1),
-                }],
-                switch_info: None,
-                op_metadata: Default::default(),
-            },
-            R2ILBlock {
-                addr: 0x1004,
-                size: 4,
-                ops: vec![
-                    R2ILOp::Copy {
-                        dst: make_reg(0, 8),
-                        src: make_const(1, 8),
-                    },
-                    R2ILOp::Branch {
-                        target: make_const(0x100c, 8),
-                    },
-                ],
-                switch_info: None,
-                op_metadata: Default::default(),
-            },
-            R2ILBlock {
-                addr: 0x1008,
-                size: 4,
-                ops: Vec::new(),
-                switch_info: None,
-                op_metadata: Default::default(),
-            },
-            R2ILBlock {
-                addr: 0x100c,
-                size: 4,
-                ops: vec![R2ILOp::Return {
-                    target: make_ram(0, 8),
-                }],
-                switch_info: None,
-                op_metadata: Default::default(),
-            },
-        ];
-        let cfg = CFG::from_blocks(&blocks).unwrap();
-        let domtree = DomTree::compute(&cfg);
-        let (defs, var_sizes) = collect_defs_from_cfg(&cfg);
-        let storage = CanonicalStorageId::from_varnode(&make_reg(0, 8));
-        let storage_by_name = HashMap::from([("reg:0".to_string(), storage)]);
-        let phi_placement =
-            PhiPlacement::compute_with_storage(&cfg, &domtree, &defs, &var_sizes, &storage_by_name);
-        let result = rename_function(&cfg, &domtree, &phi_placement, &var_sizes);
-        let SSAOp::Phi { sources, .. } = &result.get_block(0x100c)[0] else {
-            panic!("expected merge phi");
-        };
-        let live_in = sources
-            .iter()
-            .find(|source| source.version == 0)
-            .expect("entry live-in source");
-        assert_eq!(result.canonical_storage_by_var.get(live_in), Some(&storage));
-    }
-
-    #[test]
-    fn call_boundary_preserves_register_map_alias_width_for_read_only_alias() {
+    fn same_named_same_width_storages_keep_distinct_live_ins_and_graph_values() {
+        let mut arch = ArchSpec::new("rename-storage-collision");
+        arch.add_register(RegisterDef::new("alias", 0, 8));
+        arch.add_register(RegisterDef::new("alias", 8, 8));
         let blocks = vec![R2ILBlock {
-            addr: 0x1000,
+            addr: 0x2000,
             size: 4,
             ops: vec![
-                R2ILOp::Call {
-                    target: make_const(0x2000, 8),
+                R2ILOp::Copy {
+                    dst: make_unique(0x100, 8),
+                    src: make_reg(0, 8),
                 },
-                R2ILOp::IntEqual {
-                    dst: make_reg(0x80, 1),
-                    a: make_reg(0, 4),
-                    b: make_const(0, 4),
+                R2ILOp::Copy {
+                    dst: make_unique(0x108, 8),
+                    src: make_reg(8, 8),
+                },
+                R2ILOp::Copy {
+                    dst: make_reg(0, 8),
+                    src: make_const(1, 8),
+                },
+                R2ILOp::Copy {
+                    dst: make_reg(8, 8),
+                    src: make_const(2, 8),
                 },
                 R2ILOp::Return {
                     target: make_const(0, 8),
@@ -1710,51 +1531,50 @@ mod tests {
             op_metadata: Default::default(),
         }];
 
-        let cfg = CFG::from_blocks(&blocks).unwrap();
-        let domtree = DomTree::compute(&cfg);
-        let mut reg_names = RegisterNameMap::new();
-        reg_names.insert((0, 8), "RAX".to_string());
-        reg_names.insert((0, 4), "EAX".to_string());
-        let (defs, var_sizes) = collect_defs_from_cfg_with_names(&cfg, Some(&reg_names));
-        let phi_placement = PhiPlacement::compute(&cfg, &domtree, &defs, &var_sizes);
-        let boundary = CallBoundaryConfig {
-            defined_regs: vec![
-                CallBoundaryDef {
-                    name: "rax".to_string(),
-                    size: 8,
-                },
-                CallBoundaryDef {
-                    name: "eax".to_string(),
-                    size: 4,
-                },
-            ],
+        let function = crate::function::SSAFunction::from_blocks_raw(&blocks, Some(&arch))
+            .expect("raw SSA with colliding register spellings");
+        let ops = &function.get_block(0x2000).expect("entry block").ops;
+        let (
+            SSAOp::Copy {
+                src: first_live_in, ..
+            },
+            SSAOp::Copy {
+                src: second_live_in,
+                ..
+            },
+        ) = (&ops[0], &ops[1])
+        else {
+            panic!("expected two live-in copies");
         };
-        let result = rename_function_with_names_and_call_boundaries(
-            &cfg,
-            &domtree,
-            &phi_placement,
-            &var_sizes,
-            Some(&reg_names),
-            Some(&boundary),
+        assert_eq!(first_live_in.name, second_live_in.name);
+        assert_eq!(first_live_in.size, second_live_in.size);
+        assert_eq!(first_live_in.version, 0);
+        assert_eq!(second_live_in.version, 0);
+        assert_ne!(
+            first_live_in, second_live_in,
+            "exact storage must survive the shared display projection"
         );
 
-        let call_defines: Vec<&SSAVar> = result
-            .get_block(0x1000)
-            .iter()
-            .filter_map(|op| match op {
-                SSAOp::CallDefine { dst } => Some(dst),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            call_defines
-                .iter()
-                .any(|dst| dst.name == "RAX" && dst.size == 8)
+        let first_def = ops[2].dst().expect("first alias definition");
+        let second_def = ops[3].dst().expect("second alias definition");
+        assert_ne!(first_def, second_def);
+        assert_eq!((first_def.version, second_def.version), (1, 2));
+
+        let graph = crate::graph::SsaGraph::from_function(&function);
+        let first_value = graph
+            .value_id_for_var(first_live_in)
+            .expect("first live-in graph value");
+        let second_value = graph
+            .value_id_for_var(second_live_in)
+            .expect("second live-in graph value");
+        assert_ne!(first_value, second_value);
+        assert_eq!(
+            graph.canonical_storage_for_var(first_live_in),
+            Some(CanonicalStorageId::from_varnode(&make_reg(0, 8)))
         );
-        assert!(
-            call_defines
-                .iter()
-                .any(|dst| dst.name == "EAX" && dst.size == 4)
+        assert_eq!(
+            graph.canonical_storage_for_var(second_live_in),
+            Some(CanonicalStorageId::from_varnode(&make_reg(8, 8)))
         );
     }
 }

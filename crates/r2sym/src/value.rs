@@ -12,6 +12,18 @@ use z3::Context;
 use z3::DeclKind;
 use z3::ast::{Ast, BV, Dynamic};
 
+/// A symbolic value's identity in the syntactic fact sets.
+///
+/// Width is part of it because the same term read at two widths is two values.
+/// Equality and hashing are Z3's own, which are constant time on its
+/// hash-consed terms; the term is held rather than referenced so its identity
+/// cannot be recycled while a set still names it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct SymbolicKey {
+    bits: u32,
+    ast: BV,
+}
+
 /// A symbolic value that can be concrete, symbolic, or unknown.
 ///
 /// Each value carries an optional taint mask for tracking data flow.
@@ -277,9 +289,27 @@ impl<'ctx> SymValue<'ctx> {
         }
     }
 
-    pub(crate) fn symbolic_key(&self) -> Option<String> {
+    /// The identity of a symbolic value, for the sets of syntactic facts.
+    ///
+    /// This used to be the value's *rendering* -- `format!("{bits}:{ast}")` --
+    /// which is the pretty-printed SMT term. That is linear in the accumulated
+    /// expression, and the expression grows as execution composes operations
+    /// along a path, so asking whether a value is known zero cost more the
+    /// further the path had run. Measured on one 126-byte, 11-block zlib
+    /// function, the whole of a fifteen-minute run sat under
+    /// `<z3::ast::BV as Display>::fmt` reached from `value_known_zero`.
+    ///
+    /// Z3 hash-conses its terms, so two structurally identical expressions are
+    /// one node: `Hash` is `Z3_get_ast_hash` and equality is `Z3_is_eq_ast`,
+    /// both constant time, and they answer the same question the string did.
+    /// Holding the term itself also keeps it alive, so an identity cannot be
+    /// recycled underneath the set the way a raw id or pointer could be.
+    pub(crate) fn symbolic_key(&self) -> Option<SymbolicKey> {
         match self {
-            Self::Symbolic { ast, bits, .. } => Some(format!("{bits}:{}", ast)),
+            Self::Symbolic { ast, bits, .. } => Some(SymbolicKey {
+                bits: *bits,
+                ast: ast.clone(),
+            }),
             _ => None,
         }
     }

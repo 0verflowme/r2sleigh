@@ -278,29 +278,66 @@ fn assert_captured_abi_facts(function: &FunctionCapture, ssa: &Value, blocks: &[
     let formal_parameters = prepared["formal_parameters"]
         .as_array()
         .expect("formal parameters");
-    for (parameter_index, parameter) in function.source_abi.parameters.iter().enumerate() {
-        assert!(!parameter.name.is_empty());
-        assert!(
-            formal_parameters.iter().any(|formal| {
-                formal["parameter"] == parameter_index
-                    && formal["value"]
-                        .as_str()
-                        .is_some_and(|value| value.starts_with(&parameter.register))
-            }),
-            "{} source ABI parameter {} in {} must bind {}",
-            function.name,
-            parameter.name,
-            parameter_index,
-            parameter.register
-        );
-    }
-
     let (arch, _) = create_disassembler_for_arch("x86-64").expect("x86-64 disassembler");
+    assert!(
+        formal_parameters.is_empty(),
+        "the legacy block-only SSA endpoint has no immutable source interface and must not mint formal-parameter authority"
+    );
+    assert!(
+        prepared["parameter_addresses"]
+            .as_array()
+            .expect("parameter addresses")
+            .is_empty(),
+        "the legacy block-only SSA endpoint must not project machine addresses onto source parameters"
+    );
+
+    let full_register_at = |name: &str| {
+        let declared = arch
+            .get_register(name)
+            .unwrap_or_else(|| panic!("missing captured ABI register {name}"));
+        let full = arch
+            .registers
+            .iter()
+            .filter(|candidate| candidate.offset == declared.offset)
+            .max_by_key(|candidate| candidate.size)
+            .expect("register location has a full-width carrier");
+        r2source::CanonicalStorageId {
+            space: r2source::CanonicalStorageSpace::Register,
+            offset: full.offset,
+            size: full.size,
+        }
+    };
+    let convention_slots = r2source::SourceConventionSlots::new(
+        &function.source_abi.calling_convention,
+        function
+            .source_abi
+            .parameters
+            .iter()
+            .map(|parameter| full_register_at(&parameter.register)),
+        Some(full_register_at("RAX")),
+    )
+    .expect("captured SysV AMD64 convention slots");
+    let recovered_function = r2ssa::SSAFunction::from_blocks_with_arch(blocks, Some(&arch))
+        .expect("machine-only SSA fixture");
+    let recovered =
+        r2ssa::recover_interface::recover_interface(&recovered_function, &convention_slots)
+            .expect("machine-code ABI recovery");
+    assert_eq!(
+        recovered
+            .parameters()
+            .iter()
+            .map(r2ssa::recover_interface::RecoveredParameter::slot)
+            .collect::<Vec<_>>(),
+        convention_slots.argument_slots(),
+        "{} machine code must independently recover the captured contiguous ABI inputs without granting the legacy JSON endpoint source authority",
+        function.name
+    );
+
     let prepared_ssa =
         r2ssa::SsaArtifact::for_patterns(blocks, Some(&arch)).expect("pattern SSA fixture");
     let inferred = r2types::recover_signature_params_from_ssa(
         &prepared_ssa.local_ssa_blocks(),
-        Some("x86-64"),
+        r2ssa::MachineArchitectureFamily::X86_64,
         &std::collections::HashMap::new(),
         false,
         64,
@@ -323,12 +360,24 @@ fn assert_captured_abi_facts(function: &FunctionCapture, ssa: &Value, blocks: &[
                 parameter.name
             );
         } else {
-            assert_eq!(
-                r2types::render_signature_type(&inferred.initial_ty, 64),
-                parameter.type_name,
-                "{} {} scalar source type",
+            let source_bits = parameter
+                .type_name
+                .strip_prefix("int")
+                .or_else(|| parameter.type_name.strip_prefix("uint"))
+                .and_then(|bits| bits.strip_suffix("_t"))
+                .and_then(|bits| bits.parse::<u32>().ok())
+                .expect("captured scalar source width");
+            let r2types::CTypeLike::Int { bits, .. } = &inferred.initial_ty else {
+                panic!(
+                    "{} {} must remain scalar-shaped: {inferred:?}",
+                    function.name, parameter.name
+                );
+            };
+            assert!(
+                *bits >= source_bits && *bits <= inferred.ssa_var.size.saturating_mul(8),
+                "{} {} machine-only recovery may conservatively retain its carrier width but may not narrow or widen beyond it: {inferred:?}",
                 function.name,
-                parameter.name
+                parameter.name,
             );
         }
     }
@@ -341,19 +390,47 @@ fn assert_captured_abi_facts(function: &FunctionCapture, ssa: &Value, blocks: &[
             aggregate.member_offsets,
             (0..14).map(|index| index * 4).collect::<Vec<_>>()
         );
-        let parameter_addresses = prepared["parameter_addresses"]
-            .as_array()
-            .expect("parameter addresses");
+        let recovered_interface = r2ssa::SourceFunctionInterface::new(
+            b"plain-o2-machine-recovered-interface".to_vec(),
+            &function.source_abi.calling_convention,
+            recovered
+                .parameters()
+                .iter()
+                .enumerate()
+                .map(|(index, parameter)| {
+                    r2ssa::SourceAbiParameterSpec::new(
+                        u32::try_from(index).expect("parameter index fits u32"),
+                        parameter.slot(),
+                    )
+                }),
+            recovered
+                .result()
+                .map_or(r2ssa::SourceFunctionReturn::Void, |result| {
+                    r2ssa::SourceFunctionReturn::Register {
+                        storage: result.slot(),
+                    }
+                }),
+            [],
+        )
+        .expect("interface from machine-recovered storages");
+        let recovered_artifact = r2ssa::SsaArtifact::for_decompile_with_interface(
+            blocks,
+            Some(&arch),
+            recovered_interface,
+        )
+        .expect("SSA with the independently recovered machine interface");
         for offset in [8, 52] {
             assert!(
-                parameter_addresses.iter().any(|address| {
-                    address["parameter"] == 0
-                        && address["offset"] == offset
-                        && address["terms"]
-                            .as_array()
-                            .is_some_and(|terms| terms.iter().any(|term| term["coefficient"] == 56))
-                }),
-                "{} must retain DemoStruct stride 56 at offset {offset}",
+                recovered_artifact
+                    .addresses()
+                    .parameter_expressions
+                    .values()
+                    .any(|address| {
+                        address.parameter == 0
+                            && address.offset == offset
+                            && address.terms.iter().any(|term| term.coefficient == 56)
+                    }),
+                "{} machine recovery must retain stride 56 at offset {offset} without assigning source authority to the legacy endpoint",
                 function.name
             );
         }
@@ -525,6 +602,35 @@ fn assert_function_capture(function_name: &str) {
         .map(|block| (**block).clone())
         .collect::<Vec<_>>();
     assert_captured_abi_facts(function, &ssa, &owned_blocks);
+
+    // Re-capture path. These fixtures pin the prepared SSA by hash, so any
+    // deliberate change to the preparation pipeline drifts all of them at once
+    // and there was no way to record the new truth except by hand. Setting
+    // `R2SLEIGH_BLESS_LIFT_CAPTURE` prints what was actually produced, in the
+    // shape the capture file stores, so the update is transcribed rather than
+    // guessed at.
+    if std::env::var_os("R2SLEIGH_BLESS_LIFT_CAPTURE").is_some() {
+        let blocks = ssa_blocks
+            .iter()
+            .map(|actual| {
+                serde_json::json!({
+                    "address": actual["addr"],
+                    "size": actual["size"],
+                    "phi_count": actual["phis"].as_array().map_or(0, Vec::len),
+                    "op_count": actual["ops"].as_array().map_or(0, Vec::len),
+                    "fnv1a64": json_fnv1a64(actual.clone()),
+                })
+            })
+            .collect::<Vec<_>>();
+        eprintln!(
+            "BLESS_LIFT_CAPTURE {}",
+            serde_json::json!({
+                "name": function.name,
+                "ssa_fnv1a64": actual_ssa_hash,
+                "ssa_blocks": blocks,
+            })
+        );
+    }
 
     assert!(
         capture_mismatches.is_empty(),

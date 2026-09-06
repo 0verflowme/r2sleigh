@@ -29,7 +29,7 @@ use r2sleigh_export::{
     ExportFormat, InstructionAction, InstructionExportInput, SSA_JSON_SCHEMA_VERSION, SSAOpInfo,
     export_instruction, op_json_named, ssa_op_to_info,
 };
-use r2sleigh_lift::{Disassembler, SemanticMetadataOptions, build_arch_spec};
+use r2sleigh_lift::{Disassembler, SemanticMetadataOptions, TrustedSleighProfile};
 #[cfg(test)]
 use r2types::recover_vars_arch_profile;
 use std::ffi::{CStr, CString};
@@ -188,29 +188,26 @@ pub(crate) fn r2il_get_reg_profile(ctx: *const R2ILContext) -> *mut c_char {
     let mut reg_meta: std::collections::HashMap<String, (u32, u64, String)> =
         std::collections::HashMap::new();
 
-    // Emit all original register names from Sleigh.
+    // Every register, named in lower case.
+    //
+    // radare2's convention is that an arch plugin's register profile names
+    // registers in lower case, because upper case is what `RReg` uses for the
+    // alias namespace -- `PC`, `SP`, `A0` and the rest. A Sleigh specification
+    // spells its registers whichever way it likes, and the x86 one spells them
+    // in upper case, so emitting them verbatim put names like `SP` into the
+    // namespace radare2 reserves for aliases and left every consumer comparing
+    // `RDX` against a convention that says `rdx`. Lowering here is the fix; the
+    // register the name denotes is unchanged, and this plugin resolves a
+    // spelling back to the specification's own when it needs to.
     for reg in &arch.registers {
+        let name = reg.name.to_ascii_lowercase();
         profile.push_str(&format!(
             "gpr\t{}\t.{}\t{}\t0\n",
-            reg.name,
+            name,
             reg.size * 8,
             reg.offset
         ));
-        reg_meta.insert(
-            reg.name.to_ascii_lowercase(),
-            (reg.size * 8, reg.offset, reg.name.clone()),
-        );
-    }
-
-    // Emit lowercase aliases for case-insensitive lookups.
-    let mut lowercase_aliases = Vec::new();
-    for (name_lower, (bits, offset, original)) in &reg_meta {
-        if original != name_lower {
-            lowercase_aliases.push((name_lower.clone(), *bits, *offset));
-        }
-    }
-    for (name_lower, bits, offset) in lowercase_aliases {
-        profile.push_str(&format!("gpr\t{}\t.{}\t{}\t0\n", name_lower, bits, offset));
+        reg_meta.insert(name.clone(), (reg.size * 8, reg.offset, name));
     }
 
     let mut stripped_aliases = Vec::new();
@@ -240,8 +237,8 @@ pub(crate) fn r2il_get_reg_profile(ctx: *const R2ILContext) -> *mut c_char {
         reg_meta.insert(alias_lower.clone(), (bits, offset, alias_lower));
     };
 
-    let arch_name = arch.name.to_ascii_lowercase();
-    let is_arm64 = arch_name.contains("aarch64") || arch_name.contains("arm64");
+    let architecture = r2ssa::MachineArchitectureFamily::from_arch_spec(Some(arch));
+    let is_arm64 = matches!(architecture, r2ssa::MachineArchitectureFamily::AArch64);
     if is_arm64 {
         // AArch64 Sleigh specs often expose CY/ZR/NG/OV instead of cf/zf/nf/vf.
         add_gpr_alias("cf", "cy");
@@ -267,19 +264,40 @@ pub(crate) fn r2il_get_reg_profile(ctx: *const R2ILContext) -> *mut c_char {
         })
     };
 
-    let is_x86 = matches!(arch_name.as_str(), "x86" | "x86-64");
+    let is_x86 = matches!(
+        architecture,
+        r2ssa::MachineArchitectureFamily::X86 | r2ssa::MachineArchitectureFamily::X86_64
+    );
     let address_bits = arch.addr_size.checked_mul(8);
+    // The program counter is stated by the processor specification --
+    // `<programcounter register="pc"/>` -- so it is read, not guessed. Every
+    // specification this plugin ships declares it, and one that does not gets no
+    // `=PC` rather than a register picked because its name looked right.
+    //
+    // The spelling is the specification's own, and the profile names registers
+    // in lower case, so the two are reconciled here.
+    let declared_pc = arch
+        .program_counter
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .and_then(|name| reg_meta.get(&name).map(|(_, _, spelling)| spelling.clone()));
     let (pc, sp, bp) = if is_x86 {
         (
-            address_bits.and_then(|bits| first_existing_at_width(&["rip", "eip", "ip"], bits)),
+            declared_pc,
             address_bits.and_then(|bits| first_existing_at_width(&["rsp", "esp", "sp"], bits)),
             address_bits.and_then(|bits| first_existing_at_width(&["rbp", "ebp", "bp"], bits)),
         )
     } else {
         (
-            first_existing(&["pc", "$pc", "rip", "eip", "ip"]),
+            declared_pc,
             first_existing(&["sp", "$sp", "rsp", "esp"]),
-            first_existing(&["bp", "rbp", "ebp", "fp", "$fp", "s8", "$s8", "x29"]),
+            // `x29` before `s8`: `s8` is MIPS's frame pointer and AArch64's
+            // 32-bit SIMD register, and taking the collision made radare2
+            // resolve the frame-pointer alias to a floating-point register.
+            // Everything that asks whether a call preserves the frame pointer
+            // then asked about the wrong one and got no, which withholds every
+            // entry-relative fact from a function that calls.
+            first_existing(&["bp", "rbp", "ebp", "fp", "$fp", "x29", "s8", "$s8"]),
         )
     };
 
@@ -319,6 +337,27 @@ pub(crate) fn r2il_get_reg_profile(ctx: *const R2ILContext) -> *mut c_char {
     }
     if let Some(n) = bp.as_deref() {
         profile.push_str(&format!("=BP\t{}\n", n));
+    }
+    // The link register, where the architecture has one. Without this alias
+    // radare2's return-address lookup walks LR, RA, PC and settles on the
+    // program counter, so every consumer is told the return address lives in
+    // `pc`. On arm64 that named a register the prologue never saves, and the
+    // saved `x30` was left looking like an ordinary local: stored once, read by
+    // nothing, and declared from a value nothing wrote. An architecture with no
+    // link register names none of these and keeps no alias, which is the
+    // truthful answer for x86.
+    let lr = if is_arm64 {
+        first_existing(&["x30", "lr"])
+    } else {
+        // Only spellings that mean the link register wherever they appear.
+        // `r14` is ARM's, but x86-64 has a general register of that name, and
+        // claiming it as the return address made radare2 report R14 as the
+        // return-address carrier for every x86-64 function -- which refused all
+        // twenty-seven of them.
+        first_existing(&["lr", "ra", "$ra"])
+    };
+    if let Some(n) = lr.as_deref() {
+        profile.push_str(&format!("=LR\t{}\n", n));
     }
     for (idx, reg) in a_roles.iter().enumerate() {
         if let Some(n) = reg.as_deref() {
@@ -656,14 +695,7 @@ pub(crate) fn r2il_block_to_esil(ctx: *const R2ILContext, block: *const R2ILBloc
         native_size: blk.size as usize,
     };
     match export_instruction(&input, InstructionAction::Lift, ExportFormat::Esil) {
-        Ok(esil_lines) => {
-            let joined = esil_lines
-                .lines()
-                .filter(|line| !line.is_empty())
-                .collect::<Vec<_>>()
-                .join(";");
-            CString::new(joined).map_or(ptr::null_mut(), |s| s.into_raw())
-        }
+        Ok(esil) => CString::new(esil).map_or(ptr::null_mut(), |s| s.into_raw()),
         Err(_) => ptr::null_mut(),
     }
 }
@@ -1950,196 +1982,177 @@ fn op_all_varnodes(op: &R2ILOp) -> Vec<&Varnode> {
 // Architecture Helpers
 // ============================================================================
 
-/// Helper: build a disassembler and ArchSpec for a given arch string.
-fn create_disassembler_for_arch(arch: &str) -> Result<(ArchSpec, Disassembler), String> {
-    match arch.to_lowercase().as_str() {
+/// One Sleigh language: the compiled slaspec, the processor spec that pins its
+/// decode context, and the architecture name the rest of the pipeline knows it
+/// by.
+///
+/// The slaspec alone does not determine the decode. `ARM8_le.sla` decodes A32
+/// under `ARMt.pspec` (TMode=0) and Thumb under `ARMtTHUMB.pspec` (TMode=1), so
+/// the pspec is part of the language identity, not a detail. Pairings follow
+/// Ghidra's own `*.ldefs`.
+struct SleighLanguage {
+    sla: &'static [u8],
+    pspec: &'static str,
+    /// Name exposed as `ArchSpec::name`. Downstream ABI selection keys off it,
+    /// so ARM32 stays "ARM" across all four A32/Thumb x LE/BE languages; the
+    /// language actually chosen is reported by its selector key instead.
+    name: &'static str,
+    /// The canonical thread-owned profile when this exact bundle is trusted.
+    shared_profile: Option<TrustedSleighProfile>,
+}
+
+impl SleighLanguage {
+    fn shared(profile: TrustedSleighProfile) -> Self {
+        let (sla, pspec, name) = profile.specification();
+        Self {
+            sla,
+            pspec,
+            name,
+            shared_profile: Some(profile),
+        }
+    }
+
+    #[cfg(any(feature = "arm", feature = "mips"))]
+    fn analysis_only(sla: &'static [u8], pspec: &'static str, name: &'static str) -> Self {
+        Self {
+            sla,
+            pspec,
+            name,
+            shared_profile: None,
+        }
+    }
+}
+
+/// Resolve a selector key to the one Sleigh language it names.
+///
+/// Returns `None` for keys no bundled language covers. Callers refuse on
+/// `None` rather than substituting a neighbouring language: disassembly under
+/// the wrong language is well-formed and confidently wrong, which is worse
+/// than no disassembly at all.
+fn sleigh_language(arch: &str) -> Option<SleighLanguage> {
+    let language = match arch {
         #[cfg(feature = "x86")]
         "x86-64" | "x86_64" | "x64" | "amd64" => {
-            let spec = build_arch_spec(
-                sleigh_config::processor_x86::SLA_X86_64,
-                sleigh_config::processor_x86::PSPEC_X86_64,
-                "x86-64",
-            )
-            .map_err(|e| e.to_string())?;
-            let dis = Disassembler::from_sla(
-                sleigh_config::processor_x86::SLA_X86_64,
-                sleigh_config::processor_x86::PSPEC_X86_64,
-                "x86-64",
-            )
-            .map_err(|e| e.to_string())?;
-            Ok((spec, dis))
+            SleighLanguage::shared(TrustedSleighProfile::X86_64)
         }
         #[cfg(feature = "x86")]
-        "x86" | "x86-32" | "i386" | "i686" => {
-            let spec = build_arch_spec(
-                sleigh_config::processor_x86::SLA_X86,
-                sleigh_config::processor_x86::PSPEC_X86,
-                "x86",
-            )
-            .map_err(|e| e.to_string())?;
-            let dis = Disassembler::from_sla(
-                sleigh_config::processor_x86::SLA_X86,
-                sleigh_config::processor_x86::PSPEC_X86,
-                "x86",
-            )
-            .map_err(|e| e.to_string())?;
-            Ok((spec, dis))
-        }
+        "x86" | "x86-32" | "i386" | "i686" => SleighLanguage::shared(TrustedSleighProfile::X86),
+        // ARM32. `ARMt.pspec` sets TMode=0 (A32) and `ARMtTHUMB.pspec` sets
+        // TMode=1 (Thumb); `ARMCortex.pspec` also sets TMode=1 and plants a
+        // Cortex-M vector table over ram:0x0-0x40, so it is only ever right for
+        // a Cortex-M image and never for Linux/Android userland.
         #[cfg(feature = "arm")]
-        "arm" | "arm32" | "arm-le" => {
-            let spec = build_arch_spec(
-                sleigh_config::processor_arm::SLA_ARM8_LE,
-                // sleigh-config 1.x does not ship an ARM8 pspec; use a Cortex pspec instead.
-                sleigh_config::processor_arm::PSPEC_ARMCORTEX,
-                "ARM",
-            )
-            .map_err(|e| e.to_string())?;
-            let dis = Disassembler::from_sla(
-                sleigh_config::processor_arm::SLA_ARM8_LE,
-                // sleigh-config 1.x does not ship an ARM8 pspec; use a Cortex pspec instead.
-                sleigh_config::processor_arm::PSPEC_ARMCORTEX,
-                "ARM",
-            )
-            .map_err(|e| e.to_string())?;
-            Ok((spec, dis))
-        }
+        "arm" | "arm32" | "arm-le" => SleighLanguage::shared(TrustedSleighProfile::ArmCortexLe),
+        #[cfg(feature = "arm")]
+        "armbe" | "arm-be" | "armeb" => SleighLanguage::analysis_only(
+            sleigh_config::processor_arm::SLA_ARM8_BE,
+            sleigh_config::processor_arm::PSPEC_ARMT,
+            "ARM",
+        ),
+        #[cfg(feature = "arm")]
+        "thumb" | "thumb-le" => SleighLanguage::analysis_only(
+            sleigh_config::processor_arm::SLA_ARM8_LE,
+            sleigh_config::processor_arm::PSPEC_ARMTTHUMB,
+            "ARM",
+        ),
+        #[cfg(feature = "arm")]
+        "thumbbe" | "thumb-be" | "thumbeb" => SleighLanguage::analysis_only(
+            sleigh_config::processor_arm::SLA_ARM8_BE,
+            sleigh_config::processor_arm::PSPEC_ARMTTHUMB,
+            "ARM",
+        ),
         #[cfg(feature = "arm")]
         "arm64" | "arm64e" | "aarch64" => {
-            let spec = build_arch_spec(
-                sleigh_config::processor_aarch64::SLA_AARCH64_APPLESILICON,
-                sleigh_config::processor_aarch64::PSPEC_AARCH64,
-                "aarch64",
-            )
-            .map_err(|e| e.to_string())?;
-            let dis = Disassembler::from_sla(
-                sleigh_config::processor_aarch64::SLA_AARCH64_APPLESILICON,
-                sleigh_config::processor_aarch64::PSPEC_AARCH64,
-                "aarch64",
-            )
-            .map_err(|e| e.to_string())?;
-            Ok((spec, dis))
+            SleighLanguage::shared(TrustedSleighProfile::Aarch64AppleSilicon)
         }
+        #[cfg(feature = "arm")]
+        "arm64be" | "aarch64be" | "aarch64_be" => SleighLanguage::analysis_only(
+            sleigh_config::processor_aarch64::SLA_AARCH64BE,
+            sleigh_config::processor_aarch64::PSPEC_AARCH64,
+            "aarch64",
+        ),
         #[cfg(feature = "mips")]
         "mips" | "mips32" | "mips32be" | "mipsbe" | "mipseb" => {
-            let spec = build_arch_spec(
-                sleigh_config::processor_mips::SLA_MIPS32BE,
-                sleigh_config::processor_mips::PSPEC_MIPS32,
-                "mips32be",
-            )
-            .map_err(|e| e.to_string())?;
-            let dis = Disassembler::from_sla(
-                sleigh_config::processor_mips::SLA_MIPS32BE,
-                sleigh_config::processor_mips::PSPEC_MIPS32,
-                "mips32be",
-            )
-            .map_err(|e| e.to_string())?;
-            Ok((spec, dis))
+            SleighLanguage::shared(TrustedSleighProfile::Mips32Be)
         }
         #[cfg(feature = "mips")]
         "mipsel" | "mips32le" | "mips32el" => {
-            let spec = build_arch_spec(
-                sleigh_config::processor_mips::SLA_MIPS32LE,
-                sleigh_config::processor_mips::PSPEC_MIPS32,
-                "mips32le",
-            )
-            .map_err(|e| e.to_string())?;
-            let dis = Disassembler::from_sla(
-                sleigh_config::processor_mips::SLA_MIPS32LE,
-                sleigh_config::processor_mips::PSPEC_MIPS32,
-                "mips32le",
-            )
-            .map_err(|e| e.to_string())?;
-            Ok((spec, dis))
+            SleighLanguage::shared(TrustedSleighProfile::Mips32Le)
         }
+        // MIPS Release 6 dropped and re-encoded instructions the pre-R6
+        // languages still accept, so R6 needs its own slaspec.
         #[cfg(feature = "mips")]
-        "mips64" | "mips64be" => {
-            let spec = build_arch_spec(
-                sleigh_config::processor_mips::SLA_MIPS64BE,
-                sleigh_config::processor_mips::PSPEC_MIPS64,
-                "mips64be",
-            )
-            .map_err(|e| e.to_string())?;
-            let dis = Disassembler::from_sla(
-                sleigh_config::processor_mips::SLA_MIPS64BE,
-                sleigh_config::processor_mips::PSPEC_MIPS64,
-                "mips64be",
-            )
-            .map_err(|e| e.to_string())?;
-            Ok((spec, dis))
-        }
+        "mips32r6be" => SleighLanguage::analysis_only(
+            sleigh_config::processor_mips::SLA_MIPS32R6BE,
+            sleigh_config::processor_mips::PSPEC_MIPS32R6,
+            "mips32r6be",
+        ),
         #[cfg(feature = "mips")]
-        "mips64el" | "mips64le" => {
-            let spec = build_arch_spec(
-                sleigh_config::processor_mips::SLA_MIPS64LE,
-                sleigh_config::processor_mips::PSPEC_MIPS64,
-                "mips64le",
-            )
-            .map_err(|e| e.to_string())?;
-            let dis = Disassembler::from_sla(
-                sleigh_config::processor_mips::SLA_MIPS64LE,
-                sleigh_config::processor_mips::PSPEC_MIPS64,
-                "mips64le",
-            )
-            .map_err(|e| e.to_string())?;
-            Ok((spec, dis))
-        }
+        "mips32r6le" => SleighLanguage::analysis_only(
+            sleigh_config::processor_mips::SLA_MIPS32R6LE,
+            sleigh_config::processor_mips::PSPEC_MIPS32R6,
+            "mips32r6le",
+        ),
+        #[cfg(feature = "mips")]
+        "mips64" | "mips64be" => SleighLanguage::shared(TrustedSleighProfile::Mips64Be),
+        #[cfg(feature = "mips")]
+        "mips64el" | "mips64le" => SleighLanguage::shared(TrustedSleighProfile::Mips64Le),
         #[cfg(feature = "riscv")]
-        "riscv64" | "rv64" | "rv64gc" => {
-            let spec = build_arch_spec(
-                sleigh_config::processor_riscv::SLA_RISCV_LP64D,
-                sleigh_config::processor_riscv::PSPEC_RV64GC,
-                "riscv64",
-            )
-            .map_err(|e| e.to_string())?;
-            let dis = Disassembler::from_sla(
-                sleigh_config::processor_riscv::SLA_RISCV_LP64D,
-                sleigh_config::processor_riscv::PSPEC_RV64GC,
-                "riscv64",
-            )
-            .map_err(|e| e.to_string())?;
-            Ok((spec, dis))
-        }
+        "riscv64" | "rv64" | "rv64gc" => SleighLanguage::shared(TrustedSleighProfile::RiscV64Gc),
         #[cfg(feature = "riscv")]
-        "riscv32" | "rv32" | "rv32gc" => {
-            let spec = build_arch_spec(
-                sleigh_config::processor_riscv::SLA_RISCV_ILP32D,
-                sleigh_config::processor_riscv::PSPEC_RV32GC,
-                "riscv32",
-            )
-            .map_err(|e| e.to_string())?;
-            let dis = Disassembler::from_sla(
-                sleigh_config::processor_riscv::SLA_RISCV_ILP32D,
-                sleigh_config::processor_riscv::PSPEC_RV32GC,
-                "riscv32",
-            )
-            .map_err(|e| e.to_string())?;
-            Ok((spec, dis))
-        }
-        _ => {
-            let mut supported = vec![];
-            #[cfg(feature = "x86")]
-            supported.extend(["x86-64", "x86"]);
-            #[cfg(feature = "arm")]
-            supported.extend(["arm", "arm64", "aarch64"]);
-            #[cfg(feature = "mips")]
-            supported.extend(["mips32be", "mips32le", "mips64be", "mips64le"]);
-            #[cfg(feature = "riscv")]
-            supported.extend(["riscv64", "riscv32"]);
+        "riscv32" | "rv32" | "rv32gc" => SleighLanguage::shared(TrustedSleighProfile::RiscV32Gc),
+        _ => return None,
+    };
+    Some(language)
+}
 
-            if supported.is_empty() {
-                Err(
-                    "No architectures enabled; build with feature x86, arm, mips, or riscv"
-                        .to_string(),
-                )
-            } else {
-                Err(format!(
-                    "Unknown architecture '{}'. Supported: {}",
-                    arch,
-                    supported.join(", ")
-                ))
-            }
-        }
+/// Selector keys this build can serve, for the refusal message.
+fn supported_arch_keys() -> Vec<&'static str> {
+    let mut supported: Vec<&'static str> = vec![];
+    #[cfg(feature = "x86")]
+    supported.extend(["x86-64", "x86"]);
+    #[cfg(feature = "arm")]
+    supported.extend([
+        "arm", "armbe", "thumb", "thumbbe", "arm64", "aarch64", "arm64be",
+    ]);
+    #[cfg(feature = "mips")]
+    supported.extend([
+        "mips32be",
+        "mips32le",
+        "mips32r6be",
+        "mips32r6le",
+        "mips64be",
+        "mips64le",
+    ]);
+    #[cfg(feature = "riscv")]
+    supported.extend(["riscv64", "riscv32"]);
+    supported
+}
+
+/// Helper: build a disassembler and ArchSpec for a given arch string.
+fn create_disassembler_for_arch(arch: &str) -> Result<(ArchSpec, Disassembler), String> {
+    let key = arch.to_lowercase();
+    let Some(lang) = sleigh_language(&key) else {
+        let supported = supported_arch_keys();
+        return Err(if supported.is_empty() {
+            "No architectures enabled; build with feature x86, arm, mips, or riscv".to_string()
+        } else {
+            format!(
+                "Unknown architecture '{}'. Supported: {}",
+                arch,
+                supported.join(", ")
+            )
+        });
+    };
+    // Trusted embedded profiles have one thread-owned parse shared with the
+    // certifying lift path. Analysis-only language variants still get one cold
+    // load for their architecture and disassembler pair. Both paths retain the
+    // processor spec's exact program-counter declaration.
+    match lang.shared_profile {
+        Some(profile) => Disassembler::shared_arch_and_disassembler(profile),
+        None => r2sleigh_lift::embedded_arch_and_disassembler(lang.sla, lang.pspec, lang.name),
     }
+    .map_err(|e| e.to_string())
 }
 
 // Symbolic execution and CFG surfaces are implemented under r2plugin/src/analysis/.
@@ -2173,7 +2186,6 @@ struct AfcfjFunction {
 #[serde(untagged)]
 #[allow(dead_code)]
 enum AfvjRef {
-    Stack { base: String, offset: i64 },
     Register(String),
     Other(serde_json::Value),
 }
@@ -2194,10 +2206,6 @@ struct AfvjVar {
 struct AfvjPayload {
     #[serde(default)]
     reg: Vec<AfvjVar>,
-    #[serde(default)]
-    bp: Vec<AfvjVar>,
-    #[serde(default)]
-    sp: Vec<AfvjVar>,
 }
 
 #[cfg(test)]
@@ -2332,16 +2340,6 @@ fn is_generic_arg_name(name: &str) -> bool {
 }
 
 #[cfg(test)]
-fn is_low_quality_stack_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    lower.starts_with("var_")
-        || lower.starts_with("local_")
-        || lower.starts_with("stack_")
-        || lower == "saved_fp"
-        || is_generic_arg_name(&lower)
-}
-
-#[cfg(test)]
 fn parse_external_type(raw_ty: &str, ptr_bits: u32) -> Option<r2types::CTypeLike> {
     r2types::parse_external_type_like_spec(raw_ty, ptr_bits)
 }
@@ -2469,11 +2467,11 @@ fn parse_known_function_signatures(
                         .get("type")
                         .or_else(|| arg_obj.get("ty"))
                         .and_then(|v| v.as_str())
-                        .and_then(|raw| r2types::parse_type_like_spec(raw, ptr_bits));
+                        .and_then(|raw| r2types::parse_c_type_like(raw, ptr_bits));
                     params.push(ty.unwrap_or(r2types::CTypeLike::Unknown));
                 } else if let Some(raw) = arg.as_str() {
                     params.push(
-                        r2types::parse_type_like_spec(raw, ptr_bits)
+                        r2types::parse_c_type_like(raw, ptr_bits)
                             .unwrap_or(r2types::CTypeLike::Unknown),
                     );
                 }
@@ -2481,7 +2479,7 @@ fn parse_known_function_signatures(
         } else if let Some(argtypes) = obj.get("argtypes").and_then(|v| v.as_array()) {
             for raw in argtypes.iter().filter_map(|v| v.as_str()) {
                 params.push(
-                    r2types::parse_type_like_spec(raw, ptr_bits)
+                    r2types::parse_c_type_like(raw, ptr_bits)
                         .unwrap_or(r2types::CTypeLike::Unknown),
                 );
             }
@@ -2494,7 +2492,7 @@ fn parse_known_function_signatures(
             .or_else(|| obj.get("rettype"))
             .or_else(|| obj.get("type"))
             .and_then(|v| v.as_str())
-            .and_then(|raw| r2types::parse_type_like_spec(raw, ptr_bits))
+            .and_then(|raw| r2types::parse_c_type_like(raw, ptr_bits))
             .unwrap_or(r2types::CTypeLike::Unknown);
 
         let variadic = obj
@@ -2544,70 +2542,32 @@ fn parse_signature_context(json_str: &str, ptr_bits: u32) -> ParsedSignatureCont
     parsed
 }
 
-#[cfg(test)]
-fn parse_external_stack_vars(
-    json_str: &str,
-    ptr_bits: u32,
-) -> std::collections::HashMap<i64, r2types::ExternalStackVarSpec> {
-    let payload = match serde_json::from_str::<AfvjPayload>(json_str) {
-        Ok(v) => v,
-        Err(_) => return std::collections::HashMap::new(),
-    };
-
-    let mut vars = std::collections::HashMap::new();
-    let mut used_names = std::collections::HashSet::new();
-
-    for entry in payload.bp.into_iter().chain(payload.sp.into_iter()) {
-        let Some(AfvjRef::Stack { base, offset }) = entry.reference else {
-            continue;
-        };
-
-        let raw_name = entry
-            .name
-            .unwrap_or_else(|| format!("stack_{:x}", offset.unsigned_abs()));
-        let Some(clean_name) = sanitize_c_identifier(&raw_name) else {
-            continue;
-        };
-        let var_name = uniquify_name(clean_name, &mut used_names);
-        let candidate = r2types::ExternalStackVarSpec {
-            name: var_name,
-            ty: entry
-                .ty
-                .as_deref()
-                .and_then(|raw| parse_external_type(raw, ptr_bits)),
-            base: match base.trim().to_ascii_lowercase().as_str() {
-                "bp" | "ebp" | "rbp" | "fp" => r2types::ExternalStackBase::FramePointer,
-                "sp" | "esp" | "rsp" => r2types::ExternalStackBase::StackPointer,
-                _ => r2types::ExternalStackBase::Named(base),
-            },
-            role: r2types::ExternalStackSlotRole::Unknown,
-            param_index: None,
-            param_name: None,
-            source_reg: None,
-        };
-
-        match vars.get(&offset) {
-            None => {
-                vars.insert(offset, candidate);
-            }
-            Some(existing) => {
-                if is_low_quality_stack_name(&existing.name)
-                    && !is_low_quality_stack_name(&candidate.name)
-                {
-                    vars.insert(offset, candidate);
-                }
-            }
-        }
-    }
-
-    vars
-}
-
 #[derive(Debug)]
 pub(crate) struct EngineV2Output {
     pub(crate) output: String,
     pub(crate) metrics: r2engine::EngineMetrics,
     pub(crate) diagnostics: r2engine::EngineDiagnostics,
+    pub(crate) binding_audit: Option<r2engine::BindingShadowAuditOutcome>,
+    pub(crate) effect_obligations: Option<r2engine::EffectObligationAudit>,
+    pub(crate) placement_audit: Option<r2engine::PlacementAudit>,
+    pub(crate) render_refusal: Option<r2engine::DecompileRenderRefusal>,
+}
+
+/// The name the source gives this function, when it gives one.
+///
+/// radare2 already knows what the function is called -- from a symbol, from
+/// debug information, from a name the user set -- and the snapshot carries it.
+/// Deriving a name from the entry address instead discards that and prints
+/// `fcn_1000006b0` for a function the rest of the session calls
+/// `dbg.process_string`. A name radare2 generated from the address itself
+/// carries no more than the address does, so it is not preferred to our own.
+fn source_function_name(trusted: &r2ssa::TrustedSsaArtifact) -> String {
+    let function_addr = trusted.source().function().address();
+    let named = trusted.source().presentation().display_name();
+    if named.is_empty() || r2source::display_names::is_generated_function_name(named) {
+        return format!("fcn_{function_addr:x}");
+    }
+    named.to_string()
 }
 
 fn trusted_engine_function_input(
@@ -2615,7 +2575,7 @@ fn trusted_engine_function_input(
 ) -> r2engine::EngineFunctionInput {
     let function_addr = trusted.source().function().address();
     r2engine::EngineFunctionInput {
-        function_name: format!("fcn_{function_addr:x}"),
+        function_name: source_function_name(trusted),
         function_addr,
         blocks: trusted.source_blocks().to_vec(),
         arch: Some(trusted.arch_spec().clone()),
@@ -2626,9 +2586,14 @@ fn trusted_engine_function_input(
 
 fn r2sleigh_engine_decompile_trusted_output(
     _input: &R2SleighEngineRequestPayloadV2,
-    trusted: std::sync::Arc<r2ssa::TrustedSsaArtifact>,
+    ingress: crate::ffi_v2::TrustedIngress,
     execution: r2engine::EngineExecutionControl,
 ) -> Option<EngineV2Output> {
+    let crate::ffi_v2::TrustedIngress {
+        root: trusted,
+        callees,
+        capture: _,
+    } = ingress;
     let block_count = trusted.source_blocks().len();
     let function_input = trusted_engine_function_input(&trusted);
     let ptr_bits = helpers::effective_ptr_bits(trusted.arch_spec());
@@ -2639,22 +2604,32 @@ fn r2sleigh_engine_decompile_trusted_output(
     )
     .with_input_quality(r2engine::EngineFunctionInputQuality::complete(block_count))
     .with_execution_control(execution)
-    .with_trusted_ssa(trusted);
+    .with_trusted_ssa(trusted)
+    .with_callee_facts(callees);
     let response = decompiler::run_engine_decompile(decompile_input);
     Some(EngineV2Output {
         output: response.output,
         metrics: response.metrics,
         diagnostics: response.diagnostics,
+        binding_audit: Some(response.binding_audit),
+        effect_obligations: Some(response.effect_obligations),
+        placement_audit: Some(response.placement_audit),
+        render_refusal: response.render_refusal,
     })
 }
 
 fn r2sleigh_engine_type_function_trusted_output(
     _input: &R2SleighEngineRequestPayloadV2,
-    trusted: std::sync::Arc<r2ssa::TrustedSsaArtifact>,
+    ingress: crate::ffi_v2::TrustedIngress,
     execution: r2engine::EngineExecutionControl,
 ) -> Option<EngineV2Output> {
+    let crate::ffi_v2::TrustedIngress {
+        root: trusted,
+        callees,
+        capture: _,
+    } = ingress;
     let function_addr = trusted.source().function().address();
-    let function_name = format!("fcn_{function_addr:x}");
+    let function_name = source_function_name(&trusted);
     let ptr_bits = helpers::effective_ptr_bits(trusted.arch_spec());
     let policy = r2engine::analysis_policy_for_radare2_depth(0);
     let writeback_budget = r2types::TypeWritebackMutationBudget::new(
@@ -2671,7 +2646,6 @@ fn r2sleigh_engine_type_function_trusted_output(
             parsed_context: r2types::ParsedExternalContext::default(),
             interproc_max_iters: 1,
             interproc_converged: false,
-            symbolic_scope: None,
             writeback_budget,
             writeback_apply_policy,
         },
@@ -2679,7 +2653,8 @@ fn r2sleigh_engine_type_function_trusted_output(
     request.analysis = request
         .analysis
         .with_execution_control(execution)
-        .with_trusted_ssa(trusted);
+        .with_trusted_ssa(trusted)
+        .with_callee_facts(callees);
     let response = match r2engine::EngineSession::new().type_function_checked(
         r2engine::EngineTypeAnalysisRequest::from_interproc_budget(request.analysis, 1, false),
     ) {
@@ -2693,6 +2668,10 @@ fn r2sleigh_engine_type_function_trusted_output(
                 .to_string(),
                 metrics: *refusal.metrics,
                 diagnostics: *refusal.diagnostics,
+                binding_audit: None,
+                effect_obligations: None,
+                placement_audit: None,
+                render_refusal: None,
             });
         }
     };
@@ -2712,13 +2691,74 @@ fn r2sleigh_engine_type_function_trusted_output(
             max_iterations: 1,
             converged: false,
             scope_report: None,
-            symbolic_scope: None,
         },
     );
     Some(EngineV2Output {
         output: serde_json::to_string(&type_writeback).ok()?,
         metrics,
         diagnostics,
+        binding_audit: None,
+        effect_obligations: None,
+        placement_audit: None,
+        render_refusal: None,
+    })
+}
+
+/// The facts the function proves, projected for radare2's analysis stores.
+///
+/// Nothing here is a suggestion. Every entry survived a proof that fails closed,
+/// so radare2 can write it into its own stores next to what its own analysis
+/// found without a reader having to know which came from where.
+fn r2sleigh_engine_proven_facts_trusted_output(
+    _input: &R2SleighEngineRequestPayloadV2,
+    ingress: crate::ffi_v2::TrustedIngress,
+    _execution: r2engine::EngineExecutionControl,
+) -> Option<EngineV2Output> {
+    let crate::ffi_v2::TrustedIngress { root: trusted, .. } = ingress;
+    // The same size gate `decompile_function` applies, for the same reason.
+    //
+    // This path runs once per function during `aaa`, before any `pdd`, and it
+    // was the only engine entry point with neither a size guard nor a working
+    // deadline. On an optimised binary that made a single large function able
+    // to consume the whole sweep, which cost the caller every function after
+    // it rather than just that one.
+    let blocks = trusted.source_blocks();
+    let block_count = blocks.len();
+    let op_count = blocks.iter().map(|block| block.ops.len()).sum::<usize>();
+    if block_count > r2engine::ENGINE_DECOMPILE_MAX_BLOCKS
+        || op_count > r2engine::ENGINE_DECOMPILE_MAX_OPS
+    {
+        return None;
+    }
+    let facts = trusted.proven_facts();
+    let output = serde_json::json!({
+        "function": trusted.source().function().address(),
+        "indirect_calls": facts
+            .indirect_calls
+            .iter()
+            .map(|call| serde_json::json!({
+                "block": call.block_addr,
+                "table": call.table_address,
+                "targets": call.targets,
+            }))
+            .collect::<Vec<_>>(),
+        "unreachable_blocks": facts
+            .unreachable_blocks
+            .iter()
+            .map(|block| serde_json::json!({
+                "addr": block.addr,
+                "reason": block.reason,
+            }))
+            .collect::<Vec<_>>(),
+    });
+    Some(EngineV2Output {
+        output: output.to_string(),
+        metrics: r2engine::EngineMetrics::default(),
+        diagnostics: r2engine::EngineDiagnostics::default(),
+        binding_audit: None,
+        effect_obligations: None,
+        placement_audit: None,
+        render_refusal: None,
     })
 }
 
@@ -3057,10 +3097,12 @@ fn estimate_parsed_c_type_size_bytes(ty: &r2types::CTypeLike, ptr_bits: u32) -> 
     match ty {
         r2types::CTypeLike::Void => Some(0),
         r2types::CTypeLike::Bool => Some(1),
-        r2types::CTypeLike::Int { bits, .. } | r2types::CTypeLike::Float(bits) => {
+        r2types::CTypeLike::Int { bits, .. }
+        | r2types::CTypeLike::Float(bits)
+        | r2types::CTypeLike::BitVector(bits) => {
             Some((u64::from(*bits).saturating_add(7) / 8).max(1))
         }
-        r2types::CTypeLike::Pointer(_) | r2types::CTypeLike::Function => {
+        r2types::CTypeLike::Pointer(_) | r2types::CTypeLike::Function { .. } => {
             Some((ptr_bits / 8).max(1) as u64)
         }
         r2types::CTypeLike::Array(inner, Some(count)) => {
@@ -3163,16 +3205,11 @@ fn collect_pointer_arg_slot_map(
     arch: Option<&ArchSpec>,
     ptr_bits: u32,
 ) -> std::collections::HashMap<String, usize> {
-    let (arg_regs, _, _) = recover_vars_arch_profile(arch.map(|spec| spec.name.as_str()));
-    let arch_name = arch
-        .map(|a| a.name.to_ascii_lowercase())
-        .unwrap_or_default();
-    let is_arm64 = arch_name.contains("aarch64") || arch_name.contains("arm64");
-    let is_x86_64 = arch_name.contains("x86-64")
-        || arch_name.contains("x86_64")
-        || arch_name.contains("amd64")
-        || arch_name.contains("x64");
-    let is_riscv64 = arch_name.contains("riscv64") || arch_name.contains("rv64");
+    let architecture = r2ssa::MachineArchitectureFamily::from_arch_spec(arch);
+    let (arg_regs, _, _) = recover_vars_arch_profile(architecture);
+    let is_arm64 = matches!(architecture, r2ssa::MachineArchitectureFamily::AArch64);
+    let is_x86_64 = matches!(architecture, r2ssa::MachineArchitectureFamily::X86_64);
+    let is_riscv64 = matches!(architecture, r2ssa::MachineArchitectureFamily::RiscV64);
 
     let mut out = std::collections::HashMap::new();
     for (idx, (canonical, aliases)) in arg_regs.iter().enumerate() {
@@ -3372,24 +3409,11 @@ fn signed_offset_from_const(raw: u64, ptr_bits: u32) -> i64 {
 }
 
 #[cfg(test)]
-fn test_stack_register_names(arch: Option<&ArchSpec>, ptr_bits: u32) -> (String, String) {
-    let arch_name = arch
-        .map(|arch| arch.name.to_ascii_lowercase())
-        .unwrap_or_default();
-    match arch_name.as_str() {
-        name if name.contains("x86-64") || name.contains("amd64") => {
-            ("rsp".to_string(), "rbp".to_string())
-        }
-        name if name.contains("x86") || name.contains("i386") => {
-            if ptr_bits >= 64 {
-                ("rsp".to_string(), "rbp".to_string())
-            } else {
-                ("esp".to_string(), "ebp".to_string())
-            }
-        }
-        name if name.contains("aarch64") || name.contains("arm64") => {
-            ("sp".to_string(), "fp".to_string())
-        }
+fn test_stack_register_names(arch: Option<&ArchSpec>) -> (String, String) {
+    match r2ssa::MachineArchitectureFamily::from_arch_spec(arch) {
+        r2ssa::MachineArchitectureFamily::X86_64 => ("rsp".to_string(), "rbp".to_string()),
+        r2ssa::MachineArchitectureFamily::X86 => ("esp".to_string(), "ebp".to_string()),
+        r2ssa::MachineArchitectureFamily::AArch64 => ("sp".to_string(), "fp".to_string()),
         _ => ("sp".to_string(), "fp".to_string()),
     }
 }
@@ -3404,7 +3428,7 @@ fn infer_structs_from_ssa(
     use std::collections::HashMap;
 
     let pointer_arg_slot_map = collect_pointer_arg_slot_map(arch, ptr_bits);
-    let (sp_name, fp_name) = test_stack_register_names(arch, ptr_bits);
+    let (sp_name, fp_name) = test_stack_register_names(arch);
     let mut addr_exprs: HashMap<String, ArgAddrExpr> = HashMap::new();
     let mut stack_addr_offsets: HashMap<String, i64> = HashMap::new();
     let mut stack_slot_values: HashMap<(u64, i64), ArgAddrExpr> = HashMap::new();
@@ -3867,7 +3891,7 @@ fn merge_slot_type_overrides_into_signature(
     }
 
     for (slot, raw_ty) in slot_type_overrides {
-        let Some(parsed) = r2types::parse_type_like_spec(raw_ty, ptr_bits) else {
+        let Some(parsed) = r2types::parse_c_type_like(raw_ty, ptr_bits) else {
             continue;
         };
         let param = &mut sig.params[*slot];
@@ -4880,75 +4904,67 @@ mod tests {
     }
 
     #[test]
-    fn c_plugin_decj_projects_v2_responses_and_refuses_without_borrowed_snapshot() {
+    fn c_plugin_emits_one_versioned_sidecar_with_all_independent_audits() {
         let c_source = include_str!("../r_anal_sleigh.c");
-        let project_start = c_source
-            .find("static char *sleigh_engine_execute_v2_project(")
-            .expect("V2 response projector");
-        let project_end = c_source[project_start..]
+        let emitter = c_source
+            .split("static void sleigh_engine_v2_emit_binding_audit")
+            .nth(1)
+            .expect("typed audit sidecar emitter");
+
+        assert!(emitter.contains("r_json_get (diagnostics, \"binding_audit\")"));
+        assert!(emitter.contains("r_json_get (diagnostics, \"effect_obligations\")"));
+        assert!(emitter.contains("r_json_get (diagnostics, \"placement_audit\")"));
+        assert!(emitter.contains("r_json_get (diagnostics, \"render_refusal\")"));
+        assert!(emitter.contains("effect_obligations->type == R_JSON_OBJECT"));
+        assert!(emitter.contains("placement_audit->type == R_JSON_OBJECT"));
+        assert!(emitter.contains("render_refusal->type == R_JSON_OBJECT"));
+        assert!(emitter.contains("pj_kn (pj, \"schema_version\", 5)"));
+        assert!(emitter.contains("pj_k (pj, \"audit\")"));
+        assert!(emitter.contains("pj_k (pj, \"effect_obligations\")"));
+        assert!(emitter.contains("pj_k (pj, \"placement_audit\")"));
+        assert!(emitter.contains("pj_k (pj, \"render_refusal\")"));
+        assert_eq!(
+            emitter.matches("SLEIGH_BINDING_AUDIT_PREFIX").count(),
+            1,
+            "the corpus receives one atomic marker envelope per decompile"
+        );
+    }
+
+    #[test]
+    fn c_plugin_refuses_decj_without_a_borrowed_snapshot() {
+        let c_source = include_str!("../r_anal_sleigh.c");
+        // What this used to pin was a projector that assembled a decompile
+        // document in C by parsing diagnostics the engine had already produced
+        // as JSON. Nothing ever asked for it: its only caller passed the
+        // projection flag as false, because the commands that would have set it
+        // were withdrawn in favour of pdd. It is gone, and so is the reparsing.
+        assert!(
+            !c_source.contains("sleigh_engine_v2_response_json")
+                && !c_source.contains("r_json_parsedup (diagnostics_text)"),
+            "the C wrapper must not reassemble a document the engine already produced"
+        );
+        let execute = c_source
             .find("static char *sleigh_engine_execute_v2(")
-            .map(|offset| project_start + offset)
-            .expect("legacy V2 output wrapper");
-        let project = &c_source[project_start..project_end];
+            .expect("V2 executor");
+        let project = &c_source[execute..];
         let bytes = project
             .find("api->response_bytes (response, &bytes)")
             .expect("opaque response bytes inspection");
-        let json = project[bytes..]
-            .find("sleigh_engine_v2_response_json (&info, bytes)")
-            .map(|offset| bytes + offset)
-            .expect("structured JSON projection");
-        let free = project[json..]
+        let free = project[bytes..]
             .find("sleigh_engine_v2_release_or_preserve (api, &response, &session)")
-            .map(|offset| json + offset)
+            .map(|offset| bytes + offset)
             .expect("opaque response owner release");
         assert!(
-            bytes < json && json < free,
-            "all borrowed output, diagnostics, and timing views must be projected before response_free"
+            bytes < free,
+            "every borrowed view must be projected before response_free"
         );
         assert!(
             project.contains("api->response_info (response, &info)"),
-            "decj metadata must come from the V2 response inspection API"
-        );
-
-        let response_json_start = c_source
-            .find("static char *sleigh_engine_v2_response_json(")
-            .expect("decj response JSON builder");
-        let response_json_end = c_source[response_json_start..]
-            .find("static char *sleigh_engine_execute_v2_project(")
-            .map(|offset| response_json_start + offset)
-            .expect("V2 executor after JSON builder");
-        let response_json = &c_source[response_json_start..response_json_end];
-        for field in [
-            "schema_version",
-            "rendered_output",
-            "diagnostics",
-            "outcome",
-            "phase_timings",
-            "ffi_conversion_elapsed_us",
-            "refused",
-            "error",
-        ] {
-            assert!(
-                response_json.contains(field),
-                "decj schema must expose {field}"
-            );
-        }
-        assert!(
-            c_source.contains("sleigh_json_is_single_object (")
-                && response_json.contains("r_json_parsedup (diagnostics_text)")
-                && response_json.contains("diagnostics->type != R_JSON_OBJECT")
-                && response_json.contains("pj_rj (pj, diagnostics)"),
-            "diagnostics must be one complete object and emitted structurally, never as a double-encoded string"
+            "response metadata must come from the V2 inspection API"
         );
         assert!(
-            !response_json.contains("pj_raw")
-                && !response_json.contains("pj_ks (pj, \"diagnostics\""),
-            "unparsed diagnostics must never be injected into decj JSON"
-        );
-        assert!(
-            project.contains("!info.diagnostics_json.data || !info.diagnostics_json.len")
-                && project.contains("invalid output or diagnostics in V2 response"),
-            "missing or malformed diagnostics must fail closed"
+            c_source.contains("sleigh_json_is_single_object ("),
+            "kernel warnings must still require one complete diagnostics object"
         );
 
         let decj_route = c_source
@@ -5129,13 +5145,24 @@ mod tests {
             .map(|offset| provider_start + offset)
             .expect("command callback after decompiler provider");
         let provider = &c_source[provider_start..provider_end];
+        // The wire is built by the epoch-keyed capture rather than inline here,
+        // so the provider is checked for routing and the capture for serializing.
+        // The invariant is unchanged: a borrowed snapshot reaches the engine only
+        // through the V2 boundary, and never by rebuilding source state.
         assert!(
-            provider.contains("r2sleigh_wire_writer_new ()")
-                && provider.contains("free (buffer)")
-                && provider.contains("r2sleigh_wire_write_snapshot (writer, snapshot)")
-                && provider.contains(".snapshot_buffer = buffer")
+            provider.contains(".snapshot_buffer = held->wire")
                 && provider.contains("R2SLEIGH_CAP_OPAQUE_RADARE_SNAPSHOT_V2")
                 && provider.contains("sleigh_engine_execute_v2 (")
+        );
+        let capture = c_source
+            .split("static const SleighFunctionCapture *sleigh_function_capture(")
+            .nth(1)
+            .expect("the capture that owns the wire buffer");
+        assert!(
+            capture.contains("r2sleigh_wire_writer_new ()")
+                && capture.contains("r2sleigh_wire_write_snapshot (writer, snapshot)")
+                && capture.contains("r2sleigh_function_snapshot_free (snapshot)"),
+            "the capture must serialize through the V2 wire writer and own the snapshot"
         );
         for forbidden in ["get_context (", "lift_function_blocks", "snapshot_collect"] {
             assert!(
@@ -5299,7 +5326,7 @@ mod tests {
             );
         }
         let provider_start = c_source
-            .find("static RCodeMeta *sleigh_decompile(const RAnalFunctionSnapshot *snapshot)")
+            .find("static RCodeMeta *sleigh_decompile(RAnal *anal, RAnalFunction *fcn)")
             .expect("borrowed-snapshot decompiler provider");
         let provider_end = c_source[provider_start..]
             .find("static char *sleigh_cmd(")
@@ -5307,11 +5334,8 @@ mod tests {
             .expect("command callback after provider");
         let provider = &c_source[provider_start..provider_end];
         assert!(
-            provider.contains("r2sleigh_wire_writer_new ()")
-                && provider.contains("free (buffer)")
-                && provider.contains("r2sleigh_wire_write_snapshot (writer, snapshot)")
-                && provider.contains("const R2SleighEngineRequestPayloadV2 payload")
-                && provider.contains(".snapshot_buffer = buffer")
+            provider.contains("const R2SleighEngineRequestPayloadV2 payload")
+                && provider.contains(".snapshot_buffer = held->wire")
                 && provider.contains("R2SLEIGH_REQUEST_DECOMPILE_V2")
                 && provider.contains("R2SLEIGH_CAP_OPAQUE_RADARE_SNAPSHOT_V2")
                 && provider.contains("sleigh_engine_execute_v2 ("),
@@ -5836,7 +5860,8 @@ mod tests {
         );
         assert_eq!(
             parse_external_type("type.IOCPU_VTable.setCPUNumber", 64),
-            Some(ptr_type(r2types::CTypeLike::Void))
+            None,
+            "a dotted member path is not a placeable C type"
         );
     }
 
@@ -5967,15 +5992,14 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_external_stack_vars_bp_sp() {
-        let json = r#"{"sp":[{"name":"var_8h","kind":"var","type":"int64_t","ref":{"base":"RSP","offset":80}}],"bp":[{"name":"buf","kind":"var","type":"char[64]","ref":{"base":"RBP","offset":-64}},{"name":"user_input","kind":"var","type":"char *","ref":{"base":"RBP","offset":-72}}]}"#;
-        let vars = parse_external_stack_vars(json, 64);
-        assert_eq!(vars.get(&-64).map(|v| v.name.as_str()), Some("buf"));
-        assert_eq!(vars.get(&-72).map(|v| v.name.as_str()), Some("user_input"));
-        assert_eq!(
-            vars.get(&80).and_then(|v| v.base.legacy_name()),
-            Some("rsp".to_string())
-        );
+    fn x86_32_pointer_slots_do_not_inherit_sysv64_argument_registers() {
+        let mut arch = ArchSpec::new("x86");
+        arch.addr_size = 4;
+
+        let slots = collect_pointer_arg_slot_map(Some(&arch), 32);
+
+        assert!(slots.is_empty());
+        assert!(!slots.contains_key("ecx"));
     }
 
     #[test]
@@ -6008,16 +6032,6 @@ mod tests {
         assert_eq!(merged.params.len(), 2);
         assert_eq!(merged.params[0].ty, Some(signed_type(32)));
         assert_eq!(merged.params[1].ty, Some(signed_type(32)));
-    }
-
-    #[test]
-    fn test_name_sanitization_and_collisions() {
-        let json = r#"{"bp":[{"name":"bad-name","type":"int","ref":{"base":"RBP","offset":-8}},{"name":"bad name","type":"int","ref":{"base":"RBP","offset":-16}}]}"#;
-        let vars = parse_external_stack_vars(json, 64);
-        let first = vars.get(&-8).expect("first var");
-        let second = vars.get(&-16).expect("second var");
-        assert_eq!(first.name, "bad_name");
-        assert_ne!(first.name, second.name);
     }
 
     #[test]
@@ -6434,8 +6448,6 @@ mod tests {
                     role_identity: None,
                     closure_functions: 4,
                     helper_functions: 3,
-                    derived_summaries: 0,
-                    derived_diagnostics: r2sym::DerivedSummaryDiagnostics::default(),
                     region_summaries: Vec::new(),
                     worker_summaries: Vec::new(),
                 },
@@ -6473,38 +6485,6 @@ mod tests {
             r2sym::ArtifactGranularity::SummaryOnly
         );
         assert_eq!(cfg_risk.block_count, 200);
-    }
-
-    #[test]
-    fn semantic_type_fallback_payload_rejects_name_owned_role_signature() {
-        let mut summary = r2sym::function_semantic_summary_seed_for_name(
-            r2ssa::InterprocFunctionId(0x11a9),
-            "verror_at_line",
-        )
-        .unwrap_or_else(|| {
-            r2ssa::FunctionSemanticSummary::unknown(
-                r2ssa::InterprocFunctionId(0x11a9),
-                Some("verror_at_line".to_string()),
-            )
-        });
-        summary.callsite_count = 1;
-        assert!(
-            r2sym::compile_named_native_worker_summary_report(&summary, true).is_none(),
-            "name-owned diagnostic roles must not materialize advisory fallback reports"
-        );
-    }
-
-    #[test]
-    fn semantic_type_fallback_payload_does_not_apply_name_hint_over_context_override() {
-        let mut summary = r2ssa::FunctionSemanticSummary::unknown(
-            r2ssa::InterprocFunctionId(0x11aa),
-            Some("quotearg_n_options".to_string()),
-        );
-        summary.callsite_count = 1;
-        assert!(
-            r2sym::compile_named_native_worker_summary_report(&summary, true).is_none(),
-            "name-owned quoting roles must not materialize reports that could override context"
-        );
     }
 
     #[test]
@@ -6777,12 +6757,47 @@ mod integration_tests {
                 Some(type_graph),
             )
         } else {
-            r2ssa::SourceFunctionInterface::new_exact(
+            let parameter_logical_values = parameters
+                .iter()
+                .enumerate()
+                .map(|(index, storage)| {
+                    let width_bits = parameter_homes
+                        .iter()
+                        .find_map(|(parameter, _, size)| {
+                            (*parameter == index as u32)
+                                .then_some(u64::from(size.saturating_mul(8)))
+                        })
+                        .unwrap_or_else(|| u64::from(storage.storage().size.saturating_mul(8)));
+                    let (type_id, kind) = match width_bits {
+                        32 => (0, r2ssa::SourceCarrierKind::LowBits),
+                        64 => (1, r2ssa::SourceCarrierKind::Full),
+                        other => panic!("unsupported exact fixture parameter width {other}"),
+                    };
+                    r2ssa::SourceLogicalValue::new(
+                        type_id,
+                        r2ssa::SourceCarrierProjection::new(kind, 0, width_bits),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let scalar_carrier =
+                r2ssa::SourceCarrierProjection::new(r2ssa::SourceCarrierKind::LowBits, 0, 32);
+            let type_graph = r2ssa::SourceTypeGraph::new(
+                [
+                    r2ssa::SourceType::new(0, r2ssa::SourceTypeKind::SignedInteger, 32, 32),
+                    r2ssa::SourceType::new(1, r2ssa::SourceTypeKind::UnsignedInteger, 64, 64),
+                ],
+                [],
+            )
+            .expect("x86-64 scalar parameter type graph");
+            r2ssa::SourceFunctionInterface::new_exact_with_logical_types(
                 revision.clone(),
                 "sysv64",
                 parameters,
                 return_kind,
                 stack_slots,
+                parameter_logical_values,
+                Some(r2ssa::SourceLogicalValue::new(0, scalar_carrier)),
+                Some(type_graph),
             )
         }
         .and_then(|interface| {
@@ -6792,10 +6807,29 @@ mod integration_tests {
             interface.with_stack_pointer_storage(x86_register_storage(arch, "RSP"))
         })
         .and_then(|interface| interface.with_frame_pointer_storage(rbp))
+        .and_then(|interface| interface.with_exact_stacked_return(0, 8, 8, 8))
         .expect("exact x86-64 test source interface");
+        let machine_roles = r2ssa::SourceMachineRoles::new(
+            Some(x86_register_storage(arch, "RIP")),
+            Some(x86_register_storage(arch, "RSP")),
+        )
+        .and_then(|roles| {
+            roles.with_stack_allocation_contract(
+                r2ssa::SourceStackAllocationContract::with_implicit_active_sp_bytes(
+                    r2ssa::SourceStackGrowth::LowerAddresses,
+                    128,
+                ),
+            )
+        })
+        .expect("exact x86-64 test machine roles");
         std::sync::Arc::new(
-            r2engine::EngineSourceSnapshot::new(revision, Some(interface), call_sites)
-                .expect("immutable x86-64 test source snapshot"),
+            r2engine::EngineSourceSnapshot::new_with_machine_roles(
+                revision,
+                Some(interface),
+                machine_roles,
+                call_sites,
+            )
+            .expect("immutable x86-64 test source snapshot"),
         )
     }
 
@@ -6826,10 +6860,13 @@ mod integration_tests {
         println!("Profile: {}", profile);
         let arch = ctx.arch.as_ref().expect("x86-64 ArchSpec");
         assert_eq!(arch.addr_size, 8);
-        for (role, target) in [("PC", "RIP"), ("SP", "RSP"), ("BP", "RBP")] {
+        // The role targets a register by the profile's own spelling, which is
+        // lower case: radare2 keeps upper case for the alias namespace these
+        // roles live in.
+        for (role, target) in [("PC", "rip"), ("SP", "rsp"), ("BP", "rbp")] {
             assert_eq!(role_target(profile, role).as_deref(), Some(target));
             let expected = arch
-                .get_register(target)
+                .get_register(&target.to_ascii_uppercase())
                 .expect("full-width x86 address register");
             assert_eq!(expected.size, arch.addr_size);
             assert_eq!(
@@ -6844,11 +6881,180 @@ mod integration_tests {
     }
 
     #[test]
+    #[cfg(feature = "x86")]
+    fn context_and_trusted_lift_share_one_profile_in_either_order() {
+        for context_first in [true, false] {
+            std::thread::spawn(move || {
+                let arch = CString::new("x86-64").expect("architecture name");
+                let (ctx_ptr, trusted) = if context_first {
+                    let ctx_ptr = r2il_arch_init(arch.as_ptr());
+                    let trusted =
+                        Disassembler::shared_trusted_profile(TrustedSleighProfile::X86_64)
+                            .expect("trusted profile after context");
+                    (ctx_ptr, trusted)
+                } else {
+                    let trusted =
+                        Disassembler::shared_trusted_profile(TrustedSleighProfile::X86_64)
+                            .expect("trusted profile before context");
+                    let ctx_ptr = r2il_arch_init(arch.as_ptr());
+                    (ctx_ptr, trusted)
+                };
+
+                assert!(!ctx_ptr.is_null(), "context must initialize");
+                let context = unsafe { &*ctx_ptr };
+                let analysis = context.disasm.as_ref().expect("analysis disassembler");
+                assert!(
+                    analysis.shares_loaded_specification(&trusted),
+                    "both initialization orders must reach the same parsed profile"
+                );
+
+                let mut bytes = vec![0x90];
+                bytes.resize(16, 0);
+                assert!(
+                    analysis.lift_genuine_block(&bytes, 0x1000, 1).is_err(),
+                    "the C context must remain non-certifying"
+                );
+                assert!(
+                    trusted.lift_genuine_block(&bytes, 0x1000, 1).is_ok(),
+                    "the source-owned view must retain certifying authority"
+                );
+                drop_test_context(ctx_ptr);
+            })
+            .join()
+            .expect("profile ownership test thread");
+        }
+    }
+
+    /// Records cold and repeated `R2ILContext` construction separately. The
+    /// wall clock is evidence for profile sharing, not a CI bound.
+    #[test]
+    #[cfg(feature = "x86")]
+    #[ignore = "measurement, not a gate"]
+    fn r2il_context_creation_cost() {
+        let arch = CString::new("x86-64").expect("architecture name");
+        for round in 0..6 {
+            let started = std::time::Instant::now();
+            let context = r2il_arch_init(arch.as_ptr());
+            let elapsed = started.elapsed();
+            assert!(!context.is_null());
+            assert_eq!(r2il_is_loaded(context), 1);
+            eprintln!(
+                "round {round}: R2ILContext creation = {}us",
+                elapsed.as_micros()
+            );
+            drop_test_context(context);
+        }
+    }
+
+    #[test]
     #[cfg(feature = "arm")]
     fn create_disassembler_for_arch_arm64() {
         let (spec, _disasm) = create_disassembler_for_arch("arm64").expect("arm64 disassembler");
         assert_eq!(spec.name, "aarch64");
         assert_eq!(spec.addr_size, 8);
+    }
+
+    /// The A32 and Thumb languages share one slaspec and differ only in the
+    /// TMode their processor spec pins, so a wrong pspec is not a cosmetic
+    /// mismatch: it silently reinterprets every instruction. These decode real
+    /// bytes so the pairing cannot drift back.
+    #[cfg(feature = "arm")]
+    fn decode_one(arch: &str, bytes: &[u8]) -> (String, usize) {
+        let (_, disasm) = create_disassembler_for_arch(arch)
+            .unwrap_or_else(|e| panic!("{arch} disassembler: {e}"));
+        let mut window = bytes.to_vec();
+        window.resize(16, 0);
+        disasm
+            .disasm_native(&window, 0x8000)
+            .unwrap_or_else(|e| panic!("{arch} decode: {e}"))
+    }
+
+    #[test]
+    #[cfg(feature = "arm")]
+    fn arm32_decodes_a32_not_thumb() {
+        // e3500000 `cmp r0, #0`, the first instruction of test/bins/elf/errno.
+        let (text, len) = decode_one("arm", &[0x00, 0x00, 0x50, 0xe3]);
+        assert_eq!(len, 4, "A32 instruction must consume 4 bytes, got {text}");
+        assert!(
+            text.to_lowercase().starts_with("cmp r0"),
+            "expected `cmp r0,#0x0`, got {text}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "arm")]
+    fn arm32_big_endian_decodes_the_same_instruction() {
+        let (text, len) = decode_one("armbe", &[0xe3, 0x50, 0x00, 0x00]);
+        assert_eq!(len, 4, "A32 instruction must consume 4 bytes, got {text}");
+        assert!(
+            text.to_lowercase().starts_with("cmp r0"),
+            "expected `cmp r0,#0x0`, got {text}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "arm")]
+    fn thumb_decodes_thumb2_wide_instruction() {
+        // f04f 0b00 `mov.w r11, #0`, the entry point of
+        // test/bins/elf/armeb_hello_static.
+        let (text, len) = decode_one("thumb", &[0x4f, 0xf0, 0x00, 0x0b]);
+        assert_eq!(len, 4, "Thumb-2 wide instruction is 4 bytes, got {text}");
+        assert!(
+            text.to_lowercase().contains("mov") && text.contains("r11"),
+            "expected `mov.w r11,#0x0`, got {text}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "arm")]
+    fn thumb_big_endian_decodes_the_same_instruction() {
+        let (text, len) = decode_one("thumbbe", &[0xf0, 0x4f, 0x0b, 0x00]);
+        assert_eq!(len, 4, "Thumb-2 wide instruction is 4 bytes, got {text}");
+        assert!(
+            text.to_lowercase().contains("mov") && text.contains("r11"),
+            "expected `mov.w r11,#0x0`, got {text}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "arm")]
+    fn every_arm32_language_reports_the_arm_abi_name() {
+        // Downstream ABI and variable-recovery profiles select ARM32 by this
+        // exact name, so the four A32/Thumb x LE/BE languages must share it.
+        for arch in ["arm", "armbe", "thumb", "thumbbe"] {
+            let (spec, _) = create_disassembler_for_arch(arch)
+                .unwrap_or_else(|e| panic!("{arch} disassembler: {e}"));
+            assert_eq!(spec.name, "ARM", "{arch} must present as ARM");
+            assert_eq!(spec.addr_size, 4);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "arm")]
+    fn arm_language_endianness_follows_the_selector() {
+        for (arch, endian) in [
+            ("arm", r2il::Endianness::Little),
+            ("thumb", r2il::Endianness::Little),
+            ("armbe", r2il::Endianness::Big),
+            ("thumbbe", r2il::Endianness::Big),
+            ("arm64", r2il::Endianness::Little),
+            ("arm64be", r2il::Endianness::Big),
+        ] {
+            let (spec, _) = create_disassembler_for_arch(arch)
+                .unwrap_or_else(|e| panic!("{arch} disassembler: {e}"));
+            assert_eq!(spec.instruction_endianness, endian, "{arch}");
+            assert_eq!(spec.memory_endianness, endian, "{arch}");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "mips")]
+    fn mips32r6_language_is_reachable() {
+        for arch in ["mips32r6be", "mips32r6le"] {
+            let (spec, _) = create_disassembler_for_arch(arch)
+                .unwrap_or_else(|e| panic!("{arch} disassembler: {e}"));
+            assert_eq!(spec.name, arch);
+        }
     }
 
     #[test]
@@ -6964,10 +7170,11 @@ mod integration_tests {
         let (arch, _) = create_disassembler_for_arch("x86").expect("x86 disassembler");
         assert_eq!(arch.addr_size, 4);
         let profile = profile_for_arch("x86");
-        for (role, target) in [("PC", "EIP"), ("SP", "ESP"), ("BP", "EBP")] {
+        // Lower case, as the profile now spells every register.
+        for (role, target) in [("PC", "eip"), ("SP", "esp"), ("BP", "ebp")] {
             assert_eq!(role_target(&profile, role).as_deref(), Some(target));
             let expected = arch
-                .get_register(target)
+                .get_register(&target.to_ascii_uppercase())
                 .expect("full-width x86 address register");
             assert_eq!(expected.size, arch.addr_size);
             assert_eq!(
@@ -8210,7 +8417,7 @@ mod integration_tests {
             .collect::<Vec<_>>();
         let host_signature = r2types::FunctionSignatureSpec {
             ret_type: Some(r2types::CTypeLike::Int {
-                bits: 64,
+                bits: 32,
                 signedness: r2types::Signedness::Signed,
             }),
             params: vec![
@@ -8221,7 +8428,7 @@ mod integration_tests {
                 r2types::FunctionParamSpec {
                     name: "arg1".to_string(),
                     ty: Some(r2types::CTypeLike::Int {
-                        bits: 64,
+                        bits: 32,
                         signedness: r2types::Signedness::Signed,
                     }),
                 },
@@ -8239,7 +8446,7 @@ mod integration_tests {
                 r2types::ExternalRegisterParamSpec {
                     name: "arg1".to_string(),
                     ty: Some(r2types::CTypeLike::Int {
-                        bits: 64,
+                        bits: 32,
                         signedness: r2types::Signedness::Signed,
                     }),
                     reg: "RSI".to_string(),
@@ -8270,18 +8477,24 @@ mod integration_tests {
                 parsed_context,
             ),
         );
+        // Entry-relative, not frame-relative. This home is twelve below the
+        // frame pointer, and the frame pointer is eight below the entry stack
+        // pointer, so the one coordinate objects are identified in puts it at
+        // minus twenty. It was minus twelve while a slot's position was
+        // recorded against whichever register happened to name it.
+        const LEN_HOME_OFFSET: i64 = -20;
         let len_home_objects = response
             .function_facts
             .render_facts()
             .stack_slots()
-            .filter_map(|(object, _, offset, _)| (offset == -12).then_some(object))
+            .filter_map(|(object, _, offset, _)| (offset == LEN_HOME_OFFSET).then_some(object))
             .collect::<Vec<_>>();
         let [len_home_object] = len_home_objects.as_slice() else {
-            panic!("expected one -12 parameter home, got {len_home_objects:?}");
+            panic!("expected one parameter home at {LEN_HOME_OFFSET}, got {len_home_objects:?}");
         };
         let len_home = response
             .function_facts
-            .authorized_stack_param_owner_render(*len_home_object, -12)
+            .authorized_stack_param_owner_render(*len_home_object, LEN_HOME_OFFSET)
             .unwrap_or_else(|| {
                 panic!(
                     "second parameter home should authorize its signature owner; type_facts={:?}",
@@ -8289,11 +8502,30 @@ mod integration_tests {
                 )
             });
         assert_eq!(len_home.name, "arg1");
+        // The SIMD worker contains machine operations whose exact C projection
+        // is unavailable. That upstream refusal precedes placement; the saved
+        // frame-pointer object must not be reached through a fabricated local.
+        assert_eq!(response.placement_audit, r2engine::PlacementAudit::NotRun);
+        assert_eq!(
+            response.binding_audit,
+            r2engine::BindingShadowAuditOutcome::NotRun
+        );
+        assert_eq!(
+            response.render_refusal,
+            Some(
+                r2engine::DecompileRenderRefusal::MissingMachineProjectionAuthorization(
+                    r2dec::MachineProjectionRefusalOrigin::op_lowering(),
+                )
+            )
+        );
         assert!(
-            response.output.contains("r2dec residual:")
+            response.output.starts_with("/* r2dec fallback:")
+                && response
+                    .output
+                    .contains("native rendering refused: missing machine projection authorization")
                 && !response.output.contains("for (int32_t var_14h = 0;")
                 && !response.output.contains("return var_10h;"),
-            "legacy facts must remain inspectable without authorizing production executable C; output={} render_facts={:?}",
+            "certified facts must remain inspectable while the unprojected machine operation leaves only a fallback comment; output={} render_facts={:?}",
             response.output,
             response.function_facts.render_facts()
         );

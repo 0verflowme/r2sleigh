@@ -619,7 +619,9 @@ fn summary_location_arg_index(location: &r2ssa::SummaryMemoryLocation) -> Option
 fn backward_memory_arg_index(region: &crate::backward::BackwardMemoryRegion) -> Option<usize> {
     match region {
         crate::backward::BackwardMemoryRegion::Argument { index } => Some(*index),
-        crate::backward::BackwardMemoryRegion::Region(_) => None,
+        // A read through a chain of loads from a parameter dereferenced that
+        // parameter, which is the same evidence a direct read is.
+        crate::backward::BackwardMemoryRegion::Region(region) => region.root_parameter,
     }
 }
 
@@ -668,8 +670,6 @@ mod tests {
                 role_identity: None,
                 closure_functions: 0,
                 helper_functions: 0,
-                derived_summaries: 0,
-                derived_diagnostics: Default::default(),
                 region_summaries: Vec::new(),
                 worker_summaries: vec![worker],
             },

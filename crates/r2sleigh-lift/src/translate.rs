@@ -1,15 +1,11 @@
-//! Shared P-code translation abstraction.
+//! Operand helpers for the canonical libsla P-code translator.
 //!
-//! This module provides a trait-based abstraction for translating P-code operations
-//! to r2il, reducing code duplication between the `disasm` and `pcode` modules.
+//! Opcode dispatch lives in `disasm`; these helpers validate the common operand
+//! shapes used by its translation arms.
 
 use r2il::{R2ILOp, SpaceId, Varnode};
 
-/// A source of P-code operands that can be translated to r2il.
-///
-/// This trait abstracts over different P-code representations:
-/// - `libsla::PcodeInstruction` (from runtime disassembly)
-/// - `RawPcodeOp` (from raw P-code bytes)
+/// A validated view of operands from a libsla P-code instruction.
 pub trait PcodeSource {
     /// Get the output varnode, if any.
     fn output(&self) -> Option<Varnode>;
@@ -87,93 +83,6 @@ where
     let a = require_input(source, 0, name)?;
     let b = require_input(source, 1, name)?;
     Ok(f(dst, a, b))
-}
-
-/// Common P-code opcodes for translation.
-///
-/// These numeric values match Ghidra's P-code opcode definitions.
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CommonOp {
-    Copy = 1,
-    Load = 2,
-    Store = 3,
-    Branch = 4,
-    CBranch = 5,
-    BranchInd = 6,
-    Call = 7,
-    CallInd = 8,
-    CallOther = 9,
-    Return = 10,
-
-    IntEqual = 11,
-    IntNotEqual = 12,
-    IntSLess = 13,
-    IntSLessEqual = 14,
-    IntLess = 15,
-    IntLessEqual = 16,
-    IntZExt = 17,
-    IntSExt = 18,
-    IntAdd = 19,
-    IntSub = 20,
-    IntCarry = 21,
-    IntSCarry = 22,
-    IntSBorrow = 23,
-    Int2Comp = 24,  // Two's complement (unary minus)
-    IntNegate = 25, // Bitwise NOT (confusing Ghidra naming)
-    IntXor = 26,
-    IntAnd = 27,
-    IntOr = 28,
-    IntLeft = 29,
-    IntRight = 30,
-    IntSRight = 31,
-    IntMult = 32,
-    IntDiv = 33,
-    IntSDiv = 34,
-    IntRem = 35,
-    IntSRem = 36,
-
-    BoolNot = 37,
-    BoolXor = 38,
-    BoolAnd = 39,
-    BoolOr = 40,
-
-    FloatEqual = 41,
-    FloatNotEqual = 42,
-    FloatLess = 43,
-    FloatLessEqual = 44,
-    FloatNaN = 46,
-    FloatAdd = 47,
-    FloatDiv = 48,
-    FloatMult = 49,
-    FloatSub = 50,
-    FloatNeg = 51,
-    FloatAbs = 52,
-    FloatSqrt = 53,
-    Int2Float = 54,
-    Float2Int = 55,
-    FloatFloat = 56,
-    Trunc = 57,
-    FloatCeil = 58,
-    FloatFloor = 59,
-    FloatRound = 60,
-
-    Multiequal = 61,
-    Indirect = 62,
-    Piece = 63,
-    Subpiece = 64,
-
-    Cast = 65,
-    PtrAdd = 66,
-    PtrSub = 67,
-    SegmentOp = 68,
-    CpuId = 69,
-    New = 70,
-
-    Insert = 71,
-    Extract = 72,
-    PopCount = 73,
-    Lzcount = 74,
 }
 
 /// Translate a LOAD operation.

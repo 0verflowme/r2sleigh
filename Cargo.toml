@@ -9,9 +9,9 @@ members = [
     "crates/r2ssa",
     "crates/r2sym",
     "crates/r2types",
-    "crates/r2cert",
     "crates/r2engine",
     "crates/r2dec",
+    "crates/r2rewrite",
     "r2plugin",
 ]
 
@@ -23,7 +23,7 @@ authors = ["radare2 contributors", "0verflowme"]
 repository = "https://github.com/0verflowme/r2sleigh"
 
 [workspace.dependencies]
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 postcard = { version = "1.1", features = ["use-std"] }
 thiserror = "2.0"
 clap = { version = "4", features = ["derive"] }
@@ -31,7 +31,21 @@ libsla = "=1.2.0"
 sleigh-config = "=1.0.1"
 serde_json = "1"
 hex = "0.4"
-z3 = "0.20.0"
+z3 = "0.21.0"
+
+[profile.dev]
+# Line tables rather than full debug info. A backtrace still names the file and
+# line, which is what anyone here reads; what goes is the variable-level detail
+# a debugger would use, and nothing in this project's workflow uses it.
+#
+# The reason it is in the manifest rather than in each person's environment is
+# that it was in each person's environment and that did not hold. Several
+# worktrees build this workspace at once, and one that missed the setting grew a
+# twelve gigabyte debug directory against three or four for the others, which is
+# the difference between everyone building and everyone failing on a full disk.
+# A setting every contributor must remember is a setting that is sometimes
+# forgotten, and the cost of forgetting lands on whoever is building next.
+debug = "line-tables-only"
 
 [profile.release]
 # Keep everyday release builds fast enough for local iteration and CI.
@@ -45,3 +59,25 @@ strip = true
 inherits = "release"
 lto = true
 codegen-units = 1
+
+# Consuming two upstream changes that are raised and under review, so that the
+# work that depends on them is not blocked behind someone else's merge queue:
+#
+#   mnemonikr/libsla-sys#8  exposes the language's user-defined p-code operation
+#                           names, which `SleighBase` already keeps and nothing
+#                           reached.
+#   mnemonikr/libsla#18     the safe passthrough over it.
+#   mnemonikr/libsla-sys#9  resets the address-keyed parser cache while keeping
+#                           the decoded Sleigh specification.
+#   mnemonikr/libsla#19     the safe passthrough over that reset.
+#
+# A `CALLOTHER` carries only the index of the operation it invokes, and that
+# index is assigned by the compiled specification and moves with it, so nothing
+# here can identify an operation without those names. A parsed instruction is
+# cached only by address, so sharing one loaded specification is correct only
+# when that cache is reset before another byte source can be observed. Both
+# branches combine the exact diffs on those pull requests. Drop this block for
+# the released crates once they land.
+[patch.crates-io]
+libsla = { git = "https://github.com/0verflowme/libsla.git", branch = "user-op-names-clear-cache" }
+libsla-sys = { git = "https://github.com/0verflowme/libsla-sys.git", branch = "expose-user-op-names-clear-cache" }

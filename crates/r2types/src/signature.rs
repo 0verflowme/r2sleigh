@@ -175,7 +175,9 @@ impl SignatureRegistry {
 fn normalize_name(name: &str) -> String {
     let mut normalized = name.trim().to_ascii_lowercase();
 
-    for prefix in ["sym.imp.", "sym.", "imp.", "dbg."] {
+    // "flirt." is what a signature match prepends, so a matched libc function
+    // has to lose it before it can be looked up as that libc function.
+    for prefix in ["sym.imp.", "sym.", "imp.", "dbg.", "flirt."] {
         while let Some(rest) = normalized.strip_prefix(prefix) {
             normalized = rest.to_string();
         }

@@ -1,0 +1,7 @@
+base_type_name_cmp
+function_arg_order_cmp
+function_param_free
+type_context_hash_link_cb
+types_snapshot_clone_cb
+types_snapshot_preflight_cb
+var_ptr_comparator

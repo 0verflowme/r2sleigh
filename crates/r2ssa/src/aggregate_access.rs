@@ -44,6 +44,9 @@ pub struct AggregateAccessProjection {
     pub struct_type_id: u32,
     pub aggregate_id: u32,
     pub member_id: u32,
+    /// What the source calls this member, so a consumer can name it without
+    /// carrying the type graph the projection was built from.
+    pub member_name: Box<str>,
     pub member_type_id: u32,
     pub element_index: Option<AggregateElementIndexProjection>,
     pub byte_offset: u64,
@@ -265,11 +268,10 @@ pub(crate) fn collect_aggregate_access_projections(
         let Some(member_type) = graph_type(type_graph, member.type_id()) else {
             continue;
         };
-        if !matches!(
-            member_type.kind(),
-            SourceTypeKind::SignedInteger | SourceTypeKind::UnsignedInteger
-        ) || member_type.size_bits() != size_bits
-        {
+        // What decides whether an access lands on a member is where it lands
+        // and how wide it is, not what kind the member is. Requiring an integer
+        // meant a store to `s->next` projected onto nothing.
+        if member_type.size_bits() != size_bits {
             continue;
         }
         let projection = AggregateAccessProjection {
@@ -280,6 +282,7 @@ pub(crate) fn collect_aggregate_access_projections(
             struct_type_id,
             aggregate_id,
             member_id: member.member_id(),
+            member_name: member.name().into(),
             member_type_id: member.type_id(),
             element_index,
             byte_offset,

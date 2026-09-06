@@ -18,11 +18,7 @@ use crate::{
 pub struct OptimizationConfig {
     pub max_iterations: usize,
     pub enable_sccp: bool,
-    pub enable_const_prop: bool,
     pub enable_inst_combine: bool,
-    pub enable_copy_prop: bool,
-    pub enable_cse: bool,
-    pub enable_dce: bool,
     pub preserve_memory_reads: bool,
 }
 
@@ -35,7 +31,6 @@ pub struct OptimizationConfig {
 pub struct DecompilePrepConfig {
     pub max_iterations: usize,
     pub enable_inst_combine: bool,
-    pub enable_cse: bool,
 }
 
 impl Default for OptimizationConfig {
@@ -43,11 +38,7 @@ impl Default for OptimizationConfig {
         Self {
             max_iterations: 4,
             enable_sccp: true,
-            enable_const_prop: true,
             enable_inst_combine: true,
-            enable_copy_prop: true,
-            enable_cse: true,
-            enable_dce: true,
             preserve_memory_reads: false,
         }
     }
@@ -57,8 +48,7 @@ impl Default for DecompilePrepConfig {
     fn default() -> Self {
         Self {
             max_iterations: 1,
-            enable_inst_combine: false,
-            enable_cse: false,
+            enable_inst_combine: true,
         }
     }
 }
@@ -68,11 +58,7 @@ impl From<&DecompilePrepConfig> for OptimizationConfig {
         Self {
             max_iterations: value.max_iterations.max(1),
             enable_sccp: false,
-            enable_const_prop: false,
             enable_inst_combine: value.enable_inst_combine,
-            enable_copy_prop: false,
-            enable_cse: value.enable_cse,
-            enable_dce: false,
             preserve_memory_reads: true,
         }
     }
@@ -87,11 +73,6 @@ pub struct OptimizationStats {
     pub sccp_blocks_removed: usize,
     pub constants_propagated: usize,
     pub ops_simplified: usize,
-    pub copies_propagated: usize,
-    pub phis_simplified: usize,
-    pub cse_replacements: usize,
-    pub dce_removed_ops: usize,
-    pub dce_removed_phis: usize,
 }
 
 /// Run the SSA optimization pipeline on a function.
@@ -134,30 +115,7 @@ pub(crate) fn optimize_function_with_interface_and_control<C: SsaWorkControl + ?
         control.poll()?;
         let mut changed = false;
 
-        if config.enable_const_prop && !config.enable_sccp {
-            let consts = compute_constants_with_control(func, max_iters, control)?;
-            control.poll()?;
-            if replace_sources_with_constants(func, &consts, function_interface, &mut stats) {
-                changed = true;
-            }
-        }
-
         if config.enable_inst_combine && inst_combine(func, &mut stats) {
-            changed = true;
-        }
-
-        control.poll()?;
-        if config.enable_cse && common_subexpr_elim(func, &mut stats) {
-            changed = true;
-        }
-
-        control.poll()?;
-        if config.enable_copy_prop && copy_propagation(func, function_interface, &mut stats) {
-            changed = true;
-        }
-
-        control.poll()?;
-        if config.enable_dce && dead_code_elim(func, config, function_interface, &mut stats) {
             changed = true;
         }
 
@@ -176,6 +134,7 @@ struct VarKey {
     name: String,
     version: u32,
     size: u32,
+    rename_disambiguator: u32,
 }
 
 type SccpResult = (HashMap<VarKey, u64>, HashSet<(u64, u64)>);
@@ -215,17 +174,25 @@ impl VarKey {
             name: var.name.clone(),
             version: var.version,
             size: var.size,
+            rename_disambiguator: var.rename_disambiguator(),
         }
     }
 }
 
 impl Ord for VarKey {
     fn cmp(&self, other: &Self) -> Ordering {
-        (self.name.as_str(), self.version, self.size).cmp(&(
-            other.name.as_str(),
-            other.version,
-            other.size,
-        ))
+        (
+            self.name.as_str(),
+            self.version,
+            self.size,
+            self.rename_disambiguator,
+        )
+            .cmp(&(
+                other.name.as_str(),
+                other.version,
+                other.size,
+                other.rename_disambiguator,
+            ))
     }
 }
 
@@ -550,58 +517,6 @@ fn const_for_var(var: &SSAVar, consts: &HashMap<VarKey, u64>) -> Option<u64> {
     consts.get(&VarKey::from_var(var)).copied()
 }
 
-fn compute_constants_with_control<C: SsaWorkControl + ?Sized>(
-    func: &SSAFunction,
-    max_iters: usize,
-    control: &C,
-) -> Result<HashMap<VarKey, u64>, SsaExecutionStopReason> {
-    let mut consts = HashMap::new();
-
-    for _ in 0..max_iters {
-        control.poll()?;
-        let mut changed = false;
-
-        for phi in func.all_phis() {
-            control.poll()?;
-            let dst_key = VarKey::from_var(&phi.dst);
-            if consts.contains_key(&dst_key) {
-                continue;
-            }
-            let mut iter = phi.sources.iter();
-            let Some((_, first)) = iter.next() else {
-                continue;
-            };
-            let Some(first_val) = const_for_var(first, &consts) else {
-                continue;
-            };
-            if iter.all(|(_, src)| const_for_var(src, &consts) == Some(first_val)) {
-                consts.insert(dst_key, first_val);
-                changed = true;
-            }
-        }
-
-        for op in func.all_ops() {
-            control.poll()?;
-            let Some(dst) = op.dst() else { continue };
-            let dst_key = VarKey::from_var(dst);
-            if consts.contains_key(&dst_key) {
-                continue;
-            }
-            if let Some(val) = eval_const_op(op, &consts) {
-                consts.insert(dst_key, val);
-                changed = true;
-            }
-        }
-
-        if !changed {
-            break;
-        }
-    }
-
-    control.poll()?;
-    Ok(consts)
-}
-
 fn eval_const_op(op: &SSAOp, consts: &HashMap<VarKey, u64>) -> Option<u64> {
     use SSAOp::*;
 
@@ -786,6 +701,59 @@ fn eval_const_op(op: &SSAOp, consts: &HashMap<VarKey, u64>) -> Option<u64> {
     };
 
     Some(val & mask)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TerminalStorageProjection {
+    carrier: CanonicalStorageId,
+    logical: CanonicalStorageId,
+}
+
+fn coherent_return_projection(
+    function_interface: Option<&SourceFunctionInterface>,
+) -> Option<TerminalStorageProjection> {
+    let interface = function_interface?;
+    let SourceFunctionReturn::Register { storage } = interface.return_kind() else {
+        return None;
+    };
+    let logical = interface.return_logical_value()?;
+    let graph = interface.type_graph()?;
+    let source_type = graph
+        .types()
+        .get(usize::try_from(logical.type_id()).ok()?)?;
+    let carrier = logical.carrier();
+    let storage_bits = u64::from(storage.size).checked_mul(8)?;
+    if storage.space != CanonicalStorageSpace::Register
+        || storage.size == 0
+        || carrier.offset_bits() != 0
+        || carrier.size_bits() == 0
+        || carrier.size_bits() != source_type.size_bits()
+        || carrier.size_bits() % 8 != 0
+        || carrier.size_bits() > storage_bits
+    {
+        return None;
+    }
+    let logical = match carrier.kind() {
+        SourceCarrierKind::Full if carrier.size_bits() == storage_bits => storage,
+        SourceCarrierKind::LowBits
+            if carrier.size_bits() < storage_bits
+                && matches!(
+                    source_type.kind(),
+                    SourceTypeKind::SignedInteger | SourceTypeKind::UnsignedInteger
+                ) =>
+        {
+            CanonicalStorageId {
+                space: storage.space,
+                offset: storage.offset,
+                size: u32::try_from(carrier.size_bits() / 8).ok()?,
+            }
+        }
+        _ => return None,
+    };
+    Some(TerminalStorageProjection {
+        carrier: storage,
+        logical,
+    })
 }
 
 fn replace_sources_with_constants(
@@ -1249,751 +1217,6 @@ fn simplify_op(op: &SSAOp) -> Option<SSAOp> {
     Some(simplified)
 }
 
-fn copy_propagation(
-    func: &mut SSAFunction,
-    function_interface: Option<&SourceFunctionInterface>,
-    stats: &mut OptimizationStats,
-) -> bool {
-    let (replacements, changed) = build_copy_replacements(func, stats);
-    let applied = if replacements.is_empty() {
-        false
-    } else {
-        apply_replacements(func, &replacements, function_interface, stats)
-    };
-    changed || applied
-}
-
-fn build_copy_replacements(
-    func: &mut SSAFunction,
-    stats: &mut OptimizationStats,
-) -> (HashMap<VarKey, SSAVar>, bool) {
-    let mut replacements = HashMap::new();
-    let mut changed = false;
-    let block_addrs = func.block_addrs().to_vec();
-
-    for addr in block_addrs {
-        let Some(block) = func.get_block_mut(addr) else {
-            continue;
-        };
-
-        block.phis.retain(|phi| {
-            let mut iter = phi.sources.iter();
-            let Some((_, first)) = iter.next() else {
-                return true;
-            };
-            if iter.all(|(_, src)| src == first) {
-                let dst_key = VarKey::from_var(&phi.dst);
-                if phi.dst != *first {
-                    replacements.insert(dst_key, first.clone());
-                }
-                stats.phis_simplified += 1;
-                changed = true;
-                false
-            } else {
-                true
-            }
-        });
-
-        for op in &block.ops {
-            if let SSAOp::Copy { dst, src } = op
-                && dst.size == src.size
-                && dst != src
-            {
-                replacements.insert(VarKey::from_var(dst), src.clone());
-            }
-        }
-    }
-
-    (resolve_replacements(replacements), changed)
-}
-
-fn resolve_replacements(mut replacements: HashMap<VarKey, SSAVar>) -> HashMap<VarKey, SSAVar> {
-    let keys: Vec<VarKey> = replacements.keys().cloned().collect();
-    for key in keys {
-        let mut visited = HashSet::new();
-        let mut current_key = key.clone();
-        let mut current_var = replacements.get(&current_key).cloned();
-        while let Some(next) = current_var {
-            let next_key = VarKey::from_var(&next);
-            if !visited.insert(next_key.clone()) {
-                break;
-            }
-            if let Some(follow) = replacements.get(&next_key).cloned() {
-                current_var = Some(follow);
-                current_key = next_key;
-            } else {
-                replacements.insert(key.clone(), next);
-                break;
-            }
-        }
-    }
-    replacements
-}
-
-fn apply_replacements(
-    func: &mut SSAFunction,
-    replacements: &HashMap<VarKey, SSAVar>,
-    function_interface: Option<&SourceFunctionInterface>,
-    stats: &mut OptimizationStats,
-) -> bool {
-    let mut changed = false;
-    let block_addrs = func.block_addrs().to_vec();
-    let return_storage =
-        coherent_return_projection(function_interface).map(|projection| projection.carrier);
-
-    let mapper = |var: &SSAVar| -> SSAVar {
-        let mut visited = HashSet::new();
-        let mut current = var.clone();
-        let mut key = VarKey::from_var(&current);
-        while let Some(next) = replacements.get(&key).cloned() {
-            if !visited.insert(key) {
-                return var.clone();
-            }
-            current = next;
-            key = VarKey::from_var(&current);
-        }
-        current
-    };
-
-    for addr in block_addrs {
-        let is_return_block = func
-            .cfg()
-            .get_block(addr)
-            .is_some_and(|cfg_block| cfg_block.is_return());
-        let Some(block) = func.get_block_mut(addr) else {
-            continue;
-        };
-
-        for phi in &mut block.phis {
-            let preserve_phi_sources = is_return_block
-                && return_storage.is_some_and(|storage| phi.canonical_storage == Some(storage));
-            for (_, src) in &mut phi.sources {
-                let new_src = if preserve_phi_sources {
-                    src.clone()
-                } else {
-                    mapper(src)
-                };
-                if new_src != *src {
-                    *src = new_src;
-                    stats.copies_propagated += 1;
-                    changed = true;
-                }
-            }
-        }
-
-        for op in &mut block.ops {
-            let new_op = map_sources_in_op(op, &mapper);
-            if &new_op != op {
-                let delta = count_source_replacements(op, &new_op);
-                if delta > 0 {
-                    stats.copies_propagated += delta;
-                }
-                *op = new_op;
-                changed = true;
-            }
-        }
-    }
-
-    changed
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum ExprKind {
-    Unary(&'static str),
-    Binary(&'static str),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct ExprKey {
-    kind: ExprKind,
-    dst_size: u32,
-    args: Vec<VarKey>,
-}
-
-fn expr_key(op: &SSAOp) -> Option<ExprKey> {
-    use SSAOp::*;
-    let dst = op.dst()?;
-    let key = match op {
-        IntNegate { src, .. } => ExprKey {
-            kind: ExprKind::Unary("IntNegate"),
-            dst_size: dst.size,
-            args: vec![VarKey::from_var(src)],
-        },
-        IntNot { src, .. } => ExprKey {
-            kind: ExprKind::Unary("IntNot"),
-            dst_size: dst.size,
-            args: vec![VarKey::from_var(src)],
-        },
-        BoolNot { src, .. } => ExprKey {
-            kind: ExprKind::Unary("BoolNot"),
-            dst_size: dst.size,
-            args: vec![VarKey::from_var(src)],
-        },
-        IntZExt { src, .. } => ExprKey {
-            kind: ExprKind::Unary("IntZExt"),
-            dst_size: dst.size,
-            args: vec![VarKey::from_var(src)],
-        },
-        IntSExt { src, .. } => ExprKey {
-            kind: ExprKind::Unary("IntSExt"),
-            dst_size: dst.size,
-            args: vec![VarKey::from_var(src)],
-        },
-        Trunc { src, .. } => ExprKey {
-            kind: ExprKind::Unary("Trunc"),
-            dst_size: dst.size,
-            args: vec![VarKey::from_var(src)],
-        },
-        FloatNeg { src, .. } => ExprKey {
-            kind: ExprKind::Unary("FloatNeg"),
-            dst_size: dst.size,
-            args: vec![VarKey::from_var(src)],
-        },
-        FloatAbs { src, .. } => ExprKey {
-            kind: ExprKind::Unary("FloatAbs"),
-            dst_size: dst.size,
-            args: vec![VarKey::from_var(src)],
-        },
-        FloatSqrt { src, .. } => ExprKey {
-            kind: ExprKind::Unary("FloatSqrt"),
-            dst_size: dst.size,
-            args: vec![VarKey::from_var(src)],
-        },
-        Int2Float { src, .. } => ExprKey {
-            kind: ExprKind::Unary("Int2Float"),
-            dst_size: dst.size,
-            args: vec![VarKey::from_var(src)],
-        },
-        Float2Int { src, .. } => ExprKey {
-            kind: ExprKind::Unary("Float2Int"),
-            dst_size: dst.size,
-            args: vec![VarKey::from_var(src)],
-        },
-        FloatFloat { src, .. } => ExprKey {
-            kind: ExprKind::Unary("FloatFloat"),
-            dst_size: dst.size,
-            args: vec![VarKey::from_var(src)],
-        },
-        IntAdd { a, b, .. }
-        | IntMult { a, b, .. }
-        | IntAnd { a, b, .. }
-        | IntOr { a, b, .. }
-        | IntXor { a, b, .. }
-        | IntEqual { a, b, .. }
-        | IntNotEqual { a, b, .. }
-        | BoolAnd { a, b, .. }
-        | BoolOr { a, b, .. }
-        | BoolXor { a, b, .. }
-        | FloatAdd { a, b, .. }
-        | FloatMult { a, b, .. }
-        | FloatEqual { a, b, .. }
-        | FloatNotEqual { a, b, .. } => {
-            let mut args = vec![VarKey::from_var(a), VarKey::from_var(b)];
-            args.sort();
-            let kind = match op {
-                IntAdd { .. } => ExprKind::Binary("IntAdd"),
-                IntMult { .. } => ExprKind::Binary("IntMult"),
-                IntAnd { .. } => ExprKind::Binary("IntAnd"),
-                IntOr { .. } => ExprKind::Binary("IntOr"),
-                IntXor { .. } => ExprKind::Binary("IntXor"),
-                IntEqual { .. } => ExprKind::Binary("IntEqual"),
-                IntNotEqual { .. } => ExprKind::Binary("IntNotEqual"),
-                BoolAnd { .. } => ExprKind::Binary("BoolAnd"),
-                BoolOr { .. } => ExprKind::Binary("BoolOr"),
-                BoolXor { .. } => ExprKind::Binary("BoolXor"),
-                FloatAdd { .. } => ExprKind::Binary("FloatAdd"),
-                FloatMult { .. } => ExprKind::Binary("FloatMult"),
-                FloatEqual { .. } => ExprKind::Binary("FloatEqual"),
-                FloatNotEqual { .. } => ExprKind::Binary("FloatNotEqual"),
-                _ => return None,
-            };
-            ExprKey {
-                kind,
-                dst_size: dst.size,
-                args,
-            }
-        }
-        IntSub { a, b, .. }
-        | IntDiv { a, b, .. }
-        | IntSDiv { a, b, .. }
-        | IntRem { a, b, .. }
-        | IntSRem { a, b, .. }
-        | IntLeft { a, b, .. }
-        | IntRight { a, b, .. }
-        | IntSRight { a, b, .. }
-        | IntLess { a, b, .. }
-        | IntLessEqual { a, b, .. }
-        | IntSLess { a, b, .. }
-        | IntSLessEqual { a, b, .. }
-        | FloatSub { a, b, .. }
-        | FloatDiv { a, b, .. }
-        | FloatLess { a, b, .. }
-        | FloatLessEqual { a, b, .. } => {
-            let args = vec![VarKey::from_var(a), VarKey::from_var(b)];
-            let kind = match op {
-                IntSub { .. } => ExprKind::Binary("IntSub"),
-                IntDiv { .. } => ExprKind::Binary("IntDiv"),
-                IntSDiv { .. } => ExprKind::Binary("IntSDiv"),
-                IntRem { .. } => ExprKind::Binary("IntRem"),
-                IntSRem { .. } => ExprKind::Binary("IntSRem"),
-                IntLeft { .. } => ExprKind::Binary("IntLeft"),
-                IntRight { .. } => ExprKind::Binary("IntRight"),
-                IntSRight { .. } => ExprKind::Binary("IntSRight"),
-                IntLess { .. } => ExprKind::Binary("IntLess"),
-                IntLessEqual { .. } => ExprKind::Binary("IntLessEqual"),
-                IntSLess { .. } => ExprKind::Binary("IntSLess"),
-                IntSLessEqual { .. } => ExprKind::Binary("IntSLessEqual"),
-                FloatSub { .. } => ExprKind::Binary("FloatSub"),
-                FloatDiv { .. } => ExprKind::Binary("FloatDiv"),
-                FloatLess { .. } => ExprKind::Binary("FloatLess"),
-                FloatLessEqual { .. } => ExprKind::Binary("FloatLessEqual"),
-                _ => return None,
-            };
-            ExprKey {
-                kind,
-                dst_size: dst.size,
-                args,
-            }
-        }
-        _ => return None,
-    };
-
-    Some(key)
-}
-
-fn common_subexpr_elim(func: &mut SSAFunction, stats: &mut OptimizationStats) -> bool {
-    let mut changed = false;
-    let block_addrs = func.block_addrs().to_vec();
-
-    for addr in block_addrs {
-        let Some(block) = func.get_block_mut(addr) else {
-            continue;
-        };
-        let mut available: HashMap<ExprKey, SSAVar> = HashMap::new();
-
-        for op in &mut block.ops {
-            let Some(dst) = op.dst().cloned() else {
-                continue;
-            };
-            let Some(key) = expr_key(op) else { continue };
-
-            if let Some(existing) = available.get(&key).cloned() {
-                if existing.size == dst.size {
-                    *op = SSAOp::Copy { dst, src: existing };
-                    stats.cse_replacements += 1;
-                    changed = true;
-                }
-            } else {
-                available.insert(key, dst);
-            }
-        }
-    }
-
-    changed
-}
-
-fn dead_code_elim(
-    func: &mut SSAFunction,
-    config: &OptimizationConfig,
-    function_interface: Option<&SourceFunctionInterface>,
-    stats: &mut OptimizationStats,
-) -> bool {
-    let mut changed = false;
-
-    loop {
-        let use_set = collect_uses(func, function_interface);
-        let mut local_change = false;
-        let block_addrs = func.block_addrs().to_vec();
-
-        for addr in block_addrs {
-            let Some(block) = func.get_block_mut(addr) else {
-                continue;
-            };
-
-            let before_ops = block.ops.len();
-            block.ops.retain(|op| {
-                if let Some(dst) = op.dst() {
-                    let key = VarKey::from_var(dst);
-                    if !use_set.contains(&key)
-                        && !op.has_observable_effects(config.preserve_memory_reads)
-                    {
-                        stats.dce_removed_ops += 1;
-                        return false;
-                    }
-                }
-                true
-            });
-
-            let before_phis = block.phis.len();
-            block.phis.retain(|phi| {
-                let key = VarKey::from_var(&phi.dst);
-                if !use_set.contains(&key) {
-                    stats.dce_removed_phis += 1;
-                    return false;
-                }
-                true
-            });
-
-            if block.ops.len() != before_ops || block.phis.len() != before_phis {
-                local_change = true;
-            }
-        }
-
-        if !local_change {
-            break;
-        }
-        changed = true;
-    }
-
-    changed
-}
-
-#[cfg(test)]
-fn canonical_register_storages_overlap(
-    left: CanonicalStorageId,
-    right: CanonicalStorageId,
-) -> bool {
-    if left.space != CanonicalStorageSpace::Register
-        || right.space != CanonicalStorageSpace::Register
-    {
-        return false;
-    }
-    let Some(left_end) = left.offset.checked_add(u64::from(left.size)) else {
-        return false;
-    };
-    let Some(right_end) = right.offset.checked_add(u64::from(right.size)) else {
-        return false;
-    };
-    left.offset < right_end && right.offset < left_end
-}
-
-fn canonical_register_storage_is_contained(
-    container: CanonicalStorageId,
-    contained: CanonicalStorageId,
-) -> bool {
-    if container.space != CanonicalStorageSpace::Register
-        || contained.space != CanonicalStorageSpace::Register
-        || container.size == 0
-        || contained.size == 0
-        || contained.offset < container.offset
-    {
-        return false;
-    }
-    let Some(container_end) = container.offset.checked_add(u64::from(container.size)) else {
-        return false;
-    };
-    let Some(contained_end) = contained.offset.checked_add(u64::from(contained.size)) else {
-        return false;
-    };
-    contained_end <= container_end
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct TerminalStorageProjection {
-    carrier: CanonicalStorageId,
-    logical: CanonicalStorageId,
-}
-
-fn coherent_return_projection(
-    function_interface: Option<&SourceFunctionInterface>,
-) -> Option<TerminalStorageProjection> {
-    let interface = function_interface?;
-    let SourceFunctionReturn::Register { storage } = interface.return_kind() else {
-        return None;
-    };
-    let logical = interface.return_logical_value()?;
-    let graph = interface.type_graph()?;
-    let source_type = graph
-        .types()
-        .get(usize::try_from(logical.type_id()).ok()?)?;
-    let carrier = logical.carrier();
-    let storage_bits = u64::from(storage.size).checked_mul(8)?;
-    if storage.space != CanonicalStorageSpace::Register
-        || storage.size == 0
-        || carrier.offset_bits() != 0
-        || carrier.size_bits() == 0
-        || carrier.size_bits() != source_type.size_bits()
-        || carrier.size_bits() % 8 != 0
-        || carrier.size_bits() > storage_bits
-    {
-        return None;
-    }
-    let logical = match carrier.kind() {
-        SourceCarrierKind::Full if carrier.size_bits() == storage_bits => storage,
-        SourceCarrierKind::LowBits
-            if carrier.size_bits() < storage_bits
-                && matches!(
-                    source_type.kind(),
-                    SourceTypeKind::SignedInteger | SourceTypeKind::UnsignedInteger
-                ) =>
-        {
-            CanonicalStorageId {
-                space: storage.space,
-                offset: storage.offset,
-                size: u32::try_from(carrier.size_bits() / 8).ok()?,
-            }
-        }
-        _ => return None,
-    };
-    Some(TerminalStorageProjection {
-        carrier: storage,
-        logical,
-    })
-}
-
-fn cover_uncovered_register_bytes(
-    uncovered: &mut Vec<(u64, u64)>,
-    storage: CanonicalStorageId,
-) -> bool {
-    let Some(storage_end) = storage.offset.checked_add(u64::from(storage.size)) else {
-        return false;
-    };
-    let mut covered = false;
-    let mut remaining = Vec::with_capacity(uncovered.len().saturating_add(1));
-    for &(start, end) in uncovered.iter() {
-        if storage_end <= start || storage.offset >= end {
-            remaining.push((start, end));
-            continue;
-        }
-        covered = true;
-        if start < storage.offset {
-            remaining.push((start, storage.offset));
-        }
-        if storage_end < end {
-            remaining.push((storage_end, end));
-        }
-    }
-    *uncovered = remaining;
-    covered
-}
-
-fn register_storage_overlaps_ranges(storage: CanonicalStorageId, ranges: &[(u64, u64)]) -> bool {
-    if storage.space != CanonicalStorageSpace::Register {
-        return false;
-    }
-    let Some(storage_end) = storage.offset.checked_add(u64::from(storage.size)) else {
-        return false;
-    };
-    ranges
-        .iter()
-        .any(|&(start, end)| storage.offset < end && start < storage_end)
-}
-
-fn merge_register_ranges(ranges: &mut Vec<(u64, u64)>, incoming: &[(u64, u64)]) -> bool {
-    let previous = ranges.clone();
-    ranges.extend_from_slice(incoming);
-    ranges.sort_unstable();
-    let mut merged = Vec::with_capacity(ranges.len());
-    for &(start, end) in ranges.iter() {
-        if let Some((_, previous_end)) = merged.last_mut()
-            && start <= *previous_end
-        {
-            *previous_end = (*previous_end).max(end);
-        } else {
-            merged.push((start, end));
-        }
-    }
-    *ranges = merged;
-    *ranges != previous
-}
-
-struct TerminalStorageLiveness {
-    uncovered_register_ranges: Vec<(u64, u64)>,
-    preserved_definitions: HashSet<VarKey>,
-}
-
-fn transfer_terminal_storage_liveness(
-    func: &SSAFunction,
-    block_addr: u64,
-    projection: TerminalStorageProjection,
-    live_out: &[(u64, u64)],
-) -> Option<TerminalStorageLiveness> {
-    let block = func.get_block(block_addr)?;
-    let mut uncovered = live_out.to_vec();
-    let mut preserved = HashSet::new();
-    for op in block.ops.iter().rev() {
-        if uncovered.is_empty() {
-            break;
-        }
-        let Some(dst) = op.dst() else {
-            continue;
-        };
-        let Some(storage) = func.canonical_storage_for_var(dst) else {
-            continue;
-        };
-        if !register_storage_overlaps_ranges(storage, &uncovered) {
-            continue;
-        }
-        if !canonical_register_storage_is_contained(projection.carrier, storage) {
-            return None;
-        }
-        if cover_uncovered_register_bytes(&mut uncovered, storage) {
-            preserved.insert(VarKey::from_var(dst));
-        }
-    }
-
-    for phi in block.phis.iter().rev() {
-        if uncovered.is_empty() {
-            break;
-        }
-        let Some(storage) = phi.canonical_storage else {
-            continue;
-        };
-        if !register_storage_overlaps_ranges(storage, &uncovered) {
-            continue;
-        }
-        if !canonical_register_storage_is_contained(projection.carrier, storage) {
-            return None;
-        }
-        if cover_uncovered_register_bytes(&mut uncovered, storage) {
-            preserved.insert(VarKey::from_var(&phi.dst));
-            for (_, source) in &phi.sources {
-                preserved.insert(VarKey::from_var(source));
-            }
-        }
-    }
-    Some(TerminalStorageLiveness {
-        uncovered_register_ranges: uncovered,
-        preserved_definitions: preserved,
-    })
-}
-
-fn collect_preserved_projection_defs(
-    func: &SSAFunction,
-    projection: TerminalStorageProjection,
-) -> HashSet<VarKey> {
-    let mut preserved = HashSet::new();
-    let Some(logical_end) = projection
-        .logical
-        .offset
-        .checked_add(u64::from(projection.logical.size))
-    else {
-        return preserved;
-    };
-    let seed = [(projection.logical.offset, logical_end)];
-    let mut live_out_by_block = HashMap::<u64, Vec<(u64, u64)>>::new();
-    let mut pending = VecDeque::new();
-    for block in func.blocks() {
-        let Some(cfg_block) = func.cfg().get_block(block.addr) else {
-            continue;
-        };
-        if cfg_block.is_return()
-            && merge_register_ranges(live_out_by_block.entry(block.addr).or_default(), &seed)
-        {
-            pending.push_back(block.addr);
-        }
-    }
-
-    while let Some(block_addr) = pending.pop_front() {
-        let Some(live_out) = live_out_by_block.get(&block_addr) else {
-            continue;
-        };
-        let Some(liveness) =
-            transfer_terminal_storage_liveness(func, block_addr, projection, live_out)
-        else {
-            continue;
-        };
-        let live_in = liveness.uncovered_register_ranges;
-        if live_in.is_empty() {
-            continue;
-        }
-        for predecessor in func.predecessors(block_addr) {
-            if merge_register_ranges(live_out_by_block.entry(predecessor).or_default(), &live_in) {
-                pending.push_back(predecessor);
-            }
-        }
-    }
-
-    for (block_addr, live_out) in live_out_by_block {
-        if let Some(liveness) =
-            transfer_terminal_storage_liveness(func, block_addr, projection, &live_out)
-        {
-            preserved.extend(liveness.preserved_definitions);
-        }
-    }
-    preserved
-}
-
-fn collect_preserved_return_defs_in_terminal_blocks(
-    func: &SSAFunction,
-    projection: TerminalStorageProjection,
-) -> HashSet<VarKey> {
-    let mut preserved = HashSet::new();
-    let Some(logical_end) = projection
-        .logical
-        .offset
-        .checked_add(u64::from(projection.logical.size))
-    else {
-        return preserved;
-    };
-    let seed = [(projection.logical.offset, logical_end)];
-    for block in func.blocks() {
-        let Some(cfg_block) = func.cfg().get_block(block.addr) else {
-            continue;
-        };
-        if !cfg_block.is_return() {
-            continue;
-        }
-        let Some(liveness) =
-            transfer_terminal_storage_liveness(func, block.addr, projection, &seed)
-        else {
-            continue;
-        };
-        if liveness.uncovered_register_ranges.is_empty() {
-            preserved.extend(liveness.preserved_definitions);
-        }
-    }
-    preserved
-}
-
-fn collect_preserved_terminal_defs(
-    func: &SSAFunction,
-    function_interface: Option<&SourceFunctionInterface>,
-) -> HashSet<VarKey> {
-    let mut preserved = HashSet::new();
-    if let Some(projection) = coherent_return_projection(function_interface) {
-        preserved.extend(collect_preserved_return_defs_in_terminal_blocks(
-            func, projection,
-        ));
-    }
-    if let Some(storage) =
-        function_interface.and_then(SourceFunctionInterface::exact_frame_pointer_storage)
-    {
-        preserved.extend(collect_preserved_projection_defs(
-            func,
-            TerminalStorageProjection {
-                carrier: storage,
-                logical: storage,
-            },
-        ));
-    }
-
-    preserved
-}
-
-fn collect_uses(
-    func: &SSAFunction,
-    function_interface: Option<&SourceFunctionInterface>,
-) -> HashSet<VarKey> {
-    let mut uses = HashSet::new();
-
-    for phi in func.all_phis() {
-        for (_, src) in &phi.sources {
-            uses.insert(VarKey::from_var(src));
-        }
-    }
-
-    for op in func.all_ops() {
-        for src in op.sources() {
-            uses.insert(VarKey::from_var(src));
-        }
-    }
-
-    uses.extend(collect_preserved_terminal_defs(func, function_interface));
-
-    uses
-}
-
 pub(crate) fn map_sources_in_op<F>(op: &SSAOp, map: &F) -> SSAOp
 where
     F: Fn(&SSAVar) -> SSAVar,
@@ -2267,6 +1490,10 @@ where
             target: map(target),
         },
         CallDefine { dst } => CallDefine { dst: dst.clone() },
+        CallRestore { dst, src } => CallRestore {
+            dst: dst.clone(),
+            src: map(src),
+        },
         Return { target } => Return {
             target: map(target),
         },
@@ -2439,12 +1666,7 @@ where
 #[cfg(test)]
 mod sccp_tests {
     use super::*;
-    use crate::{
-        CanonicalStorageId, CanonicalStorageSpace, InstPayload, SourceCarrierProjection,
-        SourceLogicalValue, SourceStackSlotSpec, SourceType, SourceTypeGraph, SsaGraph,
-        StackAddressBase,
-    };
-    use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
+    use r2il::{R2ILBlock, R2ILOp, SpaceId, Varnode};
 
     fn make_const(val: u64, size: u32) -> Varnode {
         Varnode {
@@ -2473,303 +1695,8 @@ mod sccp_tests {
         }
     }
 
-    fn make_unique(offset: u64, size: u32) -> Varnode {
-        Varnode {
-            space: SpaceId::Unique,
-            offset,
-            size,
-            meta: None,
-        }
-    }
-
     fn raw_func(blocks: Vec<R2ILBlock>) -> SSAFunction {
         SSAFunction::from_blocks_raw_no_arch(&blocks).expect("raw SSA function should build")
-    }
-
-    fn register_storage(offset: u64, size: u32) -> CanonicalStorageId {
-        CanonicalStorageId {
-            space: CanonicalStorageSpace::Register,
-            offset,
-            size,
-        }
-    }
-
-    fn exact_u32_return_interface(storage: CanonicalStorageId) -> SourceFunctionInterface {
-        let graph = SourceTypeGraph::new(
-            [SourceType::new(0, SourceTypeKind::UnsignedInteger, 32, 32)],
-            [],
-        )
-        .expect("u32 type graph");
-        SourceFunctionInterface::new_exact_with_logical_types(
-            b"return-liveness-test-v1".to_vec(),
-            "test-cc",
-            [],
-            SourceFunctionReturn::Register { storage },
-            [],
-            [],
-            Some(SourceLogicalValue::new(
-                0,
-                SourceCarrierProjection::new(SourceCarrierKind::LowBits, 0, 32),
-            )),
-            Some(graph),
-        )
-        .expect("exact logical return interface")
-    }
-
-    fn exact_frame_pointer_interface(storage: CanonicalStorageId) -> SourceFunctionInterface {
-        SourceFunctionInterface::new_exact(
-            b"frame-liveness-test-v1".to_vec(),
-            "test-cc",
-            [],
-            SourceFunctionReturn::Void,
-            [SourceStackSlotSpec::new_local(
-                StackAddressBase::FramePointer,
-                storage,
-                -16,
-                8,
-            )],
-        )
-        .expect("exact frame-pointer interface")
-        .with_return_address_storage(register_storage(0x80, 8))
-        .expect("return-address storage")
-        .with_stack_pointer_storage(register_storage(0x40, 8))
-        .expect("stack-pointer storage")
-    }
-
-    fn inexact_frame_pointer_interface(storage: CanonicalStorageId) -> SourceFunctionInterface {
-        SourceFunctionInterface::new(
-            b"frame-liveness-test-v1".to_vec(),
-            "test-cc",
-            [],
-            SourceFunctionReturn::Void,
-            [SourceStackSlotSpec::new(
-                StackAddressBase::FramePointer,
-                storage,
-                -16,
-                8,
-            )],
-        )
-        .expect("advisory frame-pointer interface")
-    }
-
-    fn exact_stack_pointer_only_interface(storage: CanonicalStorageId) -> SourceFunctionInterface {
-        SourceFunctionInterface::new_exact(
-            b"frame-liveness-test-v1".to_vec(),
-            "test-cc",
-            [],
-            SourceFunctionReturn::Void,
-            [SourceStackSlotSpec::new_local(
-                StackAddressBase::StackPointer,
-                storage,
-                0,
-                8,
-            )],
-        )
-        .expect("exact stack-pointer-only interface")
-    }
-
-    fn frame_pop_function(frame_name: &str, frame_offset: u64) -> SSAFunction {
-        let mut arch = ArchSpec::new("frame-pop-test");
-        arch.add_register(RegisterDef::new(frame_name, frame_offset, 8));
-        arch.add_register(RegisterDef::new("stack_base", 0x40, 8));
-        arch.add_register(RegisterDef::new("pc", 0x80, 8));
-        let mut block = R2ILBlock::new(0x1000, 4);
-        block.push(R2ILOp::Load {
-            dst: make_unique(0x100, 8),
-            space: SpaceId::Ram,
-            addr: make_reg(0x40, 8),
-        });
-        block.push(R2ILOp::Copy {
-            dst: make_reg(frame_offset, 8),
-            src: make_unique(0x100, 8),
-        });
-        // A non-register destination may share the FP's numeric offset. It
-        // must not terminate register-storage liveness.
-        block.push(R2ILOp::Copy {
-            dst: make_unique(frame_offset, 8),
-            src: make_const(0x55, 8),
-        });
-        block.push(R2ILOp::IntAdd {
-            dst: make_reg(0x40, 8),
-            a: make_reg(0x40, 8),
-            b: make_const(16, 8),
-        });
-        block.push(R2ILOp::Return {
-            target: make_reg(0x80, 8),
-        });
-        SSAFunction::from_blocks_raw(&[block], Some(&arch)).expect("frame pop SSA")
-    }
-
-    fn predecessor_frame_restore_function(
-        frame_offset: u64,
-        split_after_restore: bool,
-    ) -> SSAFunction {
-        let mut arch = ArchSpec::new("predecessor-frame-restore-test");
-        arch.add_register(RegisterDef::new("frame_carrier", frame_offset, 8));
-        arch.add_register(RegisterDef::new("condition", 0x20, 1));
-        arch.add_register(RegisterDef::new("stack_base", 0x40, 8));
-        arch.add_register(RegisterDef::new("pc", 0x80, 8));
-        let mut restore = R2ILBlock::new(0x1000, 4);
-        restore.push(R2ILOp::Load {
-            dst: make_unique(0x100, 8),
-            space: SpaceId::Ram,
-            addr: make_reg(0x40, 8),
-        });
-        restore.push(R2ILOp::Copy {
-            dst: make_reg(frame_offset, 8),
-            src: make_unique(0x100, 8),
-        });
-        if split_after_restore {
-            restore.push(R2ILOp::CBranch {
-                target: make_const(0x1008, 8),
-                cond: make_reg(0x20, 1),
-            });
-        } else {
-            restore.push(R2ILOp::Branch {
-                target: make_const(0x1004, 8),
-            });
-        }
-        let mut first_return = R2ILBlock::new(0x1004, 4);
-        first_return.push(R2ILOp::Return {
-            target: make_reg(0x80, 8),
-        });
-        let mut blocks = vec![restore, first_return];
-        if split_after_restore {
-            let mut second_return = R2ILBlock::new(0x1008, 4);
-            second_return.push(R2ILOp::Return {
-                target: make_reg(0x80, 8),
-            });
-            blocks.push(second_return);
-        }
-        SSAFunction::from_blocks_raw(&blocks, Some(&arch)).expect("predecessor frame restore SSA")
-    }
-
-    fn frame_restore_chain_is_present(function: &SSAFunction, storage: CanonicalStorageId) -> bool {
-        let Some(block) = function.get_block(0x1000) else {
-            return false;
-        };
-        let load_dst = block.ops.iter().find_map(|op| match op {
-            SSAOp::Load { dst, .. } => Some(dst),
-            _ => None,
-        });
-        block.ops.iter().any(|op| match op {
-            SSAOp::Copy { dst, src } => {
-                function.canonical_storage_for_var(dst) == Some(storage) && load_dst == Some(src)
-            }
-            _ => false,
-        })
-    }
-
-    fn return_alias_function(whole_name: &str, low_name: &str) -> SSAFunction {
-        let mut arch = ArchSpec::new("return-alias-test");
-        arch.add_register(RegisterDef::new(whole_name, 0, 8));
-        arch.add_register(RegisterDef::sub(low_name, 0, 1, whole_name));
-        arch.add_register(RegisterDef::new("pc", 0x80, 8));
-        let mut block = R2ILBlock::new(0x1000, 4);
-        block.push(R2ILOp::Copy {
-            dst: make_reg(0, 8),
-            src: make_const(0, 8),
-        });
-        block.push(R2ILOp::Copy {
-            dst: make_reg(0, 1),
-            src: make_const(1, 1),
-        });
-        block.push(R2ILOp::Return {
-            target: make_reg(0x80, 8),
-        });
-        SSAFunction::from_blocks_raw(&[block], Some(&arch)).expect("return alias SSA")
-    }
-
-    fn narrow_return_function(whole_name: &str, low_name: &str) -> SSAFunction {
-        let mut arch = ArchSpec::new("narrow-return-test");
-        arch.add_register(RegisterDef::new(whole_name, 0, 8));
-        arch.add_register(RegisterDef::sub(low_name, 0, 4, whole_name));
-        arch.add_register(RegisterDef::new("pc", 0x80, 8));
-        let mut block = R2ILBlock::new(0x1000, 4);
-        block.push(R2ILOp::Copy {
-            dst: make_reg(0, 4),
-            src: make_const(7, 4),
-        });
-        block.push(R2ILOp::Return {
-            target: make_reg(0x80, 8),
-        });
-        SSAFunction::from_blocks_raw(&[block], Some(&arch)).expect("narrow return SSA")
-    }
-
-    fn return_phi_overlay_function(whole_name: &str, low_name: &str) -> SSAFunction {
-        let mut arch = ArchSpec::new("return-phi-overlay-test");
-        arch.add_register(RegisterDef::new(whole_name, 0, 8));
-        arch.add_register(RegisterDef::sub(low_name, 0, 1, whole_name));
-        arch.add_register(RegisterDef::new("cond", 0x40, 1));
-        arch.add_register(RegisterDef::new("pc", 0x80, 8));
-        let mut entry = R2ILBlock::new(0x1000, 4);
-        entry.push(R2ILOp::CBranch {
-            target: make_const(0x1008, 8),
-            cond: make_reg(0x40, 1),
-        });
-        let mut left = R2ILBlock::new(0x1004, 4);
-        left.push(R2ILOp::Copy {
-            dst: make_reg(0, 8),
-            src: make_const(1, 8),
-        });
-        left.push(R2ILOp::Branch {
-            target: make_const(0x100c, 8),
-        });
-        let mut right = R2ILBlock::new(0x1008, 4);
-        right.push(R2ILOp::Copy {
-            dst: make_reg(0, 8),
-            src: make_const(2, 8),
-        });
-        right.push(R2ILOp::Branch {
-            target: make_const(0x100c, 8),
-        });
-        let mut merge = R2ILBlock::new(0x100c, 4);
-        merge.push(R2ILOp::Copy {
-            dst: make_reg(0, 1),
-            src: make_const(3, 1),
-        });
-        merge.push(R2ILOp::Return {
-            target: make_reg(0x80, 8),
-        });
-        SSAFunction::from_blocks_raw(&[entry, left, right, merge], Some(&arch))
-            .expect("return phi overlay SSA")
-    }
-
-    fn shadowed_overlay_function(whole_name: &str, low_name: &str) -> SSAFunction {
-        let mut arch = ArchSpec::new("shadowed-return-overlay-test");
-        arch.add_register(RegisterDef::new(whole_name, 0, 8));
-        arch.add_register(RegisterDef::sub(low_name, 0, 1, whole_name));
-        arch.add_register(RegisterDef::new("pc", 0x80, 8));
-        let mut block = R2ILBlock::new(0x1000, 4);
-        block.push(R2ILOp::Copy {
-            dst: make_reg(0, 8),
-            src: make_const(0, 8),
-        });
-        block.push(R2ILOp::Copy {
-            dst: make_reg(0, 1),
-            src: make_const(1, 1),
-        });
-        block.push(R2ILOp::Copy {
-            dst: make_reg(0, 1),
-            src: make_const(2, 1),
-        });
-        block.push(R2ILOp::Return {
-            target: make_reg(0x80, 8),
-        });
-        SSAFunction::from_blocks_raw(&[block], Some(&arch)).expect("shadowed return overlay SSA")
-    }
-
-    fn optimize_with_interface(
-        function: &mut SSAFunction,
-        interface: &SourceFunctionInterface,
-    ) -> OptimizationStats {
-        optimize_function_with_interface_and_control(
-            function,
-            &OptimizationConfig::default(),
-            Some(interface),
-            &UncheckedSsaWorkControl,
-        )
-        .expect("unchecked typed optimization")
     }
 
     #[test]
@@ -3063,603 +1990,5 @@ mod sccp_tests {
         assert!(!func.cfg().has_edge(0x1000, 0x1004));
         assert!(stats.sccp_edges_pruned > 0);
         assert!(stats.sccp_blocks_removed > 0);
-    }
-
-    #[test]
-    fn dce_without_interface_does_not_guess_return_phi_from_name() {
-        let mut func = raw_func(vec![
-            R2ILBlock {
-                addr: 0x1000,
-                size: 4,
-                ops: vec![R2ILOp::CBranch {
-                    target: make_const(0x1008, 8),
-                    cond: make_reg(32, 1),
-                }],
-                switch_info: None,
-                op_metadata: Default::default(),
-            },
-            R2ILBlock {
-                addr: 0x1004,
-                size: 4,
-                ops: vec![R2ILOp::Branch {
-                    target: make_const(0x100c, 8),
-                }],
-                switch_info: None,
-                op_metadata: Default::default(),
-            },
-            R2ILBlock {
-                addr: 0x1008,
-                size: 4,
-                ops: vec![R2ILOp::Branch {
-                    target: make_const(0x100c, 8),
-                }],
-                switch_info: None,
-                op_metadata: Default::default(),
-            },
-            R2ILBlock {
-                addr: 0x100c,
-                size: 4,
-                ops: vec![R2ILOp::Return {
-                    target: make_ram(0, 8),
-                }],
-                switch_info: None,
-                op_metadata: Default::default(),
-            },
-        ]);
-
-        func.get_block_mut(0x1000).expect("entry block").ops = vec![SSAOp::CBranch {
-            target: SSAVar::new("ram:1008", 0, 8),
-            cond: SSAVar::new("tmp:cond", 0, 1),
-        }];
-        func.get_block_mut(0x1004).expect("left block").ops = vec![
-            SSAOp::Copy {
-                dst: SSAVar::new("rax", 1, 8),
-                src: SSAVar::constant(1, 8),
-            },
-            SSAOp::Branch {
-                target: SSAVar::new("ram:100c", 0, 8),
-            },
-        ];
-        func.get_block_mut(0x1008).expect("right block").ops = vec![
-            SSAOp::Copy {
-                dst: SSAVar::new("rax", 2, 8),
-                src: SSAVar::constant(0, 8),
-            },
-            SSAOp::Branch {
-                target: SSAVar::new("ram:100c", 0, 8),
-            },
-        ];
-        func.get_block_mut(0x100c).expect("merge block").phis = vec![PhiNode {
-            dst: SSAVar::new("rax", 3, 8),
-            sources: vec![
-                (0x1004, SSAVar::new("rax", 1, 8)),
-                (0x1008, SSAVar::new("rax", 2, 8)),
-            ],
-            canonical_storage: None,
-        }];
-
-        let stats = optimize_function(&mut func, &OptimizationConfig::default());
-        let merge = func.get_block(0x100c).expect("merge block");
-        assert!(
-            merge.phis.is_empty(),
-            "a detached textual register name must not preserve a phi"
-        );
-        assert!(
-            !func.get_block(0x1004).expect("left block").ops.iter().any(
-                |op| matches!(op, SSAOp::Copy { dst, .. } if dst == &SSAVar::new("rax", 1, 8))
-            ),
-            "left name-only write must be removed"
-        );
-        assert!(
-            !func.get_block(0x1008).expect("right block").ops.iter().any(
-                |op| matches!(op, SSAOp::Copy { dst, .. } if dst == &SSAVar::new("rax", 2, 8))
-            ),
-            "right name-only write must be removed"
-        );
-        assert!(
-            stats.dce_removed_phis > 0,
-            "the detached name-only phi must be accounted as dead"
-        );
-    }
-
-    #[test]
-    fn phi_storage_identity_survives_removing_preceding_phi() {
-        let mut func = raw_func(vec![
-            R2ILBlock {
-                addr: 0x1000,
-                size: 4,
-                ops: vec![R2ILOp::CBranch {
-                    target: make_const(0x1008, 8),
-                    cond: make_reg(32, 1),
-                }],
-                switch_info: None,
-                op_metadata: Default::default(),
-            },
-            R2ILBlock {
-                addr: 0x1004,
-                size: 4,
-                ops: vec![R2ILOp::Branch {
-                    target: make_const(0x100c, 8),
-                }],
-                switch_info: None,
-                op_metadata: Default::default(),
-            },
-            R2ILBlock {
-                addr: 0x1008,
-                size: 4,
-                ops: vec![R2ILOp::Branch {
-                    target: make_const(0x100c, 8),
-                }],
-                switch_info: None,
-                op_metadata: Default::default(),
-            },
-            R2ILBlock {
-                addr: 0x100c,
-                size: 4,
-                ops: vec![R2ILOp::Return {
-                    target: make_ram(0, 8),
-                }],
-                switch_info: None,
-                op_metadata: Default::default(),
-            },
-        ]);
-        let removed_storage = CanonicalStorageId {
-            space: CanonicalStorageSpace::Register,
-            offset: 0,
-            size: 8,
-        };
-        let retained_storage = CanonicalStorageId {
-            space: CanonicalStorageSpace::Register,
-            offset: 8,
-            size: 8,
-        };
-        let retained_dst = SSAVar::new("reg:8", 3, 8);
-        let merge = func.get_block_mut(0x100c).expect("merge block");
-        merge.phis = vec![
-            PhiNode {
-                dst: SSAVar::new("reg:0", 3, 8),
-                sources: vec![
-                    (0x1004, SSAVar::new("reg:0", 1, 8)),
-                    (0x1008, SSAVar::new("reg:0", 1, 8)),
-                ],
-                canonical_storage: Some(removed_storage),
-            },
-            PhiNode {
-                dst: retained_dst.clone(),
-                sources: vec![
-                    (0x1004, SSAVar::new("reg:8", 1, 8)),
-                    (0x1008, SSAVar::new("reg:8", 2, 8)),
-                ],
-                canonical_storage: Some(retained_storage),
-            },
-        ];
-        merge.ops = vec![SSAOp::Return {
-            target: retained_dst.clone(),
-        }];
-
-        let config = OptimizationConfig {
-            max_iterations: 1,
-            enable_sccp: false,
-            enable_const_prop: false,
-            enable_inst_combine: false,
-            enable_copy_prop: true,
-            enable_cse: false,
-            enable_dce: false,
-            preserve_memory_reads: false,
-        };
-        let stats = optimize_function(&mut func, &config);
-
-        assert_eq!(stats.phis_simplified, 1);
-        let merge = func.get_block(0x100c).expect("merge block");
-        assert_eq!(merge.phis.len(), 1);
-        assert_eq!(merge.phis[0].dst, retained_dst);
-        assert_eq!(merge.phis[0].canonical_storage, Some(retained_storage));
-
-        let graph = SsaGraph::from_function(&func);
-        let graph_phi = graph
-            .insts
-            .iter()
-            .find(|inst| matches!(inst.payload, InstPayload::Phi { .. }))
-            .expect("retained graph phi");
-        assert_eq!(graph_phi.canonical_storage, Some(retained_storage));
-    }
-
-    #[test]
-    fn dce_without_interface_does_not_guess_direct_return_from_name() {
-        let mut func = raw_func(vec![R2ILBlock {
-            addr: 0x1000,
-            size: 4,
-            ops: vec![R2ILOp::Return {
-                target: make_ram(0, 8),
-            }],
-            switch_info: None,
-            op_metadata: Default::default(),
-        }]);
-
-        func.get_block_mut(0x1000).expect("entry block").ops = vec![
-            SSAOp::Copy {
-                dst: SSAVar::new("eax", 1, 4),
-                src: SSAVar::constant(1, 4),
-            },
-            SSAOp::Return {
-                target: SSAVar::new("ram:0", 0, 8),
-            },
-        ];
-
-        optimize_function(&mut func, &OptimizationConfig::default());
-        assert!(
-            !func.get_block(0x1000).expect("entry block").ops.iter().any(
-                |op| matches!(op, SSAOp::Copy { dst, .. } if dst == &SSAVar::new("eax", 1, 4))
-            ),
-            "a return-like textual name has no authority without an exact interface"
-        );
-    }
-
-    #[test]
-    fn typed_dce_retains_exact_frame_pointer_pop_chain() {
-        let frame_storage = register_storage(0, 8);
-        let mut func = frame_pop_function("callee_frame_carrier", 0);
-        let interface = exact_frame_pointer_interface(frame_storage);
-
-        optimize_with_interface(&mut func, &interface);
-
-        assert!(
-            frame_restore_chain_is_present(&func, frame_storage),
-            "the exact full-width frame restore and its feeding load must remain"
-        );
-    }
-
-    #[test]
-    fn frame_pointer_liveness_requires_exact_frame_slot_authority() {
-        let frame_storage = register_storage(0, 8);
-        let mut absent = frame_pop_function("frame_like", 0);
-        let mut inexact = absent.clone();
-        let mut stack_only = absent.clone();
-
-        optimize_function(&mut absent, &OptimizationConfig::default());
-        optimize_with_interface(
-            &mut inexact,
-            &inexact_frame_pointer_interface(frame_storage),
-        );
-        optimize_with_interface(
-            &mut stack_only,
-            &exact_stack_pointer_only_interface(frame_storage),
-        );
-
-        for function in [&absent, &inexact, &stack_only] {
-            assert!(
-                !frame_restore_chain_is_present(function, frame_storage),
-                "no interface, advisory roles, and SP-only slots must not preserve FP evidence"
-            );
-        }
-    }
-
-    #[test]
-    fn typed_frame_pointer_liveness_uses_canonical_storage_not_name() {
-        let frame_storage = register_storage(0, 8);
-        let interface = exact_frame_pointer_interface(frame_storage);
-        let mut first = frame_pop_function("ordinary_saved_base", 0);
-        let mut renamed = frame_pop_function("unrelated_display_name", 0);
-
-        optimize_with_interface(&mut first, &interface);
-        optimize_with_interface(&mut renamed, &interface);
-
-        assert!(frame_restore_chain_is_present(&first, frame_storage));
-        assert!(frame_restore_chain_is_present(&renamed, frame_storage));
-        assert_eq!(
-            first.get_block(0x1000).expect("return block").ops.len(),
-            renamed.get_block(0x1000).expect("return block").ops.len()
-        );
-    }
-
-    #[test]
-    fn typed_frame_pointer_liveness_does_not_preserve_wrong_storage() {
-        let exact_storage = register_storage(0, 8);
-        let wrong_storage = register_storage(0x20, 8);
-        let interface = exact_frame_pointer_interface(exact_storage);
-        let mut func = frame_pop_function("frame_pointer", wrong_storage.offset);
-
-        optimize_with_interface(&mut func, &interface);
-
-        assert!(
-            !frame_restore_chain_is_present(&func, wrong_storage),
-            "a frame-pointer-like name at the wrong storage has no liveness authority"
-        );
-        let block = func.get_block(0x1000).expect("return block");
-        assert!(!block.ops.iter().any(|op| {
-            op.dst()
-                .is_some_and(|dst| func.canonical_storage_for_var(dst) == Some(wrong_storage))
-        }));
-        assert!(!block.ops.iter().any(|op| matches!(op, SSAOp::Load { .. })));
-    }
-
-    #[test]
-    fn typed_dce_retains_frame_pointer_restore_on_each_return() {
-        let frame_storage = register_storage(0, 8);
-        let mut arch = ArchSpec::new("multi-return-frame-restore-test");
-        arch.add_register(RegisterDef::new("frame_carrier", 0, 8));
-        arch.add_register(RegisterDef::new("cond", 0x20, 1));
-        arch.add_register(RegisterDef::new("stack_base", 0x40, 8));
-        arch.add_register(RegisterDef::new("pc", 0x80, 8));
-        let mut entry = R2ILBlock::new(0x1000, 4);
-        entry.push(R2ILOp::CBranch {
-            target: make_const(0x1008, 8),
-            cond: make_reg(0x20, 1),
-        });
-        let mut left = R2ILBlock::new(0x1004, 4);
-        left.push(R2ILOp::Load {
-            dst: make_unique(0x100, 8),
-            space: SpaceId::Ram,
-            addr: make_reg(0x40, 8),
-        });
-        left.push(R2ILOp::Copy {
-            dst: make_reg(0, 8),
-            src: make_unique(0x100, 8),
-        });
-        left.push(R2ILOp::Return {
-            target: make_reg(0x80, 8),
-        });
-        let mut right = R2ILBlock::new(0x1008, 4);
-        right.push(R2ILOp::Load {
-            dst: make_unique(0x200, 8),
-            space: SpaceId::Ram,
-            addr: make_reg(0x40, 8),
-        });
-        right.push(R2ILOp::Copy {
-            dst: make_reg(0, 8),
-            src: make_unique(0x200, 8),
-        });
-        right.push(R2ILOp::Return {
-            target: make_reg(0x80, 8),
-        });
-        let mut func = SSAFunction::from_blocks_raw(&[entry, left, right], Some(&arch))
-            .expect("multi-return frame restore SSA");
-
-        optimize_with_interface(&mut func, &exact_frame_pointer_interface(frame_storage));
-
-        for address in [0x1004, 0x1008] {
-            let block = func.get_block(address).expect("return block");
-            assert!(block.ops.iter().any(|op| {
-                matches!(op, SSAOp::Copy { dst, .. }
-                    if func.canonical_storage_for_var(dst) == Some(frame_storage))
-            }));
-            assert!(block.ops.iter().any(|op| matches!(op, SSAOp::Load { .. })));
-        }
-    }
-
-    #[test]
-    fn typed_dce_retains_frame_pointer_restore_in_return_predecessor() {
-        let frame_storage = register_storage(0, 8);
-        let mut function = predecessor_frame_restore_function(frame_storage.offset, false);
-
-        optimize_with_interface(&mut function, &exact_frame_pointer_interface(frame_storage));
-
-        assert!(frame_restore_chain_is_present(&function, frame_storage));
-        assert!(matches!(
-            function
-                .get_block(0x1004)
-                .expect("terminal return block")
-                .ops
-                .as_slice(),
-            [SSAOp::Return { .. }]
-        ));
-    }
-
-    #[test]
-    fn typed_dce_retains_one_shared_restore_for_multiple_returns() {
-        let frame_storage = register_storage(0, 8);
-        let mut function = predecessor_frame_restore_function(frame_storage.offset, true);
-
-        optimize_with_interface(&mut function, &exact_frame_pointer_interface(frame_storage));
-
-        assert!(frame_restore_chain_is_present(&function, frame_storage));
-        for address in [0x1004, 0x1008] {
-            assert!(matches!(
-                function
-                    .get_block(address)
-                    .expect("terminal return block")
-                    .ops
-                    .as_slice(),
-                [SSAOp::Return { .. }]
-            ));
-        }
-    }
-
-    #[test]
-    fn typed_dce_does_not_retain_wrong_predecessor_storage() {
-        let frame_storage = register_storage(0, 8);
-        let wrong_storage = register_storage(0x18, 8);
-        let mut function = predecessor_frame_restore_function(wrong_storage.offset, true);
-
-        optimize_with_interface(&mut function, &exact_frame_pointer_interface(frame_storage));
-
-        let restore = function.get_block(0x1000).expect("restore predecessor");
-        assert!(
-            !restore
-                .ops
-                .iter()
-                .any(|op| matches!(op, SSAOp::Load { .. }))
-        );
-        assert!(!restore.ops.iter().any(|op| {
-            op.dst()
-                .is_some_and(|dst| function.canonical_storage_for_var(dst) == Some(wrong_storage))
-        }));
-    }
-
-    #[test]
-    fn typed_dce_retains_wide_return_base_and_low_overlay() {
-        let mut func = return_alias_function("carrier", "low_lane");
-        let interface = exact_u32_return_interface(register_storage(0, 8));
-
-        optimize_with_interface(&mut func, &interface);
-
-        let retained = func
-            .get_block(0x1000)
-            .expect("return block")
-            .ops
-            .iter()
-            .filter_map(|op| op.dst())
-            .filter_map(|dst| func.canonical_storage_for_var(dst))
-            .filter(|storage| canonical_register_storages_overlap(*storage, register_storage(0, 8)))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            retained,
-            vec![register_storage(0, 8), register_storage(0, 1)],
-            "the exact physical base and later low overlay form one return composition"
-        );
-    }
-
-    #[test]
-    fn typed_dce_retains_narrow_only_lowbits_return() {
-        let mut func = narrow_return_function("carrier", "logical_result");
-        let interface = exact_u32_return_interface(register_storage(0, 8));
-
-        optimize_with_interface(&mut func, &interface);
-
-        let retained = func
-            .get_block(0x1000)
-            .expect("return block")
-            .ops
-            .iter()
-            .filter_map(|op| op.dst())
-            .filter_map(|dst| func.canonical_storage_for_var(dst))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            retained,
-            vec![register_storage(0, 4)],
-            "a narrow write exactly covering the logical LowBits projection is the return value"
-        );
-    }
-
-    #[test]
-    fn typed_dce_retains_full_phi_beneath_later_overlay() {
-        let mut func = return_phi_overlay_function("carrier", "low_lane");
-        let interface = exact_u32_return_interface(register_storage(0, 8));
-
-        optimize_with_interface(&mut func, &interface);
-
-        let merge = func.get_block(0x100c).expect("return merge block");
-        assert_eq!(merge.phis.len(), 1, "the return base phi must remain live");
-        assert_eq!(
-            merge.phis[0].canonical_storage,
-            Some(register_storage(0, 8))
-        );
-        let overlays = merge
-            .ops
-            .iter()
-            .filter_map(|op| op.dst())
-            .filter_map(|dst| func.canonical_storage_for_var(dst))
-            .collect::<Vec<_>>();
-        assert_eq!(overlays, vec![register_storage(0, 1)]);
-        for predecessor in [0x1004, 0x1008] {
-            assert!(
-                func.get_block(predecessor)
-                    .expect("return predecessor")
-                    .ops
-                    .iter()
-                    .filter_map(|op| op.dst())
-                    .filter_map(|dst| func.canonical_storage_for_var(dst))
-                    .any(|storage| storage == register_storage(0, 8)),
-                "the retained phi must keep each predecessor definition live"
-            );
-        }
-    }
-
-    #[test]
-    fn typed_dce_drops_shadowed_overlays_independent_of_names() {
-        let interface = exact_u32_return_interface(register_storage(0, 8));
-        let mut first = shadowed_overlay_function("whole_a", "slice_a");
-        let mut renamed = shadowed_overlay_function("whole_b", "slice_b");
-
-        optimize_with_interface(&mut first, &interface);
-        optimize_with_interface(&mut renamed, &interface);
-
-        let retained_writes = |function: &SSAFunction| {
-            function
-                .get_block(0x1000)
-                .expect("return block")
-                .ops
-                .iter()
-                .filter_map(|op| match op {
-                    SSAOp::Copy { dst, src } => function
-                        .canonical_storage_for_var(dst)
-                        .map(|storage| (storage, src.constant_bits())),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-        };
-        let expected = vec![
-            (register_storage(0, 8), Some(0)),
-            (register_storage(0, 1), Some(2)),
-        ];
-        assert_eq!(retained_writes(&first), expected);
-        assert_eq!(retained_writes(&renamed), expected);
-    }
-
-    #[test]
-    fn typed_return_liveness_is_carrier_name_independent() {
-        let interface = exact_u32_return_interface(register_storage(0, 8));
-        let mut first = return_alias_function("whole_a", "slice_a");
-        let mut renamed = return_alias_function("whole_b", "slice_b");
-
-        optimize_with_interface(&mut first, &interface);
-        optimize_with_interface(&mut renamed, &interface);
-
-        let retained_storages = |function: &SSAFunction| {
-            function
-                .get_block(0x1000)
-                .expect("return block")
-                .ops
-                .iter()
-                .filter_map(|op| op.dst())
-                .filter_map(|dst| function.canonical_storage_for_var(dst))
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(retained_storages(&first), retained_storages(&renamed));
-        let op_count = |function: &SSAFunction| {
-            function
-                .blocks()
-                .map(|block| block.ops.len())
-                .sum::<usize>()
-        };
-        assert_eq!(op_count(&first), op_count(&renamed));
-    }
-
-    #[test]
-    fn typed_dce_ignores_spoofed_return_like_register_name() {
-        let mut arch = ArchSpec::new("spoofed-return-name-test");
-        arch.add_register(RegisterDef::new("actual_carrier", 0, 8));
-        arch.add_register(RegisterDef::new("rax", 0x40, 8));
-        arch.add_register(RegisterDef::new("pc", 0x80, 8));
-        let mut block = R2ILBlock::new(0x1000, 4);
-        block.push(R2ILOp::Copy {
-            dst: make_reg(0, 8),
-            src: make_const(7, 8),
-        });
-        block.push(R2ILOp::Copy {
-            dst: make_reg(0x40, 8),
-            src: make_const(9, 8),
-        });
-        block.push(R2ILOp::Return {
-            target: make_reg(0x80, 8),
-        });
-        let mut func = SSAFunction::from_blocks_raw(&[block], Some(&arch)).expect("spoofed SSA");
-        let interface = exact_u32_return_interface(register_storage(0, 8));
-
-        optimize_with_interface(&mut func, &interface);
-
-        let retained = func
-            .get_block(0x1000)
-            .expect("return block")
-            .ops
-            .iter()
-            .filter_map(|op| op.dst())
-            .filter_map(|dst| func.canonical_storage_for_var(dst))
-            .collect::<Vec<_>>();
-        assert!(retained.contains(&register_storage(0, 8)));
-        assert!(
-            !retained.contains(&register_storage(0x40, 8)),
-            "a spoofed rax name outside the source-owned return storage must be dead"
-        );
     }
 }

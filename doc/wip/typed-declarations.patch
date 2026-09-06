@@ -1,0 +1,2099 @@
+diff --git a/crates/r2dec/src/binding_plan/construction.rs b/crates/r2dec/src/binding_plan/construction.rs
+index 89be38e..b718c3b 100644
+--- a/crates/r2dec/src/binding_plan/construction.rs
++++ b/crates/r2dec/src/binding_plan/construction.rs
+@@ -742,7 +742,15 @@ impl BindingPlan {
+                 .iter()
+                 .any(|value| graph.def_inst(*value).is_none());
+             bindings.push(Binding {
+-                declaration_type: CType::machine_bits(width_bits),
++                declaration_type: super::rules::declaration_type_for_binding(
++                    source_owned,
++                    component.members.iter().copied(),
++                    width_bits,
++                    source
++                        .machine_context()
++                        .memory_model()
++                        .default_address_bits(),
++                ),
+                 certificate: BindingCertificate {
+                     sources: component
+                         .sources
+@@ -925,7 +933,12 @@ impl BindingPlan {
+                         });
+                     };
+                     bindings.push(Binding {
+-                        declaration_type: CType::machine_bits(width_bits),
++                        declaration_type: super::rules::declaration_type_for_stack_object(
++                            source_owned,
++                            *object,
++                            width_bits,
++                            source.machine_context().memory_model().default_address_bits(),
++                        ),
+                         certificate: BindingCertificate {
+                             sources: Box::new([BindingCertificateSource::CertifiedEntity(*id)]),
+                         },
+@@ -949,7 +962,12 @@ impl BindingPlan {
+                         });
+                     };
+                     bindings.push(Binding {
+-                        declaration_type: CType::machine_bits(width_bits),
++                        declaration_type: super::rules::declaration_type_for_stack_object(
++                            source_owned,
++                            *object,
++                            width_bits,
++                            source.machine_context().memory_model().default_address_bits(),
++                        ),
+                         certificate: BindingCertificate {
+                             sources: Box::new([BindingCertificateSource::CertifiedEntity(*id)]),
+                         },
+@@ -983,7 +1001,12 @@ impl BindingPlan {
+                             });
+                         };
+                         bindings.push(Binding {
+-                            declaration_type: CType::machine_bits(width_bits),
++                            declaration_type: super::rules::declaration_type_for_stack_object(
++                                source_owned,
++                                *object,
++                                width_bits,
++                                source.machine_context().memory_model().default_address_bits(),
++                            ),
+                             certificate: BindingCertificate {
+                                 sources: Box::new([BindingCertificateSource::CertifiedEntity(*id)]),
+                             },
+diff --git a/crates/r2dec/src/binding_plan/rules.rs b/crates/r2dec/src/binding_plan/rules.rs
+index a5a5a89..8f22495 100644
+--- a/crates/r2dec/src/binding_plan/rules.rs
++++ b/crates/r2dec/src/binding_plan/rules.rs
+@@ -71,6 +71,149 @@ pub(super) fn component_eligible_values(
+         .collect())
+ }
+ 
++/// The type one object is declared with.
++///
++/// Until now every binding was declared `CType::machine_bits(width)` -- the
++/// unsigned integer of its storage's width -- and the recovered type was
++/// reported by the typed-recovery score rather than asserted in the C. That
++/// makes every parameter a `uint64_t`, so nothing the evidence solver proves
++/// about a pointer or a narrower result reaches a reader or a recompile.
++///
++/// The evidence decides it now, and only where it agrees with itself and with
++/// the storage. Every member of one binding is one object, so members that
++/// carry different evidence types are a genuine conflict and the machine word
++/// stands; a type whose width does not match the storage is not a description
++/// of this object and is refused the same way. A pointer is the one type whose
++/// width is the pointer width rather than the declared object's, and it is
++/// admitted at exactly that width.
++///
++/// Casts follow the declaration -- `source_type_for_var` asks the declaration
++/// before the certified hint -- so asserting here changes the operands too,
++/// which is what keeps the emitted C compiling under `-Werror` rather than
++/// converting an argument's signedness against its own declaration.
++pub(super) fn declaration_type_for_binding(
++    source_owned: &SourceOwnedFunctionFacts,
++    members: impl IntoIterator<Item = ValueId>,
++    width_bits: u32,
++    ptr_bits: u32,
++) -> r2types::CTypeLike {
++    let machine = r2types::CTypeLike::machine_bits(width_bits);
++    let evidence = source_owned.evidence_types();
++    let mut agreed: Option<r2types::CTypeLike> = None;
++    for value in members {
++        let Some(ty) = evidence.value_type(value) else {
++            continue;
++        };
++        match &agreed {
++            None => agreed = Some(ty.clone()),
++            Some(existing) if existing == ty => {}
++            Some(_) => return machine,
++        }
++    }
++    let Some(agreed) = agreed else {
++        return machine;
++    };
++    admit_declaration(agreed, width_bits, ptr_bits)
++}
++
++/// The type a stack object is declared with.
++///
++/// A spilled pointer is a pointer. Declaring the slot the machine word while
++/// the register it is spilled from is a pointer makes the reload
++/// `p = slot;` -- an integer assigned to a pointer, which does not compile --
++/// so the object and the values that flow through it have to be declared from
++/// the same evidence.
++pub(super) fn declaration_type_for_stack_object(
++    source_owned: &SourceOwnedFunctionFacts,
++    object: r2ssa::ObjectId,
++    width_bits: u32,
++    ptr_bits: u32,
++) -> r2types::CTypeLike {
++    let machine = r2types::CTypeLike::machine_bits(width_bits);
++    let source = source_owned.source();
++    let Some(fact) = source.objects().object(object) else {
++        return machine;
++    };
++    let (base, offset) = match fact.kind {
++        r2ssa::ObjectKind::StackSlot { base, offset, .. }
++        | r2ssa::ObjectKind::FrameObject { base, offset, .. } => (base, offset),
++        _ => return machine,
++    };
++    let key = r2types::StackSlotKey {
++        base: match base {
++            r2ssa::StackAddressBase::FramePointer => r2types::ExternalStackBase::FramePointer,
++            r2ssa::StackAddressBase::StackPointer => r2types::ExternalStackBase::StackPointer,
++        },
++        offset,
++    };
++    let Some((_, ty)) = source_owned
++        .evidence_types()
++        .stack_slot_types()
++        .find(|(slot, _)| **slot == key)
++    else {
++        return machine;
++    };
++    admit_declaration(ty.clone(), width_bits, ptr_bits)
++}
++
++/// Admit a recovered type only where it describes an object of this storage.
++///
++/// A type whose width is not the storage's width is not a description of this
++/// object, whatever else it may be true of, and the machine word stands. A
++/// pointer is the one type whose width is the pointer width rather than the
++/// declared object's, and it is admitted at exactly that width.
++fn admit_declaration(
++    ty: r2types::CTypeLike,
++    width_bits: u32,
++    ptr_bits: u32,
++) -> r2types::CTypeLike {
++    let admissible = match &ty {
++        r2types::CTypeLike::Pointer(_) => width_bits == ptr_bits,
++        r2types::CTypeLike::Int { bits, .. } => *bits == width_bits,
++        r2types::CTypeLike::Float(bits) => *bits == width_bits,
++        _ => false,
++    };
++    if admissible {
++        ty
++    } else {
++        r2types::CTypeLike::machine_bits(width_bits)
++    }
++}
++
++/// The storage width a declared type describes.
++///
++/// This is what the seal checks a declaration against. It used to compare the
++/// declaration to `CType::machine_bits(width)` outright, which is a check that
++/// the declaration is the machine word rather than a check that it describes
++/// the storage -- so it rejected every recovered type on sight. The width is
++/// the part the seal can re-derive from the source; what the evidence proved
++/// beyond it is not something a second derivation of the *plan* can confirm.
++pub(super) fn declaration_type_width(ty: &r2types::CTypeLike, ptr_bits: u32) -> Option<u32> {
++    match ty {
++        r2types::CTypeLike::Int {
++            bits,
++            signedness: r2types::Signedness::Unsigned,
++        } if *bits <= 128 => Some(*bits),
++        r2types::CTypeLike::Int {
++            bits,
++            signedness: r2types::Signedness::Signed,
++        } if *bits <= 128 => Some(*bits),
++        r2types::CTypeLike::Float(bits) if *bits <= 128 => Some(*bits),
++        r2types::CTypeLike::Pointer(_) => Some(ptr_bits),
++        r2types::CTypeLike::BitVector(bits) if *bits > 128 => Some(*bits),
++        _ => None,
++    }
++}
++
++/// Whether a declaration describes an object of exactly this storage width.
++pub(super) fn declaration_type_describes_width(
++    ty: &r2types::CTypeLike,
++    width_bits: u32,
++    ptr_bits: u32,
++) -> bool {
++    declaration_type_width(ty, ptr_bits) == Some(width_bits)
++}
++
+ /// The pairs of values some one instruction reads at the same time.
+ ///
+ /// If a single instruction takes both values as inputs, both hold their
+diff --git a/crates/r2dec/src/binding_plan/seal.rs b/crates/r2dec/src/binding_plan/seal.rs
+index 7d25c29..e397927 100644
+--- a/crates/r2dec/src/binding_plan/seal.rs
++++ b/crates/r2dec/src/binding_plan/seal.rs
+@@ -128,15 +128,8 @@ fn seal_parameter_width(
+         })
+ }
+ 
+-fn binding_declaration_width(ty: &CType) -> Option<u32> {
+-    match ty {
+-        CType::Int {
+-            bits,
+-            signedness: r2types::Signedness::Unsigned,
+-        } if *bits <= 128 => Some(*bits),
+-        CType::BitVector(bits) if *bits > 128 => Some(*bits),
+-        _ => None,
+-    }
++fn binding_declaration_width(ty: &CType, ptr_bits: u32) -> Option<u32> {
++    super::rules::declaration_type_width(ty, ptr_bits)
+ }
+ 
+ /// Resolve the certificate relation independently of construction's union-find.
+@@ -600,6 +593,10 @@ impl BindingPlan {
+         self.validate_source(source)
+             .map_err(BindingPlanBuildError::Seal)?;
+         let graph = source.graph();
++        let ptr_bits = source
++            .machine_context()
++            .memory_model()
++            .default_address_bits();
+         if self.dispositions.len() != graph.values.len() {
+             return Err(BindingPlanBuildError::Seal(
+                 BindingPlanSourceMismatch::DispositionCount {
+@@ -780,7 +777,8 @@ impl BindingPlan {
+                             },
+                         ));
+                     }
+-                    let Some(width_bits) = binding_declaration_width(&binding.declaration_type)
++                    let Some(width_bits) =
++                        binding_declaration_width(&binding.declaration_type, ptr_bits)
+                     else {
+                         return Err(BindingPlanBuildError::Seal(
+                             BindingPlanSourceMismatch::DeclarationWidth {
+@@ -898,7 +896,11 @@ impl BindingPlan {
+                                 BindingPlanSourceMismatch::ParameterCertificate { slot, binding },
+                             ));
+                         }
+-                        if planned.declaration_type != CType::machine_bits(width_bits) {
++                        if !super::rules::declaration_type_describes_width(
++                            &planned.declaration_type,
++                            width_bits,
++                            ptr_bits,
++                        ) {
+                             return Err(BindingPlanBuildError::Seal(
+                                 BindingPlanSourceMismatch::ParameterDeclarationWidth {
+                                     slot,
+@@ -1072,7 +1074,11 @@ impl BindingPlan {
+                             BindingPlanSourceMismatch::StackObjectCertificate { object, binding },
+                         ));
+                     }
+-                    if planned.declaration_type != CType::machine_bits(width_bits) {
++                    if !super::rules::declaration_type_describes_width(
++                            &planned.declaration_type,
++                            width_bits,
++                            ptr_bits,
++                        ) {
+                         return Err(BindingPlanBuildError::Seal(
+                             BindingPlanSourceMismatch::StackObjectDeclarationWidth {
+                                 object,
+@@ -1122,7 +1128,11 @@ impl BindingPlan {
+                             ));
+                         }
+                         if width_bits.is_none_or(|width_bits| {
+-                            planned.declaration_type != CType::machine_bits(width_bits)
++                            !super::rules::declaration_type_describes_width(
++                            &planned.declaration_type,
++                            width_bits,
++                            ptr_bits,
++                        )
+                         }) {
+                             return Err(BindingPlanBuildError::Seal(
+                                 BindingPlanSourceMismatch::StackObjectDeclarationWidth {
+@@ -1189,7 +1199,11 @@ impl BindingPlan {
+                                     },
+                                 ));
+                             }
+-                            if planned.declaration_type != CType::machine_bits(width_bits) {
++                            if !super::rules::declaration_type_describes_width(
++                            &planned.declaration_type,
++                            width_bits,
++                            ptr_bits,
++                        ) {
+                                 return Err(BindingPlanBuildError::Seal(
+                                     BindingPlanSourceMismatch::StackObjectDeclarationWidth {
+                                         object,
+diff --git a/crates/r2dec/src/fold/op_lower/implementation.rs b/crates/r2dec/src/fold/op_lower/implementation.rs
+index 7ceac57..848e9d6 100644
+--- a/crates/r2dec/src/fold/op_lower/implementation.rs
++++ b/crates/r2dec/src/fold/op_lower/implementation.rs
+@@ -1996,7 +1996,14 @@ impl<'a> FoldingContext<'a> {
+     }
+     fn cast_needed(&self, target: &CType, source: Option<&RecordedType>) -> bool {
+         let Some(source) = source.map(RecordedType::get) else {
+-            return false;
++            // Not knowing what the expression's type is says nothing about
++            // whether a conversion is needed, and for a pointer target it is
++            // exactly the case where one always is: C converts an integer to a
++            // pointer only when the program says so. Returning `false` here
++            // was safe while every declaration was an unsigned machine word
++            // and became `int8_t *p = some_uint64;` the moment the evidence
++            // was allowed to name a pointer.
++            return matches!(target, CType::Pointer(_));
+         };
+ 
+         if target == source {
+@@ -2033,6 +2040,19 @@ impl<'a> FoldingContext<'a> {
+         {
+             return expr;
+         }
++        // A pointer narrowed straight to a smaller integer is
++        // `-Wpointer-to-int-cast`: address bits are lost and the compiler will
++        // not let that be implicit. Converting at the pointer's own width
++        // first makes the narrowing the program's own statement.
++        if let CExpr::Cast {
++            ty: CType::Pointer(_),
++            ..
++        } = expr.unobserved()
++            && let CType::Int { bits, .. } = &target
++            && *bits < 64
++        {
++            return CExpr::cast(target, CExpr::cast(CType::uint(64), expr));
++        }
+         CExpr::cast(target, expr)
+     }
+ 
+@@ -2047,13 +2067,83 @@ impl<'a> FoldingContext<'a> {
+         {
+             return expr;
+         }
+-        if self.cast_needed(&target, source) {
++        // The expression itself is evidence when the source type is not
++        // recorded. A pointer-valued expression assigned to an integer needs
++        // the conversion spelled exactly as the other direction does, and
++        // asking only the recorded type meant `uint64_t n = p + i;` went out
++        // unconverted.
++        let pointer_valued = source.is_none()
++            && !matches!(target, CType::Pointer(_))
++            && self.int_meta(&target).is_some()
++            && self.looks_like_pointer(&expr);
++        if pointer_valued || self.cast_needed(&target, source) {
++            // A pointer converts to an integer of its own width; converting it
++            // straight to a narrower one is a diagnostic in its own right
++            // (`-Wpointer-to-int-cast`) because the conversion loses address
++            // bits silently. Spelling the full-width step makes the narrowing
++            // the program's statement rather than the compiler's guess.
++            if let CType::Pointer(_) = &target
++                && let Some((_, bits)) = self.expr_type_hint(&expr).and_then(|ty| self.int_meta(&ty))
++                && let Some(pointer_bits) = self
++                    .inputs
++                    .prepared_ssa
++                    .map(|prepared| prepared.machine_context().memory_model().default_address_bits())
++                && bits < pointer_bits
++            {
++                return CExpr::cast(target, CExpr::cast(uint_type_from_size(pointer_bits / 8), expr));
++            }
++            if self.looks_like_pointer(&expr)
++                && let Some((_, bits)) = self.int_meta(&target)
++                && let Some(pointer_bits) = self
++                    .inputs
++                    .prepared_ssa
++                    .map(|prepared| prepared.machine_context().memory_model().default_address_bits())
++                && bits < pointer_bits
++            {
++                return CExpr::cast(target, CExpr::cast(uint_type_from_size(pointer_bits / 8), expr));
++            }
+             CExpr::cast(target, expr)
+         } else {
+             expr
+         }
+     }
+ 
++    /// Convert a stored value to the declared type of the object written.
++    ///
++    /// A store's left-hand side is a certified access rather than a variable,
++    /// so the assignment policy above has no `dst` to ask. The object behind
++    /// the access has a declaration all the same, and it is what the compiler
++    /// reads.
++    fn assignment_rhs_from_stored_object_type(
++        &self,
++        access: r2ssa::StructuredAccessId,
++        val: &SSAVar,
++        rhs: CExpr,
++    ) -> CExpr {
++        let Some(target @ CType::Pointer(_)) = self.stored_object_declaration_type(access) else {
++            return rhs;
++        };
++        let source = self.source_type_for_var(val);
++        self.cast_expr_if_needed(rhs, target, source.as_ref())
++    }
++
++    /// The declared type of the stack object a certified access writes.
++    fn stored_object_declaration_type(
++        &self,
++        access: r2ssa::StructuredAccessId,
++    ) -> Option<CType> {
++        let names = self.inputs.binding_names?;
++        let fact = self
++            .certified_memory_access_for_current_op(true)
++            .filter(|fact| fact.access == access)?;
++        let crate::binding_plan::StackObjectDisposition::Bound { binding } =
++            names.plan().stack_object_disposition(fact.object)?
++        else {
++            return None;
++        };
++        Some(names.plan().binding(binding)?.declaration_type().clone())
++    }
++
+     fn assignment_rhs_with_type_policy(
+         &self,
+         dst: &SSAVar,
+@@ -2367,8 +2457,15 @@ impl<'a> FoldingContext<'a> {
+                 let lhs = self.assignment_lhs_expr(dst)?;
+                 let rhs_base = self.get_expr(src)?;
+                 let rhs = self.resolve_predicate_rhs_for_var(src, rhs_base);
+-                let rhs = self.assignment_rhs_with_type_policy(dst, Some(src), rhs);
++                // The operand is projected before it is converted, not after.
++                // The projection says which bits of the source object are
++                // read; the assignment cast says what the destination is. Run
++                // the other way round it re-wrapped a value already converted
++                // to the destination's type back into the source carrier's
++                // integer, which spells `int8_t *p = (uint64_t)(int8_t *)q;`
++                // once a destination may be a pointer.
+                 let rhs = self.observed_input(frame, 0, rhs);
++                let rhs = self.assignment_rhs_with_type_policy(dst, Some(src), rhs);
+                 self.assign_stmt(lhs, rhs)
+             }
+             SSAOp::Load { dst, addr, space } => {
+@@ -2409,6 +2506,7 @@ impl<'a> FoldingContext<'a> {
+                     .unwrap_or_else(|| type_from_size(val.size));
+                 let certified_lhs =
+                     self.render_certified_store_access_expr(addr, val, elem_ty.clone())?;
++                let stored_access = certified_lhs.access();
+                 // A use of a call result used to re-render the call, because
+                 // the result had no name of its own. It has one now: the site
+                 // assigns it, and rendering the call here as well would call
+@@ -2437,6 +2535,12 @@ impl<'a> FoldingContext<'a> {
+                 }
+                 let lhs = self.observed_memory_input(frame, 0, certified_lhs);
+                 let rhs = self.observed_input(frame, 1, rhs);
++                // A slot the evidence declared a pointer takes a pointer;
++                // storing the machine word into it does not compile. Only that
++                // direction is spelled here -- converting a stored value *to*
++                // an integer is what the access projection already did, and
++                // saying it again undid the pointer the read had just given.
++                let rhs = self.assignment_rhs_from_stored_object_type(stored_access, val, rhs);
+                 self.assign_stmt(lhs, rhs)
+             }
+             SSAOp::Fence { ordering } => Some(CStmt::Expr(CExpr::call(
+@@ -2733,16 +2837,21 @@ impl<'a> FoldingContext<'a> {
+             SSAOp::Subpiece { dst, src, offset } => {
+                 let lhs = self.assignment_lhs_expr(dst)?;
+                 let src_expr = input(0, src)?;
++                // Through `cast_expr_to`, which knows that a pointer narrowed
++                // straight to a smaller integer loses address bits and has to
++                // be converted at its own width first. A register alias is a
++                // `Subpiece` at offset zero, and taking the low half of a
++                // pointer-declared register is exactly that case.
+                 let rhs = if *offset == 0 && dst.size == src.size {
+                     src_expr
+                 } else if *offset == 0 {
+-                    CExpr::cast(uint_type_from_size(dst.size), src_expr)
++                    Self::cast_expr_to(src_expr, uint_type_from_size(dst.size))
+                 } else {
+                     let shift_bits = offset.saturating_mul(8);
+-                    let src_cast = CExpr::cast(uint_type_from_size(src.size), src_expr);
++                    let src_cast = Self::cast_expr_to(src_expr, uint_type_from_size(src.size));
+                     let shifted =
+                         CExpr::binary(BinaryOp::Shr, src_cast, CExpr::IntLit(shift_bits as i64));
+-                    CExpr::cast(uint_type_from_size(dst.size), shifted)
++                    Self::cast_expr_to(shifted, uint_type_from_size(dst.size))
+                 };
+                 self.assign_stmt(lhs, rhs)
+             }
+@@ -3123,6 +3232,26 @@ impl<'a> FoldingContext<'a> {
+             self.observed_input(frame, 0, self.retain_lowering_result(self.get_expr(a))?);
+         let mut rhs_expr =
+             self.observed_input(frame, 1, self.retain_lowering_result(self.get_expr(b))?);
++        // C adds an integer to a pointer, never a pointer to a pointer. Both
++        // operands can be pointer-declared honestly -- a value used as an
++        // address somewhere else is a pointer wherever it is read -- and the
++        // sum is still one base and one offset. The left operand keeps the
++        // pointer and the right becomes the offset it is being used as, which
++        // is what the machine addition computes either way.
++        // Machine address arithmetic counts bytes; C pointer arithmetic counts
++        // elements. `(int32_t *)p + 4` moves sixteen bytes where the
++        // instruction moved four, and `xxhash32` at arm64 -O1 computed the
++        // wrong hash from exactly that. Neither operand stays a pointer here:
++        // the addition is done on the addresses as numbers, which is what the
++        // machine did, and the destination's own declaration puts the pointer
++        // back. It also settles the cases C rejects outright -- a pointer
++        // added to a pointer, and a pointer subtracted from an integer.
++        if matches!(op, BinaryOp::Add | BinaryOp::Sub)
++            && (self.looks_like_pointer(&lhs_expr) || self.looks_like_pointer(&rhs_expr))
++        {
++            lhs_expr = Self::cast_expr_to(lhs_expr, uint_type_from_size(a.size));
++            rhs_expr = Self::cast_expr_to(rhs_expr, uint_type_from_size(b.size));
++        }
+         let produced_ty = operand_ty.clone();
+         if let Some(ty) = operand_ty {
+             // Stated, not hinted. This type is the operation: `IntSLess` and
+diff --git a/crates/r2dec/src/fold/op_lower/lowering.rs b/crates/r2dec/src/fold/op_lower/lowering.rs
+index 4cb46a9..75aa825 100644
+--- a/crates/r2dec/src/fold/op_lower/lowering.rs
++++ b/crates/r2dec/src/fold/op_lower/lowering.rs
+@@ -1,6 +1,6 @@
+ use super::calls::CertifiedCallArgs;
+ use super::memory_renderer::CertifiedMemoryAccessExpr;
+-use super::projection::{project_machine_use, project_machine_write};
++use super::projection::project_machine_write;
+ use super::*;
+ 
+ fn operation_requires_final_write_projection(op: &SSAOp) -> bool {
+@@ -148,11 +148,24 @@ impl<'a> FoldingContext<'a> {
+         };
+         match names.require_write(output.inst) {
+             Ok(r2ssa::MachineWriteDisposition::Exact(projection)) => {
+-                project_machine_write(lhs, rhs, *projection).map_err(|_| {
++                let (lhs, rhs) = project_machine_write(lhs, rhs, *projection).map_err(|_| {
+                     crate::observation_journal::LegacyObservationJournalError::RefusedRenderedWrite(
+                         output.inst,
+                     )
+-                })
++                })?;
++                // The projection spells how the machine writes the carrier --
++                // a lane, or a zero-extension into the full register -- in the
++                // carrier's unsigned integer. That is the last word only while
++                // the object being written is that integer. Where the plan
++                // declared it a pointer, the conversion to the declaration is
++                // what the compiler reads, and it goes outside the projection
++                // rather than under it.
++                if let Some(declared @ CType::Pointer(_)) =
++                    self.value_declaration_type(output.value)
++                {
++                    return Ok((lhs, CExpr::cast(declared, rhs)));
++                }
++                Ok((lhs, rhs))
+             }
+             Ok(r2ssa::MachineWriteDisposition::Refused(_)) => {
+                 unreachable!("require_write cannot return a refused disposition")
+@@ -279,6 +292,17 @@ impl<'a> FoldingContext<'a> {
+         lowered.ok().flatten()
+     }
+ 
++    /// The type the plan declares for a value, if it declares one.
++    fn value_declaration_type(&self, value: ValueId) -> Option<CType> {
++        let names = self.inputs.binding_names?;
++        let crate::binding_plan::ValueDisposition::Bound { binding } =
++            names.disposition_for_value(value)?
++        else {
++            return None;
++        };
++        Some(names.plan().binding(*binding)?.declaration_type().clone())
++    }
++
+     fn materialize_machine_expr(
+         &self,
+         names: &crate::binding_plan::BindingNameResolution,
+@@ -733,14 +757,35 @@ impl<'a> FoldingContext<'a> {
+                     input_idx,
+                     self.planned_value_expr(input.value)?,
+                 );
+-                project_machine_use(base, slice).map_err(|_| {
++                // A pointer read whole is spelled at its own type. The
++                // projection casts to the unsigned integer of the carrier's
++                // width, which is what every object used to be declared as;
++                // applied to an object the evidence declared a pointer it says
++                // `(uint64_t)p`, and the assignment that follows will not
++                // compile. The slice is the whole carrier at offset zero, so
++                // the projection selects nothing and the declared type is the
++                // exact statement to make about what is read.
++                let declared_pointer = matches!(
++                    self.value_declaration_type(input.value),
++                    Some(CType::Pointer(_))
++                );
++                if declared_pointer
++                    && slice.bit_offset() == 0
++                    && slice.width_bits() == slice.carrier_width_bits()
++                    && let Some(declared) = self.value_declaration_type(input.value)
++                {
++                    return Ok(CExpr::cast(declared, base));
++                }
++                super::projection::project_machine_use_of(base, slice, declared_pointer).map_err(
++                    |_| {
+                     // The machine use is exact, but the strict C dialect cannot spell
+                     // this projection without more type evidence. Refuse the emitted
+                     // occurrence instead of inventing an integer or pointer type.
+-                    crate::observation_journal::LegacyObservationJournalError::RefusedRenderedUse(
+-                        first_site,
+-                    )
+-                })
++                        crate::observation_journal::LegacyObservationJournalError::RefusedRenderedUse(
++                            first_site,
++                        )
++                    },
++                )
+             }
+             // A contextual address cannot be projected from an arbitrary AST.
+             // Only `planned_memory_input_expr` accepts the opaque expression
+diff --git a/crates/r2dec/src/fold/op_lower/projection.rs b/crates/r2dec/src/fold/op_lower/projection.rs
+index 636d2d7..f146830 100644
+--- a/crates/r2dec/src/fold/op_lower/projection.rs
++++ b/crates/r2dec/src/fold/op_lower/projection.rs
+@@ -69,6 +69,26 @@ pub(super) fn project_machine_use(
+     base: CExpr,
+     slice: MachineUseSlice,
+ ) -> Result<CExpr, MachineUseProjectionError> {
++    project_machine_use_of(base, slice, false)
++}
++
++/// Project a use, saying whether the object being read is a pointer.
++///
++/// A pointer cannot be sliced: `(uint32_t)p` narrows an address and the
++/// compiler says so (`-Wpointer-to-int-cast`), and casting it to the carrier's
++/// unsigned integer is the step that makes the slice meaningful. Reading the
++/// whole of a pointer is not a projection at all, and spelling it at the
++/// pointer's own type keeps the value a pointer for whatever reads it.
++pub(super) fn project_machine_use_of(
++    base: CExpr,
++    slice: MachineUseSlice,
++    base_is_pointer: bool,
++) -> Result<CExpr, MachineUseProjectionError> {
++    let base = if base_is_pointer && c_integer_width_is_spellable(slice.carrier_width_bits()) {
++        CExpr::cast(checked_uint_type(slice.carrier_width_bits())?, base)
++    } else {
++        base
++    };
+     let projected = if c_integer_width_is_spellable(slice.carrier_width_bits()) {
+         let carrier_type = checked_uint_type(slice.carrier_width_bits())?;
+         let selected_type = checked_uint_type(slice.width_bits())?;
+diff --git a/doc/wip/typed-declarations.patch b/doc/wip/typed-declarations.patch
+index 9f964d4..a26c327 100644
+--- a/doc/wip/typed-declarations.patch
++++ b/doc/wip/typed-declarations.patch
+@@ -1,1438 +0,0 @@
+-diff --git a/crates/r2dec/src/binding_plan/construction.rs b/crates/r2dec/src/binding_plan/construction.rs
+-index 89be38e..b718c3b 100644
+---- a/crates/r2dec/src/binding_plan/construction.rs
+-+++ b/crates/r2dec/src/binding_plan/construction.rs
+-@@ -742,7 +742,15 @@ impl BindingPlan {
+-                 .iter()
+-                 .any(|value| graph.def_inst(*value).is_none());
+-             bindings.push(Binding {
+--                declaration_type: CType::machine_bits(width_bits),
+-+                declaration_type: super::rules::declaration_type_for_binding(
+-+                    source_owned,
+-+                    component.members.iter().copied(),
+-+                    width_bits,
+-+                    source
+-+                        .machine_context()
+-+                        .memory_model()
+-+                        .default_address_bits(),
+-+                ),
+-                 certificate: BindingCertificate {
+-                     sources: component
+-                         .sources
+-@@ -925,7 +933,12 @@ impl BindingPlan {
+-                         });
+-                     };
+-                     bindings.push(Binding {
+--                        declaration_type: CType::machine_bits(width_bits),
+-+                        declaration_type: super::rules::declaration_type_for_stack_object(
+-+                            source_owned,
+-+                            *object,
+-+                            width_bits,
+-+                            source.machine_context().memory_model().default_address_bits(),
+-+                        ),
+-                         certificate: BindingCertificate {
+-                             sources: Box::new([BindingCertificateSource::CertifiedEntity(*id)]),
+-                         },
+-@@ -949,7 +962,12 @@ impl BindingPlan {
+-                         });
+-                     };
+-                     bindings.push(Binding {
+--                        declaration_type: CType::machine_bits(width_bits),
+-+                        declaration_type: super::rules::declaration_type_for_stack_object(
+-+                            source_owned,
+-+                            *object,
+-+                            width_bits,
+-+                            source.machine_context().memory_model().default_address_bits(),
+-+                        ),
+-                         certificate: BindingCertificate {
+-                             sources: Box::new([BindingCertificateSource::CertifiedEntity(*id)]),
+-                         },
+-@@ -983,7 +1001,12 @@ impl BindingPlan {
+-                             });
+-                         };
+-                         bindings.push(Binding {
+--                            declaration_type: CType::machine_bits(width_bits),
+-+                            declaration_type: super::rules::declaration_type_for_stack_object(
+-+                                source_owned,
+-+                                *object,
+-+                                width_bits,
+-+                                source.machine_context().memory_model().default_address_bits(),
+-+                            ),
+-                             certificate: BindingCertificate {
+-                                 sources: Box::new([BindingCertificateSource::CertifiedEntity(*id)]),
+-                             },
+-diff --git a/crates/r2dec/src/binding_plan/rules.rs b/crates/r2dec/src/binding_plan/rules.rs
+-index a5a5a89..8f22495 100644
+---- a/crates/r2dec/src/binding_plan/rules.rs
+-+++ b/crates/r2dec/src/binding_plan/rules.rs
+-@@ -71,6 +71,149 @@ pub(super) fn component_eligible_values(
+-         .collect())
+- }
+- 
+-+/// The type one object is declared with.
+-+///
+-+/// Until now every binding was declared `CType::machine_bits(width)` -- the
+-+/// unsigned integer of its storage's width -- and the recovered type was
+-+/// reported by the typed-recovery score rather than asserted in the C. That
+-+/// makes every parameter a `uint64_t`, so nothing the evidence solver proves
+-+/// about a pointer or a narrower result reaches a reader or a recompile.
+-+///
+-+/// The evidence decides it now, and only where it agrees with itself and with
+-+/// the storage. Every member of one binding is one object, so members that
+-+/// carry different evidence types are a genuine conflict and the machine word
+-+/// stands; a type whose width does not match the storage is not a description
+-+/// of this object and is refused the same way. A pointer is the one type whose
+-+/// width is the pointer width rather than the declared object's, and it is
+-+/// admitted at exactly that width.
+-+///
+-+/// Casts follow the declaration -- `source_type_for_var` asks the declaration
+-+/// before the certified hint -- so asserting here changes the operands too,
+-+/// which is what keeps the emitted C compiling under `-Werror` rather than
+-+/// converting an argument's signedness against its own declaration.
+-+pub(super) fn declaration_type_for_binding(
+-+    source_owned: &SourceOwnedFunctionFacts,
+-+    members: impl IntoIterator<Item = ValueId>,
+-+    width_bits: u32,
+-+    ptr_bits: u32,
+-+) -> r2types::CTypeLike {
+-+    let machine = r2types::CTypeLike::machine_bits(width_bits);
+-+    let evidence = source_owned.evidence_types();
+-+    let mut agreed: Option<r2types::CTypeLike> = None;
+-+    for value in members {
+-+        let Some(ty) = evidence.value_type(value) else {
+-+            continue;
+-+        };
+-+        match &agreed {
+-+            None => agreed = Some(ty.clone()),
+-+            Some(existing) if existing == ty => {}
+-+            Some(_) => return machine,
+-+        }
+-+    }
+-+    let Some(agreed) = agreed else {
+-+        return machine;
+-+    };
+-+    admit_declaration(agreed, width_bits, ptr_bits)
+-+}
+-+
+-+/// The type a stack object is declared with.
+-+///
+-+/// A spilled pointer is a pointer. Declaring the slot the machine word while
+-+/// the register it is spilled from is a pointer makes the reload
+-+/// `p = slot;` -- an integer assigned to a pointer, which does not compile --
+-+/// so the object and the values that flow through it have to be declared from
+-+/// the same evidence.
+-+pub(super) fn declaration_type_for_stack_object(
+-+    source_owned: &SourceOwnedFunctionFacts,
+-+    object: r2ssa::ObjectId,
+-+    width_bits: u32,
+-+    ptr_bits: u32,
+-+) -> r2types::CTypeLike {
+-+    let machine = r2types::CTypeLike::machine_bits(width_bits);
+-+    let source = source_owned.source();
+-+    let Some(fact) = source.objects().object(object) else {
+-+        return machine;
+-+    };
+-+    let (base, offset) = match fact.kind {
+-+        r2ssa::ObjectKind::StackSlot { base, offset, .. }
+-+        | r2ssa::ObjectKind::FrameObject { base, offset, .. } => (base, offset),
+-+        _ => return machine,
+-+    };
+-+    let key = r2types::StackSlotKey {
+-+        base: match base {
+-+            r2ssa::StackAddressBase::FramePointer => r2types::ExternalStackBase::FramePointer,
+-+            r2ssa::StackAddressBase::StackPointer => r2types::ExternalStackBase::StackPointer,
+-+        },
+-+        offset,
+-+    };
+-+    let Some((_, ty)) = source_owned
+-+        .evidence_types()
+-+        .stack_slot_types()
+-+        .find(|(slot, _)| **slot == key)
+-+    else {
+-+        return machine;
+-+    };
+-+    admit_declaration(ty.clone(), width_bits, ptr_bits)
+-+}
+-+
+-+/// Admit a recovered type only where it describes an object of this storage.
+-+///
+-+/// A type whose width is not the storage's width is not a description of this
+-+/// object, whatever else it may be true of, and the machine word stands. A
+-+/// pointer is the one type whose width is the pointer width rather than the
+-+/// declared object's, and it is admitted at exactly that width.
+-+fn admit_declaration(
+-+    ty: r2types::CTypeLike,
+-+    width_bits: u32,
+-+    ptr_bits: u32,
+-+) -> r2types::CTypeLike {
+-+    let admissible = match &ty {
+-+        r2types::CTypeLike::Pointer(_) => width_bits == ptr_bits,
+-+        r2types::CTypeLike::Int { bits, .. } => *bits == width_bits,
+-+        r2types::CTypeLike::Float(bits) => *bits == width_bits,
+-+        _ => false,
+-+    };
+-+    if admissible {
+-+        ty
+-+    } else {
+-+        r2types::CTypeLike::machine_bits(width_bits)
+-+    }
+-+}
+-+
+-+/// The storage width a declared type describes.
+-+///
+-+/// This is what the seal checks a declaration against. It used to compare the
+-+/// declaration to `CType::machine_bits(width)` outright, which is a check that
+-+/// the declaration is the machine word rather than a check that it describes
+-+/// the storage -- so it rejected every recovered type on sight. The width is
+-+/// the part the seal can re-derive from the source; what the evidence proved
+-+/// beyond it is not something a second derivation of the *plan* can confirm.
+-+pub(super) fn declaration_type_width(ty: &r2types::CTypeLike, ptr_bits: u32) -> Option<u32> {
+-+    match ty {
+-+        r2types::CTypeLike::Int {
+-+            bits,
+-+            signedness: r2types::Signedness::Unsigned,
+-+        } if *bits <= 128 => Some(*bits),
+-+        r2types::CTypeLike::Int {
+-+            bits,
+-+            signedness: r2types::Signedness::Signed,
+-+        } if *bits <= 128 => Some(*bits),
+-+        r2types::CTypeLike::Float(bits) if *bits <= 128 => Some(*bits),
+-+        r2types::CTypeLike::Pointer(_) => Some(ptr_bits),
+-+        r2types::CTypeLike::BitVector(bits) if *bits > 128 => Some(*bits),
+-+        _ => None,
+-+    }
+-+}
+-+
+-+/// Whether a declaration describes an object of exactly this storage width.
+-+pub(super) fn declaration_type_describes_width(
+-+    ty: &r2types::CTypeLike,
+-+    width_bits: u32,
+-+    ptr_bits: u32,
+-+) -> bool {
+-+    declaration_type_width(ty, ptr_bits) == Some(width_bits)
+-+}
+-+
+- /// The pairs of values some one instruction reads at the same time.
+- ///
+- /// If a single instruction takes both values as inputs, both hold their
+-diff --git a/crates/r2dec/src/binding_plan/seal.rs b/crates/r2dec/src/binding_plan/seal.rs
+-index 7d25c29..e397927 100644
+---- a/crates/r2dec/src/binding_plan/seal.rs
+-+++ b/crates/r2dec/src/binding_plan/seal.rs
+-@@ -128,15 +128,8 @@ fn seal_parameter_width(
+-         })
+- }
+- 
+--fn binding_declaration_width(ty: &CType) -> Option<u32> {
+--    match ty {
+--        CType::Int {
+--            bits,
+--            signedness: r2types::Signedness::Unsigned,
+--        } if *bits <= 128 => Some(*bits),
+--        CType::BitVector(bits) if *bits > 128 => Some(*bits),
+--        _ => None,
+--    }
+-+fn binding_declaration_width(ty: &CType, ptr_bits: u32) -> Option<u32> {
+-+    super::rules::declaration_type_width(ty, ptr_bits)
+- }
+- 
+- /// Resolve the certificate relation independently of construction's union-find.
+-@@ -600,6 +593,10 @@ impl BindingPlan {
+-         self.validate_source(source)
+-             .map_err(BindingPlanBuildError::Seal)?;
+-         let graph = source.graph();
+-+        let ptr_bits = source
+-+            .machine_context()
+-+            .memory_model()
+-+            .default_address_bits();
+-         if self.dispositions.len() != graph.values.len() {
+-             return Err(BindingPlanBuildError::Seal(
+-                 BindingPlanSourceMismatch::DispositionCount {
+-@@ -780,7 +777,8 @@ impl BindingPlan {
+-                             },
+-                         ));
+-                     }
+--                    let Some(width_bits) = binding_declaration_width(&binding.declaration_type)
+-+                    let Some(width_bits) =
+-+                        binding_declaration_width(&binding.declaration_type, ptr_bits)
+-                     else {
+-                         return Err(BindingPlanBuildError::Seal(
+-                             BindingPlanSourceMismatch::DeclarationWidth {
+-@@ -898,7 +896,11 @@ impl BindingPlan {
+-                                 BindingPlanSourceMismatch::ParameterCertificate { slot, binding },
+-                             ));
+-                         }
+--                        if planned.declaration_type != CType::machine_bits(width_bits) {
+-+                        if !super::rules::declaration_type_describes_width(
+-+                            &planned.declaration_type,
+-+                            width_bits,
+-+                            ptr_bits,
+-+                        ) {
+-                             return Err(BindingPlanBuildError::Seal(
+-                                 BindingPlanSourceMismatch::ParameterDeclarationWidth {
+-                                     slot,
+-@@ -1072,7 +1074,11 @@ impl BindingPlan {
+-                             BindingPlanSourceMismatch::StackObjectCertificate { object, binding },
+-                         ));
+-                     }
+--                    if planned.declaration_type != CType::machine_bits(width_bits) {
+-+                    if !super::rules::declaration_type_describes_width(
+-+                            &planned.declaration_type,
+-+                            width_bits,
+-+                            ptr_bits,
+-+                        ) {
+-                         return Err(BindingPlanBuildError::Seal(
+-                             BindingPlanSourceMismatch::StackObjectDeclarationWidth {
+-                                 object,
+-@@ -1122,7 +1128,11 @@ impl BindingPlan {
+-                             ));
+-                         }
+-                         if width_bits.is_none_or(|width_bits| {
+--                            planned.declaration_type != CType::machine_bits(width_bits)
+-+                            !super::rules::declaration_type_describes_width(
+-+                            &planned.declaration_type,
+-+                            width_bits,
+-+                            ptr_bits,
+-+                        )
+-                         }) {
+-                             return Err(BindingPlanBuildError::Seal(
+-                                 BindingPlanSourceMismatch::StackObjectDeclarationWidth {
+-@@ -1189,7 +1199,11 @@ impl BindingPlan {
+-                                     },
+-                                 ));
+-                             }
+--                            if planned.declaration_type != CType::machine_bits(width_bits) {
+-+                            if !super::rules::declaration_type_describes_width(
+-+                            &planned.declaration_type,
+-+                            width_bits,
+-+                            ptr_bits,
+-+                        ) {
+-                                 return Err(BindingPlanBuildError::Seal(
+-                                     BindingPlanSourceMismatch::StackObjectDeclarationWidth {
+-                                         object,
+-diff --git a/crates/r2dec/src/fold/op_lower/implementation.rs b/crates/r2dec/src/fold/op_lower/implementation.rs
+-index 7ceac57..58cb640 100644
+---- a/crates/r2dec/src/fold/op_lower/implementation.rs
+-+++ b/crates/r2dec/src/fold/op_lower/implementation.rs
+-@@ -1996,7 +1996,14 @@ impl<'a> FoldingContext<'a> {
+-     }
+-     fn cast_needed(&self, target: &CType, source: Option<&RecordedType>) -> bool {
+-         let Some(source) = source.map(RecordedType::get) else {
+--            return false;
+-+            // Not knowing what the expression's type is says nothing about
+-+            // whether a conversion is needed, and for a pointer target it is
+-+            // exactly the case where one always is: C converts an integer to a
+-+            // pointer only when the program says so. Returning `false` here
+-+            // was safe while every declaration was an unsigned machine word
+-+            // and became `int8_t *p = some_uint64;` the moment the evidence
+-+            // was allowed to name a pointer.
+-+            return matches!(target, CType::Pointer(_));
+-         };
+- 
+-         if target == source {
+-@@ -2033,6 +2040,19 @@ impl<'a> FoldingContext<'a> {
+-         {
+-             return expr;
+-         }
+-+        // A pointer narrowed straight to a smaller integer is
+-+        // `-Wpointer-to-int-cast`: address bits are lost and the compiler will
+-+        // not let that be implicit. Converting at the pointer's own width
+-+        // first makes the narrowing the program's own statement.
+-+        if let CExpr::Cast {
+-+            ty: CType::Pointer(_),
+-+            ..
+-+        } = expr.unobserved()
+-+            && let CType::Int { bits, .. } = &target
+-+            && *bits < 64
+-+        {
+-+            return CExpr::cast(target, CExpr::cast(CType::uint(64), expr));
+-+        }
+-         CExpr::cast(target, expr)
+-     }
+- 
+-@@ -2047,13 +2067,72 @@ impl<'a> FoldingContext<'a> {
+-         {
+-             return expr;
+-         }
+--        if self.cast_needed(&target, source) {
+-+        // The expression itself is evidence when the source type is not
+-+        // recorded. A pointer-valued expression assigned to an integer needs
+-+        // the conversion spelled exactly as the other direction does, and
+-+        // asking only the recorded type meant `uint64_t n = p + i;` went out
+-+        // unconverted.
+-+        let pointer_valued = source.is_none()
+-+            && !matches!(target, CType::Pointer(_))
+-+            && self.int_meta(&target).is_some()
+-+            && self.looks_like_pointer(&expr);
+-+        if pointer_valued || self.cast_needed(&target, source) {
+-+            // A pointer converts to an integer of its own width; converting it
+-+            // straight to a narrower one is a diagnostic in its own right
+-+            // (`-Wpointer-to-int-cast`) because the conversion loses address
+-+            // bits silently. Spelling the full-width step makes the narrowing
+-+            // the program's statement rather than the compiler's guess.
+-+            if self.looks_like_pointer(&expr)
+-+                && let Some((_, bits)) = self.int_meta(&target)
+-+                && let Some(pointer_bits) = self
+-+                    .inputs
+-+                    .prepared_ssa
+-+                    .map(|prepared| prepared.machine_context().memory_model().default_address_bits())
+-+                && bits < pointer_bits
+-+            {
+-+                return CExpr::cast(target, CExpr::cast(uint_type_from_size(pointer_bits / 8), expr));
+-+            }
+-             CExpr::cast(target, expr)
+-         } else {
+-             expr
+-         }
+-     }
+- 
+-+    /// Convert a stored value to the declared type of the object written.
+-+    ///
+-+    /// A store's left-hand side is a certified access rather than a variable,
+-+    /// so the assignment policy above has no `dst` to ask. The object behind
+-+    /// the access has a declaration all the same, and it is what the compiler
+-+    /// reads.
+-+    fn assignment_rhs_from_stored_object_type(
+-+        &self,
+-+        addr: &SSAVar,
+-+        val: &SSAVar,
+-+        rhs: CExpr,
+-+    ) -> CExpr {
+-+        let Some(target) = self
+-+            .prepared_value_id_for_var(addr)
+-+            .and_then(|address| self.stored_object_declaration_type(address))
+-+        else {
+-+            return rhs;
+-+        };
+-+        let source = self.source_type_for_var(val);
+-+        self.cast_expr_if_needed(rhs, target, source.as_ref())
+-+    }
+-+
+-+    /// The declared type of the stack object a certified access writes.
+-+    fn stored_object_declaration_type(&self, address: r2ssa::ValueId) -> Option<CType> {
+-+        let names = self.inputs.binding_names?;
+-+        let _ = address;
+-+        let fact = self.certified_memory_access_for_current_op(true)?;
+-+        let crate::binding_plan::StackObjectDisposition::Bound { binding } =
+-+            names.plan().stack_object_disposition(fact.object)?
+-+        else {
+-+            return None;
+-+        };
+-+        Some(names.plan().binding(binding)?.declaration_type().clone())
+-+    }
+-+
+-     fn assignment_rhs_with_type_policy(
+-         &self,
+-         dst: &SSAVar,
+-@@ -2367,8 +2446,15 @@ impl<'a> FoldingContext<'a> {
+-                 let lhs = self.assignment_lhs_expr(dst)?;
+-                 let rhs_base = self.get_expr(src)?;
+-                 let rhs = self.resolve_predicate_rhs_for_var(src, rhs_base);
+--                let rhs = self.assignment_rhs_with_type_policy(dst, Some(src), rhs);
+-+                // The operand is projected before it is converted, not after.
+-+                // The projection says which bits of the source object are
+-+                // read; the assignment cast says what the destination is. Run
+-+                // the other way round it re-wrapped a value already converted
+-+                // to the destination's type back into the source carrier's
+-+                // integer, which spells `int8_t *p = (uint64_t)(int8_t *)q;`
+-+                // once a destination may be a pointer.
+-                 let rhs = self.observed_input(frame, 0, rhs);
+-+                let rhs = self.assignment_rhs_with_type_policy(dst, Some(src), rhs);
+-                 self.assign_stmt(lhs, rhs)
+-             }
+-             SSAOp::Load { dst, addr, space } => {
+-@@ -2437,6 +2523,11 @@ impl<'a> FoldingContext<'a> {
+-                 }
+-                 let lhs = self.observed_memory_input(frame, 0, certified_lhs);
+-                 let rhs = self.observed_input(frame, 1, rhs);
+-+                // The object written decides the conversion, exactly as it
+-+                // does for a register assignment. A stack slot the evidence
+-+                // declared a pointer takes a pointer, and storing the machine
+-+                // word into it does not compile.
+-+                let rhs = self.assignment_rhs_from_stored_object_type(addr, val, rhs);
+-                 self.assign_stmt(lhs, rhs)
+-             }
+-             SSAOp::Fence { ordering } => Some(CStmt::Expr(CExpr::call(
+-@@ -3123,6 +3214,18 @@ impl<'a> FoldingContext<'a> {
+-             self.observed_input(frame, 0, self.retain_lowering_result(self.get_expr(a))?);
+-         let mut rhs_expr =
+-             self.observed_input(frame, 1, self.retain_lowering_result(self.get_expr(b))?);
+-+        // C adds an integer to a pointer, never a pointer to a pointer. Both
+-+        // operands can be pointer-declared honestly -- a value used as an
+-+        // address somewhere else is a pointer wherever it is read -- and the
+-+        // sum is still one base and one offset. The left operand keeps the
+-+        // pointer and the right becomes the offset it is being used as, which
+-+        // is what the machine addition computes either way.
+-+        if matches!(op, BinaryOp::Add | BinaryOp::Sub)
+-+            && self.looks_like_pointer(&lhs_expr)
+-+            && self.looks_like_pointer(&rhs_expr)
+-+        {
+-+            rhs_expr = CExpr::cast(uint_type_from_size(b.size), rhs_expr);
+-+        }
+-         let produced_ty = operand_ty.clone();
+-         if let Some(ty) = operand_ty {
+-             // Stated, not hinted. This type is the operation: `IntSLess` and
+-diff --git a/crates/r2dec/src/fold/op_lower/lowering.rs b/crates/r2dec/src/fold/op_lower/lowering.rs
+-index 4cb46a9..c55d285 100644
+---- a/crates/r2dec/src/fold/op_lower/lowering.rs
+-+++ b/crates/r2dec/src/fold/op_lower/lowering.rs
+-@@ -279,6 +279,17 @@ impl<'a> FoldingContext<'a> {
+-         lowered.ok().flatten()
+-     }
+- 
+-+    /// The type the plan declares for a value, if it declares one.
+-+    fn value_declaration_type(&self, value: ValueId) -> Option<CType> {
+-+        let names = self.inputs.binding_names?;
+-+        let crate::binding_plan::ValueDisposition::Bound { binding } =
+-+            names.disposition_for_value(value)?
+-+        else {
+-+            return None;
+-+        };
+-+        Some(names.plan().binding(*binding)?.declaration_type().clone())
+-+    }
+-+
+-     fn materialize_machine_expr(
+-         &self,
+-         names: &crate::binding_plan::BindingNameResolution,
+-@@ -733,14 +744,35 @@ impl<'a> FoldingContext<'a> {
+-                     input_idx,
+-                     self.planned_value_expr(input.value)?,
+-                 );
+--                project_machine_use(base, slice).map_err(|_| {
+-+                // A pointer read whole is spelled at its own type. The
+-+                // projection casts to the unsigned integer of the carrier's
+-+                // width, which is what every object used to be declared as;
+-+                // applied to an object the evidence declared a pointer it says
+-+                // `(uint64_t)p`, and the assignment that follows will not
+-+                // compile. The slice is the whole carrier at offset zero, so
+-+                // the projection selects nothing and the declared type is the
+-+                // exact statement to make about what is read.
+-+                let declared_pointer = matches!(
+-+                    self.value_declaration_type(input.value),
+-+                    Some(CType::Pointer(_))
+-+                );
+-+                if declared_pointer
+-+                    && slice.bit_offset() == 0
+-+                    && slice.width_bits() == slice.carrier_width_bits()
+-+                    && let Some(declared) = self.value_declaration_type(input.value)
+-+                {
+-+                    return Ok(CExpr::cast(declared, base));
+-+                }
+-+                super::projection::project_machine_use_of(base, slice, declared_pointer).map_err(
+-+                    |_| {
+-                     // The machine use is exact, but the strict C dialect cannot spell
+-                     // this projection without more type evidence. Refuse the emitted
+-                     // occurrence instead of inventing an integer or pointer type.
+--                    crate::observation_journal::LegacyObservationJournalError::RefusedRenderedUse(
+--                        first_site,
+--                    )
+--                })
+-+                        crate::observation_journal::LegacyObservationJournalError::RefusedRenderedUse(
+-+                            first_site,
+-+                        )
+-+                    },
+-+                )
+-             }
+-             // A contextual address cannot be projected from an arbitrary AST.
+-             // Only `planned_memory_input_expr` accepts the opaque expression
+-diff --git a/crates/r2dec/src/fold/op_lower/projection.rs b/crates/r2dec/src/fold/op_lower/projection.rs
+-index 636d2d7..f146830 100644
+---- a/crates/r2dec/src/fold/op_lower/projection.rs
+-+++ b/crates/r2dec/src/fold/op_lower/projection.rs
+-@@ -69,6 +69,26 @@ pub(super) fn project_machine_use(
+-     base: CExpr,
+-     slice: MachineUseSlice,
+- ) -> Result<CExpr, MachineUseProjectionError> {
+-+    project_machine_use_of(base, slice, false)
+-+}
+-+
+-+/// Project a use, saying whether the object being read is a pointer.
+-+///
+-+/// A pointer cannot be sliced: `(uint32_t)p` narrows an address and the
+-+/// compiler says so (`-Wpointer-to-int-cast`), and casting it to the carrier's
+-+/// unsigned integer is the step that makes the slice meaningful. Reading the
+-+/// whole of a pointer is not a projection at all, and spelling it at the
+-+/// pointer's own type keeps the value a pointer for whatever reads it.
+-+pub(super) fn project_machine_use_of(
+-+    base: CExpr,
+-+    slice: MachineUseSlice,
+-+    base_is_pointer: bool,
+-+) -> Result<CExpr, MachineUseProjectionError> {
+-+    let base = if base_is_pointer && c_integer_width_is_spellable(slice.carrier_width_bits()) {
+-+        CExpr::cast(checked_uint_type(slice.carrier_width_bits())?, base)
+-+    } else {
+-+        base
+-+    };
+-     let projected = if c_integer_width_is_spellable(slice.carrier_width_bits()) {
+-         let carrier_type = checked_uint_type(slice.carrier_width_bits())?;
+-         let selected_type = checked_uint_type(slice.width_bits())?;
+-diff --git a/doc/wip/typed-declarations.patch b/doc/wip/typed-declarations.patch
+-index 7203353..10d3ba1 100644
+---- a/doc/wip/typed-declarations.patch
+-+++ b/doc/wip/typed-declarations.patch
+-@@ -1,865 +0,0 @@
+--diff --git a/crates/r2dec/src/binding_plan/construction.rs b/crates/r2dec/src/binding_plan/construction.rs
+--index 89be38e..b718c3b 100644
+----- a/crates/r2dec/src/binding_plan/construction.rs
+--+++ b/crates/r2dec/src/binding_plan/construction.rs
+--@@ -742,7 +742,15 @@ impl BindingPlan {
+--                 .iter()
+--                 .any(|value| graph.def_inst(*value).is_none());
+--             bindings.push(Binding {
+---                declaration_type: CType::machine_bits(width_bits),
+--+                declaration_type: super::rules::declaration_type_for_binding(
+--+                    source_owned,
+--+                    component.members.iter().copied(),
+--+                    width_bits,
+--+                    source
+--+                        .machine_context()
+--+                        .memory_model()
+--+                        .default_address_bits(),
+--+                ),
+--                 certificate: BindingCertificate {
+--                     sources: component
+--                         .sources
+--@@ -925,7 +933,12 @@ impl BindingPlan {
+--                         });
+--                     };
+--                     bindings.push(Binding {
+---                        declaration_type: CType::machine_bits(width_bits),
+--+                        declaration_type: super::rules::declaration_type_for_stack_object(
+--+                            source_owned,
+--+                            *object,
+--+                            width_bits,
+--+                            source.machine_context().memory_model().default_address_bits(),
+--+                        ),
+--                         certificate: BindingCertificate {
+--                             sources: Box::new([BindingCertificateSource::CertifiedEntity(*id)]),
+--                         },
+--@@ -949,7 +962,12 @@ impl BindingPlan {
+--                         });
+--                     };
+--                     bindings.push(Binding {
+---                        declaration_type: CType::machine_bits(width_bits),
+--+                        declaration_type: super::rules::declaration_type_for_stack_object(
+--+                            source_owned,
+--+                            *object,
+--+                            width_bits,
+--+                            source.machine_context().memory_model().default_address_bits(),
+--+                        ),
+--                         certificate: BindingCertificate {
+--                             sources: Box::new([BindingCertificateSource::CertifiedEntity(*id)]),
+--                         },
+--@@ -983,7 +1001,12 @@ impl BindingPlan {
+--                             });
+--                         };
+--                         bindings.push(Binding {
+---                            declaration_type: CType::machine_bits(width_bits),
+--+                            declaration_type: super::rules::declaration_type_for_stack_object(
+--+                                source_owned,
+--+                                *object,
+--+                                width_bits,
+--+                                source.machine_context().memory_model().default_address_bits(),
+--+                            ),
+--                             certificate: BindingCertificate {
+--                                 sources: Box::new([BindingCertificateSource::CertifiedEntity(*id)]),
+--                             },
+--diff --git a/crates/r2dec/src/binding_plan/rules.rs b/crates/r2dec/src/binding_plan/rules.rs
+--index a5a5a89..8f22495 100644
+----- a/crates/r2dec/src/binding_plan/rules.rs
+--+++ b/crates/r2dec/src/binding_plan/rules.rs
+--@@ -71,6 +71,149 @@ pub(super) fn component_eligible_values(
+--         .collect())
+-- }
+-- 
+--+/// The type one object is declared with.
+--+///
+--+/// Until now every binding was declared `CType::machine_bits(width)` -- the
+--+/// unsigned integer of its storage's width -- and the recovered type was
+--+/// reported by the typed-recovery score rather than asserted in the C. That
+--+/// makes every parameter a `uint64_t`, so nothing the evidence solver proves
+--+/// about a pointer or a narrower result reaches a reader or a recompile.
+--+///
+--+/// The evidence decides it now, and only where it agrees with itself and with
+--+/// the storage. Every member of one binding is one object, so members that
+--+/// carry different evidence types are a genuine conflict and the machine word
+--+/// stands; a type whose width does not match the storage is not a description
+--+/// of this object and is refused the same way. A pointer is the one type whose
+--+/// width is the pointer width rather than the declared object's, and it is
+--+/// admitted at exactly that width.
+--+///
+--+/// Casts follow the declaration -- `source_type_for_var` asks the declaration
+--+/// before the certified hint -- so asserting here changes the operands too,
+--+/// which is what keeps the emitted C compiling under `-Werror` rather than
+--+/// converting an argument's signedness against its own declaration.
+--+pub(super) fn declaration_type_for_binding(
+--+    source_owned: &SourceOwnedFunctionFacts,
+--+    members: impl IntoIterator<Item = ValueId>,
+--+    width_bits: u32,
+--+    ptr_bits: u32,
+--+) -> r2types::CTypeLike {
+--+    let machine = r2types::CTypeLike::machine_bits(width_bits);
+--+    let evidence = source_owned.evidence_types();
+--+    let mut agreed: Option<r2types::CTypeLike> = None;
+--+    for value in members {
+--+        let Some(ty) = evidence.value_type(value) else {
+--+            continue;
+--+        };
+--+        match &agreed {
+--+            None => agreed = Some(ty.clone()),
+--+            Some(existing) if existing == ty => {}
+--+            Some(_) => return machine,
+--+        }
+--+    }
+--+    let Some(agreed) = agreed else {
+--+        return machine;
+--+    };
+--+    admit_declaration(agreed, width_bits, ptr_bits)
+--+}
+--+
+--+/// The type a stack object is declared with.
+--+///
+--+/// A spilled pointer is a pointer. Declaring the slot the machine word while
+--+/// the register it is spilled from is a pointer makes the reload
+--+/// `p = slot;` -- an integer assigned to a pointer, which does not compile --
+--+/// so the object and the values that flow through it have to be declared from
+--+/// the same evidence.
+--+pub(super) fn declaration_type_for_stack_object(
+--+    source_owned: &SourceOwnedFunctionFacts,
+--+    object: r2ssa::ObjectId,
+--+    width_bits: u32,
+--+    ptr_bits: u32,
+--+) -> r2types::CTypeLike {
+--+    let machine = r2types::CTypeLike::machine_bits(width_bits);
+--+    let source = source_owned.source();
+--+    let Some(fact) = source.objects().object(object) else {
+--+        return machine;
+--+    };
+--+    let (base, offset) = match fact.kind {
+--+        r2ssa::ObjectKind::StackSlot { base, offset, .. }
+--+        | r2ssa::ObjectKind::FrameObject { base, offset, .. } => (base, offset),
+--+        _ => return machine,
+--+    };
+--+    let key = r2types::StackSlotKey {
+--+        base: match base {
+--+            r2ssa::StackAddressBase::FramePointer => r2types::ExternalStackBase::FramePointer,
+--+            r2ssa::StackAddressBase::StackPointer => r2types::ExternalStackBase::StackPointer,
+--+        },
+--+        offset,
+--+    };
+--+    let Some((_, ty)) = source_owned
+--+        .evidence_types()
+--+        .stack_slot_types()
+--+        .find(|(slot, _)| **slot == key)
+--+    else {
+--+        return machine;
+--+    };
+--+    admit_declaration(ty.clone(), width_bits, ptr_bits)
+--+}
+--+
+--+/// Admit a recovered type only where it describes an object of this storage.
+--+///
+--+/// A type whose width is not the storage's width is not a description of this
+--+/// object, whatever else it may be true of, and the machine word stands. A
+--+/// pointer is the one type whose width is the pointer width rather than the
+--+/// declared object's, and it is admitted at exactly that width.
+--+fn admit_declaration(
+--+    ty: r2types::CTypeLike,
+--+    width_bits: u32,
+--+    ptr_bits: u32,
+--+) -> r2types::CTypeLike {
+--+    let admissible = match &ty {
+--+        r2types::CTypeLike::Pointer(_) => width_bits == ptr_bits,
+--+        r2types::CTypeLike::Int { bits, .. } => *bits == width_bits,
+--+        r2types::CTypeLike::Float(bits) => *bits == width_bits,
+--+        _ => false,
+--+    };
+--+    if admissible {
+--+        ty
+--+    } else {
+--+        r2types::CTypeLike::machine_bits(width_bits)
+--+    }
+--+}
+--+
+--+/// The storage width a declared type describes.
+--+///
+--+/// This is what the seal checks a declaration against. It used to compare the
+--+/// declaration to `CType::machine_bits(width)` outright, which is a check that
+--+/// the declaration is the machine word rather than a check that it describes
+--+/// the storage -- so it rejected every recovered type on sight. The width is
+--+/// the part the seal can re-derive from the source; what the evidence proved
+--+/// beyond it is not something a second derivation of the *plan* can confirm.
+--+pub(super) fn declaration_type_width(ty: &r2types::CTypeLike, ptr_bits: u32) -> Option<u32> {
+--+    match ty {
+--+        r2types::CTypeLike::Int {
+--+            bits,
+--+            signedness: r2types::Signedness::Unsigned,
+--+        } if *bits <= 128 => Some(*bits),
+--+        r2types::CTypeLike::Int {
+--+            bits,
+--+            signedness: r2types::Signedness::Signed,
+--+        } if *bits <= 128 => Some(*bits),
+--+        r2types::CTypeLike::Float(bits) if *bits <= 128 => Some(*bits),
+--+        r2types::CTypeLike::Pointer(_) => Some(ptr_bits),
+--+        r2types::CTypeLike::BitVector(bits) if *bits > 128 => Some(*bits),
+--+        _ => None,
+--+    }
+--+}
+--+
+--+/// Whether a declaration describes an object of exactly this storage width.
+--+pub(super) fn declaration_type_describes_width(
+--+    ty: &r2types::CTypeLike,
+--+    width_bits: u32,
+--+    ptr_bits: u32,
+--+) -> bool {
+--+    declaration_type_width(ty, ptr_bits) == Some(width_bits)
+--+}
+--+
+-- /// The pairs of values some one instruction reads at the same time.
+-- ///
+-- /// If a single instruction takes both values as inputs, both hold their
+--diff --git a/crates/r2dec/src/binding_plan/seal.rs b/crates/r2dec/src/binding_plan/seal.rs
+--index 7d25c29..e397927 100644
+----- a/crates/r2dec/src/binding_plan/seal.rs
+--+++ b/crates/r2dec/src/binding_plan/seal.rs
+--@@ -128,15 +128,8 @@ fn seal_parameter_width(
+--         })
+-- }
+-- 
+---fn binding_declaration_width(ty: &CType) -> Option<u32> {
+---    match ty {
+---        CType::Int {
+---            bits,
+---            signedness: r2types::Signedness::Unsigned,
+---        } if *bits <= 128 => Some(*bits),
+---        CType::BitVector(bits) if *bits > 128 => Some(*bits),
+---        _ => None,
+---    }
+--+fn binding_declaration_width(ty: &CType, ptr_bits: u32) -> Option<u32> {
+--+    super::rules::declaration_type_width(ty, ptr_bits)
+-- }
+-- 
+-- /// Resolve the certificate relation independently of construction's union-find.
+--@@ -600,6 +593,10 @@ impl BindingPlan {
+--         self.validate_source(source)
+--             .map_err(BindingPlanBuildError::Seal)?;
+--         let graph = source.graph();
+--+        let ptr_bits = source
+--+            .machine_context()
+--+            .memory_model()
+--+            .default_address_bits();
+--         if self.dispositions.len() != graph.values.len() {
+--             return Err(BindingPlanBuildError::Seal(
+--                 BindingPlanSourceMismatch::DispositionCount {
+--@@ -780,7 +777,8 @@ impl BindingPlan {
+--                             },
+--                         ));
+--                     }
+---                    let Some(width_bits) = binding_declaration_width(&binding.declaration_type)
+--+                    let Some(width_bits) =
+--+                        binding_declaration_width(&binding.declaration_type, ptr_bits)
+--                     else {
+--                         return Err(BindingPlanBuildError::Seal(
+--                             BindingPlanSourceMismatch::DeclarationWidth {
+--@@ -898,7 +896,11 @@ impl BindingPlan {
+--                                 BindingPlanSourceMismatch::ParameterCertificate { slot, binding },
+--                             ));
+--                         }
+---                        if planned.declaration_type != CType::machine_bits(width_bits) {
+--+                        if !super::rules::declaration_type_describes_width(
+--+                            &planned.declaration_type,
+--+                            width_bits,
+--+                            ptr_bits,
+--+                        ) {
+--                             return Err(BindingPlanBuildError::Seal(
+--                                 BindingPlanSourceMismatch::ParameterDeclarationWidth {
+--                                     slot,
+--@@ -1072,7 +1074,11 @@ impl BindingPlan {
+--                             BindingPlanSourceMismatch::StackObjectCertificate { object, binding },
+--                         ));
+--                     }
+---                    if planned.declaration_type != CType::machine_bits(width_bits) {
+--+                    if !super::rules::declaration_type_describes_width(
+--+                            &planned.declaration_type,
+--+                            width_bits,
+--+                            ptr_bits,
+--+                        ) {
+--                         return Err(BindingPlanBuildError::Seal(
+--                             BindingPlanSourceMismatch::StackObjectDeclarationWidth {
+--                                 object,
+--@@ -1122,7 +1128,11 @@ impl BindingPlan {
+--                             ));
+--                         }
+--                         if width_bits.is_none_or(|width_bits| {
+---                            planned.declaration_type != CType::machine_bits(width_bits)
+--+                            !super::rules::declaration_type_describes_width(
+--+                            &planned.declaration_type,
+--+                            width_bits,
+--+                            ptr_bits,
+--+                        )
+--                         }) {
+--                             return Err(BindingPlanBuildError::Seal(
+--                                 BindingPlanSourceMismatch::StackObjectDeclarationWidth {
+--@@ -1189,7 +1199,11 @@ impl BindingPlan {
+--                                     },
+--                                 ));
+--                             }
+---                            if planned.declaration_type != CType::machine_bits(width_bits) {
+--+                            if !super::rules::declaration_type_describes_width(
+--+                            &planned.declaration_type,
+--+                            width_bits,
+--+                            ptr_bits,
+--+                        ) {
+--                                 return Err(BindingPlanBuildError::Seal(
+--                                     BindingPlanSourceMismatch::StackObjectDeclarationWidth {
+--                                         object,
+--diff --git a/crates/r2dec/src/fold/op_lower/implementation.rs b/crates/r2dec/src/fold/op_lower/implementation.rs
+--index 7ceac57..9acaa58 100644
+----- a/crates/r2dec/src/fold/op_lower/implementation.rs
+--+++ b/crates/r2dec/src/fold/op_lower/implementation.rs
+--@@ -1996,7 +1996,14 @@ impl<'a> FoldingContext<'a> {
+--     }
+--     fn cast_needed(&self, target: &CType, source: Option<&RecordedType>) -> bool {
+--         let Some(source) = source.map(RecordedType::get) else {
+---            return false;
+--+            // Not knowing what the expression's type is says nothing about
+--+            // whether a conversion is needed, and for a pointer target it is
+--+            // exactly the case where one always is: C converts an integer to a
+--+            // pointer only when the program says so. Returning `false` here
+--+            // was safe while every declaration was an unsigned machine word
+--+            // and became `int8_t *p = some_uint64;` the moment the evidence
+--+            // was allowed to name a pointer.
+--+            return matches!(target, CType::Pointer(_));
+--         };
+-- 
+--         if target == source {
+--@@ -2047,13 +2054,58 @@ impl<'a> FoldingContext<'a> {
+--         {
+--             return expr;
+--         }
+---        if self.cast_needed(&target, source) {
+--+        // The expression itself is evidence when the source type is not
+--+        // recorded. A pointer-valued expression assigned to an integer needs
+--+        // the conversion spelled exactly as the other direction does, and
+--+        // asking only the recorded type meant `uint64_t n = p + i;` went out
+--+        // unconverted.
+--+        let pointer_valued = source.is_none()
+--+            && !matches!(target, CType::Pointer(_))
+--+            && self.int_meta(&target).is_some()
+--+            && self.looks_like_pointer(&expr);
+--+        if pointer_valued || self.cast_needed(&target, source) {
+--             CExpr::cast(target, expr)
+--         } else {
+--             expr
+--         }
+--     }
+-- 
+--+    /// Convert a stored value to the declared type of the object written.
+--+    ///
+--+    /// A store's left-hand side is a certified access rather than a variable,
+--+    /// so the assignment policy above has no `dst` to ask. The object behind
+--+    /// the access has a declaration all the same, and it is what the compiler
+--+    /// reads.
+--+    fn assignment_rhs_from_stored_object_type(
+--+        &self,
+--+        addr: &SSAVar,
+--+        val: &SSAVar,
+--+        rhs: CExpr,
+--+    ) -> CExpr {
+--+        let Some(target) = self
+--+            .prepared_value_id_for_var(addr)
+--+            .and_then(|address| self.stored_object_declaration_type(address))
+--+        else {
+--+            return rhs;
+--+        };
+--+        let source = self.source_type_for_var(val);
+--+        self.cast_expr_if_needed(rhs, target, source.as_ref())
+--+    }
+--+
+--+    /// The declared type of the stack object a certified access writes.
+--+    fn stored_object_declaration_type(&self, address: r2ssa::ValueId) -> Option<CType> {
+--+        let names = self.inputs.binding_names?;
+--+        let fact = self
+--+            .certified_memory_access_for_current_op(true)
+--+            .filter(|fact| fact.address == address)?;
+--+        let crate::binding_plan::StackObjectDisposition::Bound { binding } =
+--+            names.plan().stack_object_disposition(fact.object)?
+--+        else {
+--+            return None;
+--+        };
+--+        Some(names.plan().binding(binding)?.declaration_type().clone())
+--+    }
+--+
+--     fn assignment_rhs_with_type_policy(
+--         &self,
+--         dst: &SSAVar,
+--@@ -2367,8 +2419,15 @@ impl<'a> FoldingContext<'a> {
+--                 let lhs = self.assignment_lhs_expr(dst)?;
+--                 let rhs_base = self.get_expr(src)?;
+--                 let rhs = self.resolve_predicate_rhs_for_var(src, rhs_base);
+---                let rhs = self.assignment_rhs_with_type_policy(dst, Some(src), rhs);
+--+                // The operand is projected before it is converted, not after.
+--+                // The projection says which bits of the source object are
+--+                // read; the assignment cast says what the destination is. Run
+--+                // the other way round it re-wrapped a value already converted
+--+                // to the destination's type back into the source carrier's
+--+                // integer, which spells `int8_t *p = (uint64_t)(int8_t *)q;`
+--+                // once a destination may be a pointer.
+--                 let rhs = self.observed_input(frame, 0, rhs);
+--+                let rhs = self.assignment_rhs_with_type_policy(dst, Some(src), rhs);
+--                 self.assign_stmt(lhs, rhs)
+--             }
+--             SSAOp::Load { dst, addr, space } => {
+--@@ -2437,6 +2496,11 @@ impl<'a> FoldingContext<'a> {
+--                 }
+--                 let lhs = self.observed_memory_input(frame, 0, certified_lhs);
+--                 let rhs = self.observed_input(frame, 1, rhs);
+--+                // The object written decides the conversion, exactly as it
+--+                // does for a register assignment. A stack slot the evidence
+--+                // declared a pointer takes a pointer, and storing the machine
+--+                // word into it does not compile.
+--+                let rhs = self.assignment_rhs_from_stored_object_type(addr, val, rhs);
+--                 self.assign_stmt(lhs, rhs)
+--             }
+--             SSAOp::Fence { ordering } => Some(CStmt::Expr(CExpr::call(
+--@@ -3123,6 +3187,18 @@ impl<'a> FoldingContext<'a> {
+--             self.observed_input(frame, 0, self.retain_lowering_result(self.get_expr(a))?);
+--         let mut rhs_expr =
+--             self.observed_input(frame, 1, self.retain_lowering_result(self.get_expr(b))?);
+--+        // C adds an integer to a pointer, never a pointer to a pointer. Both
+--+        // operands can be pointer-declared honestly -- a value used as an
+--+        // address somewhere else is a pointer wherever it is read -- and the
+--+        // sum is still one base and one offset. The left operand keeps the
+--+        // pointer and the right becomes the offset it is being used as, which
+--+        // is what the machine addition computes either way.
+--+        if matches!(op, BinaryOp::Add | BinaryOp::Sub)
+--+            && self.looks_like_pointer(&lhs_expr)
+--+            && self.looks_like_pointer(&rhs_expr)
+--+        {
+--+            rhs_expr = CExpr::cast(uint_type_from_size(b.size), rhs_expr);
+--+        }
+--         let produced_ty = operand_ty.clone();
+--         if let Some(ty) = operand_ty {
+--             // Stated, not hinted. This type is the operation: `IntSLess` and
+--diff --git a/crates/r2dec/src/fold/op_lower/lowering.rs b/crates/r2dec/src/fold/op_lower/lowering.rs
+--index 4cb46a9..c1376b9 100644
+----- a/crates/r2dec/src/fold/op_lower/lowering.rs
+--+++ b/crates/r2dec/src/fold/op_lower/lowering.rs
+--@@ -279,6 +279,17 @@ impl<'a> FoldingContext<'a> {
+--         lowered.ok().flatten()
+--     }
+-- 
+--+    /// The type the plan declares for a value, if it declares one.
+--+    fn value_declaration_type(&self, value: ValueId) -> Option<CType> {
+--+        let names = self.inputs.binding_names?;
+--+        let crate::binding_plan::ValueDisposition::Bound { binding } =
+--+            names.disposition_for_value(value)?
+--+        else {
+--+            return None;
+--+        };
+--+        Some(names.plan().binding(*binding)?.declaration_type().clone())
+--+    }
+--+
+--     fn materialize_machine_expr(
+--         &self,
+--         names: &crate::binding_plan::BindingNameResolution,
+--@@ -733,6 +744,21 @@ impl<'a> FoldingContext<'a> {
+--                     input_idx,
+--                     self.planned_value_expr(input.value)?,
+--                 );
+--+                // A pointer read whole is spelled at its own type. The
+--+                // projection casts to the unsigned integer of the carrier's
+--+                // width, which is what every object used to be declared as;
+--+                // applied to an object the evidence declared a pointer it says
+--+                // `(uint64_t)p`, and the assignment that follows will not
+--+                // compile. The slice is the whole carrier at offset zero, so
+--+                // the projection selects nothing and the declared type is the
+--+                // exact statement to make about what is read.
+--+                if slice.bit_offset() == 0
+--+                    && slice.width_bits() == slice.carrier_width_bits()
+--+                    && let Some(declared @ CType::Pointer(_)) =
+--+                        self.value_declaration_type(input.value)
+--+                {
+--+                    return Ok(CExpr::cast(declared, base));
+--+                }
+--                 project_machine_use(base, slice).map_err(|_| {
+--                     // The machine use is exact, but the strict C dialect cannot spell
+--                     // this projection without more type evidence. Refuse the emitted
+--diff --git a/doc/wip/typed-declarations.patch b/doc/wip/typed-declarations.patch
+--index 472a454..6a77396 100644
+----- a/doc/wip/typed-declarations.patch
+--+++ b/doc/wip/typed-declarations.patch
+--@@ -1,376 +0,0 @@
+---diff --git a/crates/r2dec/src/binding_plan/construction.rs b/crates/r2dec/src/binding_plan/construction.rs
+---index 89be38e..b718c3b 100644
+------ a/crates/r2dec/src/binding_plan/construction.rs
+---+++ b/crates/r2dec/src/binding_plan/construction.rs
+---@@ -742,7 +742,15 @@ impl BindingPlan {
+---                 .iter()
+---                 .any(|value| graph.def_inst(*value).is_none());
+---             bindings.push(Binding {
+----                declaration_type: CType::machine_bits(width_bits),
+---+                declaration_type: super::rules::declaration_type_for_binding(
+---+                    source_owned,
+---+                    component.members.iter().copied(),
+---+                    width_bits,
+---+                    source
+---+                        .machine_context()
+---+                        .memory_model()
+---+                        .default_address_bits(),
+---+                ),
+---                 certificate: BindingCertificate {
+---                     sources: component
+---                         .sources
+---@@ -925,7 +933,12 @@ impl BindingPlan {
+---                         });
+---                     };
+---                     bindings.push(Binding {
+----                        declaration_type: CType::machine_bits(width_bits),
+---+                        declaration_type: super::rules::declaration_type_for_stack_object(
+---+                            source_owned,
+---+                            *object,
+---+                            width_bits,
+---+                            source.machine_context().memory_model().default_address_bits(),
+---+                        ),
+---                         certificate: BindingCertificate {
+---                             sources: Box::new([BindingCertificateSource::CertifiedEntity(*id)]),
+---                         },
+---@@ -949,7 +962,12 @@ impl BindingPlan {
+---                         });
+---                     };
+---                     bindings.push(Binding {
+----                        declaration_type: CType::machine_bits(width_bits),
+---+                        declaration_type: super::rules::declaration_type_for_stack_object(
+---+                            source_owned,
+---+                            *object,
+---+                            width_bits,
+---+                            source.machine_context().memory_model().default_address_bits(),
+---+                        ),
+---                         certificate: BindingCertificate {
+---                             sources: Box::new([BindingCertificateSource::CertifiedEntity(*id)]),
+---                         },
+---@@ -983,7 +1001,12 @@ impl BindingPlan {
+---                             });
+---                         };
+---                         bindings.push(Binding {
+----                            declaration_type: CType::machine_bits(width_bits),
+---+                            declaration_type: super::rules::declaration_type_for_stack_object(
+---+                                source_owned,
+---+                                *object,
+---+                                width_bits,
+---+                                source.machine_context().memory_model().default_address_bits(),
+---+                            ),
+---                             certificate: BindingCertificate {
+---                                 sources: Box::new([BindingCertificateSource::CertifiedEntity(*id)]),
+---                             },
+---diff --git a/crates/r2dec/src/binding_plan/rules.rs b/crates/r2dec/src/binding_plan/rules.rs
+---index a5a5a89..8f22495 100644
+------ a/crates/r2dec/src/binding_plan/rules.rs
+---+++ b/crates/r2dec/src/binding_plan/rules.rs
+---@@ -71,6 +71,149 @@ pub(super) fn component_eligible_values(
+---         .collect())
+--- }
+--- 
+---+/// The type one object is declared with.
+---+///
+---+/// Until now every binding was declared `CType::machine_bits(width)` -- the
+---+/// unsigned integer of its storage's width -- and the recovered type was
+---+/// reported by the typed-recovery score rather than asserted in the C. That
+---+/// makes every parameter a `uint64_t`, so nothing the evidence solver proves
+---+/// about a pointer or a narrower result reaches a reader or a recompile.
+---+///
+---+/// The evidence decides it now, and only where it agrees with itself and with
+---+/// the storage. Every member of one binding is one object, so members that
+---+/// carry different evidence types are a genuine conflict and the machine word
+---+/// stands; a type whose width does not match the storage is not a description
+---+/// of this object and is refused the same way. A pointer is the one type whose
+---+/// width is the pointer width rather than the declared object's, and it is
+---+/// admitted at exactly that width.
+---+///
+---+/// Casts follow the declaration -- `source_type_for_var` asks the declaration
+---+/// before the certified hint -- so asserting here changes the operands too,
+---+/// which is what keeps the emitted C compiling under `-Werror` rather than
+---+/// converting an argument's signedness against its own declaration.
+---+pub(super) fn declaration_type_for_binding(
+---+    source_owned: &SourceOwnedFunctionFacts,
+---+    members: impl IntoIterator<Item = ValueId>,
+---+    width_bits: u32,
+---+    ptr_bits: u32,
+---+) -> r2types::CTypeLike {
+---+    let machine = r2types::CTypeLike::machine_bits(width_bits);
+---+    let evidence = source_owned.evidence_types();
+---+    let mut agreed: Option<r2types::CTypeLike> = None;
+---+    for value in members {
+---+        let Some(ty) = evidence.value_type(value) else {
+---+            continue;
+---+        };
+---+        match &agreed {
+---+            None => agreed = Some(ty.clone()),
+---+            Some(existing) if existing == ty => {}
+---+            Some(_) => return machine,
+---+        }
+---+    }
+---+    let Some(agreed) = agreed else {
+---+        return machine;
+---+    };
+---+    admit_declaration(agreed, width_bits, ptr_bits)
+---+}
+---+
+---+/// The type a stack object is declared with.
+---+///
+---+/// A spilled pointer is a pointer. Declaring the slot the machine word while
+---+/// the register it is spilled from is a pointer makes the reload
+---+/// `p = slot;` -- an integer assigned to a pointer, which does not compile --
+---+/// so the object and the values that flow through it have to be declared from
+---+/// the same evidence.
+---+pub(super) fn declaration_type_for_stack_object(
+---+    source_owned: &SourceOwnedFunctionFacts,
+---+    object: r2ssa::ObjectId,
+---+    width_bits: u32,
+---+    ptr_bits: u32,
+---+) -> r2types::CTypeLike {
+---+    let machine = r2types::CTypeLike::machine_bits(width_bits);
+---+    let source = source_owned.source();
+---+    let Some(fact) = source.objects().object(object) else {
+---+        return machine;
+---+    };
+---+    let (base, offset) = match fact.kind {
+---+        r2ssa::ObjectKind::StackSlot { base, offset, .. }
+---+        | r2ssa::ObjectKind::FrameObject { base, offset, .. } => (base, offset),
+---+        _ => return machine,
+---+    };
+---+    let key = r2types::StackSlotKey {
+---+        base: match base {
+---+            r2ssa::StackAddressBase::FramePointer => r2types::ExternalStackBase::FramePointer,
+---+            r2ssa::StackAddressBase::StackPointer => r2types::ExternalStackBase::StackPointer,
+---+        },
+---+        offset,
+---+    };
+---+    let Some((_, ty)) = source_owned
+---+        .evidence_types()
+---+        .stack_slot_types()
+---+        .find(|(slot, _)| **slot == key)
+---+    else {
+---+        return machine;
+---+    };
+---+    admit_declaration(ty.clone(), width_bits, ptr_bits)
+---+}
+---+
+---+/// Admit a recovered type only where it describes an object of this storage.
+---+///
+---+/// A type whose width is not the storage's width is not a description of this
+---+/// object, whatever else it may be true of, and the machine word stands. A
+---+/// pointer is the one type whose width is the pointer width rather than the
+---+/// declared object's, and it is admitted at exactly that width.
+---+fn admit_declaration(
+---+    ty: r2types::CTypeLike,
+---+    width_bits: u32,
+---+    ptr_bits: u32,
+---+) -> r2types::CTypeLike {
+---+    let admissible = match &ty {
+---+        r2types::CTypeLike::Pointer(_) => width_bits == ptr_bits,
+---+        r2types::CTypeLike::Int { bits, .. } => *bits == width_bits,
+---+        r2types::CTypeLike::Float(bits) => *bits == width_bits,
+---+        _ => false,
+---+    };
+---+    if admissible {
+---+        ty
+---+    } else {
+---+        r2types::CTypeLike::machine_bits(width_bits)
+---+    }
+---+}
+---+
+---+/// The storage width a declared type describes.
+---+///
+---+/// This is what the seal checks a declaration against. It used to compare the
+---+/// declaration to `CType::machine_bits(width)` outright, which is a check that
+---+/// the declaration is the machine word rather than a check that it describes
+---+/// the storage -- so it rejected every recovered type on sight. The width is
+---+/// the part the seal can re-derive from the source; what the evidence proved
+---+/// beyond it is not something a second derivation of the *plan* can confirm.
+---+pub(super) fn declaration_type_width(ty: &r2types::CTypeLike, ptr_bits: u32) -> Option<u32> {
+---+    match ty {
+---+        r2types::CTypeLike::Int {
+---+            bits,
+---+            signedness: r2types::Signedness::Unsigned,
+---+        } if *bits <= 128 => Some(*bits),
+---+        r2types::CTypeLike::Int {
+---+            bits,
+---+            signedness: r2types::Signedness::Signed,
+---+        } if *bits <= 128 => Some(*bits),
+---+        r2types::CTypeLike::Float(bits) if *bits <= 128 => Some(*bits),
+---+        r2types::CTypeLike::Pointer(_) => Some(ptr_bits),
+---+        r2types::CTypeLike::BitVector(bits) if *bits > 128 => Some(*bits),
+---+        _ => None,
+---+    }
+---+}
+---+
+---+/// Whether a declaration describes an object of exactly this storage width.
+---+pub(super) fn declaration_type_describes_width(
+---+    ty: &r2types::CTypeLike,
+---+    width_bits: u32,
+---+    ptr_bits: u32,
+---+) -> bool {
+---+    declaration_type_width(ty, ptr_bits) == Some(width_bits)
+---+}
+---+
+--- /// The pairs of values some one instruction reads at the same time.
+--- ///
+--- /// If a single instruction takes both values as inputs, both hold their
+---diff --git a/crates/r2dec/src/binding_plan/seal.rs b/crates/r2dec/src/binding_plan/seal.rs
+---index 7d25c29..e397927 100644
+------ a/crates/r2dec/src/binding_plan/seal.rs
+---+++ b/crates/r2dec/src/binding_plan/seal.rs
+---@@ -128,15 +128,8 @@ fn seal_parameter_width(
+---         })
+--- }
+--- 
+----fn binding_declaration_width(ty: &CType) -> Option<u32> {
+----    match ty {
+----        CType::Int {
+----            bits,
+----            signedness: r2types::Signedness::Unsigned,
+----        } if *bits <= 128 => Some(*bits),
+----        CType::BitVector(bits) if *bits > 128 => Some(*bits),
+----        _ => None,
+----    }
+---+fn binding_declaration_width(ty: &CType, ptr_bits: u32) -> Option<u32> {
+---+    super::rules::declaration_type_width(ty, ptr_bits)
+--- }
+--- 
+--- /// Resolve the certificate relation independently of construction's union-find.
+---@@ -600,6 +593,10 @@ impl BindingPlan {
+---         self.validate_source(source)
+---             .map_err(BindingPlanBuildError::Seal)?;
+---         let graph = source.graph();
+---+        let ptr_bits = source
+---+            .machine_context()
+---+            .memory_model()
+---+            .default_address_bits();
+---         if self.dispositions.len() != graph.values.len() {
+---             return Err(BindingPlanBuildError::Seal(
+---                 BindingPlanSourceMismatch::DispositionCount {
+---@@ -780,7 +777,8 @@ impl BindingPlan {
+---                             },
+---                         ));
+---                     }
+----                    let Some(width_bits) = binding_declaration_width(&binding.declaration_type)
+---+                    let Some(width_bits) =
+---+                        binding_declaration_width(&binding.declaration_type, ptr_bits)
+---                     else {
+---                         return Err(BindingPlanBuildError::Seal(
+---                             BindingPlanSourceMismatch::DeclarationWidth {
+---@@ -898,7 +896,11 @@ impl BindingPlan {
+---                                 BindingPlanSourceMismatch::ParameterCertificate { slot, binding },
+---                             ));
+---                         }
+----                        if planned.declaration_type != CType::machine_bits(width_bits) {
+---+                        if !super::rules::declaration_type_describes_width(
+---+                            &planned.declaration_type,
+---+                            width_bits,
+---+                            ptr_bits,
+---+                        ) {
+---                             return Err(BindingPlanBuildError::Seal(
+---                                 BindingPlanSourceMismatch::ParameterDeclarationWidth {
+---                                     slot,
+---@@ -1072,7 +1074,11 @@ impl BindingPlan {
+---                             BindingPlanSourceMismatch::StackObjectCertificate { object, binding },
+---                         ));
+---                     }
+----                    if planned.declaration_type != CType::machine_bits(width_bits) {
+---+                    if !super::rules::declaration_type_describes_width(
+---+                            &planned.declaration_type,
+---+                            width_bits,
+---+                            ptr_bits,
+---+                        ) {
+---                         return Err(BindingPlanBuildError::Seal(
+---                             BindingPlanSourceMismatch::StackObjectDeclarationWidth {
+---                                 object,
+---@@ -1122,7 +1128,11 @@ impl BindingPlan {
+---                             ));
+---                         }
+---                         if width_bits.is_none_or(|width_bits| {
+----                            planned.declaration_type != CType::machine_bits(width_bits)
+---+                            !super::rules::declaration_type_describes_width(
+---+                            &planned.declaration_type,
+---+                            width_bits,
+---+                            ptr_bits,
+---+                        )
+---                         }) {
+---                             return Err(BindingPlanBuildError::Seal(
+---                                 BindingPlanSourceMismatch::StackObjectDeclarationWidth {
+---@@ -1189,7 +1199,11 @@ impl BindingPlan {
+---                                     },
+---                                 ));
+---                             }
+----                            if planned.declaration_type != CType::machine_bits(width_bits) {
+---+                            if !super::rules::declaration_type_describes_width(
+---+                            &planned.declaration_type,
+---+                            width_bits,
+---+                            ptr_bits,
+---+                        ) {
+---                                 return Err(BindingPlanBuildError::Seal(
+---                                     BindingPlanSourceMismatch::StackObjectDeclarationWidth {
+---                                         object,
+---diff --git a/crates/r2dec/src/fold/op_lower/implementation.rs b/crates/r2dec/src/fold/op_lower/implementation.rs
+---index 7ceac57..4917bb1 100644
+------ a/crates/r2dec/src/fold/op_lower/implementation.rs
+---+++ b/crates/r2dec/src/fold/op_lower/implementation.rs
+---@@ -1996,7 +1996,14 @@ impl<'a> FoldingContext<'a> {
+---     }
+---     fn cast_needed(&self, target: &CType, source: Option<&RecordedType>) -> bool {
+---         let Some(source) = source.map(RecordedType::get) else {
+----            return false;
+---+            // Not knowing what the expression's type is says nothing about
+---+            // whether a conversion is needed, and for a pointer target it is
+---+            // exactly the case where one always is: C converts an integer to a
+---+            // pointer only when the program says so. Returning `false` here
+---+            // was safe while every declaration was an unsigned machine word
+---+            // and became `int8_t *p = some_uint64;` the moment the evidence
+---+            // was allowed to name a pointer.
+---+            return matches!(target, CType::Pointer(_));
+---         };
+--- 
+---         if target == source {
+---diff --git a/crates/r2dec/src/fold/op_lower/lowering.rs b/crates/r2dec/src/fold/op_lower/lowering.rs
+---index 4cb46a9..c1376b9 100644
+------ a/crates/r2dec/src/fold/op_lower/lowering.rs
+---+++ b/crates/r2dec/src/fold/op_lower/lowering.rs
+---@@ -279,6 +279,17 @@ impl<'a> FoldingContext<'a> {
+---         lowered.ok().flatten()
+---     }
+--- 
+---+    /// The type the plan declares for a value, if it declares one.
+---+    fn value_declaration_type(&self, value: ValueId) -> Option<CType> {
+---+        let names = self.inputs.binding_names?;
+---+        let crate::binding_plan::ValueDisposition::Bound { binding } =
+---+            names.disposition_for_value(value)?
+---+        else {
+---+            return None;
+---+        };
+---+        Some(names.plan().binding(*binding)?.declaration_type().clone())
+---+    }
+---+
+---     fn materialize_machine_expr(
+---         &self,
+---         names: &crate::binding_plan::BindingNameResolution,
+---@@ -733,6 +744,21 @@ impl<'a> FoldingContext<'a> {
+---                     input_idx,
+---                     self.planned_value_expr(input.value)?,
+---                 );
+---+                // A pointer read whole is spelled at its own type. The
+---+                // projection casts to the unsigned integer of the carrier's
+---+                // width, which is what every object used to be declared as;
+---+                // applied to an object the evidence declared a pointer it says
+---+                // `(uint64_t)p`, and the assignment that follows will not
+---+                // compile. The slice is the whole carrier at offset zero, so
+---+                // the projection selects nothing and the declared type is the
+---+                // exact statement to make about what is read.
+---+                if slice.bit_offset() == 0
+---+                    && slice.width_bits() == slice.carrier_width_bits()
+---+                    && let Some(declared @ CType::Pointer(_)) =
+---+                        self.value_declaration_type(input.value)
+---+                {
+---+                    return Ok(CExpr::cast(declared, base));
+---+                }
+---                 project_machine_use(base, slice).map_err(|_| {
+---                     // The machine use is exact, but the strict C dialect cannot spell
+---                     // this projection without more type evidence. Refuse the emitted

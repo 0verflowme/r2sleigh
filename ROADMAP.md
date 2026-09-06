@@ -507,9 +507,21 @@ Known Heuristic Debt
 The following items are intentional short-term debt and should be retired, not
 expanded:
 
-- name-first native worker family matching in `r2sym`
-- hardcoded role/signature tables used as authoritative facts
+- hardcoded role/signature tables used as authoritative facts -- mostly retired.
+  The name-keyed coreutils registries in `r2types::role_registry` and
+  `r2sym::native_worker` are deleted, and name-first native worker family
+  matching went with them. What remains is `semantic_typedef_is_authoritative`,
+  which is still an ungated name list and still live on the emitted-C path; the
+  program counter is now read from the processor specification, while the stack
+  pointer, frame pointer, argument and return registers and the link register
+  are still guessed from spelling lists; and the x86 register family seeding in
+  `r2ssa` is one of roughly fourteen hand-written register tables that should
+  collapse onto the spec-derived `RegisterFamilyInfo::from_arch`
+- thresholds with no derivation in `r2engine`'s decompile route and in
+  `r2plugin`'s stack-address recursion
 - duplicated route policy in `r2dec` and `r2engine`
+- `r2engine` is two files for 25,000 lines, and its `EngineSession` is a
+  zero-sized unit struct carrying twenty `&self` methods over about 990 lines
 - shape-only loop/switch rendering without checked certificates
 - summary pseudo-calls standing in for real loop/control reconstruction
 - remaining decompiler-side stack-home/call-argument rescue paths
@@ -2197,3 +2209,397 @@ The target plugin system should eventually have these properties:
 - the public command surface is smaller and smarter, not larger
 
 That is the gold standard we should optimize toward.
+
+Two Open Defects and the Seam They Share
+----------------------------------------
+
+Both remaining known-wrong renderings trace to the same seam, and neither is
+fixable where it shows. Recording the evidence so the next attempt starts from
+it rather than repeating the search.
+
+**A dereference is dropped.** `int test_struct_field(DemoStruct *obj, int v)`
+returns `obj->thirteenth + obj->first` and renders as `obj + obj[12]`: an
+address added to an integer. The load itself is rendered correctly --
+`render_canonical_load_expr` returns `Deref(Var("obj"))`, and the fold's
+`get_expr` returns it unchanged. The wrong value enters through
+`analysis/lower.rs::get_expr`, which is a second, independent answer to "what
+does this name denote". It consults `forwarded_values` provenance before the
+definition, and for a value loaded through a pointer that provenance names the
+slot the *pointer* came from. Guarding the provenance is not enough: with the
+guard in place the next branch, `render_semantic_value_for_var`, returns the
+pointer too, because the semantic value recorded for the load result is the
+address rather than what was read. The conflation is in the semantic-value
+model, not at any one call site.
+
+**Parameter names are withheld.** `process_string(char *s)` renders as
+`process_string(int32_t arg0)` while `authenticate(char *password)` -- an
+identical prototype in the same binary -- recovers its name. radare2 withholds
+the whole function interface, and with it the presentation names, when
+`stack_resources_complete` is false.
+
+Traced twice, and the first account was wrong: the slot that fails is not a
+parameter home but an untyped *local*, carrying size zero because radare2 knows
+a variable lives there and not how big it is. Treating such a slot as outside
+the described inventory -- on both sides of the wire -- does deliver the names,
+and `process_string(void *s)` and `alloc_and_copy(void *src, ...)` render with
+them.
+
+It then uncovers a second, unrelated defect underneath. With the interface
+allowed through, x86 `entry0` carries a type graph that
+`SourceTypeGraph::new` rejects as `InvalidType`, so that function stops
+rendering altogether. The type is malformed independently of anything about
+slots; it was simply never reached before, because the interface gate had
+already refused the snapshot.
+
+So the work is two changes, not one, and shipping the first alone trades a
+recovered name for a function that no longer decompiles. The second is where
+to start: find why the graph carries a type whose size or alignment does not
+describe anything, and fix that before relaxing the gate.
+
+The common seam is the second lowering implementation. `analysis/lower.rs` and
+`fold/op_lower` both derive what a name denotes, and they disagree; the frame
+inventory and the prototype are likewise entangled across the snapshot
+boundary. Collapsing each to one owner is the prerequisite, not a follow-up.
+
+What a Certification Layer Would Have to Do
+-------------------------------------------
+
+The plugin carried a certification kernel: nine hand-written recognizers for
+function shapes -- terminal return, and terminal return decorated with a guard,
+a conditional, a switch, one loop, one direct call, one memory access, an
+aggregate member, or a private-frame join -- each building a typed C AST whose
+meaning could be evaluated against canonical SSA. It has been removed. The idea
+is worth keeping and the implementation was not, so the reasoning is recorded
+here rather than in the history.
+
+Three things were wrong with it, and any replacement has to answer all three.
+
+**It recognized shapes, so its reach was whatever had been written down.**
+Roughly one function in ten matched. Coverage grew linearly in hand-written
+modules while the space of function shapes did not, so the gap against the
+ordinary renderer could not close by adding more of them.
+
+**It was not a proof.** The differential evaluated the typed AST against SSA
+over sampled state within bounds, which is a good falsification technique and a
+weaker claim than the word certified suggests. Nothing was sealed; a run that
+found no mismatch had found no mismatch.
+
+**It checked an artifact nobody read.** Its C was written to be checkable --
+explicit widths, every intermediate bound, arithmetic through helper functions
+-- and once that stopped being what the reader saw, the check no longer said
+anything about the output. Whatever it established, it established about a
+rendering that was discarded.
+
+A replacement worth having would check the rendering that is actually printed,
+and would do so without a catalogue of shapes. Both are hard for the same
+reason: the readable AST deliberately omits what a checker needs, so either it
+grows those facts back -- becoming the thing that was deleted -- or the
+SSA-to-AST lowering is validated once, generically, which is translation
+validation and a research project rather than a refactor.
+
+Until one of those is real, the honest statement is the one the renderer now
+makes: this is a rendering, and here is what could not be shown about it.
+
+The Value-Rendering Seam
+------------------------
+
+One question -- what expression does this SSA name denote -- is answered
+independently in at least six places, and they do not agree. Fixing them one at
+a time does not converge: each correction moves the defect to whichever path
+runs next.
+
+The paths found so far, in the order a returned struct-field read reaches them:
+
+1. `fold::op_lower::get_expr`, the value renderer, which consulted forwarding
+   provenance before the value's own definition.
+2. `fold::op_lower::semanticize_visible_expr`, whose dereference arm accepted a
+   candidate equal to its own operand.
+3. `analysis::lower::LowerCtx::get_expr`, which builds the definitions the fold
+   later consults, and which follows provenance first for the same reason.
+4. `fold::op_lower::return_resolver::expand_return_expr_in_context`, a name
+   ladder of its own.
+5. The return-register site in `fold_block`, which expands and re-semanticizes
+   `op_to_expr` output.
+6. `structure.rs`, which synthesizes a trailing return from an expression it
+   derived separately.
+
+The first three now share one rule for the case where a read of memory defines
+the name, which is why `obj->thirteenth + obj->first` lowers correctly; the
+returned expression is still built by the last three and still prints the
+pointer.
+
+The fix is not another rule. It is one entry point for value rendering that
+every path calls, with the context-specific adjustments -- return position,
+call-argument position, condition position -- applied on top of a single
+answer rather than replacing it. Until that exists, a correction anywhere in
+this list is a correction to one caller, and the defect survives in the others.
+
+Where the Leaked Names Come From
+--------------------------------
+
+The undeclared-name detector marks 55 constructs across three fixture
+binaries. Two thirds of them are one symptom, and it was traced as far as
+this before the trail ran into the value-rendering seam recorded above.
+
+The symptom is a parameter assigned the address of its own frame slot:
+
+    int bitwise_check(unsigned int x) { if ((x & 0xF0) == 0x50) ...
+
+    int32_t dbg.bitwise_check(int32_t x) {
+        x = local_10 + 8;          // <- not a statement the program makes
+        if ((x & 240) != 80) {
+
+What the machine does there is `str w0, [var_8h]` followed by two
+`ldr w8, [var_8h]`: the prologue puts the argument in its home slot and reads
+it back twice. Each read is rendered as an assignment whose left side is the
+slot's name and whose right side is the slot's *address*.
+
+Established by tracing:
+
+- The load renderer is not at fault. `render_canonical_load_expr` returns
+  `Var("x")` for both reads, which is right: the slot is named after the
+  parameter, so reading it yields `x`.
+- The name on the left is also right. The load's destination is aliased to `x`
+  because it holds `x`.
+- The statement nonetheless leaves the fold as `x = local_10 + 8`, so the
+  right-hand side is replaced somewhere between the load renderer returning
+  and the statement being assembled.
+- `is_entry_arg_alias_store` exists to drop the prologue store for exactly
+  this shape. Its third recovery path -- follow the stored value back through
+  transparent copies to an entry register -- is unreachable behind an
+  unconditional `return None;`. Enabling it changes nothing measurable, so
+  something earlier already declines; the dead line is noted here rather than
+  removed on speculation.
+
+The remaining step is the same one the seam needs: a single value-rendering
+entry point, so that what the load renderer answers is what the statement
+carries. Until then the marker at least says the line is not program text.
+
+
+
+Current State (August 2026)
+---------------------------
+
+The four tracks of the spine rewrite are complete and the corpus gate is met.
+What that does and does not mean is worth stating precisely, because the two
+numbers below measure different things and only one of them is a claim about
+real programs.
+
+**The corpus gate: fifty-four of fifty-four.** Generation, the strict compile
+(`-Werror -Wconversion -Wsign-conversion`), the diagnostic compile and the
+differential oracle all read fifty-four across nine functions and six
+configurations. Nothing renders wrong.
+
+The caveat belongs with the number rather than against it: the verifier rewrites
+the C it checks, cutting the image's bytes into a blob and rewriting absolute
+addresses into it, and the diagnostic column compiles with warnings off after a
+repair pass. So the score does not say those cells emit self-contained,
+independently compilable C. The corpus is a canary, not a specification.
+
+**Real-world coverage: thirteen of forty-eight real functions, and the number
+went down on purpose.** The earlier figure here said one in ten and was wrong,
+because it counted every entry radare2 lists as a function. On `/bin/ls`, 88 of
+the 136 are sixteen-byte import thunks in `__TEXT.__auth_stubs` --
+`adrp`/`add`/`ldr`/`braa` and nothing else. Of the 48 real functions, 13 render.
+
+It read twenty-two until a direct branch out of a function stopped being treated
+as a transfer the structured form expresses. Nine of those twenty-two were
+rendering a wrong answer: the tail call was elided, the arguments it had set up
+were dead once nothing read them, and a comparator rendered without its fallback
+`strcoll` comparison at all, returning an unspecified value on that path under a
+proof line reading `0 refused`. They refuse now. A coverage figure that counts
+wrong answers is worse than a smaller one that does not, which is the whole
+reason `tests/coverage` exists.
+
+Measured by grouping the refusals by their typed cause rather than their
+message:
+
+| count | population | refusal |
+|-------|------------|---------|
+| 88 | import thunks | indirect branch out of the function |
+| 16 | real functions | effect obligations refused |
+| 4 | real functions | placement: `unobserved_binding_write` |
+| 3 | real functions | observation journal: `ExactUseRequiresRenderedOccurrence` |
+| 3 | real functions | missing machine projection: op lowering, at two sites |
+| 2 | real functions | placement: `preserved_carrier_read_before_assignment` |
+| 2 | real functions | semantic fallback: worker slice in compiled mode |
+| 1 | real function | placement: `read_before_assignment` |
+| 1 | real function | observation journal: `RenderedValueRequired` |
+| 1 | real function | observation journal: `ConflictingUse` |
+| 1 | real function | unrepresentable control flow |
+| 1 | real function (`main`) | unrepresentable operation |
+
+The corpus binaries carry the same measurement as a gate:
+`tests/coverage/run_coverage.sh` decompiles all 313 functions across the six
+configurations and fails when one that rendered stops rendering.
+
+**The eighty-eight import thunks are one cause and low value.** Every one is
+`braa x16, x17` after loading `x16` from `__auth_got`, which Sleigh writes as
+`AuthIA(x16, x17); pc = x16; goto [pc]`. The branch leaves the function through a
+value the machine cannot evaluate, and the renderer has no shape for that. The
+honest C form is a tail call, but claiming it requires proving the target is not
+one of this function's own blocks -- an unresolved jump table arrives in exactly
+the same shape -- and radare2's resolution is advisory, not machine evidence.
+The output would also be a thunk calling the symbol radare2 has already named
+the thunk after, which is why this is recorded as the largest count and not as
+the highest leverage.
+
+The trap user-operations are done, and so is the branch they left behind.
+`SoftwareBreakpoint` and `UndefinedInstructionException` were the only two
+`/bin/ls` uses, both writing `pc` because that is how Sleigh says control leaves
+for an exception handler. `R2ILOp::Breakpoint` produces nothing, so the branch
+Sleigh writes after the trap was reading a `pc` no operation defined; a trap now
+ends the instruction it traps in and the block it ends, and `__builtin_trap()`
+answers the trap obligation it takes.
+
+**Performance is not a constraint.** Radare2's own analysis dominates
+end to end: `aaa` on `/bin/ls` is 11.7s and decompiling all 136 functions on top
+of it costs 12.6s, about 93ms per function. On the corpus binaries `aaa` alone is
+1.62s against 1.70s for `aaa` plus one decompilation. Cost scales linearly with
+function count and nothing here needs optimising before it needs finishing.
+
+**Where the subsystems actually stand.** `r2sym` is sixty-seven thousand lines
+using z3 in eighty places, and `r2dec` reaches a solver exactly once: the render
+path consumes summaries and evidence, not live symbolic execution. That may be
+the right shape, but the engagement is thin enough to be worth a deliberate
+answer rather than an assumption. There is no VM or emulator crate.
+
+
+What is missing, measured
+-------------------------
+
+Taken on DecBench's own dataset and on the 245 functions the whole-binary gate
+renders. Ordered by severity, which is not the same as by size: a silently wrong
+answer outranks a missing feature, and a missing feature outranks debt.
+
+**Severity 1 -- calls are silently dropped.** On `bzip2recover` at `-O0`, the
+machine code makes 26 calls and we render 12. Every function we render drops at
+least one, and the proof line on each says `0 refused`. `readError` is the
+clearest: the source calls `fprintf`, `perror`, `fprintf`, `exit`; we emit
+`perror` and `exit` and discard both `fprintf` calls along with their format
+strings. The callees dropped are the variadic and unknown-signature ones, so the
+mechanism is the call boundary failing to complete and the obligation being
+elided rather than refused -- the same shape as the tail-call defect fixed this
+session, where a transfer was elided as one the structured form expressed and
+nine functions rendered a wrong answer under a clean proof. This is the most
+important open defect in the tree.
+
+**Severity 2 -- whole categories of information are never recovered.** Across
+the 245 rendered functions:
+
+| present in | what |
+|---|---|
+| 0% | string literals -- radare2 has them (`str._s:_I_O_error_...`) and nothing consumes them |
+| 0% | array indexing; everything stays pointer arithmetic |
+| 0% | struct member access |
+| 0% | named globals -- `progName` renders as `0x6000`, though radare2 named it |
+| 48% | no type beyond `uint32_t`/`uint64_t` |
+| 93% | machine temporaries (`tmp_3e480_1`, `stack_m16`) |
+| 97% | register-named locals (`X8_1`, `EDI_0`) |
+| 58% | CPU flag variables exposed as C (`ZF_1`, `NG_1`) |
+| 18% | `r2sleigh_*` helper intrinsics that no real toolchain has |
+
+DecBench scores this directly: `type_match` 0.00 against angr's 0.59 on the same
+binary. The information is largely *available* -- radare2 resolves the strings,
+the globals and the stack slots -- and the pipeline discards it.
+
+**Severity 3 -- coverage.** 54 per cent of the real source functions in a
+DecBench `-O0` binary (7 of 13). 78 per cent across our own corpus. 27 per cent
+of the real functions in an optimised arm64e binary. The largest single cause in
+the gate is the composed return value; the largest population overall is import
+thunks, which are low value and recorded as such.
+
+**Severity 4 -- implementation debt.** `r2sym` is 67k lines using z3 in
+seventeen files and the render path reaches a solver in one, so the largest
+subsystem in the tree is barely engaged by the product. Register roles are still
+hand-written tables. `is_stack_reg_name` matches by substring. `EngineSession`
+is a zero-sized unit struct with twenty methods over ~990 lines. Two thresholds
+in `r2engine/src/route.rs` and `STACK_RESOLVE_MAX_DEPTH` are undderived.
+`doc/duplicated-predicates.md` carries three questions still answered in more
+than one place.
+
+**Not a constraint: performance.** Radare2's own analysis dominates end to end
+and decompilation costs about 93ms per function. Nothing here needs optimising
+before it needs finishing.
+
+Components we do not have and need
+----------------------------------
+
+The measurement above is not a list of bugs; four of its five rows are one
+missing capability each. These are new components, not repairs.
+
+1. **A call-boundary model for variadic and unknown-signature callees.** The
+   severity-1 defect. Until a call whose signature is not known can still be
+   rendered as a call with the arguments the convention proves, every function
+   calling `printf` is wrong rather than incomplete.
+2. **A data reader for `.rodata` and named globals.** The cheapest large win in
+   the tree: radare2 already resolves string literals and object names, and
+   consuming them turns `0x6000` into `progName` and recovers every format
+   string. It moves nothing structural and touches only rendering.
+3. **A type inference engine that answers.** `r2types` is 50k lines and recovers
+   nothing measurable. What is needed is evidence-based inference -- pointer from
+   use as a load address, signedness from a signed comparison, width from access
+   size, struct from consistent offset access off one base, array from strided
+   access -- with today's honest default for whatever stays unproven.
+4. **Stack-frame recovery into named typed locals.** `stack_m16` is a slot, not
+   a variable. DecBench's ground truth for `bzip2recover` has 39 stack variables
+   and we align none of them.
+5. **Expression folding over machine detail.** Flag variables folded into the
+   comparison that consumes them, the unoptimised spill-and-reload collapsed,
+   and the arithmetic helpers reduced to C operators where the operator is
+   exact.
+
+Roadmap to Completion
+---------------------
+
+In order, highest leverage first. The first item is a correctness defect and
+outranks everything else on the list.
+
+1. **Stop dropping calls.** Fourteen of twenty-six calls in one `-O0` binary,
+   in every function rendered, reported as `0 refused`. Find where a call
+   boundary that cannot complete is elided rather than refused, make it refuse,
+   measure how much coverage that costs, and then model the variadic and
+   unknown-signature call so the coverage comes back honestly.
+
+2. **Read the data section.** String literals and named globals, from facts
+   radare2 already has. Zero per cent to most functions, and it is rendering
+   work rather than analysis work.
+
+3. **Fold the machine out of the expressions.** Flags into their comparisons,
+   the spill-and-reload round trip collapsed, helpers reduced to operators.
+   Moves `byte_match` and readability together, and is protected by the
+   differential oracle.
+
+4. **Infer types, and recover stack locals as variables.** The whole of
+   `type_match`, and the largest single decision on this list: it changes what
+   this decompiler is willing to claim. Evidence-based inference keeps the
+   principle; declining keeps the zero.
+
+5. **Render the composed return value.** The largest single refusal cause in the
+   whole-binary gate, mapped in `doc/handoff-location-ssa.md` with the
+   single-value assumption in five modules that blocks it.
+
+6. **Retire the register-role tables.** The program counter comes from the
+   processor specification now; mnemonikr/sleigh-config#8 exposes the compiler
+   specification, and the remaining lists follow when it lands.
+
+7. **Decide what the dependency patch becomes.** `Cargo.toml` patches `libsla`
+   and `libsla-sys` to fork branches carrying two open pull requests, and the
+   corpus depends on them. Wait, ask, or vendor.
+
+8. **Answer for `r2sym`.** Sixty-seven thousand lines, z3 in seventeen files,
+   and one reach from the render path. Either the engagement is thin because the
+   design is right, or the largest subsystem in the tree is not paying for
+   itself. That question has never been put deliberately.
+
+9. **Generalise the user operations.** `NEON_ext` and `NEON_ushl` are
+   implemented because the corpus needs those two. Anything else refuses
+   honestly, but this is not `CALLOTHER` coverage.
+
+10. **Clean the undefined behaviour in emitted vector C.** The `ushl` expansion
+    evaluates both shift directions before selecting, so the discarded branch
+    shifts by a negative count, and several `__uint128_t` loads are misaligned.
+
+11. **Audit the changed test expectations.** Roughly eight assertions moved and
+    one lift-capture golden was re-blessed during the run to fifty-four. A
+    changed test is the easiest place for a mistake to hide.

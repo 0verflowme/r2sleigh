@@ -7,15 +7,22 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::{
-    CTypeLike, Constraint, ConstraintSource, ExternalStackBase, ExternalStackVarSpec,
-    ExternalStruct, ExternalTypeDb, FunctionSignatureSpec, FunctionType, MemoryCapability,
-    ResolvedFieldLayout, ResolvedSignature, SignatureRegistry, Signedness, SolvedTypes,
-    SolverConfig, StackSlotKey, Type, TypeArena, TypeId, TypeOracle, TypeSolver, to_c_type_like,
+    CTypeLike, Constraint, ConstraintSource, ExternalStackVarSpec, ExternalStruct, ExternalTypeDb,
+    FunctionSignatureSpec, FunctionType, MemoryCapability, ResolvedFieldLayout, ResolvedSignature,
+    SignatureRegistry, Signedness, SolvedTypes, SolverConfig, StackSlotKey, Type, TypeArena,
+    TypeId, TypeOracle, TypeSolver, to_c_type_like,
 };
 use r2ssa::{
-    DecompilePrepFacts, ObjectKind, SSAFunction, SSAOp, SSAVar, SsaArtifact, StackAddressBase,
-    StackAddressRoot,
+    CallBoundarySlot, DecompilePrepFacts, ObjectKind, SSAFunction, SSAOp, SSAVar,
+    SourceCallArgumentValue, SsaArtifact, StackAddressRoot,
 };
+
+#[derive(Debug, Clone, Default)]
+struct PreparedCallTypeFlow {
+    direct_target: Option<u64>,
+    arguments: BTreeMap<usize, SSAVar>,
+    result: Option<SSAVar>,
+}
 
 /// Type inference context.
 pub struct TypeInference {
@@ -39,8 +46,15 @@ pub struct TypeInference {
     external_stack_slots: BTreeMap<StackSlotKey, ExternalStackVarSpec>,
     /// Proven SSA var -> stack-slot bindings from decompile prep.
     ssa_stack_slots: BTreeMap<SSAVar, StackSlotKey>,
+    /// Exact source-owned values crossing each complete call boundary.
+    ///
+    /// The key is the canonical graph operation site. Register spellings and
+    /// scans around a call are never used to reconstruct this flow.
+    prepared_call_flows: BTreeMap<(u64, usize), PreparedCallTypeFlow>,
     /// Optional external host type database.
     external_type_db: ExternalTypeDb,
+    /// What the source calls each aggregate member, by byte offset.
+    source_field_names: HashMap<u64, String>,
     /// Last solver output for this function inference pass.
     solved_types: Option<SolvedTypes>,
 }
@@ -94,7 +108,9 @@ impl TypeInference {
             external_signature: None,
             external_stack_slots: BTreeMap::new(),
             ssa_stack_slots: BTreeMap::new(),
+            prepared_call_flows: BTreeMap::new(),
             external_type_db: ExternalTypeDb::default(),
+            source_field_names: HashMap::new(),
             solved_types: None,
         }
     }
@@ -107,18 +123,6 @@ impl TypeInference {
     /// Set externally recovered function signature.
     pub fn set_external_signature(&mut self, signature: Option<FunctionSignatureSpec>) {
         self.external_signature = signature;
-    }
-
-    /// Set externally recovered stack variables.
-    pub fn set_external_stack_vars(&mut self, stack_vars: HashMap<i64, ExternalStackVarSpec>) {
-        for (offset, spec) in stack_vars {
-            self.external_stack_slots
-                .entry(StackSlotKey {
-                    base: spec.base.clone(),
-                    offset,
-                })
-                .or_insert(spec);
-        }
     }
 
     /// Set canonical externally recovered stack-slot facts.
@@ -136,14 +140,15 @@ impl TypeInference {
             return;
         };
         for (var, root) in &facts.stack_address_roots {
-            self.ssa_stack_slots
-                .insert(var.clone(), stack_slot_key_from_root(*root));
+            self.ssa_stack_slots.insert(var.clone(), *root);
         }
     }
 
     /// Set SSA -> stack-slot bindings from the canonical prepared SSA artifact.
     pub fn set_prepared_ssa(&mut self, prepared: &SsaArtifact) {
+        self.source_field_names = crate::prepare::source_field_names(prepared);
         self.ssa_stack_slots.clear();
+        self.prepared_call_flows.clear();
 
         for (key, object) in &prepared.objects().value_objects {
             if key.space != r2il::SpaceId::Ram {
@@ -168,8 +173,43 @@ impl TypeInference {
                 } => StackAddressRoot { base, offset },
                 _ => continue,
             };
-            self.ssa_stack_slots
-                .insert(var.clone(), stack_slot_key_from_root(root));
+            self.ssa_stack_slots.insert(var.clone(), root);
+        }
+
+        for boundary in prepared.facts().boundaries.calls.values() {
+            if !boundary.complete {
+                continue;
+            }
+            let Some(site) = prepared.graph().op_site_for_inst(boundary.at) else {
+                continue;
+            };
+            let Some(call_site) = prepared.facts().call_sites.by_id.get(&boundary.call_site) else {
+                continue;
+            };
+            if call_site.at != boundary.at {
+                continue;
+            }
+
+            let mut flow = PreparedCallTypeFlow {
+                direct_target: call_site.direct_target,
+                ..PreparedCallTypeFlow::default()
+            };
+            for argument in &boundary.arguments {
+                let CallBoundarySlot::Register { index, .. } = argument.slot else {
+                    continue;
+                };
+                let SourceCallArgumentValue::Value(value) = argument.value else {
+                    continue;
+                };
+                let Some(var) = prepared.value_var(value).cloned() else {
+                    continue;
+                };
+                flow.arguments.insert(index as usize, var);
+            }
+            if let [result] = boundary.results.as_slice() {
+                flow.result = prepared.value_var(result.value).cloned();
+            }
+            self.prepared_call_flows.insert(site, flow);
         }
     }
 
@@ -287,8 +327,8 @@ impl TypeInference {
     fn emit_inferred_constraints(
         &self,
         func: &SSAFunction,
-        defs: &HashMap<String, SSAOp>,
-        deref_consumers: &HashMap<String, u32>,
+        defs: &HashMap<SSAVar, SSAOp>,
+        deref_consumers: &HashMap<SSAVar, u32>,
         arena: &mut TypeArena,
         constraints: &mut Vec<Constraint>,
         struct_hints: &mut HashMap<SSAVar, String>,
@@ -342,7 +382,7 @@ impl TypeInference {
 
                         if let Some((base, offset, stride)) = self.detect_addr_pattern(addr, defs) {
                             let field_name =
-                                self.lookup_field_name(offset, struct_hints.get(&base));
+                                self.lookup_field_name(offset, dst.size, struct_hints.get(&base));
                             constraints.push(Constraint::FieldAccess {
                                 base_ptr: base.clone(),
                                 offset,
@@ -378,7 +418,7 @@ impl TypeInference {
 
                         if let Some((base, offset, stride)) = self.detect_addr_pattern(addr, defs) {
                             let field_name =
-                                self.lookup_field_name(offset, struct_hints.get(&base));
+                                self.lookup_field_name(offset, val.size, struct_hints.get(&base));
                             constraints.push(Constraint::FieldAccess {
                                 base_ptr: base.clone(),
                                 offset,
@@ -792,13 +832,13 @@ impl TypeInference {
         dst: &SSAVar,
         a: &SSAVar,
         b: &SSAVar,
-        defs: &HashMap<String, SSAOp>,
-        deref_consumers: &HashMap<String, u32>,
+        defs: &HashMap<SSAVar, SSAOp>,
+        deref_consumers: &HashMap<SSAVar, u32>,
         arena: &mut TypeArena,
         constraints: &mut Vec<Constraint>,
         struct_hints: &mut HashMap<SSAVar, String>,
     ) -> bool {
-        let Some(elem_size) = deref_consumers.get(&dst.display_name()).copied() else {
+        let Some(elem_size) = deref_consumers.get(dst).copied() else {
             return false;
         };
         let Some((base, offset, stride)) = self.detect_addr_pattern(dst, defs) else {
@@ -819,7 +859,7 @@ impl TypeInference {
         });
 
         if offset != 0 {
-            let field_name = self.lookup_field_name(offset, struct_hints.get(&base));
+            let field_name = self.lookup_field_name(offset, elem_size, struct_hints.get(&base));
             constraints.push(Constraint::FieldAccess {
                 base_ptr: base.clone(),
                 offset,
@@ -845,9 +885,9 @@ impl TypeInference {
             });
         }
 
-        let index_var = if a.display_name() == base.display_name() {
+        let index_var = if a == &base {
             Some(b)
-        } else if b.display_name() == base.display_name() {
+        } else if b == &base {
             Some(a)
         } else {
             None
@@ -953,16 +993,17 @@ impl TypeInference {
                     _ => continue,
                 };
 
-                let Some(sig) = self.resolve_call_signature(target, arena) else {
+                let Some(flow) = self.prepared_call_flows.get(&(block.addr, call_idx)) else {
+                    continue;
+                };
+                let Some(sig) = self.resolve_call_signature(flow.direct_target, arena) else {
                     continue;
                 };
 
-                let args = collect_call_args(&block.ops, call_idx, &self.arg_regs);
-                for (idx, arg_var) in args.iter().enumerate() {
-                    if idx >= sig.params.len() {
-                        break;
-                    }
-                    let ty = sig.params[idx];
+                for (idx, arg_var) in &flow.arguments {
+                    let Some(ty) = sig.params.get(*idx).copied() else {
+                        continue;
+                    };
                     constraints.push(Constraint::SetType {
                         var: arg_var.clone(),
                         ty,
@@ -973,8 +1014,11 @@ impl TypeInference {
                     }
                 }
 
-                let ret = collect_call_return(&block.ops, call_idx, &self.ret_regs)
-                    .map(|ret_var| (ret_var, sig.ret));
+                let args = (0..sig.params.len())
+                    .map(|index| flow.arguments.get(&index).cloned())
+                    .collect::<Option<Vec<_>>>()
+                    .unwrap_or_default();
+                let ret = flow.result.clone().map(|ret_var| (ret_var, sig.ret));
                 constraints.push(Constraint::CallSig {
                     target: target.clone(),
                     args,
@@ -988,61 +1032,90 @@ impl TypeInference {
 
     fn resolve_call_signature(
         &self,
-        target: &SSAVar,
+        direct_target: Option<u64>,
         arena: &mut TypeArena,
     ) -> Option<ResolvedSignature> {
-        let mut candidates = Vec::new();
-        candidates.push(target.name.clone());
+        let name = self.function_names.get(&direct_target?)?;
 
-        if let Some(addr) = parse_const_addr(&target.name)
-            && let Some(name) = self.function_names.get(&addr)
-        {
-            candidates.push(name.clone());
+        let candidate = name.as_str();
+        if let Some(sig) = self.func_types.get(candidate) {
+            let params = sig
+                .params
+                .iter()
+                .map(|ty| self.type_like_to_typeid(ty, arena).0)
+                .collect();
+            let ret = self.type_like_to_typeid(&sig.return_type, arena).0;
+            return Some(ResolvedSignature {
+                ret,
+                params,
+                variadic: sig.variadic,
+            });
         }
-
-        for candidate in candidates {
-            if let Some(sig) = self.func_types.get(&candidate) {
-                let params = sig
-                    .params
-                    .iter()
-                    .map(|ty| self.type_like_to_typeid(ty, arena).0)
-                    .collect();
-                let ret = self.type_like_to_typeid(&sig.return_type, arena).0;
-                return Some(ResolvedSignature {
-                    ret,
-                    params,
-                    variadic: sig.variadic,
-                });
-            }
-            if let Some(sig) = self
-                .signature_registry
-                .resolve(&candidate, arena, self.ptr_size)
-            {
-                return Some(sig);
-            }
+        if let Some(sig) = self
+            .signature_registry
+            .resolve(candidate, arena, self.ptr_size)
+        {
+            return Some(sig);
         }
 
         None
     }
 
-    fn lookup_field_name(&self, offset: u64, struct_name_hint: Option<&String>) -> Option<String> {
+    /// Whether a declared field is exactly as wide as the access that reached
+    /// it. An offset alone does not identify a field: an eight-byte pointer
+    /// load at offset zero otherwise took the name of a four-byte member
+    /// sharing that offset, and `return head` rendered as `return head->value`.
+    /// A field whose type carries no scalar width is left to the offset match,
+    /// which is the rule the field certificates already use.
+    fn external_field_width_matches(
+        &self,
+        field: &crate::ExternalField,
+        access_width: u32,
+    ) -> bool {
+        if access_width == 0 {
+            return true;
+        }
+        field
+            .ty
+            .as_deref()
+            .and_then(|spec| crate::parse_c_type_like(spec, self.ptr_size))
+            .and_then(|ty| crate::function_facts::type_like_size_bytes(&ty, self.ptr_size))
+            .is_none_or(|width| width == u64::from(access_width))
+    }
+
+    fn lookup_field_name(
+        &self,
+        offset: u64,
+        access_width: u32,
+        struct_name_hint: Option<&String>,
+    ) -> Option<String> {
+        // What the source called it beats anything reconstructed from offsets.
+        if let Some(name) = self.source_field_names.get(&offset) {
+            return Some(name.clone());
+        }
         if let Some(name) = struct_name_hint {
             let key = name.to_ascii_lowercase();
             if let Some(st) = self.external_type_db.structs.get(&key)
                 && let Some(field) = st.fields.get(&offset)
             {
-                return Some(field.name.clone());
+                return self
+                    .external_field_width_matches(field, access_width)
+                    .then(|| field.name.clone());
             }
             if let Some(un) = self.external_type_db.unions.get(&key)
                 && let Some(field) = un.fields.get(&offset)
             {
-                return Some(field.name.clone());
+                return self
+                    .external_field_width_matches(field, access_width)
+                    .then(|| field.name.clone());
             }
         }
 
         let mut found: Option<String> = None;
         for st in self.external_type_db.structs.values() {
-            if let Some(field) = st.fields.get(&offset) {
+            if let Some(field) = st.fields.get(&offset)
+                && self.external_field_width_matches(field, access_width)
+            {
                 if let Some(existing) = &found {
                     if existing != &field.name {
                         return None;
@@ -1053,7 +1126,9 @@ impl TypeInference {
             }
         }
         for un in self.external_type_db.unions.values() {
-            if let Some(field) = un.fields.get(&offset) {
+            if let Some(field) = un.fields.get(&offset)
+                && self.external_field_width_matches(field, access_width)
+            {
                 if let Some(existing) = &found {
                     if existing != &field.name {
                         return None;
@@ -1070,9 +1145,9 @@ impl TypeInference {
     fn detect_addr_pattern(
         &self,
         addr: &SSAVar,
-        defs: &HashMap<String, SSAOp>,
+        defs: &HashMap<SSAVar, SSAOp>,
     ) -> Option<(SSAVar, u64, Option<u32>)> {
-        let op = defs.get(&addr.display_name())?;
+        let op = defs.get(addr)?;
 
         match op {
             SSAOp::PtrAdd {
@@ -1123,9 +1198,9 @@ impl TypeInference {
         &self,
         base: &SSAVar,
         candidate: &SSAVar,
-        defs: &HashMap<String, SSAOp>,
+        defs: &HashMap<SSAVar, SSAOp>,
     ) -> Option<(SSAVar, u32)> {
-        let mul = defs.get(&candidate.display_name())?;
+        let mul = defs.get(candidate)?;
         match mul {
             SSAOp::IntMult { a, b, .. } => {
                 if let Some(scale) = parse_const_u64(a) {
@@ -1170,7 +1245,7 @@ impl TypeInference {
             CTypeLike::Union(name) | CTypeLike::Enum(name) => {
                 (arena.unknown_alias(name.clone()), None)
             }
-            CTypeLike::Function => (arena.top(), None),
+            CTypeLike::Function { .. } | CTypeLike::BitVector(_) => (arena.top(), None),
             CTypeLike::Unknown => (arena.top(), None),
         }
     }
@@ -1182,7 +1257,7 @@ impl TypeInference {
         fallback_size: u32,
     ) -> CTypeLike {
         match to_c_type_like(arena, ty_id) {
-            CTypeLike::Function => CTypeLike::Unknown,
+            CTypeLike::Function { .. } => CTypeLike::Unknown,
             CTypeLike::Unknown => self.type_from_size(fallback_size),
             other => other,
         }
@@ -1221,21 +1296,6 @@ impl TypeInference {
         }
     }
 
-    /// Export inferred types keyed by variable display/lowered names.
-    pub fn var_type_hints(&self) -> HashMap<String, CTypeLike> {
-        let mut out = HashMap::new();
-        for (var, ty) in &self.var_types {
-            let key = var.display_name();
-            out.insert(key.clone(), ty.clone());
-            out.insert(key.to_lowercase(), ty.clone());
-
-            let base = var.name.to_lowercase();
-            out.insert(base.clone(), ty.clone());
-            out.insert(format!("{}_{}", base, var.version), ty.clone());
-        }
-        out
-    }
-
     /// Register a function type.
     pub fn add_function_type<T: Into<FunctionType>>(&mut self, name: &str, func_type: T) {
         self.func_types.insert(name.to_string(), func_type.into());
@@ -1256,16 +1316,6 @@ impl TypeInference {
             solved,
             external_type_db: &self.external_type_db,
         })
-    }
-}
-
-fn stack_slot_key_from_root(root: StackAddressRoot) -> StackSlotKey {
-    StackSlotKey {
-        base: match root.base {
-            StackAddressBase::FramePointer => ExternalStackBase::FramePointer,
-            StackAddressBase::StackPointer => ExternalStackBase::StackPointer,
-        },
-        offset: root.offset,
     }
 }
 
@@ -1340,17 +1390,17 @@ impl TypeOracle for CombinedTypeOracle<'_> {
     }
 }
 
-fn build_def_map(func: &SSAFunction) -> HashMap<String, SSAOp> {
+fn build_def_map(func: &SSAFunction) -> HashMap<SSAVar, SSAOp> {
     let mut defs = HashMap::new();
     for block in func.blocks() {
         for op in &block.ops {
             if let Some(dst) = op.dst() {
-                defs.insert(dst.display_name(), op.clone());
+                defs.insert(dst.clone(), op.clone());
             }
         }
         for phi in &block.phis {
             defs.insert(
-                phi.dst.display_name(),
+                phi.dst.clone(),
                 SSAOp::Phi {
                     dst: phi.dst.clone(),
                     sources: phi.sources.iter().map(|(_, src)| src.clone()).collect(),
@@ -1363,8 +1413,8 @@ fn build_def_map(func: &SSAFunction) -> HashMap<String, SSAOp> {
 
 fn collect_deref_consumers(
     func: &SSAFunction,
-    defs: &HashMap<String, SSAOp>,
-) -> HashMap<String, u32> {
+    defs: &HashMap<SSAVar, SSAOp>,
+) -> HashMap<SSAVar, u32> {
     let mut out = HashMap::new();
     for block in func.blocks() {
         for op in &block.ops {
@@ -1390,11 +1440,11 @@ fn collect_deref_consumers(
 fn mark_deref_chain(
     addr: &SSAVar,
     elem_size: u32,
-    defs: &HashMap<String, SSAOp>,
-    out: &mut HashMap<String, u32>,
-    visited: &mut HashSet<String>,
+    defs: &HashMap<SSAVar, SSAOp>,
+    out: &mut HashMap<SSAVar, u32>,
+    visited: &mut HashSet<SSAVar>,
 ) {
-    let key = addr.display_name();
+    let key = addr.clone();
     out.entry(key.clone())
         .and_modify(|size| *size = (*size).max(elem_size))
         .or_insert(elem_size);
@@ -1463,55 +1513,8 @@ fn collect_vars(func: &SSAFunction) -> Vec<SSAVar> {
     vars
 }
 
-fn parse_const_addr(name: &str) -> Option<u64> {
-    if let Some(val_str) = name.strip_prefix("const:") {
-        let val_str = val_str.split('_').next().unwrap_or(val_str);
-        if let Some(dec) = val_str
-            .strip_prefix("0d")
-            .or_else(|| val_str.strip_prefix("0D"))
-        {
-            return dec.parse().ok();
-        }
-        if let Some(hex) = val_str
-            .strip_prefix("0x")
-            .or_else(|| val_str.strip_prefix("0X"))
-        {
-            return u64::from_str_radix(hex, 16).ok();
-        }
-        u64::from_str_radix(val_str, 16).ok()
-    } else if let Some(val_str) = name.strip_prefix("ram:") {
-        let val_str = val_str.split('_').next().unwrap_or(val_str);
-        u64::from_str_radix(val_str, 16).ok()
-    } else {
-        None
-    }
-}
-
 fn parse_const_offset(var: &SSAVar) -> Option<i64> {
-    if !var.is_const() {
-        return None;
-    }
-    let val = {
-        let val_str = var
-            .name
-            .strip_prefix("const:")?
-            .split('_')
-            .next()
-            .unwrap_or_default();
-        if let Some(hex) = val_str
-            .strip_prefix("0x")
-            .or_else(|| val_str.strip_prefix("0X"))
-        {
-            u64::from_str_radix(hex, 16).ok()?
-        } else if let Some(dec) = val_str
-            .strip_prefix("0d")
-            .or_else(|| val_str.strip_prefix("0D"))
-        {
-            dec.parse().ok()?
-        } else {
-            u64::from_str_radix(val_str, 16).ok()?
-        }
-    };
+    let val = var.constant_bits()?;
     const LIKELY_NEGATIVE_THRESHOLD: u64 = 0xffffffffffff0000;
     if val > LIKELY_NEGATIVE_THRESHOLD {
         let neg = (!val).wrapping_add(1);
@@ -1521,22 +1524,68 @@ fn parse_const_offset(var: &SSAVar) -> Option<i64> {
     }
 }
 
-fn register_alias_names(reg_name: &str) -> Vec<String> {
-    let lower = reg_name.to_ascii_lowercase();
+/// Every name the machine has for the storage a register names, widest form first.
+pub fn register_alias_names(reg_name: &str) -> Vec<String> {
+    let lower = reg_name.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return Vec::new();
+    }
+
     let aliases = match lower.as_str() {
-        "rax" | "eax" | "ax" | "al" | "ah" => &["rax", "eax", "ax", "al", "ah"][..],
-        "rbx" | "ebx" | "bx" | "bl" | "bh" => &["rbx", "ebx", "bx", "bl", "bh"][..],
-        "rcx" | "ecx" | "cx" | "cl" | "ch" => &["rcx", "ecx", "cx", "cl", "ch"][..],
-        "rdx" | "edx" | "dx" | "dl" | "dh" => &["rdx", "edx", "dx", "dl", "dh"][..],
-        "rsi" | "esi" | "si" | "sil" => &["rsi", "esi", "si", "sil"][..],
-        "rdi" | "edi" | "di" | "dil" => &["rdi", "edi", "di", "dil"][..],
-        "rbp" | "ebp" | "bp" | "bpl" => &["rbp", "ebp", "bp", "bpl"][..],
-        "rsp" | "esp" | "sp" | "spl" => &["rsp", "esp", "sp", "spl"][..],
-        "r8" | "r8d" | "r8w" | "r8b" => &["r8", "r8d", "r8w", "r8b"][..],
-        "r9" | "r9d" | "r9w" | "r9b" => &["r9", "r9d", "r9w", "r9b"][..],
-        _ => return vec![lower],
+        "rax" | "eax" | "ax" | "al" | "ah" => Some(&["rax", "eax", "ax", "al", "ah"][..]),
+        "rbx" | "ebx" | "bx" | "bl" | "bh" => Some(&["rbx", "ebx", "bx", "bl", "bh"][..]),
+        "rcx" | "ecx" | "cx" | "cl" | "ch" => Some(&["rcx", "ecx", "cx", "cl", "ch"][..]),
+        "rdx" | "edx" | "dx" | "dl" | "dh" => Some(&["rdx", "edx", "dx", "dl", "dh"][..]),
+        "rsi" | "esi" | "si" | "sil" => Some(&["rsi", "esi", "si", "sil"][..]),
+        "rdi" | "edi" | "di" | "dil" => Some(&["rdi", "edi", "di", "dil"][..]),
+        "rbp" | "ebp" | "bp" | "bpl" => Some(&["rbp", "ebp", "bp", "bpl"][..]),
+        "rsp" | "esp" | "sp" | "spl" => Some(&["rsp", "esp", "sp", "spl"][..]),
+        _ => None,
     };
-    aliases.iter().map(|alias| (*alias).to_string()).collect()
+    if let Some(aliases) = aliases {
+        return aliases.iter().map(|alias| (*alias).to_string()).collect();
+    }
+
+    for base in ["r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"] {
+        if lower == base
+            || lower == format!("{base}d")
+            || lower == format!("{base}w")
+            || lower == format!("{base}b")
+        {
+            return vec![
+                base.to_string(),
+                format!("{base}d"),
+                format!("{base}w"),
+                format!("{base}b"),
+            ];
+        }
+    }
+
+    // A scalar float or double in a vector register sits in the low lane, which Sleigh names apart.
+    if let Some(rest) = lower.strip_prefix("xmm")
+        && let Some(index) = rest.split('_').next()
+        && !index.is_empty()
+        && index.chars().all(|c| c.is_ascii_digit())
+    {
+        return vec![
+            format!("xmm{index}"),
+            format!("xmm{index}_da"),
+            format!("xmm{index}_qa"),
+        ];
+    }
+
+    if let Some(rest) = lower.strip_prefix('x')
+        && rest.chars().all(|c| c.is_ascii_digit())
+    {
+        return vec![lower.clone(), format!("w{rest}")];
+    }
+    if let Some(rest) = lower.strip_prefix('w')
+        && rest.chars().all(|c| c.is_ascii_digit())
+    {
+        return vec![format!("x{rest}"), lower];
+    }
+
+    vec![lower]
 }
 
 fn signed_int(bits: u32) -> CTypeLike {
@@ -1548,82 +1597,6 @@ fn signed_int(bits: u32) -> CTypeLike {
 
 fn parse_const_u64(var: &SSAVar) -> Option<u64> {
     parse_const_offset(var).and_then(|offset| u64::try_from(offset).ok())
-}
-
-fn collect_call_args(ops: &[SSAOp], call_idx: usize, arg_regs: &[String]) -> Vec<SSAVar> {
-    if arg_regs.is_empty() {
-        return Vec::new();
-    }
-
-    let mut found: HashMap<String, SSAVar> = HashMap::new();
-    let mut idx = call_idx;
-    while idx > 0 {
-        idx -= 1;
-        let prev = &ops[idx];
-
-        if matches!(prev, SSAOp::Call { .. } | SSAOp::CallInd { .. }) {
-            break;
-        }
-
-        let (dst, src) = match prev {
-            SSAOp::Copy { dst, src }
-            | SSAOp::IntZExt { dst, src }
-            | SSAOp::IntSExt { dst, src }
-            | SSAOp::Cast { dst, src } => (dst, src),
-            _ => continue,
-        };
-
-        let dst_name = dst.name.to_ascii_lowercase();
-        if arg_regs.iter().any(|reg| reg == &dst_name) && !found.contains_key(&dst_name) {
-            found.insert(dst_name, src.clone());
-        }
-    }
-
-    let mut ordered = Vec::new();
-    for reg in arg_regs {
-        if let Some(var) = found.remove(reg) {
-            ordered.push(var);
-        } else {
-            break;
-        }
-    }
-
-    ordered
-}
-
-fn collect_call_return(ops: &[SSAOp], call_idx: usize, ret_regs: &[String]) -> Option<SSAVar> {
-    let is_ret_reg = |name: &str| {
-        let base = name.split('_').next().unwrap_or(name);
-        ret_regs
-            .iter()
-            .any(|reg| reg == name || reg == base || name.starts_with(reg))
-    };
-
-    let mut idx = call_idx + 1;
-    while idx < ops.len() {
-        let next = &ops[idx];
-
-        if matches!(next, SSAOp::Call { .. } | SSAOp::CallInd { .. }) {
-            break;
-        }
-
-        match next {
-            SSAOp::Copy { dst, src }
-            | SSAOp::IntZExt { dst, src }
-            | SSAOp::IntSExt { dst, src }
-            | SSAOp::Cast { dst, src } => {
-                let src_name = src.name.to_ascii_lowercase();
-                if is_ret_reg(&src_name) {
-                    return Some(dst.clone());
-                }
-            }
-            _ => {}
-        }
-
-        idx += 1;
-    }
-
-    None
 }
 
 fn struct_name_from_type(arena: &TypeArena, ty: TypeId) -> Option<&str> {
@@ -1696,15 +1669,6 @@ mod tests {
         assert_eq!(ti.type_from_size(2), signed_int(16));
         assert_eq!(ti.type_from_size(4), signed_int(32));
         assert_eq!(ti.type_from_size(8), signed_int(64));
-    }
-
-    #[test]
-    fn test_parse_const_addr() {
-        assert_eq!(parse_const_addr("const:0x40_0"), Some(0x40));
-        assert_eq!(parse_const_addr("const:40"), Some(0x40));
-        assert_eq!(parse_const_addr("const:0d40"), Some(40));
-        assert_eq!(parse_const_addr("ram:401000_0"), Some(0x401000));
-        assert_eq!(parse_const_addr("RAX_1"), None);
     }
 
     #[test]
@@ -1821,7 +1785,7 @@ mod tests {
                     space: SpaceId::Ram,
                     addr,
                     ..
-                } => Some(addr.display_name()),
+                } => Some(addr.clone()),
                 _ => None,
             })
             .expect("Ram load address");
@@ -1833,7 +1797,7 @@ mod tests {
                     space: SpaceId::Custom(7),
                     addr,
                     ..
-                } => Some(addr.display_name()),
+                } => Some(addr.clone()),
                 _ => None,
             })
             .expect("Custom load address");
@@ -1877,6 +1841,28 @@ mod tests {
             Some(&arch),
         );
 
+        let block = func.get_block(0x1000).expect("call block");
+        let first = match &block.ops[0] {
+            SSAOp::Copy { src, .. } => src.clone(),
+            _ => panic!("first exact argument source"),
+        };
+        let second = match &block.ops[1] {
+            SSAOp::Copy { src, .. } => src.clone(),
+            _ => panic!("second exact argument source"),
+        };
+        let result = match &block.ops[3] {
+            SSAOp::Copy { dst, .. } => dst.clone(),
+            _ => panic!("exact result value"),
+        };
+        ti.prepared_call_flows.insert(
+            (0x1000, 2),
+            PreparedCallTypeFlow {
+                direct_target: Some(0x401000),
+                arguments: BTreeMap::from([(0, first), (1, second)]),
+                result: Some(result),
+            },
+        );
+
         let constraints = emit_call_sig_for_test(&ti, &func);
         let call_sig = constraints
             .iter()
@@ -1897,11 +1883,12 @@ mod tests {
     }
 
     #[test]
-    fn test_emit_call_signature_constraints_tracks_args_and_return_for_callind() {
+    fn call_spelling_without_source_boundary_emits_no_signature_constraints() {
         let arch = test_arch_for_call_regs();
         let mut ti = TypeInference::new(64);
+        ti.set_function_names(HashMap::from([(0x401000, "test_target".to_string())]));
         ti.add_function_type(
-            "const:401000",
+            "test_target",
             FunctionType {
                 return_type: signed_int(32),
                 params: vec![signed_int(64), signed_int(64)],
@@ -1930,38 +1917,24 @@ mod tests {
             Some(&arch),
         );
 
-        let constraints = emit_call_sig_for_test(&ti, &func);
-        let call_sig = constraints
-            .iter()
-            .find_map(|c| match c {
-                Constraint::CallSig {
-                    args, params, ret, ..
-                } => Some((args, params, ret)),
-                _ => None,
-            })
-            .expect("callind should emit CallSig constraint");
-        assert_eq!(call_sig.0.len(), 2, "should recover two register arguments");
-        assert_eq!(
-            call_sig.1.len(),
-            2,
-            "signature should carry two parameter types"
+        assert!(
+            emit_call_sig_for_test(&ti, &func).is_empty(),
+            "register spellings and adjacency around a call are not a source boundary"
         );
-        assert!(call_sig.2.is_some(), "should recover return register flow");
     }
 
     #[test]
     fn test_parse_const_u64_uses_canonical_offset_rules() {
+        assert_eq!(parse_const_u64(&SSAVar::constant(0x100, 8)), Some(0x100));
+        assert_eq!(parse_const_u64(&SSAVar::constant(100, 8)), Some(100));
+        assert_eq!(
+            parse_const_u64(&SSAVar::constant(0xffff_ffff_ffff_ffb8, 8)),
+            None
+        );
         assert_eq!(
             parse_const_u64(&SSAVar::new("const:100", 0, 8)),
-            Some(0x100)
-        );
-        assert_eq!(
-            parse_const_u64(&SSAVar::new("const:0d100", 0, 8)),
-            Some(100)
-        );
-        assert_eq!(
-            parse_const_u64(&SSAVar::new("const:ffffffffffffffb8", 0, 8)),
-            None
+            None,
+            "a constant-looking presentation name is not semantic evidence"
         );
     }
 
@@ -1973,7 +1946,7 @@ mod tests {
         let mut struct_hints = HashMap::new();
 
         let base = SSAVar::new("arg1", 0, 8);
-        let offset = SSAVar::new("const:30", 0, 8);
+        let offset = SSAVar::constant(0x30, 8);
         let dst = SSAVar::new("tmp:1000", 1, 8);
         let op = SSAOp::IntAdd {
             dst: dst.clone(),
@@ -1981,14 +1954,14 @@ mod tests {
             b: offset,
         };
         let mut defs = HashMap::new();
-        defs.insert(dst.display_name(), op);
+        defs.insert(dst.clone(), op);
         let mut deref = HashMap::new();
-        deref.insert(dst.display_name(), 4);
+        deref.insert(dst.clone(), 4);
 
         let handled = ti.emit_ptr_arith_constraints_for_deref(
             &dst,
             &base,
-            &SSAVar::new("const:30", 0, 8),
+            &SSAVar::constant(0x30, 8),
             &defs,
             &deref,
             &mut arena,
@@ -2030,10 +2003,10 @@ mod tests {
         let op = SSAOp::IntAdd {
             dst: addr.clone(),
             a: base.clone(),
-            b: SSAVar::new("const:100", 0, 8),
+            b: SSAVar::constant(0x100, 8),
         };
         let mut defs = HashMap::new();
-        defs.insert(addr.display_name(), op);
+        defs.insert(addr.clone(), op);
 
         let (detected_base, offset, stride) = ti
             .detect_addr_pattern(&addr, &defs)
@@ -2041,46 +2014,6 @@ mod tests {
         assert_eq!(detected_base, base);
         assert_eq!(offset, 0x100);
         assert_eq!(stride, None);
-    }
-
-    #[test]
-    fn test_collect_call_args_tracks_sysv_ordered_register_writes() {
-        let arg1 = SSAVar::new("arg1", 0, 8);
-        let arg2 = SSAVar::new("arg2", 0, 8);
-        let call_target = SSAVar::new("const:401000", 0, 8);
-        let ops = vec![
-            SSAOp::Copy {
-                dst: SSAVar::new("rdi", 1, 8),
-                src: arg1.clone(),
-            },
-            SSAOp::Copy {
-                dst: SSAVar::new("rsi", 1, 8),
-                src: arg2.clone(),
-            },
-            SSAOp::Call {
-                target: call_target,
-            },
-        ];
-        let regs = vec!["rdi".to_string(), "rsi".to_string(), "rdx".to_string()];
-        let args = collect_call_args(&ops, 2, &regs);
-        assert_eq!(args, vec![arg1, arg2]);
-    }
-
-    #[test]
-    fn test_collect_call_return_tracks_return_register_copy() {
-        let ret_tmp = SSAVar::new("tmp:ret", 1, 8);
-        let ops = vec![
-            SSAOp::Call {
-                target: SSAVar::new("const:401000", 0, 8),
-            },
-            SSAOp::Copy {
-                dst: ret_tmp.clone(),
-                src: SSAVar::new("rax", 1, 8),
-            },
-        ];
-        let ret_regs = vec!["rax".to_string(), "eax".to_string()];
-        let ret = collect_call_return(&ops, 0, &ret_regs);
-        assert_eq!(ret, Some(ret_tmp));
     }
 
     #[test]
@@ -2201,18 +2134,20 @@ mod tests {
     }
 
     #[test]
-    fn test_legacy_external_stack_vars_are_canonicalized_without_name_fallback() {
+    fn external_stack_slot_metadata_requires_the_exact_structural_root() {
         let mut ti = TypeInference::new(64);
         let slot_var = SSAVar::new("tmp:stack", 1, 8);
-        ti.set_external_stack_vars(HashMap::from([(
-            -8,
+        ti.set_external_stack_slots(BTreeMap::from([(
+            StackSlotKey {
+                base: r2ssa::StackAddressBase::FramePointer,
+                offset: -8,
+            },
             ExternalStackVarSpec {
                 name: "count".to_string(),
                 ty: Some(CTypeLike::Int {
                     bits: 32,
                     signedness: Signedness::Signed,
                 }),
-                base: ExternalStackBase::FramePointer,
                 role: crate::ExternalStackSlotRole::Local,
                 param_index: None,
                 param_name: None,
@@ -2222,7 +2157,7 @@ mod tests {
         ti.ssa_stack_slots.insert(
             slot_var.clone(),
             StackSlotKey {
-                base: ExternalStackBase::FramePointer,
+                base: r2ssa::StackAddressBase::FramePointer,
                 offset: -8,
             },
         );
@@ -2235,7 +2170,7 @@ mod tests {
         assert!(
             ti.stack_slot_spec_for_var(&SSAVar::new("count", 1, 8))
                 .is_none(),
-            "legacy offset-only metadata must not bind unrelated SSA vars by name"
+            "structural stack metadata must not bind unrelated SSA vars by name"
         );
     }
 
@@ -2299,7 +2234,7 @@ mod tests {
         let mut ti = TypeInference::new(64);
         ti.set_external_stack_slots(BTreeMap::from([(
             StackSlotKey {
-                base: ExternalStackBase::FramePointer,
+                base: r2ssa::StackAddressBase::FramePointer,
                 offset: -16,
             },
             ExternalStackVarSpec {
@@ -2308,7 +2243,6 @@ mod tests {
                     bits: 32,
                     signedness: Signedness::Signed,
                 }),
-                base: ExternalStackBase::FramePointer,
                 role: crate::ExternalStackSlotRole::Local,
                 param_index: None,
                 param_name: None,
@@ -2363,13 +2297,12 @@ mod tests {
         let mut ti = TypeInference::new(64);
         ti.set_external_stack_slots(BTreeMap::from([(
             StackSlotKey {
-                base: ExternalStackBase::FramePointer,
+                base: r2ssa::StackAddressBase::FramePointer,
                 offset: -16,
             },
             ExternalStackVarSpec {
                 name: "slot".to_string(),
                 ty: None,
-                base: ExternalStackBase::FramePointer,
                 role: crate::ExternalStackSlotRole::Local,
                 param_index: None,
                 param_name: None,

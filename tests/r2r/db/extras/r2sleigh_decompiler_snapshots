@@ -1,0 +1,50 @@
+NAME=decompiler_bool_carrier_chain_full_snapshot
+FILE=bins/vuln_test_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+int32_t dbg.test_bool_carrier_chain(int32_t x, int32_t y)
+{
+    if (x != y) {
+        return x;
+    } else {
+        return y;
+    }
+}
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaaa
+s `afl~test_bool_carrier_chain$[0]` > /dev/null
+pdd | python3 normalize_snapshot.py decompiler
+EOF_CMDS
+BROKEN=1
+RUN
+
+NAME=decompiler_complex_check_stable_header_and_local_prefix
+FILE=bins/vuln_test_x86
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+int32_t dbg.complex_check(int32_t a, int32_t b)
+{
+    int32_t diff;
+
+    diff = a - b;
+    {
+        if (b + a != 64) {
+            return 0;
+        }
+        if (diff != 14) {
+            return 0;
+        } else {
+            return 1;
+        }
+    }
+}
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+a:sla > /dev/null
+aaa
+s `afl~complex_check$[0]` > /dev/null
+pdd | python3 normalize_snapshot.py decompiler
+EOF_CMDS
+BROKEN=1
+RUN

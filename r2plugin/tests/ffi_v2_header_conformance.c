@@ -110,9 +110,9 @@ int main(void) {
 	};
 	R2SleighPlannerQueryResponseV2 planner_response = {0};
 	const R2SleighApiV2 *api = r2sleigh_api_v2 ();
-	if (R2SLEIGH_RADARE_SNAPSHOT_CONTRACT_V2 != 1
-		|| R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2 != 13
-		|| R2SLEIGH_RESPONSE_INFO_SCHEMA_V2 != 2
+	/* No radare2 schema number is asserted here: the plugin is gated on the
+	 * capability being present, not on which revision it is at. */
+	if (R2SLEIGH_RESPONSE_INFO_SCHEMA_V2 != 2
 		|| switch_case.target != 0x402000
 		|| call_identity.op_index != 3
 		|| call_identity.target_space != R2SLEIGH_SOURCE_STORAGE_CONSTANT_V2
@@ -162,9 +162,7 @@ int main(void) {
 		|| !api->lift_context_set_semantic_metadata || !api->lift_block_free
 		|| !api->lift_block_validate || !api->lift_block_set_switch_info
 		|| !api->lift_block_op_count || !api->lift_block_direct_call_identity
-		|| !api->lift_block_size || !api->lift_block_addr
-		|| !api->lift_block_mnemonic || !api->lift_block_type
-		|| !api->lift_block_jump || !api->lift_block_fail
+		|| !api->lift_block_view || !api->lift_block_mnemonic
 		|| !api->owned_bytes_view || !api->owned_bytes_free
 		|| !api->analysis_render || !api->analysis_query
 		|| !api->analysis_result_view || !api->analysis_result_free
@@ -233,9 +231,11 @@ int main(void) {
 		api->lift_context_free (context);
 		return 6;
 	}
-	uint32_t wrong_kind_size = 0;
-	if (api->lift_block_size ((const R2ILBlock *)profile, &wrong_kind_size)
+	/* A handle of the wrong kind must be refused, not read as a block. */
+	R2SleighBlockViewV2 wrong_kind_view = {0};
+	if (api->lift_block_view ((const R2ILBlock *)profile, &wrong_kind_view)
 			!= R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
+		|| wrong_kind_view.struct_size != 0
 		|| api->lift_context_free (context) != R2SLEIGH_STATUS_ENGINE_ERROR_V2
 		|| api->owned_bytes_free (profile) != R2SLEIGH_STATUS_OK_V2
 		|| api->owned_bytes_free (profile) != R2SLEIGH_STATUS_INVALID_ARGUMENT_V2

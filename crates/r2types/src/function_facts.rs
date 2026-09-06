@@ -10,189 +10,25 @@ use crate::facts::{
     OutParamCertificateEvidence, OutParamCertificateSource, SignatureCertificateSource,
     SignatureProjectionResult, VisibleBindingKind,
 };
-use crate::{CTypeLike, normalize_external_type_name, parse_type_like_spec};
+use crate::{CTypeLike, normalize_external_type_name, parse_c_type_like};
 
 pub type OpSiteKey = (u64, usize);
 pub type MemoryOpSiteKey = (u64, usize, bool);
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ParamSlotResolver {
-    slots_by_register: BTreeMap<String, usize>,
+struct ParamSlotResolver {
+    slots_by_value: BTreeMap<r2ssa::ValueId, usize>,
 }
 
 impl ParamSlotResolver {
-    pub fn new() -> Self {
-        Self::default()
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.slots_by_value.is_empty()
     }
 
-    pub fn from_arch_name(arch_name: Option<&str>) -> Self {
-        let (arg_regs, _, _) = crate::prepare::recover_vars_arch_profile(arch_name);
-        Self::from_arg_alias_map(arg_regs)
+    fn slot_for_value(&self, value: r2ssa::ValueId) -> Option<usize> {
+        self.slots_by_value.get(&value).copied()
     }
-
-    pub fn from_arg_alias_map(arg_regs: crate::prepare::ArgAliasMap) -> Self {
-        let mut resolver = Self::new();
-        for (slot, (canonical, aliases)) in arg_regs.iter().enumerate() {
-            resolver.insert_alias(canonical, slot);
-            for alias in *aliases {
-                resolver.insert_alias(alias, slot);
-            }
-        }
-        resolver
-    }
-
-    pub fn from_arg_regs<I, S>(arg_regs: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<str>,
-    {
-        let mut resolver = Self::new();
-        for (slot, reg) in arg_regs.into_iter().enumerate() {
-            resolver.insert_register_family_aliases(reg.as_ref(), slot);
-        }
-        resolver
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.slots_by_register.is_empty()
-    }
-
-    pub fn insert_alias(&mut self, register: &str, slot: usize) {
-        let normalized = normalize_param_slot_register_name(register);
-        if normalized.is_empty() {
-            return;
-        }
-        self.slots_by_register.entry(normalized).or_insert(slot);
-    }
-
-    pub fn slot_for_register_name(&self, register: &str) -> Option<usize> {
-        let normalized = normalize_param_slot_register_name(register);
-        self.slots_by_register.get(&normalized).copied()
-    }
-
-    pub fn slot_for_var(&self, var: &r2ssa::SSAVar) -> Option<usize> {
-        if var.version != 0 || !var.is_register() || var.is_memory() {
-            return None;
-        }
-        self.slot_for_register_name(&var.name)
-    }
-
-    fn insert_register_family_aliases(&mut self, register: &str, slot: usize) {
-        let normalized = normalize_param_slot_register_name(register);
-        if normalized.is_empty() {
-            return;
-        }
-        self.insert_alias(&normalized, slot);
-        for alias in inferred_param_slot_register_aliases(&normalized) {
-            self.insert_alias(&alias, slot);
-        }
-    }
-}
-
-fn normalize_param_slot_register_name(register: &str) -> String {
-    register.trim_start_matches('$').to_ascii_lowercase()
-}
-
-fn inferred_param_slot_register_aliases(register: &str) -> Vec<String> {
-    match register {
-        "rax" => {
-            return ["eax", "ax", "al", "ah"]
-                .into_iter()
-                .map(str::to_string)
-                .collect();
-        }
-        "eax" | "ax" | "al" | "ah" => return vec!["rax".to_string()],
-        "rbx" => {
-            return ["ebx", "bx", "bl", "bh"]
-                .into_iter()
-                .map(str::to_string)
-                .collect();
-        }
-        "ebx" | "bx" | "bl" | "bh" => return vec!["rbx".to_string()],
-        "rcx" => {
-            return ["ecx", "cx", "cl", "ch"]
-                .into_iter()
-                .map(str::to_string)
-                .collect();
-        }
-        "ecx" | "cx" | "cl" | "ch" => return vec!["rcx".to_string()],
-        "rdx" => {
-            return ["edx", "dx", "dl", "dh"]
-                .into_iter()
-                .map(str::to_string)
-                .collect();
-        }
-        "edx" | "dx" | "dl" | "dh" => return vec!["rdx".to_string()],
-        "rsi" => {
-            return ["esi", "si", "sil"]
-                .into_iter()
-                .map(str::to_string)
-                .collect();
-        }
-        "esi" | "si" | "sil" => return vec!["rsi".to_string()],
-        "rdi" => {
-            return ["edi", "di", "dil"]
-                .into_iter()
-                .map(str::to_string)
-                .collect();
-        }
-        "edi" | "di" | "dil" => return vec!["rdi".to_string()],
-        "rbp" => {
-            return ["ebp", "bp", "bpl"]
-                .into_iter()
-                .map(str::to_string)
-                .collect();
-        }
-        "ebp" | "bp" | "bpl" => return vec!["rbp".to_string()],
-        "rsp" => {
-            return ["esp", "sp", "spl"]
-                .into_iter()
-                .map(str::to_string)
-                .collect();
-        }
-        "esp" | "sp" | "spl" => return vec!["rsp".to_string()],
-        _ => {}
-    }
-
-    if let Some(rest) = register.strip_prefix('r')
-        && let Some(index) = rest.strip_suffix('d').or_else(|| rest.strip_suffix('w'))
-        && index.chars().all(|c| c.is_ascii_digit())
-    {
-        return vec![format!("r{index}")];
-    }
-    if let Some(index) = register.strip_prefix('r')
-        && index.chars().all(|c| c.is_ascii_digit())
-    {
-        return vec![
-            format!("r{index}d"),
-            format!("r{index}w"),
-            format!("r{index}b"),
-        ];
-    }
-    if let Some(index) = register.strip_prefix('x')
-        && index.chars().all(|c| c.is_ascii_digit())
-    {
-        return vec![format!("w{index}")];
-    }
-    if let Some(index) = register.strip_prefix('w')
-        && index.chars().all(|c| c.is_ascii_digit())
-    {
-        return vec![format!("x{index}")];
-    }
-    if let Some(index) = register.strip_prefix('a')
-        && let Ok(index) = index.parse::<u8>()
-        && index <= 7
-    {
-        return vec![format!("x{}", index + 10)];
-    }
-    if let Some(index) = register.strip_prefix('x')
-        && let Ok(index) = index.parse::<u8>()
-        && (10..=17).contains(&index)
-    {
-        return vec![format!("a{}", index - 10)];
-    }
-
-    Vec::new()
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -245,6 +81,30 @@ impl FunctionCallResultFacts {
             .filter_map(|value| self.by_value.get(value))
     }
 
+    /// The value the call boundary itself defines.
+    ///
+    /// A result may acquire a stable stack owner after copies, a store and a
+    /// reload. That owner is useful for later reads, but it is not the value
+    /// whose definition the call statement renders. The boundary definition is
+    /// the earliest identity result carried in a register; propagated identity
+    /// results occur later. A tie is ambiguous and therefore remains unowned.
+    pub fn definition_for_site(&self, callsite: CallsiteKey) -> Option<&CallResultFact> {
+        let is_boundary_definition = |result: &CallResultFact| {
+            result.relation.is_identity()
+                && matches!(result.carrier, r2ssa::ReturnCarrier::Register { .. })
+        };
+        let earliest = self
+            .results_for_site(callsite)
+            .filter(|result| is_boundary_definition(result))
+            .map(|result| result.at)
+            .min()?;
+        let mut definitions = self
+            .results_for_site(callsite)
+            .filter(|result| is_boundary_definition(result) && result.at == earliest);
+        let definition = definitions.next()?;
+        definitions.next().is_none().then_some(definition)
+    }
+
     pub fn owner_for_site(&self, callsite: CallsiteKey) -> Option<&r2ssa::ValueOwner> {
         let direct_stack_owner = self.unique_owner_for_site_matching(callsite, |result, owner| {
             result.relation.is_identity()
@@ -275,6 +135,20 @@ impl FunctionCallResultFacts {
                 )
         });
         match carrier_stack_owner {
+            Ok(Some(owner)) => return Some(owner),
+            Err(()) => return None,
+            Ok(None) => {}
+        }
+
+        // A result carried in a register and owned by a value. Every branch
+        // above requires a stack slot, so a register-carried result never had
+        // an owner and the call site was never recorded as assigning it.
+        let register_owner = self.unique_owner_for_site_matching(callsite, |result, owner| {
+            result.relation.is_identity()
+                && matches!(&result.carrier, r2ssa::ReturnCarrier::Register { .. })
+                && matches!(owner, r2ssa::ValueOwner::Value(_))
+        });
+        match register_owner {
             Ok(Some(owner)) => return Some(owner),
             Err(()) => return None,
             Ok(None) => {}
@@ -340,8 +214,18 @@ pub enum CallsiteRenderDisposition {
     SideEffectStatement,
     AssignedResult,
     NestedExpression,
+    /// A value-returning callee returns directly to this function's caller.
+    TerminalReturn,
+    /// A void callee returns directly to this function's caller.
+    TerminalVoidReturn,
     Suppressed,
     Residualized,
+}
+
+impl CallsiteRenderDisposition {
+    pub const fn is_terminal_return(self) -> bool {
+        matches!(self, Self::TerminalReturn | Self::TerminalVoidReturn)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -689,11 +573,13 @@ impl FunctionRenderFacts {
                 return None;
             };
             match self.certified_entities.get(binding) {
-                Some(
-                    entity @ CertifiedEntity::LoopCarrier {
-                        identity_values, ..
-                    },
-                ) if identity_values.contains(&value) => Some(entity),
+                Some(entity @ CertifiedEntity::LoopCarrier { members, .. })
+                    if members
+                        .binary_search_by_key(&value, |member| member.value)
+                        .is_ok() =>
+                {
+                    Some(entity)
+                }
                 _ => None,
             }
         });
@@ -965,9 +851,12 @@ fn indexed_param_home_name<'a>(
     .then_some(name)
 }
 
-fn type_like_size_bytes(ty: &CTypeLike, ptr_bits: u32) -> Option<u64> {
+pub(crate) fn type_like_size_bytes(ty: &CTypeLike, ptr_bits: u32) -> Option<u64> {
     match ty {
-        CTypeLike::Void | CTypeLike::Unknown | CTypeLike::Function => None,
+        CTypeLike::Void
+        | CTypeLike::Unknown
+        | CTypeLike::BitVector(_)
+        | CTypeLike::Function { .. } => None,
         CTypeLike::Bool => Some(1),
         CTypeLike::Int { bits, .. } | CTypeLike::Float(bits) => {
             Some((u64::from(*bits).saturating_add(7) / 8).max(1))
@@ -983,6 +872,94 @@ fn type_like_size_bytes(ty: &CTypeLike, ptr_bits: u32) -> Option<u64> {
     }
 }
 
+/// The exact storage width a C declaration type describes.
+pub fn declaration_type_width_bits(ty: &CTypeLike, ptr_bits: u32) -> Option<u32> {
+    match ty {
+        CTypeLike::Int {
+            bits,
+            signedness: crate::Signedness::Signed | crate::Signedness::Unsigned,
+        }
+        | CTypeLike::Float(bits)
+            if *bits <= 128 =>
+        {
+            Some(*bits)
+        }
+        CTypeLike::Pointer(_) => Some(ptr_bits),
+        CTypeLike::Array(element, Some(count)) => {
+            declaration_type_width_bits(element, ptr_bits)?.checked_mul(u32::try_from(*count).ok()?)
+        }
+        CTypeLike::BitVector(bits) if *bits > 128 => Some(*bits),
+        CTypeLike::Typedef(name) => crate::parse_external_type_like_spec(name, ptr_bits)
+            .and_then(|parsed| parsed.bits(ptr_bits)),
+        _ => None,
+    }
+}
+
+/// Admit a logical type only where it describes this exact storage width.
+pub fn admit_declaration_type(ty: CTypeLike, width_bits: u32, ptr_bits: u32) -> CTypeLike {
+    // Fixed-width C spellings are scalar types, not distinct semantic aliases.
+    // Canonicalizing them here gives every downstream type boundary the same
+    // structured fact while preserving source-significant aliases such as
+    // `size_t`, whose canonical integer spelling differs from its name.
+    let ty = crate::signature_infer::resolve_builtin_typedefs(ty, ptr_bits);
+    let admissible = match &ty {
+        CTypeLike::Pointer(_) => width_bits == ptr_bits,
+        CTypeLike::Int { bits, .. } | CTypeLike::Float(bits) => *bits == width_bits,
+        CTypeLike::Typedef(name) => {
+            crate::parse_external_type_like_spec(name, ptr_bits)
+                .and_then(|parsed| parsed.bits(ptr_bits))
+                == Some(width_bits)
+        }
+        _ => false,
+    };
+    if admissible {
+        ty
+    } else {
+        CTypeLike::machine_bits(width_bits)
+    }
+}
+
+fn function_type_matches_source_interface(
+    signature: &crate::FunctionType,
+    interface: &r2ssa::SourceFunctionInterface,
+    ptr_bits: u32,
+) -> bool {
+    if ptr_bits == 0 || signature.params.len() != interface.parameters().len() {
+        return false;
+    }
+    let parameter_widths_match = signature.params.iter().enumerate().all(|(index, ty)| {
+        let Some(actual_bits) = declaration_type_width_bits(ty, ptr_bits).map(u64::from) else {
+            return false;
+        };
+        let expected_bits = interface
+            .parameter_logical_values()
+            .get(index)
+            .map(|logical| logical.carrier().size_bits())
+            .or_else(|| {
+                interface
+                    .parameters()
+                    .get(index)
+                    .map(|parameter| u64::from(parameter.storage().size) * 8)
+            });
+        expected_bits == Some(actual_bits)
+    });
+    if !parameter_widths_match {
+        return false;
+    }
+    match (interface.return_kind(), &signature.return_type) {
+        (r2ssa::SourceFunctionReturn::Void, CTypeLike::Void) => true,
+        (r2ssa::SourceFunctionReturn::Register { storage }, ty) => {
+            let actual_bits = declaration_type_width_bits(ty, ptr_bits).map(u64::from);
+            let expected_bits = interface
+                .return_logical_value()
+                .map(|logical| logical.carrier().size_bits())
+                .or_else(|| Some(u64::from(storage.size) * 8));
+            actual_bits == expected_bits
+        }
+        _ => false,
+    }
+}
+
 fn field_certificate_width_matches(
     cert: &crate::facts::FieldAccessCertificate,
     access_width: u32,
@@ -990,7 +967,7 @@ fn field_certificate_width_matches(
 ) -> bool {
     cert.field_type
         .as_deref()
-        .and_then(|field_type| parse_type_like_spec(field_type, ptr_bits))
+        .and_then(|field_type| parse_c_type_like(field_type, ptr_bits))
         .and_then(|ty| type_like_size_bytes(&ty, ptr_bits))
         .is_none_or(|width| width == u64::from(access_width))
 }
@@ -1038,6 +1015,9 @@ pub enum CertifiedEntity {
         slot: u32,
         entry_values: BTreeSet<r2ssa::ValueId>,
         carrier_width: u32,
+        /// Exact logical type from the immutable source interface. Absence is
+        /// unknown and must not be repaired from a merged renderer signature.
+        ty: Option<CTypeLike>,
     },
     StackSlot {
         id: r2ssa::SemanticId,
@@ -1045,6 +1025,18 @@ pub enum CertifiedEntity {
         base: r2ssa::StackAddressBase,
         offset: i64,
         size: Option<u32>,
+        array_layout: r2ssa::StackArrayLayoutDisposition,
+        /// Full source slot identity, including its local/parameter-home role.
+        /// Absence grants no source-variable identity; a separate upstream
+        /// callee-allocation proof is required for an anonymous C object.
+        source_slot: Option<r2ssa::SourceStackSlotSpec>,
+        /// Upstream proof for a compiler-created, source-less callee-owned
+        /// stack object. Consumers may use it but must not reconstruct it.
+        callee_allocation: Option<r2ssa::CalleeStackAllocationCertificate>,
+        /// Exact declared type of the slot from the immutable source
+        /// interface's type graph. Absence is unknown and must not be
+        /// repaired from evidence.
+        ty: Option<CTypeLike>,
     },
     LoopCarrier {
         id: r2ssa::SemanticId,
@@ -1056,6 +1048,7 @@ pub enum CertifiedEntity {
         entries: Vec<r2ssa::LoopCarrierEdgeValue>,
         updates: Vec<r2ssa::LoopCarrierUpdateFact>,
         dominating_initializers: Vec<r2ssa::LoopCarrierEdgeValue>,
+        members: Vec<r2ssa::LoopCarrierMemberFact>,
         ty: Option<CTypeLike>,
     },
 }
@@ -1066,6 +1059,24 @@ impl CertifiedEntity {
             Self::Parameter { id, .. }
             | Self::StackSlot { id, .. }
             | Self::LoopCarrier { id, .. } => *id,
+        }
+    }
+
+    /// Canonical SSA values that may name one mutable renderer binding.
+    ///
+    /// Membership is program-point sensitive: entry values, loop updates, and
+    /// dominating initializers may participate only when lowering preserves the
+    /// assignments at their original definition sites. This certificate does
+    /// not authorize globally substituting any member's expression with the
+    /// binding. Stack-slot entities return `None` because object identity alone
+    /// is not a certificate of `ValueId` membership.
+    pub fn coalescing_values(&self) -> Option<BTreeSet<r2ssa::ValueId>> {
+        match self {
+            Self::Parameter { entry_values, .. } => Some(entry_values.clone()),
+            Self::LoopCarrier { members, .. } => {
+                Some(members.iter().map(|member| member.value).collect())
+            }
+            Self::StackSlot { .. } => None,
         }
     }
 }
@@ -1195,7 +1206,18 @@ pub struct ReturnValueRenderFact {
     pub op_index: usize,
     pub value: r2ssa::ValueId,
     pub width: u32,
+    /// Ordered contained-slice writes over `value`, empty for an ordinary
+    /// return. See `r2ssa::ReturnValueCertificate::overlays`: when this is not
+    /// empty `value` is the base rather than the whole returned value.
+    pub overlays: Vec<r2ssa::ReturnValueOverlay>,
     pub control_domain: r2ssa::ControlDomain,
+}
+
+impl ReturnValueRenderFact {
+    /// Every value this return carries, base first and overlays in order.
+    pub fn values(&self) -> impl Iterator<Item = r2ssa::ValueId> + '_ {
+        std::iter::once(self.value).chain(self.overlays.iter().map(|overlay| overlay.value))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1236,6 +1258,7 @@ pub struct LoopStructureFact {
     pub body: Vec<u64>,
     pub latches: Vec<u64>,
     pub exits: Vec<u64>,
+    pub for_loop: Option<r2ssa::ForLoopCertificate>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1267,6 +1290,22 @@ pub struct CallsiteArgumentFacts {
     pub target: r2ssa::ValueId,
     pub direct_target: Option<u64>,
     pub argument_values: Vec<CallArgumentValueFact>,
+    /// Whether the callee takes a variadic tail, as the source's prototype for
+    /// it says. Two call sites of one variadic callee legitimately pass
+    /// different numbers of arguments, and the declaration a rendering owes
+    /// the callee has to say so or it cannot describe both.
+    pub variadic: bool,
+    /// How many leading `argument_values` the callee's prototype names, where
+    /// a prototype described the call. The rest are the variadic tail.
+    pub fixed_argument_count: Option<usize>,
+    /// Exact logical signature projected from a callee body in the same
+    /// source-owned capture. Its carrier contract has already been checked
+    /// against this call site by `r2ssa`.
+    pub callee_signature: Option<crate::FunctionType>,
+    /// Per-callsite argument-count proof for a variadic call. This is absent
+    /// for fixed calls and never inferred from live argument registers.
+    pub variadic_argument_count_evidence: Option<r2ssa::VariadicCallsiteArgumentCountEvidence>,
+    pub variadic_argument_count_refusal: Option<r2ssa::VariadicCallsiteArgumentCountRefusal>,
     pub register_argument_locations: Vec<RegisterCallArgumentLocationFact>,
     pub stack_argument_locations: Vec<StackCallArgumentLocationFact>,
 }
@@ -1301,7 +1340,7 @@ pub struct CallArgumentValueFact {
 pub struct RegisterCallArgumentLocationFact {
     pub index: usize,
     pub value: r2ssa::ValueId,
-    pub name: String,
+    pub storage: r2ssa::CanonicalStorageId,
     pub source_inst: Option<r2ssa::InstId>,
 }
 
@@ -1437,7 +1476,6 @@ pub struct DecompileRouteFacts {
     pub reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fallback_comment: Option<String>,
-    pub skip_runtime_type_inference: bool,
     pub use_prepared_semantic_view: bool,
 }
 
@@ -1549,6 +1587,9 @@ pub struct FunctionFacts {
     decompile_route: Option<DecompileRouteFacts>,
     input_quality: Option<FunctionInputQualityFacts>,
     callee_resolution: CalleeResolutionFacts,
+    /// Spellings radare2 already holds for the addresses this function
+    /// touches. Rendering reads them; nothing that decides behaviour does.
+    display_names: crate::DisplayNames,
     callsites: FunctionCallsiteFacts,
     call_results: FunctionCallResultFacts,
     call_render: FunctionCallRenderFacts,
@@ -1571,10 +1612,67 @@ pub struct FunctionFacts {
 pub struct SourceOwnedFunctionFacts {
     source: Arc<r2ssa::SsaArtifact>,
     report: FunctionFacts,
+    evidence_types: crate::EvidenceTypes,
+    _callee_signatures: BTreeMap<u64, SourceOwnedCalleeSignature>,
+}
+
+/// One C signature derived from the exact retained body that owns it.
+///
+/// Construction is crate-private: callers may transport this certificate, but
+/// cannot pair an arbitrary signature with an SSA body. The retained function
+/// interface also lets a caller prove that this is the same physical contract
+/// `r2ssa` admitted at its call site before consuming the logical C types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceOwnedCalleeSignature {
+    address: u64,
+    interface: r2ssa::SourceFunctionInterface,
+    signature: crate::FunctionType,
+}
+
+impl SourceOwnedCalleeSignature {
+    /// Derive a callee's C signature certificate from the body that owns it.
+    ///
+    /// The body is read here and not retained. What proves this signature
+    /// belongs to a call site is the interface matching the one the call site
+    /// declares, which is a comparison by value; holding the SSA allocation as
+    /// well made every certificate keep a whole prepared function alive, which
+    /// is what a caller then had to cache to reuse one.
+    pub(crate) fn new(
+        source: &Arc<r2ssa::SsaArtifact>,
+        signature: crate::FunctionType,
+    ) -> Option<Self> {
+        let interface = source.machine_context().function_interface()?.clone();
+        function_type_matches_source_interface(
+            &signature,
+            &interface,
+            source
+                .machine_context()
+                .memory_model()
+                .default_address_bits(),
+        )
+        .then_some(Self {
+            address: source.function().entry,
+            interface,
+            signature,
+        })
+    }
+
+    pub(crate) fn address(&self) -> u64 {
+        self.address
+    }
 }
 
 impl SourceOwnedFunctionFacts {
-    pub(crate) fn seal(source: Arc<r2ssa::SsaArtifact>, mut report: FunctionFacts) -> Option<Self> {
+    #[cfg(test)]
+    pub(crate) fn seal(source: Arc<r2ssa::SsaArtifact>, report: FunctionFacts) -> Option<Self> {
+        Self::seal_with_callee_signatures(source, report, BTreeMap::new())
+    }
+
+    pub(crate) fn seal_with_callee_signatures(
+        source: Arc<r2ssa::SsaArtifact>,
+        mut report: FunctionFacts,
+        callee_signatures: BTreeMap<u64, SourceOwnedCalleeSignature>,
+    ) -> Option<Self> {
         // Canonicalization is part of sealing. Runtime consumers must observe
         // this exact report and may not clone then normalize it independently.
         report.canonicalize_type_facts();
@@ -1588,7 +1686,37 @@ impl SourceOwnedFunctionFacts {
         {
             return None;
         }
-        Some(Self { source, report })
+        // Source-owned facts are authoritative only when every source-dependent
+        // projection is exactly what this retained SSA artifact produces. Both
+        // construction and consumers previously read `report`, so a stale
+        // detached render/call/control row could validate against itself. Build
+        // the projection again from the retained source and the final canonical
+        // type payload, then require exact equality before sealing.
+        let mut expected = report.clone();
+        Self::rebuild_source_owned_decompile_evidence(source.as_ref(), &mut expected);
+        expected.apply_source_owned_callee_signatures(source.as_ref(), &callee_signatures);
+        if report.types != expected.types
+            || report.callee_resolution != expected.callee_resolution
+            || report.callsites != expected.callsites
+            || report.call_results != expected.call_results
+            || report.call_render != expected.call_render
+            || report.control != expected.control
+            || report.render != expected.render
+        {
+            return None;
+        }
+        let ptr_bits = source
+            .machine_context()
+            .memory_model()
+            .default_address_bits();
+        let evidence_types =
+            crate::solve_evidence_types(source.as_ref(), &report.callsite_signatures(), ptr_bits);
+        Some(Self {
+            source,
+            report,
+            evidence_types,
+            _callee_signatures: callee_signatures,
+        })
     }
 
     pub fn source(&self) -> &r2ssa::SsaArtifact {
@@ -1605,6 +1733,11 @@ impl SourceOwnedFunctionFacts {
 
     pub fn report(&self) -> &FunctionFacts {
         &self.report
+    }
+
+    /// Exact ValueId/ObjectId-keyed type solution for the retained source.
+    pub fn evidence_types(&self) -> &crate::EvidenceTypes {
+        &self.evidence_types
     }
 
     pub(crate) fn stamp_report_decompile_route(
@@ -1659,7 +1792,6 @@ impl SourceOwnedFunctionFacts {
             fallback_comment: (kind == DecompileRouteKind::FallbackComment)
                 .then_some(fallback_comment)
                 .flatten(),
-            skip_runtime_type_inference: true,
             use_prepared_semantic_view,
         }));
         compatible
@@ -1670,104 +1802,264 @@ impl SourceOwnedFunctionFacts {
     /// Parameter-slot resolution needs a coherent ABI. When the source does not
     /// carry one there are no parameter slots to resolve, so the steps keyed on
     /// them have nothing to do; every other piece of evidence is still valid and
-    /// is still attached. Returns how many call-argument type constraints were
-    /// applied.
+    /// is still attached. Returns which parameter declarations changed and
+    /// whether the return declaration changed in the final signature.
+    #[cfg(test)]
     pub(crate) fn enrich_report_from_source_for_decompile(
         source: &r2ssa::SsaArtifact,
         report: &mut FunctionFacts,
-    ) -> usize {
-        let param_slots = exact_source_param_slot_resolver(source);
+    ) -> (BTreeSet<usize>, bool) {
+        Self::enrich_report_from_source_with_callee_signatures(source, report, &BTreeMap::new())
+    }
+
+    /// The parameter slots whose declared type changed, and whether the return
+    /// changed, are decided here, on `merged_signature`, and handed on. They
+    /// were once counted here and recounted by the plan refresh on the
+    /// render-authorized projection, and the two owners disagreeing failed the
+    /// function. One fact has one owner.
+    pub(crate) fn enrich_report_from_source_with_callee_signatures(
+        source: &r2ssa::SsaArtifact,
+        report: &mut FunctionFacts,
+        callee_signatures: &BTreeMap<u64, SourceOwnedCalleeSignature>,
+    ) -> (BTreeSet<usize>, bool) {
+        let prior_signature = report.types.merged_signature.clone();
         let mut enriched = report.clone();
         let mut usage = source.facts().assumption_usage.clone();
         usage.extend(enriched.assumption_usage());
         enriched.assumption_usage = usage;
-        enriched.attach_prepared_decompile_evidence(source);
-        if let Some(param_slots) = param_slots.as_ref() {
-            enriched.populate_certified_parameter_exprs(source, param_slots);
-        }
-        enriched.normalize_field_certificates_from_external_layout();
-        if let Some(param_slots) = param_slots.as_ref() {
-            enriched.populate_member_access_render_facts_from_field_certificates(
-                source,
-                param_slots,
-            );
-        }
-        enriched.populate_certified_loop_carrier_types();
-        if let Some(param_slots) = param_slots.as_ref() {
-            enriched.populate_array_access_render_facts_from_scalar_candidates(source, param_slots);
-        }
-        let applied_constraints = enriched.apply_certified_call_argument_type_constraints(
-            source
-                .machine_context()
-                .memory_model()
-                .default_address_bits(),
-        );
+        enriched.display_names.absorb(source.display_names());
+        Self::rebuild_source_owned_decompile_evidence(source, &mut enriched);
+        enriched.apply_source_owned_callee_signatures(source, callee_signatures);
+        let ptr_bits = source
+            .machine_context()
+            .memory_model()
+            .default_address_bits();
+        enriched.apply_certified_call_argument_type_constraints(ptr_bits);
+        enriched.apply_recovered_evidence_types(source, ptr_bits);
+        // Exact immutable interface evidence outranks advisory propagation.
+        // Apply it after recovered call evidence so the latter cannot rewrite
+        // a declared signedness or logical projection through a weak scalar.
+        // Where the interface carries a type graph the whole signature comes
+        // from it; the return-only projection below then finds it agreeing.
+        enriched.apply_exact_source_signature(source);
+        enriched.apply_exact_source_return_type(source);
+        // Type constraints may change advisory member/carrier types. Rebuild
+        // once more so the sealed render projection is a pure function of the
+        // final type facts and the exact retained source.
+        Self::rebuild_source_owned_decompile_evidence(source, &mut enriched);
+        enriched.apply_source_owned_callee_signatures(source, callee_signatures);
+        let final_signature = enriched.types.merged_signature.as_ref();
+        let changed_parameters = final_signature.map_or_else(BTreeSet::new, |signature| {
+            signature
+                .params
+                .iter()
+                .enumerate()
+                .filter(|(slot, parameter)| {
+                    prior_signature
+                        .as_ref()
+                        .and_then(|signature| signature.params.get(*slot))
+                        .and_then(|parameter| parameter.ty.as_ref())
+                        != parameter.ty.as_ref()
+                })
+                .map(|(slot, _)| slot)
+                .collect()
+        });
+        let return_type_changed = prior_signature
+            .as_ref()
+            .and_then(|signature| signature.ret_type.as_ref())
+            != final_signature.and_then(|signature| signature.ret_type.as_ref());
         *report = enriched;
-        applied_constraints
+        (changed_parameters, return_type_changed)
     }
+
+    fn rebuild_source_owned_decompile_evidence(
+        source: &r2ssa::SsaArtifact,
+        report: &mut FunctionFacts,
+    ) {
+        let param_slots = exact_source_param_slot_resolver(source);
+        report.attach_prepared_decompile_evidence(source);
+        if let Some(param_slots) = param_slots.as_ref() {
+            report.populate_certified_parameter_exprs(source, param_slots);
+        }
+        report.normalize_field_certificates_from_external_layout();
+        if let Some(param_slots) = param_slots.as_ref() {
+            report.populate_member_access_render_facts_from_field_certificates(source, param_slots);
+        }
+        report.populate_certified_loop_carrier_types();
+        if let Some(param_slots) = param_slots.as_ref() {
+            report.populate_array_access_render_facts_from_scalar_candidates(source, param_slots);
+        }
+    }
+}
+
+/// The logical return type licensed by the exact source interface and every
+/// certified machine return boundary.
+///
+/// This is independent of whether advisory type recovery happened to create a
+/// whole [`FunctionSignatureSpec`]. In particular, a tail-only function has no
+/// `SSAOp::Return` from which the decompiler could infer a type, while its exact
+/// tail-call boundary still proves the carrier returned on the caller's behalf.
+pub fn exact_source_return_type(source: &r2ssa::SsaArtifact) -> Option<CTypeLike> {
+    let context = source.machine_context();
+    let abi = context.abi_model();
+    let memory = context.memory_model();
+    if !abi.is_available() || !abi.is_coherent() || !memory.is_available() || !memory.is_coherent()
+    {
+        return None;
+    }
+    let interface = context.function_interface()?;
+    let r2ssa::SourceFunctionReturn::Register { storage } = interface.return_kind() else {
+        return None;
+    };
+    if storage.space != r2ssa::CanonicalStorageSpace::Register || storage.size == 0 {
+        return None;
+    }
+    let logical = interface.return_logical_value()?;
+    let graph = interface.type_graph()?;
+    let source_type = graph
+        .types()
+        .get(usize::try_from(logical.type_id()).ok()?)
+        .filter(|source_type| source_type.id() == logical.type_id())?;
+    let projection = logical.carrier();
+    let storage_bits = u64::from(storage.size).checked_mul(8)?;
+    if projection.offset_bits() != 0
+        || projection.size_bits() == 0
+        || projection.size_bits() != source_type.size_bits()
+        || projection.size_bits() % 8 != 0
+        || projection.size_bits() > storage_bits
+    {
+        return None;
+    }
+    let logical_width = match projection.kind() {
+        r2ssa::SourceCarrierKind::Full if projection.size_bits() == storage_bits => storage.size,
+        r2ssa::SourceCarrierKind::LowBits
+            if projection.size_bits() < storage_bits
+                && matches!(
+                    source_type.kind(),
+                    r2ssa::SourceTypeKind::SignedInteger | r2ssa::SourceTypeKind::UnsignedInteger
+                ) =>
+        {
+            u32::try_from(projection.size_bits() / 8).ok()?
+        }
+        _ => return None,
+    };
+    let expected_carrier = r2ssa::ReturnCarrier::Register { storage };
+    let mut return_count = 0usize;
+    for &block_addr in source.function().block_addrs() {
+        let block = source.function().get_block(block_addr)?;
+        for (op_index, op) in block.ops.iter().enumerate() {
+            if !matches!(op, r2ssa::SSAOp::Return { .. }) {
+                continue;
+            }
+            return_count = return_count.checked_add(1)?;
+            let certificate = source.return_certificate_for_op(block_addr, op_index)?;
+            if !exact_return_certificate_matches(
+                certificate,
+                logical,
+                logical_width,
+                &expected_carrier,
+            ) {
+                return None;
+            }
+        }
+    }
+    let mut tail_return_count = 0usize;
+    for call_site in source
+        .facts()
+        .call_sites
+        .by_id
+        .values()
+        .filter(|call_site| call_site.transfer == r2ssa::CallSiteTransfer::TailCall)
+    {
+        let certificate = source.certificates().callsites.get(&call_site.id)?;
+        let boundary = source.facts().boundaries.calls.get(&call_site.id)?;
+        if !exact_tail_return_certificate_matches(call_site, certificate, boundary, storage) {
+            return None;
+        }
+        tail_return_count = tail_return_count.checked_add(1)?;
+    }
+    let certified_tail_return_count = source
+        .certificates()
+        .callsites
+        .values()
+        .filter(|certificate| certificate.transfer == r2ssa::CallSiteTransfer::TailCall)
+        .count();
+    if return_count + tail_return_count == 0
+        || source.certificates().returns.len() != return_count
+        || source.certificates().returns_by_inst.len() != return_count
+        || certified_tail_return_count != tail_return_count
+    {
+        return None;
+    }
+
+    crate::writeback::source_type_like(graph, logical.type_id(), &mut BTreeSet::new())
+}
+
+fn exact_return_certificate_matches(
+    certificate: &r2ssa::ReturnValueCertificate,
+    logical: r2ssa::SourceLogicalValue,
+    logical_width: u32,
+    expected_carrier: &r2ssa::ReturnCarrier,
+) -> bool {
+    certificate.source_logical_value == Some(logical)
+        && certificate.width == logical_width
+        && certificate.carrier.as_ref() == Some(expected_carrier)
+}
+
+fn exact_tail_return_certificate_matches(
+    call_site: &r2ssa::CallSiteFact,
+    certificate: &r2ssa::CallsiteCertificate,
+    boundary: &r2ssa::SourceCallBoundaryFact,
+    expected_storage: r2ssa::CanonicalStorageId,
+) -> bool {
+    call_site.transfer == r2ssa::CallSiteTransfer::TailCall
+        && call_site.raw_identity.is_some()
+        && certificate.transfer == r2ssa::CallSiteTransfer::TailCall
+        && certificate.call_site == call_site.id
+        && certificate.at == call_site.at
+        && certificate.target == call_site.target
+        && boundary.call_site == call_site.id
+        && boundary.at == call_site.at
+        && boundary.complete
+        && boundary.result_kind
+            == Some(r2ssa::SourceCallResult::Register {
+                storage: expected_storage,
+            })
 }
 
 fn exact_source_param_slot_resolver(source: &r2ssa::SsaArtifact) -> Option<ParamSlotResolver> {
     let context = source.machine_context();
     let interface = context.function_interface()?;
     let abi = context.abi_model();
-    if !abi.is_available()
-        || !abi.is_coherent()
-        || abi.argument_registers().len() != interface.parameters().len()
-    {
+    if !abi.is_available() {
         return None;
     }
-    let mut resolver = ParamSlotResolver::new();
-    let mut indices = BTreeSet::new();
-    let mut parameter_storages = Vec::new();
-    for parameter in interface.parameters() {
-        let slot = usize::try_from(parameter.index()).ok()?;
-        if parameter.storage().space != r2ssa::CanonicalStorageSpace::Register
-            || !indices.insert(slot)
-        {
-            return None;
-        }
-        let mut abi_slots = abi
+    let mut resolver = ParamSlotResolver::default();
+    for (index, parameter) in &source.facts().boundaries.parameters {
+        let slot = usize::try_from(*index).ok()?;
+        let source_parameter = interface
+            .parameters()
+            .iter()
+            .find(|candidate| candidate.index() == *index)?;
+        let abi_slot = abi
             .argument_registers()
             .iter()
-            .filter(|candidate| candidate.index() == parameter.index());
-        let abi_slot = abi_slots.next()?;
-        if abi_slots.next().is_some() || abi_slot.storage() != parameter.storage() {
-            return None;
-        }
-        parameter_storages.push((slot, parameter.storage()));
-    }
-    let mut matched_slots = BTreeSet::new();
-    for (alias, alias_storage) in context.register_storages_by_name() {
-        if alias_storage.space != r2ssa::CanonicalStorageSpace::Register || alias_storage.size == 0
-        {
-            continue;
-        }
-        let mut matches = parameter_storages.iter().filter(|(_, parameter)| {
-            parameter.space == alias_storage.space
-                && parameter.offset == alias_storage.offset
-                && alias_storage.size <= parameter.size
-        });
-        let Some((slot, _)) = matches.next() else {
-            continue;
-        };
-        if matches.next().is_some() {
-            return None;
-        }
-        let normalized = normalize_param_slot_register_name(alias);
-        if normalized.is_empty()
+            .find(|candidate| candidate.index() == *index)?;
+        let graph_value = source.graph().value(parameter.value)?;
+        if parameter.index != *index
+            || parameter.abi_storage != source_parameter.storage()
+            || parameter.abi_storage != abi_slot.storage()
+            || graph_value.canonical_storage != Some(parameter.graph_storage)
+            || graph_value.var.size != parameter.graph_storage.size
+            || graph_value.var.version != 0
+            || source.graph().def_inst(parameter.value).is_some()
             || resolver
-                .slots_by_register
-                .get(&normalized)
-                .is_some_and(|existing| existing != slot)
+                .slots_by_value
+                .insert(parameter.value, slot)
+                .is_some()
         {
             return None;
         }
-        resolver.slots_by_register.insert(normalized, *slot);
-        matched_slots.insert(*slot);
-    }
-    if matched_slots.len() != parameter_storages.len() {
-        return None;
     }
     Some(resolver)
 }
@@ -1783,6 +2075,7 @@ impl FunctionFacts {
             decompile_route: None,
             input_quality: None,
             callee_resolution: CalleeResolutionFacts::default(),
+            display_names: crate::DisplayNames::default(),
             callsites: FunctionCallsiteFacts::default(),
             call_results: FunctionCallResultFacts::default(),
             call_render: FunctionCallRenderFacts::default(),
@@ -1887,6 +2180,31 @@ impl FunctionFacts {
         (!self.callsites.is_empty()).then_some(&self.callsites)
     }
 
+    fn apply_source_owned_callee_signatures(
+        &mut self,
+        source: &r2ssa::SsaArtifact,
+        signatures: &BTreeMap<u64, SourceOwnedCalleeSignature>,
+    ) {
+        for arguments in self.callsites.by_callsite.values_mut() {
+            let Some(target) = arguments.direct_target else {
+                continue;
+            };
+            let Some(signature) = signatures.get(&target) else {
+                continue;
+            };
+            let same_interface = source
+                .machine_context()
+                .call_site_interface(arguments.call_site_id)
+                .and_then(r2ssa::SourceCallSiteInterface::exact_callee_interface)
+                .is_some_and(|interface| interface == &signature.interface);
+            if same_interface && signature.address() == target {
+                let mut logical_signature = signature.signature.clone();
+                logical_signature.variadic = arguments.variadic;
+                arguments.callee_signature = Some(logical_signature);
+            }
+        }
+    }
+
     pub fn with_call_results(mut self, call_results: FunctionCallResultFacts) -> Self {
         self.call_results = call_results;
         self
@@ -1938,6 +2256,21 @@ impl FunctionFacts {
 
     pub fn render_facts(&self) -> &FunctionRenderFacts {
         &self.render
+    }
+
+    /// Spellings for the addresses this function touches.
+    ///
+    /// Rendering asks this what to print. Nothing that decides what a call
+    /// does, which route to take, or what type something has may consult it:
+    /// a name is presentation, and treating it as evidence is how a decompiler
+    /// starts inventing semantics from symbol strings.
+    pub fn display_names(&self) -> &crate::DisplayNames {
+        &self.display_names
+    }
+
+    /// Attach the spellings radare2 already holds.
+    pub fn set_display_names(&mut self, names: crate::DisplayNames) {
+        self.display_names = names;
     }
 
     pub fn control_facts(&self) -> &FunctionControlFacts {
@@ -2329,7 +2662,7 @@ impl FunctionFacts {
                 field_type: cert
                     .field_type
                     .as_deref()
-                    .and_then(|ty| parse_type_like_spec(ty, ptr_bits)),
+                    .and_then(|ty| parse_c_type_like(ty, ptr_bits)),
                 access_width: memory.width,
             })
             .collect()
@@ -2539,12 +2872,17 @@ impl FunctionFacts {
         let prepared_control = prepared_control_facts(prepared);
         let prepared_render = FunctionRenderFacts::from_prepared(prepared);
 
-        merge_callee_resolution_facts(&mut self.callee_resolution, prepared_callee_resolution);
-        merge_callsite_facts(&mut self.callsites, prepared_callsites);
-        merge_call_result_facts(&mut self.call_results, prepared_call_results);
-        merge_call_render_facts(&mut self.call_render, prepared_call_render);
-        merge_control_facts(&mut self.control, prepared_control);
-        merge_render_facts(&mut self.render, prepared_render);
+        // These fields are projections of one exact prepared artifact, not
+        // extension points. Letting detached rows win with `or_insert` gave the
+        // report and its validator the same stale answer. Advisory type and
+        // presentation inputs are consumed while rebuilding, but the resulting
+        // source-owned maps are replaced atomically.
+        self.callee_resolution = prepared_callee_resolution;
+        self.callsites = prepared_callsites;
+        self.call_results = prepared_call_results;
+        self.call_render = prepared_call_render;
+        self.control = prepared_control;
+        self.render = prepared_render;
     }
 
     /// Bind canonical entry values to ABI parameter-slot semantic identities.
@@ -2558,12 +2896,24 @@ impl FunctionFacts {
         prepared: &r2ssa::SsaArtifact,
         param_slots: &ParamSlotResolver,
     ) {
+        // Register call arguments are implicit machine reads and therefore do
+        // not appear in the graph's ordinary use lists. The callsite
+        // certificate is their canonical use table; index it once so a formal
+        // handed straight to a callee remains a live parameter binding.
+        let implicit_call_arguments = prepared
+            .certificates()
+            .callsites
+            .values()
+            .flat_map(|callsite| callsite.argument_values.iter().copied())
+            .collect::<BTreeSet<_>>();
         let mut entry_values_by_slot = BTreeMap::<u32, (BTreeSet<r2ssa::ValueId>, u32)>::new();
         for value in &prepared.graph().values {
-            if value.var.version != 0 || !parameter_entry_value_has_live_use(prepared, value.id) {
+            if value.var.version != 0
+                || !parameter_entry_value_has_live_use(prepared, value.id, &implicit_call_arguments)
+            {
                 continue;
             }
-            let Some(slot) = param_slots.slot_for_var(&value.var) else {
+            let Some(slot) = param_slots.slot_for_value(value.id) else {
                 continue;
             };
             let Some(parameter_id) = r2ssa::SemanticId::parameter(slot) else {
@@ -2577,6 +2927,13 @@ impl FunctionFacts {
                 continue;
             };
             cert.bindings.insert(parameter_id);
+            r2il::refusal_evidence!(
+                "parameter-entry",
+                "slot {slot} entry value {:?} of {} bytes ({:?})",
+                value.id,
+                value.var.size,
+                value.canonical_storage
+            );
             let entry = entry_values_by_slot.entry(slot as u32).or_default();
             entry.0.insert(value.id);
             entry.1 = entry.1.max(value.var.size);
@@ -2650,6 +3007,35 @@ impl FunctionFacts {
         }
         for (slot, (entry_values, carrier_width)) in entry_values_by_slot {
             let id = r2ssa::SemanticId::Parameter(slot);
+            r2il::refusal_evidence!(
+                "parameter-entity",
+                "slot {slot} carrier {carrier_width} logical {:?}",
+                prepared
+                    .machine_context()
+                    .function_interface()
+                    .and_then(|interface| interface
+                        .parameter_logical_values()
+                        .get(slot as usize)
+                        .copied())
+            );
+            let ty = prepared
+                .machine_context()
+                .function_interface()
+                .filter(|interface| {
+                    interface
+                        .parameters()
+                        .get(slot as usize)
+                        .is_some_and(|parameter| parameter.index() == slot)
+                })
+                .and_then(|interface| {
+                    let graph = interface.type_graph()?;
+                    let logical = interface.parameter_logical_values().get(slot as usize)?;
+                    crate::writeback::source_type_like(
+                        graph,
+                        logical.type_id(),
+                        &mut BTreeSet::new(),
+                    )
+                });
             self.render.certified_entities.insert(
                 id,
                 CertifiedEntity::Parameter {
@@ -2657,6 +3043,7 @@ impl FunctionFacts {
                     slot,
                     entry_values,
                     carrier_width,
+                    ty,
                 },
             );
         }
@@ -2701,29 +3088,17 @@ impl FunctionFacts {
             .render
             .loop_carriers()
             .filter_map(|entity| match entity {
-                CertifiedEntity::LoopCarrier {
-                    id,
-                    phi,
-                    identity_values,
-                    ..
-                } => Some((*id, *phi, identity_values.clone())),
+                CertifiedEntity::LoopCarrier { id, members, .. } => Some((*id, members.clone())),
                 _ => None,
             })
             .collect::<Vec<_>>();
 
-        for (id, phi, identity_values) in carriers {
+        for (id, members) in carriers {
             let mut candidates = Vec::<CTypeLike>::new();
-            let mut carrier_values = identity_values;
-            carrier_values.insert(phi);
-            if let Some(CertifiedEntity::LoopCarrier {
-                entries, updates, ..
-            }) = self.render.certified_entities.get(&id)
-            {
-                carrier_values.extend(entries.iter().map(|entry| entry.value));
-                carrier_values.extend(updates.iter().flat_map(|update| {
-                    std::iter::once(update.value).chain(update.identity_values.iter().copied())
-                }));
-            }
+            let carrier_values = members
+                .into_iter()
+                .map(|member| member.value)
+                .collect::<BTreeSet<_>>();
             for value in &carrier_values {
                 if let Some(slot) = self.render.exact_parameter_slot_for_value(*value)
                     && let Some(ty) = signature
@@ -2768,11 +3143,15 @@ impl FunctionFacts {
     /// certified path to one ABI parameter and the callee identity carries a
     /// typed signature. Conflicting callees leave the caller type unchanged.
     pub fn apply_certified_call_argument_type_constraints(&mut self, ptr_bits: u32) -> usize {
+        let type_db = &self.types.external_type_db;
         let mut constraints = BTreeMap::<usize, CTypeLike>::new();
         let mut conflicted = BTreeSet::new();
         for (callsite, arguments) in &self.callsites.by_callsite {
             let identity = self.callee_resolution.identity_for_callsite(*callsite);
-            let signature = identity.and_then(crate::CalleeIdentity::known_signature);
+            let signature = arguments
+                .callee_signature
+                .as_ref()
+                .or_else(|| identity.and_then(crate::CalleeIdentity::known_signature));
             let Some(signature) = signature else {
                 continue;
             };
@@ -2799,6 +3178,7 @@ impl FunctionFacts {
                             existing,
                             Some(hint),
                             ptr_bits,
+                            type_db,
                         ) =>
                     {
                         constraints.insert(slot, hint.clone());
@@ -2808,6 +3188,7 @@ impl FunctionFacts {
                             hint,
                             Some(existing),
                             ptr_bits,
+                            type_db,
                         ) => {}
                     Some(_) => {
                         constraints.remove(&slot);
@@ -2835,6 +3216,7 @@ impl FunctionFacts {
                             existing,
                             Some(&hint),
                             ptr_bits,
+                            type_db,
                         )
                 }
             };
@@ -2862,6 +3244,313 @@ impl FunctionFacts {
         self.types
             .certify_current_signature_with_source(SignatureCertificateSource::CalleeSignature);
         applied.len()
+    }
+
+    /// Take the whole signature from the immutable source interface where it
+    /// carries a type graph: each parameter's and the return's declared type,
+    /// resolved through the graph, which is the same source the binding layer
+    /// declares from. The rendered header and the body then agree by
+    /// construction. radare2's spelled signature was the header's source before
+    /// and stays the fallback: it names typedefs the renderer cannot place and
+    /// carries signedness the source never declared, which is how `z_streamp`
+    /// rendered as a machine word and a header parameter disagreed with the
+    /// typed local it was stored into. Parameter names are kept from the
+    /// spelled signature when it has the same arity.
+    fn apply_exact_source_signature(&mut self, source: &r2ssa::SsaArtifact) -> bool {
+        let context = source.machine_context();
+        let Some(interface) = context.function_interface() else {
+            return false;
+        };
+        let Some(graph) = interface.type_graph() else {
+            return false;
+        };
+        let logical = interface.parameter_logical_values();
+        if logical.len() != interface.parameters().len() {
+            return false;
+        }
+        let spelled = self.types.merged_signature.clone();
+        let names = spelled
+            .as_ref()
+            .filter(|signature| signature.params.len() == logical.len())
+            .map(|signature| {
+                signature
+                    .params
+                    .iter()
+                    .map(|param| param.name.clone())
+                    .collect::<Vec<_>>()
+            });
+        let mut params = Vec::with_capacity(logical.len());
+        for (index, value) in logical.iter().enumerate() {
+            let Some(ty) =
+                crate::writeback::source_type_like(graph, value.type_id(), &mut BTreeSet::new())
+            else {
+                return false;
+            };
+            let name = names
+                .as_ref()
+                .and_then(|names| names.get(index).cloned())
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| format!("arg{index}"));
+            params.push(crate::FunctionParamSpec { name, ty: Some(ty) });
+        }
+        let ret_type = match interface.return_kind() {
+            r2ssa::SourceFunctionReturn::Void => Some(CTypeLike::Void),
+            r2ssa::SourceFunctionReturn::Register { .. } => {
+                interface.return_logical_value().and_then(|value| {
+                    crate::writeback::source_type_like(graph, value.type_id(), &mut BTreeSet::new())
+                })
+            }
+        };
+        let Some(ret_type) = ret_type else {
+            return false;
+        };
+        let signature = crate::FunctionSignatureSpec {
+            ret_type: Some(ret_type),
+            params,
+        };
+        let Some(certificate) = crate::SignatureCertificate::from_signature(
+            &signature,
+            [SignatureCertificateSource::SourceInterface],
+        ) else {
+            return false;
+        };
+        self.types.merged_signature = Some(signature);
+        self.types.signature_certificate = Some(certificate);
+        true
+    }
+
+    /// Preserve the source-declared logical return type only when every native
+    /// return has the exact SSA certificate for that declared carrier. The
+    /// immutable interface owns the logical type; the return certificates prove
+    /// that this function actually returns a value through that carrier.
+    fn apply_exact_source_return_type(&mut self, source: &r2ssa::SsaArtifact) -> bool {
+        let Some(return_type) = exact_source_return_type(source) else {
+            return false;
+        };
+        let Some(previous_signature) = self.types.merged_signature.clone() else {
+            return false;
+        };
+        let previous_certificate = self.types.signature_certificate.clone();
+        if previous_signature.ret_type.as_ref() == Some(&return_type) {
+            if let Some(mut sources) = previous_certificate
+                .as_ref()
+                .filter(|certificate| certificate.signature == previous_signature)
+                .map(|certificate| certificate.sources.clone())
+            {
+                sources.push(SignatureCertificateSource::SourceReturnType);
+                sources.sort();
+                sources.dedup();
+                if let Some(certificate) =
+                    crate::SignatureCertificate::from_signature(&previous_signature, sources)
+                {
+                    self.types.signature_certificate = Some(certificate);
+                }
+            }
+            return false;
+        }
+        let Some(signature) = self.types.merged_signature.as_mut() else {
+            return false;
+        };
+        signature.ret_type = Some(return_type);
+        let updated_signature = signature.clone();
+        let mut sources = previous_certificate
+            .as_ref()
+            .filter(|certificate| certificate.signature == previous_signature)
+            .map(|certificate| certificate.sources.clone())
+            .unwrap_or_default();
+        // This evidence proves only the return type. Treating it as general
+        // ExternalContext evidence would also certify unrelated parameter
+        // types and could incorrectly authorize full-signature writeback.
+        sources.push(SignatureCertificateSource::SourceReturnType);
+        sources.sort();
+        sources.dedup();
+        let Some(certificate) =
+            crate::SignatureCertificate::from_signature(&updated_signature, sources)
+        else {
+            self.types.merged_signature = Some(previous_signature);
+            self.types.signature_certificate = previous_certificate;
+            return false;
+        };
+        self.types.signature_certificate = Some(certificate);
+        true
+    }
+
+    /// The prototype each call site reaches, keyed the way the solver needs it.
+    fn callsite_signatures(&self) -> BTreeMap<r2ssa::CallSiteId, crate::FunctionType> {
+        let mut signatures = BTreeMap::new();
+        for (callsite, arguments) in &self.callsites.by_callsite {
+            let Some(signature) = arguments.callee_signature.as_ref().or_else(|| {
+                self.callee_resolution
+                    .identity_for_callsite(*callsite)
+                    .and_then(crate::CalleeIdentity::known_signature)
+            }) else {
+                continue;
+            };
+            signatures.insert(arguments.call_site_id, signature.clone());
+        }
+        signatures
+    }
+
+    /// Type what the code proves, for a function that carries no declared types.
+    ///
+    /// The solver is given every callee prototype, every certified access width
+    /// and every SSA identity at once and run to a fixpoint; what comes back is
+    /// only written where the fact it would replace is storage width rather than
+    /// evidence, so a recovered type never overwrites a declared one and a value
+    /// the solver did not reach keeps whatever it had.
+    pub fn apply_recovered_evidence_types(&mut self, source: &r2ssa::SsaArtifact, ptr_bits: u32) {
+        let signatures = self.callsite_signatures();
+        let recovered = crate::evidence::solve_evidence_types(source, &signatures, ptr_bits);
+        if recovered.is_empty() {
+            return;
+        }
+        self.apply_recovered_parameter_types(source, &recovered, ptr_bits);
+        self.apply_recovered_return_type(source, &recovered, ptr_bits);
+        self.apply_recovered_stack_slot_types(&recovered, ptr_bits);
+    }
+
+    /// The type of each exact source parameter value the solver reached.
+    ///
+    /// Boundary facts own the slot-to-`ValueId` mapping. A missing or
+    /// contradictory solution leaves just that parameter unchanged, while a
+    /// pointer or operation-proven scalar signedness may replace the weak
+    /// machine-width declaration inferred for the same slot.
+    fn apply_recovered_parameter_types(
+        &mut self,
+        source: &r2ssa::SsaArtifact,
+        recovered: &crate::EvidenceTypes,
+        ptr_bits: u32,
+    ) {
+        let type_db = &self.types.external_type_db;
+        let Some(signature) = self.types.merged_signature.as_mut() else {
+            return;
+        };
+        let mut changed = false;
+        for (slot, parameter) in &source.facts().boundaries.parameters {
+            if parameter.index != *slot {
+                continue;
+            }
+            let Ok(index) = usize::try_from(*slot) else {
+                continue;
+            };
+            let Some(candidate) = recovered.value_type(parameter.value) else {
+                continue;
+            };
+            let Some(param) = signature.params.get_mut(index) else {
+                continue;
+            };
+            let replace = match param.ty.as_ref() {
+                None => true,
+                Some(existing) => {
+                    recovered_type_outranks(existing, candidate, ptr_bits, type_db)
+                        || recovered_scalar_signedness_outranks(existing, candidate, ptr_bits)
+                }
+            };
+            if replace {
+                param.ty = Some(candidate.clone());
+                changed = true;
+            }
+        }
+        if changed {
+            self.types
+                .certify_current_signature_with_source(SignatureCertificateSource::LocalInference);
+        }
+    }
+
+    /// The type of the value the function hands back.
+    ///
+    /// Only a return that is already claimed to carry a value is retyped: a
+    /// function proven to return nothing keeps returning nothing, whatever a
+    /// leftover register happens to hold.
+    fn apply_recovered_return_type(
+        &mut self,
+        source: &r2ssa::SsaArtifact,
+        recovered: &crate::EvidenceTypes,
+        ptr_bits: u32,
+    ) {
+        let type_db = &self.types.external_type_db;
+        let Some(signature) = self.types.merged_signature.as_ref() else {
+            return;
+        };
+        let Some(existing) = signature.ret_type.clone() else {
+            return;
+        };
+        if !crate::facts::is_weak_storage_scalar_type(&existing, ptr_bits) {
+            return;
+        }
+
+        let mut candidate: Option<CTypeLike> = None;
+        for certificate in &source.certificates().returns {
+            let Some(ty) = recovered.value_type(certificate.value) else {
+                return;
+            };
+            match &candidate {
+                None => candidate = Some(ty.clone()),
+                Some(existing) if existing == ty => {}
+                // Two returns that disagree have not agreed on a type.
+                Some(_) => return,
+            }
+        }
+        let Some(candidate) = candidate else {
+            return;
+        };
+        if !recovered_type_outranks(&existing, &candidate, ptr_bits, type_db) {
+            return;
+        }
+        if let Some(signature) = self.types.merged_signature.as_mut() {
+            signature.ret_type = Some(candidate);
+        }
+        self.types
+            .certify_current_signature_with_source(SignatureCertificateSource::CalleeSignature);
+    }
+
+    /// The type of each stack home the solver reached.
+    fn apply_recovered_stack_slot_types(
+        &mut self,
+        recovered: &crate::EvidenceTypes,
+        ptr_bits: u32,
+    ) {
+        let type_db = &self.types.external_type_db;
+        let mut retyped: Vec<(String, CTypeLike)> = Vec::new();
+        for (key, ty) in recovered.stack_slot_types() {
+            let Some(slot) = self.types.stack_slots.get_mut(key) else {
+                continue;
+            };
+            let replace = match slot.ty.as_ref() {
+                None => true,
+                Some(existing) => {
+                    recovered_type_outranks(existing, ty, ptr_bits, type_db)
+                        || recovered_scalar_signedness_outranks(existing, ty, ptr_bits)
+                }
+            };
+            if !replace {
+                continue;
+            }
+            slot.ty = Some(ty.clone());
+            retyped.push((slot.name.clone(), ty.clone()));
+        }
+        if retyped.is_empty() {
+            return;
+        }
+        for (name, ty) in retyped {
+            for binding in self
+                .types
+                .visible_bindings
+                .iter_mut()
+                .filter(|binding| binding.name == name)
+            {
+                let replace = match binding.ty.as_ref() {
+                    None => true,
+                    Some(existing) => {
+                        recovered_type_outranks(existing, &ty, ptr_bits, type_db)
+                            || recovered_scalar_signedness_outranks(existing, &ty, ptr_bits)
+                    }
+                };
+                if replace {
+                    binding.ty = Some(ty.clone());
+                }
+            }
+        }
     }
 
     pub fn interproc_summary_set(&self) -> Option<&r2ssa::InterprocSummarySet> {
@@ -2960,13 +3649,20 @@ impl FunctionFacts {
     }
 }
 
-fn parameter_entry_value_has_live_use(prepared: &r2ssa::SsaArtifact, root: r2ssa::ValueId) -> bool {
+fn parameter_entry_value_has_live_use(
+    prepared: &r2ssa::SsaArtifact,
+    root: r2ssa::ValueId,
+    implicit_call_arguments: &BTreeSet<r2ssa::ValueId>,
+) -> bool {
     let graph = prepared.graph();
     let mut pending = vec![root];
     let mut visited = BTreeSet::new();
     while let Some(value) = pending.pop() {
         if !visited.insert(value) {
             continue;
+        }
+        if implicit_call_arguments.contains(&value) {
+            return true;
         }
         for use_site in graph.use_sites(value) {
             let Some(inst) = graph.inst(use_site.inst) else {
@@ -2984,6 +3680,71 @@ fn parameter_entry_value_has_live_use(prepared: &r2ssa::SsaArtifact, root: r2ssa
     false
 }
 
+/// Whether a recovered type is better evidence than what is already recorded.
+///
+/// A width is not a type. A slot that nothing is known about is given the width
+/// of the register that spilled it, and any structured type outranks that; a
+/// type that is already structured is never demoted, so a recovered type cannot
+/// overwrite a declared one.
+fn recovered_type_outranks(
+    existing: &CTypeLike,
+    recovered: &CTypeLike,
+    ptr_bits: u32,
+    type_db: &crate::ExternalTypeDb,
+) -> bool {
+    if crate::signature_infer::signature_types_are_equivalent(existing, recovered, ptr_bits) {
+        return false;
+    }
+    if crate::facts::signature_hint_can_replace_existing(
+        existing,
+        Some(recovered),
+        ptr_bits,
+        type_db,
+    ) {
+        return true;
+    }
+    crate::facts::is_weak_storage_scalar_type(existing, ptr_bits)
+        && recovered_type_is_evidence(recovered, ptr_bits)
+}
+
+/// Whether a type says more than the width of the storage that held it.
+fn recovered_type_is_evidence(ty: &CTypeLike, ptr_bits: u32) -> bool {
+    match ty {
+        CTypeLike::Pointer(inner) => !matches!(inner.as_ref(), CTypeLike::Unknown),
+        CTypeLike::Float(_)
+        | CTypeLike::Bool
+        | CTypeLike::Struct(_)
+        | CTypeLike::Union(_)
+        | CTypeLike::Enum(_) => true,
+        CTypeLike::Typedef(name) => !crate::facts::is_weak_storage_scalar_typedef(name, ptr_bits),
+        _ => false,
+    }
+}
+
+/// Operation-proven signedness refines a weak scalar of the same width.
+fn recovered_scalar_signedness_outranks(
+    existing: &CTypeLike,
+    recovered: &CTypeLike,
+    ptr_bits: u32,
+) -> bool {
+    let scalar = |ty: &CTypeLike| match ty {
+        CTypeLike::Int { bits, signedness } => Some((*bits, *signedness)),
+        CTypeLike::Typedef(name) => match crate::parse_c_type_like(name, ptr_bits) {
+            Some(CTypeLike::Int { bits, signedness }) => Some((bits, signedness)),
+            _ => None,
+        },
+        _ => None,
+    };
+    let (Some((existing_bits, existing_signedness)), Some((recovered_bits, recovered_signedness))) =
+        (scalar(existing), scalar(recovered))
+    else {
+        return false;
+    };
+    existing_bits == recovered_bits
+        && existing_signedness != recovered_signedness
+        && recovered_signedness != crate::Signedness::Unknown
+}
+
 fn struct_name_from_pointer_type(ty: Option<&CTypeLike>) -> Option<&str> {
     let CTypeLike::Pointer(inner) = ty? else {
         return None;
@@ -2999,13 +3760,25 @@ fn prepared_callee_resolution_facts(
     function_facts: &FunctionFacts,
 ) -> CalleeResolutionFacts {
     let type_facts = function_facts.types.clone().canonicalized();
+    // These were empty maps, so every direct call resolved to nothing and
+    // rendered as `sub_<addr>` even when radare2 had the name all along.
+    let function_names = function_facts
+        .display_names
+        .functions()
+        .iter()
+        .map(|(addr, name)| (*addr, name.clone()))
+        .collect::<HashMap<_, _>>();
+    let symbols = function_facts
+        .display_names
+        .symbols()
+        .iter()
+        .map(|(addr, name)| (*addr, name.clone()))
+        .collect::<HashMap<_, _>>();
     let known_function_signatures = type_facts
         .known_function_signatures
         .iter()
         .map(|(name, ty)| (crate::normalize_callee_name(name), ty.clone()))
         .collect::<HashMap<_, _>>();
-    let function_names = HashMap::new();
-    let symbols = HashMap::new();
     let ctx = CalleeIdentityContext {
         function_names: &function_names,
         symbols: &symbols,
@@ -3033,127 +3806,6 @@ fn prepared_callee_resolution_facts(
     )
 }
 
-fn merge_callee_resolution_facts(
-    existing: &mut CalleeResolutionFacts,
-    prepared: CalleeResolutionFacts,
-) {
-    for (key, identity) in prepared.by_key {
-        existing.by_key.entry(key).or_insert(identity);
-    }
-    for (addr, key) in prepared.by_direct_addr {
-        existing.by_direct_addr.entry(addr).or_insert(key);
-    }
-    for (callsite, key) in prepared.by_callsite {
-        existing.by_callsite.entry(callsite).or_insert(key);
-    }
-    for (name, key) in prepared.by_name {
-        existing.by_name.entry(name).or_insert(key);
-    }
-}
-
-fn merge_callsite_facts(existing: &mut FunctionCallsiteFacts, prepared: FunctionCallsiteFacts) {
-    for (callsite, facts) in prepared.by_callsite {
-        existing.by_callsite.entry(callsite).or_insert(facts);
-    }
-}
-
-fn merge_call_result_facts(
-    existing: &mut FunctionCallResultFacts,
-    prepared: FunctionCallResultFacts,
-) {
-    for (value, fact) in prepared.by_value {
-        existing.by_value.entry(value).or_insert(fact);
-    }
-    for (callsite, values) in prepared.by_callsite {
-        let existing_values = existing.by_callsite.entry(callsite).or_default();
-        for value in values {
-            if !existing_values.contains(&value) {
-                existing_values.push(value);
-            }
-        }
-    }
-}
-
-fn merge_call_render_facts(
-    existing: &mut FunctionCallRenderFacts,
-    prepared: FunctionCallRenderFacts,
-) {
-    for (callsite, fact) in prepared.by_callsite {
-        existing.by_callsite.entry(callsite).or_insert(fact);
-    }
-}
-
-fn merge_control_facts(existing: &mut FunctionControlFacts, prepared: FunctionControlFacts) {
-    for (block, fact) in prepared.branch_predicates {
-        existing.branch_predicates.entry(block).or_insert(fact);
-    }
-    for (block, assumptions) in prepared.block_assumptions {
-        let existing_assumptions = existing.block_assumptions.entry(block).or_default();
-        for assumption in assumptions {
-            if !existing_assumptions.contains(&assumption) {
-                existing_assumptions.push(assumption);
-            }
-        }
-    }
-    for (loop_id, fact) in prepared.loops {
-        existing.loops.entry(loop_id).or_insert(fact);
-    }
-    for (block, fact) in prepared.switches {
-        existing.switches.entry(block).or_insert(fact);
-    }
-    for (id, domain) in prepared.control_domains.domains {
-        existing.control_domains.domains.entry(id).or_insert(domain);
-    }
-    for (block, id) in prepared.control_domains.by_block {
-        existing.control_domains.by_block.entry(block).or_insert(id);
-    }
-}
-
-fn merge_render_facts(existing: &mut FunctionRenderFacts, prepared: FunctionRenderFacts) {
-    for (id, fact) in prepared.certified_exprs {
-        existing.certified_exprs.entry(id).or_insert(fact);
-    }
-    for (id, fact) in prepared.certified_entities {
-        existing.certified_entities.entry(id).or_insert(fact);
-    }
-    for (id, fact) in prepared.certified_effects {
-        existing.certified_effects.entry(id).or_insert(fact);
-    }
-    for (op, id) in prepared.return_effects_by_op {
-        existing.return_effects_by_op.entry(op).or_insert(id);
-    }
-    for (op, ids) in prepared.memory_effects_by_op {
-        let existing_ids = existing.memory_effects_by_op.entry(op).or_default();
-        for id in ids {
-            if !existing_ids.contains(&id) {
-                existing_ids.push(id);
-            }
-        }
-    }
-    for (value, fact) in prepared.string_literals_by_value {
-        existing
-            .string_literals_by_value
-            .entry(value)
-            .or_insert(fact);
-    }
-    for (op, facts) in prepared.member_accesses_by_op {
-        let existing_facts = existing.member_accesses_by_op.entry(op).or_default();
-        for fact in facts {
-            if !existing_facts.contains(&fact) {
-                existing_facts.push(fact);
-            }
-        }
-    }
-    for (op, facts) in prepared.array_accesses_by_op {
-        let existing_facts = existing.array_accesses_by_op.entry(op).or_default();
-        for fact in facts {
-            if !existing_facts.contains(&fact) {
-                existing_facts.push(fact);
-            }
-        }
-    }
-}
-
 fn prepared_callsite_argument_facts(prepared: &r2ssa::SsaArtifact) -> FunctionCallsiteFacts {
     let by_callsite = prepared
         .certificates()
@@ -3176,13 +3828,14 @@ fn prepared_callsite_argument_facts(prepared: &r2ssa::SsaArtifact) -> FunctionCa
                 .argument_certificates
                 .iter()
                 .filter_map(|argument| {
-                    let r2ssa::CallArgumentLocation::Register { name } = &argument.location else {
+                    let r2ssa::CallArgumentLocation::Register { storage } = &argument.location
+                    else {
                         return None;
                     };
                     Some(RegisterCallArgumentLocationFact {
                         index: argument.index,
                         value: argument.value,
-                        name: name.clone(),
+                        storage: *storage,
                         source_inst: argument.source_inst,
                     })
                 })
@@ -3218,6 +3871,14 @@ fn prepared_callsite_argument_facts(prepared: &r2ssa::SsaArtifact) -> FunctionCa
                     target: cert.target,
                     direct_target: cert.direct_target,
                     argument_values,
+                    variadic: cert.variadic,
+                    fixed_argument_count: cert.fixed_argument_count,
+                    // Carrier widths alone do not prove C signedness. A
+                    // source-owned callee analysis fills this only after its
+                    // exact retained interface matches this call site.
+                    callee_signature: None,
+                    variadic_argument_count_evidence: cert.variadic_argument_count_evidence,
+                    variadic_argument_count_refusal: cert.variadic_argument_count_refusal,
                     register_argument_locations,
                     stack_argument_locations,
                 },
@@ -3272,10 +3933,42 @@ fn prepared_call_render_facts(
                 block_addr: cert.block_addr,
                 op_index: cert.op_index,
             };
-            let disposition = if call_results
-                .results_for_site(callsite)
-                .any(|result| matches!(result.owner, Some(r2ssa::ValueOwner::StackSlot { .. })))
-            {
+            // Whether the call site assigns its result is one question, and
+            // `owner_for_site` answers it. Asking a second, narrower one here
+            // -- does some result have a *stack slot* owner -- made the two
+            // disagree the moment a register-carried result gained an owner:
+            // the disposition said side effect while the owner lookup named a
+            // value, so the call rendered as a bare statement *and* as its
+            // definition's right-hand side, and one site was evaluated twice.
+            let count_refusal = if cert.variadic {
+                cert.variadic_argument_count_refusal.or_else(|| {
+                    cert.variadic_argument_count_evidence.is_none().then_some(
+                        r2ssa::VariadicCallsiteArgumentCountRefusal::MissingFormatParameter,
+                    )
+                })
+            } else {
+                None
+            };
+            let disposition = if count_refusal.is_some() {
+                CallsiteRenderDisposition::Residualized
+            } else if cert.transfer == r2ssa::CallSiteTransfer::TailCall {
+                match prepared
+                    .facts()
+                    .boundaries
+                    .calls
+                    .get(&cert.call_site)
+                    .filter(|boundary| boundary.complete && boundary.at == cert.at)
+                    .and_then(|boundary| boundary.result_kind)
+                {
+                    Some(r2ssa::SourceCallResult::Register { .. }) => {
+                        CallsiteRenderDisposition::TerminalReturn
+                    }
+                    Some(r2ssa::SourceCallResult::Void) => {
+                        CallsiteRenderDisposition::TerminalVoidReturn
+                    }
+                    None => CallsiteRenderDisposition::Residualized,
+                }
+            } else if call_results.owner_for_site(callsite).is_some() {
                 CallsiteRenderDisposition::AssignedResult
             } else {
                 CallsiteRenderDisposition::SideEffectStatement
@@ -3287,7 +3980,8 @@ fn prepared_call_render_facts(
                     target: Some(cert.target),
                     disposition,
                     proof_values: cert.argument_values.clone(),
-                    residual_reason: None,
+                    residual_reason: count_refusal
+                        .map(|refusal| format!("variadic callsite: {}", refusal.kind())),
                 },
             )
         })
@@ -3445,10 +4139,10 @@ fn prepared_address_base_param_slot(
         .and_then(|reload| graph.value(reload.canonical_source))
         && source.var.version == 0
     {
-        return param_slots.slot_for_var(&source.var);
+        return param_slots.slot_for_value(source.id);
     }
     let Some(def_inst) = graph.def_inst(value) else {
-        return param_slots.slot_for_var(var);
+        return param_slots.slot_for_value(value);
     };
     let inst = graph.inst(def_inst)?;
     if matches!(inst.payload, r2ssa::InstPayload::Phi { .. }) {
@@ -3529,7 +4223,7 @@ fn prepared_sub_param_slot(
 }
 
 fn const_var_i64(var: &r2ssa::SSAVar) -> Option<i64> {
-    let raw = r2ssa::parse_const_value(&var.name)?;
+    let raw = var.constant_bits()?;
     let bits = var.size.saturating_mul(8);
     if bits == 0 || bits >= 64 {
         return Some(raw as i64);
@@ -3824,6 +4518,7 @@ fn prepared_render_facts(prepared: &r2ssa::SsaArtifact) -> FunctionRenderFacts {
                         op_index: cert.op_index,
                         value: cert.value,
                         width: cert.width,
+                        overlays: cert.overlays.clone(),
                         control_domain,
                     },
                 },
@@ -3851,6 +4546,19 @@ fn prepared_render_facts(prepared: &r2ssa::SsaArtifact) -> FunctionRenderFacts {
                     base: cert.base,
                     offset: cert.offset,
                     size: cert.size,
+                    array_layout: cert.array_layout.clone(),
+                    source_slot: cert.source_slot,
+                    callee_allocation: cert.callee_allocation.clone(),
+                    ty: cert
+                        .source_slot
+                        .and_then(|slot| slot.logical_type())
+                        .and_then(|type_id| {
+                            let graph = prepared
+                                .machine_context()
+                                .function_interface()?
+                                .type_graph()?;
+                            crate::writeback::source_type_like(graph, type_id, &mut BTreeSet::new())
+                        }),
                 },
             )
         })
@@ -3912,6 +4620,12 @@ fn prepared_render_facts(prepared: &r2ssa::SsaArtifact) -> FunctionRenderFacts {
             }
         }
     }
+    // Whether a carrier is part of the program is a question about the program,
+    // and r2ssa is what answers those. Asking instead whether the phi sits in a
+    // backward slice from the roots certified so far made publication depend on
+    // what else had been certified, so a carrier whose only consumer was the
+    // function's own result vanished whenever the return went uncertified.
+    let unobserved = prepared.unobserved_merges();
     let mut carrier_edge_roots = Vec::new();
     let mut carrier_identity_values = BTreeSet::new();
     for carrier in prepared
@@ -3919,20 +4633,12 @@ fn prepared_render_facts(prepared: &r2ssa::SsaArtifact) -> FunctionRenderFacts {
         .loops
         .values()
         .flat_map(|loop_fact| loop_fact.carriers.iter())
-        .filter(|carrier| observable_values.contains(&carrier.phi))
+        .filter(|carrier| !unobserved.contains(carrier.phi))
     {
         carrier_identity_values.extend(carrier.identity_values.iter().copied());
         carrier_edge_roots.extend(carrier.entries.iter().map(|entry| entry.value));
         carrier_edge_roots.extend(carrier.updates.iter().map(|update| update.value));
-        for value in carrier
-            .identity_values
-            .iter()
-            .copied()
-            .chain(carrier.entries.iter().map(|edge| edge.value))
-            .chain(carrier.updates.iter().flat_map(|update| {
-                std::iter::once(update.value).chain(update.identity_values.iter().copied())
-            }))
-        {
+        for value in carrier.members.iter().map(|member| member.value) {
             if let Some(expr) = certified_exprs.get_mut(&r2ssa::SemanticId::expression(value)) {
                 expr.bindings.insert(carrier.id);
             }
@@ -3949,11 +4655,16 @@ fn prepared_render_facts(prepared: &r2ssa::SsaArtifact) -> FunctionRenderFacts {
                 entries: carrier.entries.clone(),
                 updates: carrier.updates.clone(),
                 dominating_initializers: carrier.dominating_initializers.clone(),
+                members: carrier.members.clone(),
                 ty: None,
             },
         );
     }
     let consumer_roots = prepared_render_consumer_occurrences(prepared, carrier_edge_roots);
+    // One propagation answers every read: how often a value is inlined does
+    // not depend on which read is asking.
+    let inline_multiplicity =
+        expression_inline_multiplicity(prepared.graph(), &consumer_roots, &carrier_identity_values);
     for effect in certified_memory_effects.values_mut() {
         let CertifiedEffect::Memory { fact, .. } = effect else {
             continue;
@@ -3964,19 +4675,7 @@ fn prepared_render_facts(prepared: &r2ssa::SsaArtifact) -> FunctionRenderFacts {
         if certificates.stack_slots.contains_key(&fact.object) {
             continue;
         }
-        let dependency_occurrences = consumer_roots.iter().copied().fold(0_u8, |count, root| {
-            if count > 1 {
-                return count;
-            }
-            count.saturating_add(expression_dependency_path_count(
-                prepared.graph(),
-                root,
-                value,
-                &carrier_identity_values,
-                &mut BTreeSet::new(),
-            ))
-        });
-        fact.materialize_result = dependency_occurrences > 1;
+        fact.materialize_result = inline_multiplicity.get(&value).copied().unwrap_or(0) > 1;
     }
     let mut certified_effects = certified_memory_effects;
     certified_effects.extend(certified_return_effects);
@@ -4030,40 +4729,67 @@ fn prepared_render_consumer_occurrences(
     roots
 }
 
-fn expression_dependency_path_count(
+/// How many times each value is inlined into the expressions rooted at
+/// `roots`, saturated at two.
+///
+/// Rendering inlines an expression, so a value reachable by two distinct
+/// dependency paths is printed twice, and the caller only needs to know
+/// whether that happens at all.
+///
+/// This is one propagation for the whole function rather than one search per
+/// value asked about. The search it replaces enumerated paths and memoised a
+/// value only when nothing below it was still being computed -- which, on a
+/// cycle, is every value above the cycle, so the memo was defeated exactly
+/// where it was needed and the walk fell back to enumerating paths. Any
+/// function with a loop therefore cost time exponential in its shared
+/// subexpressions: `gz_decomp` in zlib built at -O2, eighteen blocks and
+/// eighty-two instructions, did not finish in two hundred seconds, and a
+/// sweep of that binary died on it.
+///
+/// Multiplicity flows the other way, from the roots down to the leaves, and is
+/// a least fixpoint over a lattice of three values. It is monotone, so a
+/// worklist settles it in one pass over each edge per increase, and a cycle is
+/// no longer a special case: a value a loop carries back into itself simply
+/// reaches two, which is what "printed more than once" means for it. A carrier
+/// identity is where inlining stops, so it neither counts nor propagates.
+fn expression_inline_multiplicity(
     graph: &r2ssa::SsaGraph,
-    current: r2ssa::ValueId,
-    target: r2ssa::ValueId,
+    roots: &[r2ssa::ValueId],
     carrier_identities: &BTreeSet<r2ssa::ValueId>,
-    visiting: &mut BTreeSet<r2ssa::ValueId>,
-) -> u8 {
-    if current == target {
-        return 1;
+) -> BTreeMap<r2ssa::ValueId, u8> {
+    let mut multiplicity = BTreeMap::<r2ssa::ValueId, u8>::new();
+    let mut worklist = Vec::new();
+    for root in roots {
+        if carrier_identities.contains(root) {
+            continue;
+        }
+        let slot = multiplicity.entry(*root).or_insert(0);
+        let raised = slot.saturating_add(1).min(2);
+        if raised != *slot {
+            *slot = raised;
+            worklist.push(*root);
+        }
     }
-    if carrier_identities.contains(&current) || !visiting.insert(current) {
-        return 0;
+    while let Some(value) = worklist.pop() {
+        let Some(share) = multiplicity.get(&value).copied() else {
+            continue;
+        };
+        let Some(inst) = graph.def_inst(value).and_then(|inst| graph.inst(inst)) else {
+            continue;
+        };
+        for input in &inst.inputs {
+            if carrier_identities.contains(input) {
+                continue;
+            }
+            let slot = multiplicity.entry(*input).or_insert(0);
+            let raised = slot.saturating_add(share).min(2);
+            if raised != *slot {
+                *slot = raised;
+                worklist.push(*input);
+            }
+        }
     }
-    let count = graph
-        .def_inst(current)
-        .and_then(|inst| graph.inst(inst))
-        .map(|inst| {
-            inst.inputs.iter().fold(0_u8, |count, input| {
-                if count > 1 {
-                    count
-                } else {
-                    count.saturating_add(expression_dependency_path_count(
-                        graph,
-                        *input,
-                        target,
-                        carrier_identities,
-                        visiting,
-                    ))
-                }
-            })
-        })
-        .unwrap_or_default();
-    visiting.remove(&current);
-    count.min(2)
+    multiplicity
 }
 
 fn prepared_control_facts(prepared: &r2ssa::SsaArtifact) -> FunctionControlFacts {
@@ -4142,6 +4868,7 @@ fn prepared_control_facts(prepared: &r2ssa::SsaArtifact) -> FunctionControlFacts
                     body: sorted_u64s(&cert.body),
                     latches: sorted_u64s(&cert.latches),
                     exits: sorted_u64s(&cert.exits),
+                    for_loop: cert.for_loop.clone(),
                 },
             )
         })
@@ -4362,27 +5089,230 @@ fn push_structured_summary_pointer_indices(
 mod tests {
     use super::*;
     use crate::{ExternalStackBase, FunctionParamSpec};
-    use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
-    use std::collections::{BTreeMap, HashMap};
+    use r2il::{
+        ArchSpec, R2ILBlock, R2ILOp, RegisterBitSlice, RegisterDef, RegisterProjection,
+        RegisterProjectionDisposition, RegisterStorage, SpaceId, Varnode,
+    };
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
 
     #[test]
-    fn exact_source_param_slots_include_source_owned_low_width_aliases() {
+    fn constant_looking_spelling_is_not_constant_evidence() {
+        assert_eq!(
+            const_var_i64(&r2ssa::SSAVar::new("const:ffffffffffffffb8", 0, 8)),
+            None
+        );
+        assert_eq!(
+            const_var_i64(&r2ssa::SSAVar::constant(0xffff_ffff_ffff_ffb8, 8)),
+            Some(-72)
+        );
+    }
+
+    #[test]
+    fn parameter_coalescing_values_are_exact_entry_membership() {
+        let entry_values =
+            BTreeSet::from([r2ssa::ValueId(7), r2ssa::ValueId(2), r2ssa::ValueId(11)]);
+        let entity = CertifiedEntity::Parameter {
+            id: r2ssa::SemanticId::Parameter(0),
+            slot: 0,
+            entry_values: entry_values.clone(),
+            carrier_width: 8,
+            ty: None,
+        };
+
+        assert_eq!(entity.coalescing_values(), Some(entry_values));
+    }
+
+    #[test]
+    fn loop_carrier_coalescing_values_cover_every_program_point_role() {
+        let entity = CertifiedEntity::LoopCarrier {
+            id: r2ssa::SemanticId::LoopCarrier(r2ssa::ValueId(1)),
+            loop_id: r2ssa::LoopId(0),
+            header: 0x401000,
+            phi: r2ssa::ValueId(1),
+            width: 4,
+            identity_values: BTreeSet::from([r2ssa::ValueId(4), r2ssa::ValueId(1)]),
+            entries: vec![
+                r2ssa::LoopCarrierEdgeValue {
+                    predecessor: 0x400ff0,
+                    value: r2ssa::ValueId(7),
+                    site: r2ssa::UseSite {
+                        inst: r2ssa::InstId(20),
+                        input_idx: 0,
+                    },
+                },
+                r2ssa::LoopCarrierEdgeValue {
+                    predecessor: 0x400fe0,
+                    value: r2ssa::ValueId(3),
+                    site: r2ssa::UseSite {
+                        inst: r2ssa::InstId(20),
+                        input_idx: 1,
+                    },
+                },
+            ],
+            updates: vec![r2ssa::LoopCarrierUpdateFact {
+                predecessor: 0x401010,
+                value: r2ssa::ValueId(9),
+                site: r2ssa::UseSite {
+                    inst: r2ssa::InstId(20),
+                    input_idx: 2,
+                },
+                identity_values: BTreeSet::from([r2ssa::ValueId(8), r2ssa::ValueId(2)]),
+            }],
+            dominating_initializers: vec![
+                r2ssa::LoopCarrierEdgeValue {
+                    predecessor: 0x400fd0,
+                    value: r2ssa::ValueId(6),
+                    site: r2ssa::UseSite {
+                        inst: r2ssa::InstId(30),
+                        input_idx: 0,
+                    },
+                },
+                r2ssa::LoopCarrierEdgeValue {
+                    predecessor: 0x400fc0,
+                    value: r2ssa::ValueId(3),
+                    site: r2ssa::UseSite {
+                        inst: r2ssa::InstId(30),
+                        input_idx: 1,
+                    },
+                },
+            ],
+            members: [1, 2, 3, 4, 6, 7, 8, 9]
+                .into_iter()
+                .map(|value| r2ssa::LoopCarrierMemberFact {
+                    value: r2ssa::ValueId(value),
+                    roles: BTreeSet::from([r2ssa::LoopCarrierMemberRole::StorageContinuation]),
+                })
+                .collect(),
+            ty: None,
+        };
+
+        assert_eq!(
+            entity.coalescing_values(),
+            Some(BTreeSet::from([
+                r2ssa::ValueId(1),
+                r2ssa::ValueId(2),
+                r2ssa::ValueId(3),
+                r2ssa::ValueId(4),
+                r2ssa::ValueId(6),
+                r2ssa::ValueId(7),
+                r2ssa::ValueId(8),
+                r2ssa::ValueId(9),
+            ]))
+        );
+    }
+
+    #[test]
+    fn coalescing_membership_is_order_independent_and_stack_slots_refuse_it() {
+        let edge = |predecessor, value| r2ssa::LoopCarrierEdgeValue {
+            predecessor,
+            value: r2ssa::ValueId(value),
+            site: r2ssa::UseSite {
+                inst: r2ssa::InstId(value),
+                input_idx: 0,
+            },
+        };
+        let update = |predecessor, value, identities| r2ssa::LoopCarrierUpdateFact {
+            predecessor,
+            value: r2ssa::ValueId(value),
+            site: r2ssa::UseSite {
+                inst: r2ssa::InstId(value),
+                input_idx: 0,
+            },
+            identity_values: identities,
+        };
+        let make_carrier =
+            |entries, updates, dominating_initializers, members| CertifiedEntity::LoopCarrier {
+                id: r2ssa::SemanticId::LoopCarrier(r2ssa::ValueId(1)),
+                loop_id: r2ssa::LoopId(0),
+                header: 0x401000,
+                phi: r2ssa::ValueId(1),
+                width: 8,
+                identity_values: BTreeSet::from([r2ssa::ValueId(5), r2ssa::ValueId(1)]),
+                entries,
+                updates,
+                dominating_initializers,
+                members,
+                ty: None,
+            };
+        let members = |values: Vec<u32>| {
+            values
+                .into_iter()
+                .map(|value| r2ssa::LoopCarrierMemberFact {
+                    value: r2ssa::ValueId(value),
+                    roles: BTreeSet::from([r2ssa::LoopCarrierMemberRole::StorageContinuation]),
+                })
+                .collect::<Vec<_>>()
+        };
+        let forward = make_carrier(
+            vec![edge(10, 2), edge(20, 3)],
+            vec![
+                update(30, 4, BTreeSet::from([r2ssa::ValueId(6)])),
+                update(40, 7, BTreeSet::from([r2ssa::ValueId(8)])),
+            ],
+            vec![edge(50, 9), edge(60, 10)],
+            members(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]),
+        );
+        let reversed = make_carrier(
+            vec![edge(20, 3), edge(10, 2)],
+            vec![
+                update(40, 7, BTreeSet::from([r2ssa::ValueId(8)])),
+                update(30, 4, BTreeSet::from([r2ssa::ValueId(6)])),
+            ],
+            vec![edge(60, 10), edge(50, 9)],
+            members(vec![10, 9, 8, 7, 6, 5, 4, 3, 2, 1]),
+        );
+        let object = r2ssa::ObjectId(3);
+        let stack_slot = CertifiedEntity::StackSlot {
+            id: r2ssa::SemanticId::stack_slot(object),
+            object,
+            base: r2ssa::StackAddressBase::FramePointer,
+            offset: -8,
+            size: Some(8),
+            array_layout: r2ssa::StackArrayLayoutDisposition::NotIndexed,
+            source_slot: None,
+            callee_allocation: None,
+            ty: None,
+        };
+
+        assert_eq!(forward.coalescing_values(), reversed.coalescing_values());
+        assert_eq!(stack_slot.coalescing_values(), None);
+    }
+
+    #[test]
+    fn exact_source_param_slots_ignore_misleading_register_names() {
         let mut arch = ArchSpec::new("x86-64");
-        arch.add_register(RegisterDef::new("rdi", 0x20, 8));
-        arch.add_register(RegisterDef::new("edi", 0x20, 4));
-        arch.add_register(RegisterDef::new("rsp", 0x30, 8));
+        arch.add_register(RegisterDef::new("rax", 0x20, 8));
+        arch.add_register(RegisterDef::new("not_an_argument", 0x20, 4));
+        arch.add_register(RegisterDef::new("rdi", 0x30, 8));
         arch.add_register(RegisterDef::new("rip", 0x40, 8));
         let storage = r2ssa::CanonicalStorageId {
             space: r2ssa::CanonicalStorageSpace::Register,
             offset: 0x20,
             size: 8,
         };
-        let interface = r2ssa::SourceFunctionInterface::new_exact(
+        let logical = r2ssa::SourceLogicalValue::new(
+            0,
+            r2ssa::SourceCarrierProjection::new(r2ssa::SourceCarrierKind::Full, 0, 64),
+        );
+        let type_graph = r2ssa::SourceTypeGraph::new(
+            [r2ssa::SourceType::new(
+                0,
+                r2ssa::SourceTypeKind::UnsignedInteger,
+                64,
+                64,
+            )],
+            [],
+        )
+        .expect("exact parameter type graph");
+        let interface = r2ssa::SourceFunctionInterface::new_exact_with_logical_types(
             b"exact-param-alias".to_vec(),
             "sysv64",
             [r2ssa::SourceAbiParameterSpec::new(0, storage)],
             r2ssa::SourceFunctionReturn::Void,
             [],
+            [logical],
+            None,
+            Some(type_graph),
         )
         .and_then(|interface| {
             interface.with_stack_pointer_storage(r2ssa::CanonicalStorageId {
@@ -4399,16 +5329,40 @@ mod tests {
             })
         })
         .expect("exact interface");
-        let source = r2ssa::SsaArtifact::for_decompile_with_interface(
-            &[R2ILBlock::new(0x1000, 1)],
-            Some(&arch),
-            interface,
-        )
-        .expect("prepared source");
+        let mut block = R2ILBlock::new(0x1000, 1);
+        block.push(R2ILOp::Copy {
+            dst: Varnode::unique(0x100, 8),
+            src: Varnode::register(0x20, 8),
+        });
+        let source =
+            r2ssa::SsaArtifact::for_decompile_with_interface(&[block], Some(&arch), interface)
+                .expect("prepared source");
 
         let resolver = exact_source_param_slot_resolver(&source).expect("exact resolver");
-        assert_eq!(resolver.slot_for_register_name("rdi"), Some(0));
-        assert_eq!(resolver.slot_for_register_name("edi"), Some(0));
+        let parameter = source
+            .facts()
+            .boundaries
+            .parameters
+            .get(&0)
+            .expect("exact boundary parameter");
+        assert_eq!(resolver.slot_for_value(parameter.value), Some(0));
+        let parameter_var = &source
+            .graph()
+            .value(parameter.value)
+            .expect("parameter graph value")
+            .var;
+        assert_eq!(
+            source
+                .decompile_prep_facts()
+                .and_then(|facts| facts.formal_parameter_of(parameter_var)),
+            Some(0),
+            "SSA preparation must consume the same exact boundary slot"
+        );
+        assert_eq!(
+            Some(parameter_var.name.as_str()),
+            Some("rax"),
+            "the deliberately ABI-misleading display name must not change the slot"
+        );
     }
 
     #[test]
@@ -4419,6 +5373,288 @@ mod tests {
             .expect("prepared source without interface");
 
         assert!(exact_source_param_slot_resolver(&source).is_none());
+    }
+
+    fn exact_signed_i32_return_source(has_return: bool) -> r2ssa::SsaArtifact {
+        let mut arch = ArchSpec::new("x86-64");
+        for (name, offset, size) in [
+            ("rax", 0x00, 8),
+            ("eax", 0x00, 4),
+            ("rsp", 0x28, 8),
+            ("rip", 0x30, 8),
+        ] {
+            arch.add_register(RegisterDef::new(name, offset, size));
+        }
+        let projection = |written: RegisterStorage, carrier: RegisterStorage, size_bits: u64| {
+            RegisterProjection {
+                written,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier,
+                    slice: RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits,
+                    },
+                },
+            }
+        };
+        arch.register_projections = vec![
+            projection(
+                RegisterStorage { offset: 0, size: 8 },
+                RegisterStorage { offset: 0, size: 8 },
+                64,
+            ),
+            projection(
+                RegisterStorage { offset: 0, size: 4 },
+                RegisterStorage { offset: 0, size: 8 },
+                32,
+            ),
+            projection(
+                RegisterStorage {
+                    offset: 0x28,
+                    size: 8,
+                },
+                RegisterStorage {
+                    offset: 0x28,
+                    size: 8,
+                },
+                64,
+            ),
+            projection(
+                RegisterStorage {
+                    offset: 0x30,
+                    size: 8,
+                },
+                RegisterStorage {
+                    offset: 0x30,
+                    size: 8,
+                },
+                64,
+            ),
+        ];
+        let mut block = R2ILBlock::new(0x401000, 2);
+        // An arithmetic write followed by the carrier clear the lift states
+        // for it. Arithmetic rather than a copy so the narrow result survives
+        // as its own definition instead of being folded into its uses, and the
+        // extension has an `eax` to name.
+        block.push(R2ILOp::IntAdd {
+            dst: Varnode::register(0, 4),
+            a: Varnode::register(0, 4),
+            b: Varnode::constant(7, 4),
+        });
+        block.push(R2ILOp::IntZExt {
+            dst: Varnode::register(0, 8),
+            src: Varnode::register(0, 4),
+        });
+        if has_return {
+            block.push(R2ILOp::Return {
+                target: Varnode::register(0x30, 8),
+            });
+        }
+        let storage = |offset| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let logical = r2ssa::SourceLogicalValue::new(
+            0,
+            r2ssa::SourceCarrierProjection::new(r2ssa::SourceCarrierKind::LowBits, 0, 32),
+        );
+        let graph = r2ssa::SourceTypeGraph::new(
+            [r2ssa::SourceType::new(
+                0,
+                r2ssa::SourceTypeKind::SignedInteger,
+                32,
+                32,
+            )],
+            [],
+        )
+        .expect("exact signed return graph");
+        let interface = r2ssa::SourceFunctionInterface::new_exact_with_logical_types(
+            b"exact-signed-return".to_vec(),
+            "sysv64",
+            [],
+            r2ssa::SourceFunctionReturn::Register {
+                storage: storage(0),
+            },
+            [],
+            [],
+            Some(logical),
+            Some(graph),
+        )
+        .and_then(|interface| interface.with_stack_pointer_storage(storage(0x28)))
+        .and_then(|interface| interface.with_return_address_storage(storage(0x30)))
+        .expect("exact signed return interface");
+        r2ssa::SsaArtifact::for_decompile_with_interface(&[block], Some(&arch), interface)
+            .expect("prepared signed return source")
+    }
+
+    #[test]
+    fn exact_source_return_type_preserves_signed_i32_with_matching_certificate() {
+        let source = exact_signed_i32_return_source(true);
+
+        assert_eq!(
+            exact_source_return_type(&source),
+            Some(CTypeLike::Int {
+                bits: 32,
+                signedness: crate::Signedness::Signed,
+            })
+        );
+
+        let signature = FunctionSignatureSpec {
+            ret_type: Some(CTypeLike::Int {
+                bits: 32,
+                signedness: crate::Signedness::Signed,
+            }),
+            params: Vec::new(),
+        };
+        let mut facts = FunctionFacts::new(
+            FunctionTypeFacts {
+                merged_signature: Some(signature.clone()),
+                signature_certificate: crate::SignatureCertificate::from_signature(
+                    &signature,
+                    [crate::SignatureCertificateSource::ExternalContext],
+                ),
+                ..FunctionTypeFacts::default()
+            },
+            None,
+        );
+        assert!(!facts.apply_exact_source_return_type(&source));
+        assert!(
+            facts
+                .type_facts()
+                .signature_certificate
+                .as_ref()
+                .is_some_and(|certificate| certificate
+                    .sources
+                    .contains(&crate::SignatureCertificateSource::SourceReturnType))
+        );
+    }
+
+    #[test]
+    fn exact_source_return_type_refuses_missing_or_mismatched_certificate() {
+        let missing = exact_signed_i32_return_source(false);
+        assert!(missing.certificates().returns.is_empty());
+        assert_eq!(exact_source_return_type(&missing), None);
+
+        let matching = exact_signed_i32_return_source(true);
+        let mut mismatched = matching.certificates().returns[0].clone();
+        mismatched.width = 8;
+        let logical = matching
+            .machine_context()
+            .function_interface()
+            .and_then(r2ssa::SourceFunctionInterface::return_logical_value)
+            .expect("exact logical return");
+        assert!(!exact_return_certificate_matches(
+            &mismatched,
+            logical,
+            4,
+            &r2ssa::ReturnCarrier::Register {
+                storage: r2ssa::CanonicalStorageId {
+                    space: r2ssa::CanonicalStorageSpace::Register,
+                    offset: 0,
+                    size: 8,
+                },
+            },
+        ));
+        let mut forged_logical = matching.certificates().returns[0].clone();
+        forged_logical.source_logical_value = None;
+        assert!(!exact_return_certificate_matches(
+            &forged_logical,
+            logical,
+            4,
+            &r2ssa::ReturnCarrier::Register {
+                storage: r2ssa::CanonicalStorageId {
+                    space: r2ssa::CanonicalStorageSpace::Register,
+                    offset: 0,
+                    size: 8,
+                },
+            },
+        ));
+    }
+
+    #[test]
+    fn exact_tail_return_requires_a_complete_matching_source_boundary() {
+        let storage = r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset: 0,
+            size: 8,
+        };
+        let target_storage = r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Ram,
+            offset: 0x402000,
+            size: 8,
+        };
+        let call_site_id = r2ssa::CallSiteId(0);
+        let at = r2ssa::InstId(3);
+        let target = r2ssa::ValueId(7);
+        let call_site = r2ssa::CallSiteFact {
+            id: call_site_id,
+            at,
+            raw_identity: Some(r2ssa::SourceCallSiteIdentity::new(
+                0x401000,
+                2,
+                target_storage,
+            )),
+            target,
+            direct_target: Some(0x402000),
+            fallthrough: None,
+            transfer: r2ssa::CallSiteTransfer::TailCall,
+            memory_effect: r2ssa::CallMemoryEffect::Unknown,
+        };
+        let certificate = r2ssa::CallsiteCertificate {
+            call_site: call_site_id,
+            at,
+            block_addr: 0x401000,
+            op_index: 2,
+            target,
+            direct_target: Some(0x402000),
+            fallthrough: None,
+            transfer: r2ssa::CallSiteTransfer::TailCall,
+            argument_values: Vec::new(),
+            variadic: false,
+            fixed_argument_count: Some(0),
+            variadic_argument_count_evidence: None,
+            variadic_argument_count_refusal: None,
+            stack_argument_values: Vec::new(),
+            argument_certificates: Vec::new(),
+        };
+        let mut boundary = r2ssa::SourceCallBoundaryFact {
+            call_site: call_site_id,
+            at,
+            calling_convention: Some("sysv64".to_string()),
+            variadic: Some(false),
+            noreturn: Some(false),
+            result_kind: Some(r2ssa::SourceCallResult::Register { storage }),
+            arguments: Vec::new(),
+            fixed_argument_count: Some(0),
+            variadic_argument_count_evidence: None,
+            variadic_argument_count_refusal: None,
+            results: Vec::new(),
+            complete: true,
+        };
+
+        assert!(exact_tail_return_certificate_matches(
+            &call_site,
+            &certificate,
+            &boundary,
+            storage,
+        ));
+
+        boundary.complete = false;
+        assert!(!exact_tail_return_certificate_matches(
+            &call_site,
+            &certificate,
+            &boundary,
+            storage,
+        ));
+        boundary.complete = true;
+        boundary.result_kind = Some(r2ssa::SourceCallResult::Void);
+        assert!(!exact_tail_return_certificate_matches(
+            &call_site,
+            &certificate,
+            &boundary,
+            storage,
+        ));
     }
 
     #[test]
@@ -4480,6 +5716,10 @@ mod tests {
                             base,
                             offset,
                             size: None,
+                            array_layout: r2ssa::StackArrayLayoutDisposition::NotIndexed,
+                            source_slot: None,
+                            callee_allocation: None,
+                            ty: None,
                         },
                     )
                 })
@@ -4576,6 +5816,34 @@ mod tests {
     }
 
     #[test]
+    fn prepared_display_name_does_not_create_a_known_signature() {
+        let mut block = R2ILBlock::new(0x401000, 4);
+        block.push(R2ILOp::Call {
+            target: Varnode::constant(0x402000, 8),
+        });
+        let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&x86_stack_home_arch()))
+            .expect("prepared direct call");
+        let callsite = CallsiteKey {
+            block_addr: 0x401000,
+            op_index: 0,
+        };
+        let mut names = crate::DisplayNames::default();
+        names.insert_function(0x402000, "sym.imp.__memcpy_chk");
+        let mut facts = FunctionFacts::default();
+        facts.set_display_names(names);
+
+        facts.attach_prepared_decompile_evidence(&prepared);
+
+        let identity = facts
+            .callee_resolution()
+            .and_then(|resolution| resolution.identity_for_callsite(callsite))
+            .expect("direct target identity");
+        assert_eq!(identity.raw_name(), "sym.imp.__memcpy_chk");
+        assert!(identity.known_signature().is_none());
+        assert_eq!(identity.non_variadic_known_arity(), None);
+    }
+
+    #[test]
     fn function_facts_owns_canonical_callsite_arguments() {
         let callsite = crate::CallsiteKey {
             block_addr: 0x401000,
@@ -4592,10 +5860,19 @@ mod tests {
                     target: r2ssa::ValueId(10),
                     direct_target: Some(0x402000),
                     argument_values: vec![CallArgumentValueFact { index: 0, value }],
+                    variadic: false,
+                    fixed_argument_count: None,
+                    callee_signature: None,
+                    variadic_argument_count_evidence: None,
+                    variadic_argument_count_refusal: None,
                     register_argument_locations: vec![RegisterCallArgumentLocationFact {
                         index: 0,
                         value,
-                        name: "rdi".to_string(),
+                        storage: r2ssa::CanonicalStorageId {
+                            space: r2ssa::CanonicalStorageSpace::Register,
+                            offset: 0,
+                            size: 8,
+                        },
                         source_inst: Some(r2ssa::InstId(4)),
                     }],
                     stack_argument_locations: Vec::new(),
@@ -4618,10 +5895,105 @@ mod tests {
                 .callsites()
                 .and_then(|callsites| callsites.arguments_for_site(callsite))
                 .and_then(|args| args.register_argument_locations.first())
-                .map(|location| (location.index, location.value, location.name.as_str())),
-            Some((0, value, "rdi")),
+                .map(|location| (location.index, location.value, location.storage)),
+            Some((
+                0,
+                value,
+                r2ssa::CanonicalStorageId {
+                    space: r2ssa::CanonicalStorageSpace::Register,
+                    offset: 0,
+                    size: 8,
+                },
+            )),
             "register argument location proof must travel through FunctionFacts"
         );
+    }
+
+    #[test]
+    fn a_recovered_pointer_replaces_a_storage_width_scalar() {
+        let existing = CTypeLike::Int {
+            bits: 32,
+            signedness: crate::Signedness::Signed,
+        };
+        let recovered = CTypeLike::Pointer(Box::new(CTypeLike::Void));
+        assert!(recovered_type_outranks(
+            &existing,
+            &recovered,
+            64,
+            &crate::ExternalTypeDb::default()
+        ));
+    }
+
+    #[test]
+    fn declaration_admission_canonicalizes_only_builtin_scalar_spellings() {
+        assert_eq!(
+            admit_declaration_type(CTypeLike::Typedef("int64_t".to_string()), 64, 64),
+            CTypeLike::Int {
+                bits: 64,
+                signedness: crate::Signedness::Signed,
+            }
+        );
+        assert_eq!(
+            admit_declaration_type(CTypeLike::Typedef("size_t".to_string()), 64, 64),
+            CTypeLike::Typedef("size_t".to_string()),
+            "a semantic alias keeps its source-owned identity"
+        );
+    }
+
+    #[test]
+    fn a_recovered_type_never_demotes_a_structured_one() {
+        let existing = CTypeLike::Pointer(Box::new(CTypeLike::Struct("Node".to_string())));
+        for recovered in [
+            CTypeLike::Int {
+                bits: 64,
+                signedness: crate::Signedness::Signed,
+            },
+            CTypeLike::Pointer(Box::new(CTypeLike::Void)),
+            CTypeLike::Typedef("int64_t".to_string()),
+        ] {
+            assert!(
+                !recovered_type_outranks(
+                    &existing,
+                    &recovered,
+                    64,
+                    &crate::ExternalTypeDb::default()
+                ),
+                "{recovered:?} must not replace a struct pointer"
+            );
+        }
+    }
+
+    #[test]
+    fn a_recovered_type_that_renders_the_same_is_not_a_replacement() {
+        let existing = CTypeLike::Typedef("int32_t".to_string());
+        let recovered = CTypeLike::Int {
+            bits: 32,
+            signedness: crate::Signedness::Signed,
+        };
+        assert!(!recovered_type_outranks(
+            &existing,
+            &recovered,
+            64,
+            &crate::ExternalTypeDb::default()
+        ));
+    }
+
+    #[test]
+    fn a_storage_width_scalar_is_not_evidence_for_replacing_another_one() {
+        let existing = CTypeLike::Int {
+            bits: 64,
+            signedness: crate::Signedness::Signed,
+        };
+        let recovered = CTypeLike::Int {
+            bits: 32,
+            signedness: crate::Signedness::Unsigned,
+        };
+        assert!(!recovered_type_outranks(
+            &existing,
+            &recovered,
+            64,
+            &crate::ExternalTypeDb::default()
+        ));
     }
 
     #[test]
@@ -4665,6 +6037,11 @@ mod tests {
                     target: r2ssa::ValueId(10),
                     direct_target: Some(0x402000),
                     argument_values: vec![CallArgumentValueFact { index: 0, value }],
+                    variadic: false,
+                    fixed_argument_count: None,
+                    callee_signature: None,
+                    variadic_argument_count_evidence: None,
+                    variadic_argument_count_refusal: None,
                     register_argument_locations: Vec::new(),
                     stack_argument_locations: Vec::new(),
                 },
@@ -4782,10 +6159,19 @@ mod tests {
                 index: 0,
                 value: register_value,
             }],
+            variadic: false,
+            fixed_argument_count: None,
+            callee_signature: None,
+            variadic_argument_count_evidence: None,
+            variadic_argument_count_refusal: None,
             register_argument_locations: vec![RegisterCallArgumentLocationFact {
                 index: 0,
                 value: register_value,
-                name: "rdi".to_string(),
+                storage: r2ssa::CanonicalStorageId {
+                    space: r2ssa::CanonicalStorageSpace::Register,
+                    offset: 0,
+                    size: 8,
+                },
                 source_inst: Some(r2ssa::InstId(4)),
             }],
             stack_argument_locations: vec![
@@ -4845,7 +6231,11 @@ mod tests {
                         width: 8,
                         relation: r2ssa::CallResultValueRelation::Identity,
                         carrier: r2ssa::ReturnCarrier::Register {
-                            name: "rax".to_string(),
+                            storage: r2ssa::CanonicalStorageId {
+                                space: r2ssa::CanonicalStorageSpace::Register,
+                                offset: 0x10,
+                                size: 8,
+                            },
                         },
                         owner: Some(owner.clone()),
                     },
@@ -4860,7 +6250,11 @@ mod tests {
                         width: 4,
                         relation: r2ssa::CallResultValueRelation::Derived,
                         carrier: r2ssa::ReturnCarrier::Register {
-                            name: "eax".to_string(),
+                            storage: r2ssa::CanonicalStorageId {
+                                space: r2ssa::CanonicalStorageSpace::Register,
+                                offset: 0x10,
+                                size: 4,
+                            },
                         },
                         owner: Some(r2ssa::ValueOwner::StackSlot {
                             object: r2ssa::ObjectId(4),
@@ -4906,6 +6300,69 @@ mod tests {
     }
 
     #[test]
+    fn call_result_definition_is_not_replaced_by_a_later_stack_owner() {
+        let callsite = crate::CallsiteKey {
+            block_addr: 0x401000,
+            op_index: 7,
+        };
+        let defined = r2ssa::ValueId(20);
+        let stored = r2ssa::ValueId(21);
+        let storage = r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset: 0x10,
+            size: 8,
+        };
+        let stack_owner = r2ssa::ValueOwner::StackSlot {
+            object: r2ssa::ObjectId(3),
+            offset: -8,
+        };
+        let call_results = FunctionCallResultFacts {
+            by_value: BTreeMap::from([
+                (
+                    defined,
+                    CallResultFact {
+                        callsite,
+                        call_site_id: r2ssa::CallSiteId(2),
+                        at: r2ssa::InstId(8),
+                        value: defined,
+                        width: 8,
+                        relation: r2ssa::CallResultValueRelation::Identity,
+                        carrier: r2ssa::ReturnCarrier::Register { storage },
+                        owner: Some(r2ssa::ValueOwner::Value(defined)),
+                    },
+                ),
+                (
+                    stored,
+                    CallResultFact {
+                        callsite,
+                        call_site_id: r2ssa::CallSiteId(2),
+                        at: r2ssa::InstId(9),
+                        value: stored,
+                        width: 8,
+                        relation: r2ssa::CallResultValueRelation::Identity,
+                        carrier: r2ssa::ReturnCarrier::Register { storage },
+                        owner: Some(stack_owner.clone()),
+                    },
+                ),
+            ]),
+            by_callsite: BTreeMap::from([(callsite, vec![defined, stored])]),
+        };
+
+        assert_eq!(
+            call_results
+                .definition_for_site(callsite)
+                .map(|result| result.value),
+            Some(defined),
+            "the call statement must keep the boundary definition the binding plan can spell"
+        );
+        assert_eq!(
+            call_results.owner_for_site(callsite),
+            Some(&stack_owner),
+            "the later stable owner remains available for subsequent result flow"
+        );
+    }
+
+    #[test]
     fn prepared_call_results_bind_certified_exprs_to_stable_call_ids() {
         let mut block = R2ILBlock::new(0x401000, 4);
         block.push(R2ILOp::Call {
@@ -4921,8 +6378,36 @@ mod tests {
             addr: Varnode::unique(0x100, 8),
             val: Varnode::register(0x00, 8),
         });
-        let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&x86_stack_home_arch()))
-            .expect("prepared");
+        let result_storage = r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset: 0,
+            size: 8,
+        };
+        let target_storage = r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Constant,
+            offset: 0x402000,
+            size: 8,
+        };
+        let call_interface = r2ssa::SourceCallSiteInterface::new(
+            b"certified-call-result-fixture".to_vec(),
+            r2ssa::SourceCallSiteIdentity::new(0x401000, 0, target_storage),
+            true,
+            "sysv64",
+            [],
+            false,
+            false,
+            r2ssa::SourceCallResult::Register {
+                storage: result_storage,
+            },
+        )
+        .expect("exact call-result interface");
+        let prepared = r2ssa::SsaArtifact::for_decompile_with_interfaces(
+            &[block],
+            Some(&x86_stack_home_arch()),
+            None,
+            vec![call_interface],
+        )
+        .expect("prepared exact call-result fixture");
         let mut facts = FunctionFacts::default();
         facts.attach_prepared_decompile_evidence(&prepared);
 
@@ -4952,13 +6437,158 @@ mod tests {
     }
 
     #[test]
-    fn prepared_decompile_evidence_preserves_existing_function_facts() {
+    fn an_implicit_call_read_keeps_its_entry_value_as_a_certified_parameter() {
+        let mut block = R2ILBlock::new(0x401000, 4);
+        let target = Varnode::constant(0x402000, 8);
+        block.push(R2ILOp::Call {
+            target: target.clone(),
+        });
+        let register_storage = |offset| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let revision = b"implicit-call-parameter".to_vec();
+        let parameter_storage = register_storage(0x10);
+        let function_interface = r2ssa::SourceFunctionInterface::new_exact(
+            revision.clone(),
+            "sysv64",
+            [r2ssa::SourceAbiParameterSpec::new(0, parameter_storage)],
+            r2ssa::SourceFunctionReturn::Void,
+            [],
+        )
+        .and_then(|interface| interface.with_return_address_storage(register_storage(0x30)))
+        .and_then(|interface| interface.with_stack_pointer_storage(register_storage(0x28)))
+        .expect("exact caller interface");
+        let logical_parameter = r2ssa::SourceLogicalValue::new(
+            0,
+            r2ssa::SourceCarrierProjection::new(r2ssa::SourceCarrierKind::LowBits, 0, 32),
+        );
+        let callee_interface = r2ssa::SourceFunctionInterface::new_exact_with_logical_types(
+            revision.clone(),
+            "sysv64",
+            [r2ssa::SourceAbiParameterSpec::new(0, parameter_storage)],
+            r2ssa::SourceFunctionReturn::Void,
+            [],
+            [logical_parameter],
+            None,
+            Some(
+                r2ssa::SourceTypeGraph::new(
+                    [r2ssa::SourceType::new(
+                        0,
+                        r2ssa::SourceTypeKind::UnsignedInteger,
+                        32,
+                        32,
+                    )],
+                    [],
+                )
+                .expect("callee type graph"),
+            ),
+        )
+        .expect("logical callee interface");
+        let call_interface = r2ssa::SourceCallSiteInterface::new(
+            revision,
+            r2ssa::SourceCallSiteIdentity::new(
+                0x401000,
+                0,
+                r2ssa::CanonicalStorageId::from_varnode(&target),
+            ),
+            true,
+            "sysv64",
+            [r2ssa::SourceCallArgumentSpec::new(0, parameter_storage)],
+            false,
+            false,
+            r2ssa::SourceCallResult::Void,
+        )
+        .and_then(|interface| interface.with_exact_callee_interface(callee_interface.clone()))
+        .expect("exact callee interface");
+        let prepared = r2ssa::SsaArtifact::for_decompile_with_interfaces(
+            &[block],
+            Some(&x86_stack_home_arch()),
+            Some(function_interface),
+            vec![call_interface],
+        )
+        .expect("prepared implicit-call fixture");
+        let parameter = prepared
+            .facts()
+            .boundaries
+            .parameters
+            .get(&0)
+            .expect("entry parameter boundary");
+        assert!(prepared.graph().use_sites(parameter.value).is_empty());
+        assert_eq!(
+            prepared
+                .callsite_certificate_for_op(0x401000, 0)
+                .expect("callsite certificate")
+                .argument_values,
+            [parameter.value]
+        );
+
+        let mut facts = FunctionFacts::default();
+        facts.attach_prepared_decompile_evidence(&prepared);
+        let callsite = CallsiteKey {
+            block_addr: 0x401000,
+            op_index: 0,
+        };
+        assert_eq!(
+            facts
+                .callsites()
+                .and_then(|facts| facts.arguments_for_site(callsite))
+                .and_then(|facts| facts.callee_signature.as_ref()),
+            None,
+            "an exact carrier interface does not prove the callee's C signedness"
+        );
+
+        let callee_source = Arc::new(
+            r2ssa::SsaArtifact::for_decompile_with_interface(
+                &[R2ILBlock::new(0x402000, 4)],
+                Some(&x86_stack_home_arch()),
+                callee_interface,
+            )
+            .expect("prepared callee owner"),
+        );
+        let signed_signature = crate::FunctionType {
+            return_type: CTypeLike::Void,
+            params: vec![CTypeLike::Int {
+                bits: 32,
+                signedness: crate::Signedness::Signed,
+            }],
+            variadic: false,
+        };
+        let source_owned_signature =
+            SourceOwnedCalleeSignature::new(&callee_source, signed_signature.clone())
+                .expect("logical type fits the exact low-bit carrier");
+        facts.apply_source_owned_callee_signatures(
+            &prepared,
+            &BTreeMap::from([(0x402000, source_owned_signature)]),
+        );
+        assert_eq!(
+            facts
+                .callsites()
+                .and_then(|facts| facts.arguments_for_site(callsite))
+                .and_then(|facts| facts.callee_signature.as_ref()),
+            Some(&signed_signature),
+            "only the retained callee body may add logical signedness"
+        );
+        facts.populate_certified_parameter_exprs(&prepared, &x86_stack_home_param_slots(&prepared));
+
+        assert_eq!(
+            facts
+                .render()
+                .expect("render facts")
+                .parameter_values(0)
+                .collect::<Vec<_>>(),
+            [parameter.value]
+        );
+    }
+
+    #[test]
+    fn prepared_decompile_evidence_replaces_detached_source_dependent_rows() {
         let mut block = R2ILBlock::new(0x401000, 4);
         block.push(R2ILOp::Call {
             target: Varnode::constant(0x402000, 8),
         });
-        let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&x86_stack_home_arch()))
-            .expect("prepared");
+        let prepared = x86_stack_home_prepared(&[block]);
         let callsite = CallsiteKey {
             block_addr: 0x401000,
             op_index: 0,
@@ -4974,6 +6604,11 @@ mod tests {
                 index: 0,
                 value: sentinel_value,
             }],
+            variadic: false,
+            fixed_argument_count: None,
+            callee_signature: None,
+            variadic_argument_count_evidence: None,
+            variadic_argument_count_refusal: None,
             register_argument_locations: Vec::new(),
             stack_argument_locations: Vec::new(),
         };
@@ -5024,35 +6659,33 @@ mod tests {
 
         facts.attach_prepared_decompile_evidence(&prepared);
 
-        assert_eq!(
+        assert_ne!(
             facts
                 .callsites()
                 .and_then(|callsites| callsites.arguments_for_site(callsite)),
             Some(&sentinel_callsite),
-            "prepared callsite evidence must not overwrite existing FunctionFacts callsite proof"
+            "a detached callsite row must not outrank the retained prepared artifact"
         );
-        assert_eq!(
+        assert_ne!(
             facts
                 .call_render()
                 .and_then(|render| render.fact_for_site(callsite)),
             Some(&sentinel_render),
-            "prepared call-render evidence must not overwrite existing FunctionFacts render disposition"
+            "a detached call-render disposition must not outrank the retained prepared artifact"
         );
-        assert_eq!(
+        assert!(
             facts
                 .render()
                 .and_then(|render| render.string_literal_for_value(string_value))
-                .map(|literal| literal.text.as_str()),
-            Some("existing"),
-            "prepared render facts must not erase existing string literal render evidence"
+                .is_none(),
+            "an unvalidated detached string annotation must be removed during source rebuild"
         );
-        assert_eq!(
+        assert!(
             facts
                 .render()
                 .and_then(|render| render.member_accesses_by_op.get(&member_op))
-                .and_then(|members| members.first()),
-            Some(&member_access),
-            "prepared render facts must not erase existing member-access evidence"
+                .is_none(),
+            "an unvalidated detached member projection must be removed during source rebuild"
         );
         assert!(
             facts
@@ -5060,6 +6693,62 @@ mod tests {
                 .and_then(|resolution| resolution.identity_for_callsite(callsite))
                 .is_some(),
             "prepared evidence should still fill missing FunctionFacts groups"
+        );
+    }
+
+    #[test]
+    fn source_owned_seal_rederives_render_call_and_control_facts() {
+        let mut block = R2ILBlock::new(0x401000, 4);
+        block.push(R2ILOp::Call {
+            target: Varnode::constant(0x402000, 8),
+        });
+        let source = Arc::new(
+            r2ssa::SsaArtifact::for_decompile(&[block], Some(&x86_stack_home_arch()))
+                .expect("prepared source-owned seal fixture"),
+        );
+        let canonical_report = || {
+            let mut report =
+                FunctionFacts::default().with_assumptions(source.facts().assumptions.clone());
+            SourceOwnedFunctionFacts::enrich_report_from_source_for_decompile(
+                source.as_ref(),
+                &mut report,
+            );
+            report
+        };
+
+        assert!(
+            SourceOwnedFunctionFacts::seal(Arc::clone(&source), canonical_report()).is_some(),
+            "the independently rederived canonical report must seal"
+        );
+
+        let mut forged_render = canonical_report();
+        forged_render
+            .render
+            .certified_exprs
+            .values_mut()
+            .next()
+            .expect("fixture certified expression")
+            .fact
+            .width = 1;
+        assert!(
+            SourceOwnedFunctionFacts::seal(Arc::clone(&source), forged_render).is_none(),
+            "a detached render-core mutation must not validate against itself"
+        );
+
+        let mut forged_call = canonical_report();
+        assert!(!forged_call.call_render.by_callsite.is_empty());
+        forged_call.call_render.by_callsite.clear();
+        assert!(
+            SourceOwnedFunctionFacts::seal(Arc::clone(&source), forged_call).is_none(),
+            "a detached call-render mutation must not validate against itself"
+        );
+
+        let mut forged_control = canonical_report();
+        assert!(!forged_control.control.control_domains.by_block.is_empty());
+        forged_control.control = FunctionControlFacts::default();
+        assert!(
+            SourceOwnedFunctionFacts::seal(source, forged_control).is_none(),
+            "a detached control projection must not validate against itself"
         );
     }
 
@@ -5076,8 +6765,7 @@ mod tests {
             space: SpaceId::Ram,
             addr: Varnode::unique(0x100, 8),
         });
-        let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&x86_stack_home_arch()))
-            .expect("prepared");
+        let prepared = x86_stack_home_prepared(&[block]);
         let type_facts = FunctionTypeFacts {
             field_access_certificates: vec![crate::facts::FieldAccessCertificate {
                 slot: 0,
@@ -5092,7 +6780,7 @@ mod tests {
         facts.attach_prepared_decompile_evidence(&prepared);
         facts.populate_member_access_render_facts_from_field_certificates(
             &prepared,
-            &x86_stack_home_param_slots(),
+            &x86_stack_home_param_slots(&prepared),
         );
 
         let render = facts.render().expect("prepared render facts");
@@ -5146,11 +6834,7 @@ mod tests {
         exit.push(R2ILOp::Return {
             target: Varnode::register(0x08, 8),
         });
-        let prepared = r2ssa::SsaArtifact::for_decompile(
-            &[entry, header, latch, exit],
-            Some(&x86_stack_home_arch()),
-        )
-        .expect("prepared loop");
+        let prepared = x86_stack_home_prepared(&[entry, header, latch, exit]);
         let type_facts = FunctionTypeFacts {
             field_access_certificates: vec![
                 crate::facts::FieldAccessCertificate {
@@ -5171,9 +6855,33 @@ mod tests {
         let mut facts = FunctionFacts::new(type_facts, None);
 
         facts.attach_prepared_decompile_evidence(&prepared);
+        let upstream_carrier = prepared
+            .structured()
+            .loops
+            .values()
+            .flat_map(|loop_fact| loop_fact.carriers.iter())
+            .next()
+            .expect("prepared loop carrier");
+        let projected_carrier = facts
+            .render()
+            .and_then(|render| render.certified_entities.get(&upstream_carrier.id))
+            .expect("projected loop carrier");
+        assert!(matches!(
+            projected_carrier,
+            CertifiedEntity::LoopCarrier {
+                entries,
+                updates,
+                dominating_initializers,
+                members,
+                ..
+            } if entries == &upstream_carrier.entries
+                && updates == &upstream_carrier.updates
+                && dominating_initializers == &upstream_carrier.dominating_initializers
+                && members == &upstream_carrier.members
+        ));
         facts.populate_member_access_render_facts_from_field_certificates(
             &prepared,
-            &x86_stack_home_param_slots(),
+            &x86_stack_home_param_slots(&prepared),
         );
         facts.populate_certified_loop_carrier_types();
 
@@ -5209,8 +6917,7 @@ mod tests {
             space: SpaceId::Ram,
             addr: Varnode::unique(0x100, 8),
         });
-        let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&x86_stack_home_arch()))
-            .expect("prepared");
+        let prepared = x86_stack_home_prepared(&[block]);
         let type_facts = FunctionTypeFacts {
             field_access_certificates: vec![crate::facts::FieldAccessCertificate {
                 slot: 0,
@@ -5225,7 +6932,7 @@ mod tests {
         facts.attach_prepared_decompile_evidence(&prepared);
         facts.populate_member_access_render_facts_from_field_certificates(
             &prepared,
-            &x86_stack_home_param_slots(),
+            &x86_stack_home_param_slots(&prepared),
         );
 
         assert!(
@@ -5249,8 +6956,7 @@ mod tests {
             space: SpaceId::Ram,
             addr: Varnode::unique(0x100, 8),
         });
-        let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&x86_stack_home_arch()))
-            .expect("prepared");
+        let prepared = x86_stack_home_prepared(&[block]);
         let type_facts = FunctionTypeFacts {
             field_access_certificates: vec![crate::facts::FieldAccessCertificate {
                 slot: 0,
@@ -5265,7 +6971,7 @@ mod tests {
         facts.attach_prepared_decompile_evidence(&prepared);
         facts.populate_member_access_render_facts_from_field_certificates(
             &prepared,
-            &x86_stack_home_param_slots(),
+            &x86_stack_home_param_slots(&prepared),
         );
 
         assert!(
@@ -5289,7 +6995,7 @@ mod tests {
         matching_facts.attach_prepared_decompile_evidence(&prepared);
         matching_facts.populate_member_access_render_facts_from_field_certificates(
             &prepared,
-            &x86_stack_home_param_slots(),
+            &x86_stack_home_param_slots(&prepared),
         );
 
         assert!(
@@ -5321,11 +7027,17 @@ mod tests {
         };
         let frame_pointer = register_storage(0x20);
         let parameter = register_storage(0x10);
+        let second_parameter = register_storage(0x18);
         let interface = r2ssa::SourceFunctionInterface::new_exact(
             b"x86-stack-home-fixture".to_vec(),
             "sysv64",
-            [r2ssa::SourceAbiParameterSpec::new(0, parameter)],
-            r2ssa::SourceFunctionReturn::Void,
+            [
+                r2ssa::SourceAbiParameterSpec::new(0, parameter),
+                r2ssa::SourceAbiParameterSpec::new(1, second_parameter),
+            ],
+            r2ssa::SourceFunctionReturn::Register {
+                storage: register_storage(0x00),
+            },
             [r2ssa::SourceStackSlotSpec::new_parameter_home(
                 r2ssa::StackAddressBase::FramePointer,
                 frame_pointer,
@@ -5347,8 +7059,8 @@ mod tests {
         .expect("prepared exact stack-home fixture")
     }
 
-    fn x86_stack_home_param_slots() -> ParamSlotResolver {
-        ParamSlotResolver::from_arch_name(Some("x86-64"))
+    fn x86_stack_home_param_slots(prepared: &r2ssa::SsaArtifact) -> ParamSlotResolver {
+        exact_source_param_slot_resolver(prepared).expect("exact source parameter slots")
     }
 
     #[test]
@@ -5370,12 +7082,12 @@ mod tests {
             addr: Varnode::unique(0x100, 8),
         });
         block.push(R2ILOp::IntAdd {
-            dst: Varnode::unique(0x108, 8),
+            dst: Varnode::register(0x00, 8),
             a: Varnode::register(0x00, 8),
             b: Varnode::register(0x00, 8),
         });
         block.push(R2ILOp::Return {
-            target: Varnode::unique(0x108, 8),
+            target: Varnode::register(0x30, 8),
         });
         let prepared = x86_stack_home_prepared(&[block]);
         let signature = FunctionSignatureSpec {
@@ -5403,7 +7115,7 @@ mod tests {
             None,
         );
         facts.attach_prepared_decompile_evidence(&prepared);
-        facts.populate_certified_parameter_exprs(&prepared, &x86_stack_home_param_slots());
+        facts.populate_certified_parameter_exprs(&prepared, &x86_stack_home_param_slots(&prepared));
         let render = facts.render().expect("certified render facts");
 
         let rdi = prepared
@@ -5571,8 +7283,7 @@ mod tests {
         block.push(R2ILOp::Return {
             target: Varnode::constant(0, 8),
         });
-        let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&x86_stack_home_arch()))
-            .expect("prepared");
+        let prepared = x86_stack_home_prepared(&[block]);
         let render = FunctionRenderFacts::from_prepared(&prepared);
         let read = render
             .memory_accesses()
@@ -5601,8 +7312,7 @@ mod tests {
         block.push(R2ILOp::Return {
             target: Varnode::constant(0, 8),
         });
-        let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&x86_stack_home_arch()))
-            .expect("prepared");
+        let prepared = x86_stack_home_prepared(&[block]);
         let render = FunctionRenderFacts::from_prepared(&prepared);
         let read = render
             .memory_accesses()
@@ -5630,11 +7340,10 @@ mod tests {
         block.push(R2ILOp::Return {
             target: Varnode::unique(0x108, 8),
         });
-        let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&x86_stack_home_arch()))
-            .expect("prepared");
+        let prepared = x86_stack_home_prepared(&[block]);
         let mut facts = FunctionFacts::default();
         facts.attach_prepared_decompile_evidence(&prepared);
-        facts.populate_certified_parameter_exprs(&prepared, &x86_stack_home_param_slots());
+        facts.populate_certified_parameter_exprs(&prepared, &x86_stack_home_param_slots(&prepared));
         let render = facts.render().expect("render facts");
         let copied = prepared
             .graph()
@@ -5688,27 +7397,6 @@ mod tests {
     }
 
     #[test]
-    fn param_slot_resolver_maps_explicit_windows_x64_register_order() {
-        let resolver = ParamSlotResolver::from_arg_regs(["rcx", "rdx"]);
-
-        assert_eq!(resolver.slot_for_register_name("rcx"), Some(0));
-        assert_eq!(resolver.slot_for_register_name("ecx"), Some(0));
-        assert_eq!(resolver.slot_for_register_name("rdx"), Some(1));
-        assert_eq!(resolver.slot_for_register_name("edx"), Some(1));
-        assert_eq!(resolver.slot_for_register_name("rdi"), None);
-    }
-
-    #[test]
-    fn param_slot_resolver_maps_aarch64_aliases_from_abi_evidence() {
-        let resolver = ParamSlotResolver::from_arch_name(Some("aarch64"));
-
-        assert_eq!(resolver.slot_for_register_name("x0"), Some(0));
-        assert_eq!(resolver.slot_for_register_name("w0"), Some(0));
-        assert_eq!(resolver.slot_for_register_name("x1"), Some(1));
-        assert_eq!(resolver.slot_for_register_name("w1"), Some(1));
-    }
-
-    #[test]
     fn field_certificates_fail_closed_without_param_slot_resolver() {
         let prepared = member_load_prepared_for_register(&x86_stack_home_arch(), 0x10);
         let mut facts = FunctionFacts::new(field_certificate_type_facts(0, 8), None);
@@ -5716,7 +7404,7 @@ mod tests {
         facts.attach_prepared_decompile_evidence(&prepared);
         facts.populate_member_access_render_facts_from_field_certificates(
             &prepared,
-            &ParamSlotResolver::new(),
+            &ParamSlotResolver::default(),
         );
 
         assert!(
@@ -5724,56 +7412,6 @@ mod tests {
                 .member_access_for_op(0x401000, 1, false, "hash", 8, Some(8))
                 .is_none()),
             "missing ABI slot evidence must not guess rdi as parameter slot 0"
-        );
-    }
-
-    #[test]
-    fn field_certificates_use_explicit_windows_x64_param_slots() {
-        let mut arch = ArchSpec::new("x86-64");
-        arch.add_register(RegisterDef::new("rax", 0x00, 8));
-        arch.add_register(RegisterDef::new("rcx", 0x10, 8));
-        arch.add_register(RegisterDef::new("rdx", 0x18, 8));
-        let param_slots = ParamSlotResolver::from_arg_regs(["rcx", "rdx"]);
-
-        let rcx_prepared = member_load_prepared_for_register(&arch, 0x10);
-        let mut rcx_facts = FunctionFacts::new(field_certificate_type_facts(0, 8), None);
-        rcx_facts.attach_prepared_decompile_evidence(&rcx_prepared);
-        rcx_facts.populate_member_access_render_facts_from_field_certificates(
-            &rcx_prepared,
-            &param_slots,
-        );
-        assert!(
-            rcx_facts.render().is_some_and(|render| render
-                .member_access_for_op(0x401000, 1, false, "hash", 8, Some(8))
-                .is_some()),
-            "explicit Windows x64 resolver must map rcx to slot 0"
-        );
-
-        let rdx_prepared = member_load_prepared_for_register(&arch, 0x18);
-        let mut wrong_slot_facts = FunctionFacts::new(field_certificate_type_facts(0, 8), None);
-        wrong_slot_facts.attach_prepared_decompile_evidence(&rdx_prepared);
-        wrong_slot_facts.populate_member_access_render_facts_from_field_certificates(
-            &rdx_prepared,
-            &param_slots,
-        );
-        assert!(
-            wrong_slot_facts.render().is_none_or(|render| render
-                .member_access_for_op(0x401000, 1, false, "hash", 8, Some(8))
-                .is_none()),
-            "slot 0 certificate must not authorize rdx when resolver maps rdx to slot 1"
-        );
-
-        let mut matching_slot_facts = FunctionFacts::new(field_certificate_type_facts(1, 8), None);
-        matching_slot_facts.attach_prepared_decompile_evidence(&rdx_prepared);
-        matching_slot_facts.populate_member_access_render_facts_from_field_certificates(
-            &rdx_prepared,
-            &param_slots,
-        );
-        assert!(
-            matching_slot_facts.render().is_some_and(|render| render
-                .member_access_for_op(0x401000, 1, false, "hash", 8, Some(8))
-                .is_some()),
-            "explicit Windows x64 resolver must map rdx to slot 1"
         );
     }
 
@@ -5835,7 +7473,7 @@ mod tests {
         facts.attach_prepared_decompile_evidence(&prepared);
         facts.populate_member_access_render_facts_from_field_certificates(
             &prepared,
-            &x86_stack_home_param_slots(),
+            &x86_stack_home_param_slots(&prepared),
         );
 
         assert!(
@@ -5863,7 +7501,7 @@ mod tests {
         facts.attach_prepared_decompile_evidence(&prepared);
         facts.populate_member_access_render_facts_from_field_certificates(
             &prepared,
-            &x86_stack_home_param_slots(),
+            &x86_stack_home_param_slots(&prepared),
         );
 
         assert!(
@@ -5901,8 +7539,7 @@ mod tests {
             space: SpaceId::Ram,
             addr: Varnode::unique(0x118, 8),
         });
-        let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&x86_stack_home_arch()))
-            .expect("prepared");
+        let prepared = x86_stack_home_prepared(&[block]);
         let index_value = prepared
             .memory_certificate_for_op_site(0x401000, 4, false)
             .expect("array load certificate")
@@ -5941,14 +7578,14 @@ mod tests {
         let mut facts = FunctionFacts::new(type_facts, None);
 
         facts.attach_prepared_decompile_evidence(&prepared);
-        facts.populate_certified_parameter_exprs(&prepared, &x86_stack_home_param_slots());
+        facts.populate_certified_parameter_exprs(&prepared, &x86_stack_home_param_slots(&prepared));
         facts.populate_member_access_render_facts_from_field_certificates(
             &prepared,
-            &x86_stack_home_param_slots(),
+            &x86_stack_home_param_slots(&prepared),
         );
         facts.populate_array_access_render_facts_from_scalar_candidates(
             &prepared,
-            &x86_stack_home_param_slots(),
+            &x86_stack_home_param_slots(&prepared),
         );
 
         let render = facts.render().expect("render facts");
@@ -5982,8 +7619,7 @@ mod tests {
             space: SpaceId::Ram,
             addr: Varnode::register(0x18, 8),
         });
-        let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&x86_stack_home_arch()))
-            .expect("prepared");
+        let prepared = x86_stack_home_prepared(&[block]);
         let type_facts_for_slot = |slot| FunctionTypeFacts {
             array_index_certificates: vec![crate::facts::ArrayIndexCertificate {
                 slot,
@@ -6014,7 +7650,7 @@ mod tests {
         wrong_slot_facts.attach_prepared_decompile_evidence(&prepared);
         wrong_slot_facts.populate_member_access_render_facts_from_field_certificates(
             &prepared,
-            &x86_stack_home_param_slots(),
+            &x86_stack_home_param_slots(&prepared),
         );
         assert!(
             wrong_slot_facts.render().is_none_or(|render| render
@@ -6027,7 +7663,7 @@ mod tests {
         matching_slot_facts.attach_prepared_decompile_evidence(&prepared);
         matching_slot_facts.populate_member_access_render_facts_from_field_certificates(
             &prepared,
-            &x86_stack_home_param_slots(),
+            &x86_stack_home_param_slots(&prepared),
         );
         assert!(
             matching_slot_facts.render().is_none_or(|render| render
@@ -6074,6 +7710,7 @@ mod tests {
             body: vec![0x403000, 0x403010],
             latches: vec![0x403010],
             exits: vec![0x403020],
+            for_loop: None,
         };
         let control = FunctionControlFacts {
             branch_predicates: BTreeMap::from([(branch.block_addr, branch.clone())]),
@@ -6158,6 +7795,10 @@ mod tests {
                     base: r2ssa::StackAddressBase::FramePointer,
                     offset: -8,
                     size: None,
+                    array_layout: r2ssa::StackArrayLayoutDisposition::NotIndexed,
+                    source_slot: None,
+                    callee_allocation: None,
+                    ty: None,
                 },
             )]),
             certified_effects: BTreeMap::from([
@@ -6190,6 +7831,7 @@ mod tests {
                             op_index: 2,
                             value,
                             width: 8,
+                            overlays: Vec::new(),
                             control_domain: test_control_domain(),
                         },
                     },
@@ -6692,7 +8334,6 @@ mod tests {
                             bits: 64,
                             signedness: crate::Signedness::Signed,
                         }),
-                        base: ExternalStackBase::StackPointer,
                         role: ExternalStackSlotRole::StackArg,
                         param_index: Some(6),
                         param_name: Some("arg7".to_string()),
@@ -6735,7 +8376,6 @@ mod tests {
                     crate::ExternalStackSlotSpec {
                         name: "node_home".to_string(),
                         ty: None,
-                        base: ExternalStackBase::FramePointer,
                         role: ExternalStackSlotRole::ParamHome,
                         param_index: Some(0),
                         param_name: Some("node".to_string()),
@@ -6788,7 +8428,6 @@ mod tests {
                     crate::ExternalStackSlotSpec {
                         name: "arg1_home".to_string(),
                         ty: None,
-                        base: ExternalStackBase::FramePointer,
                         role: ExternalStackSlotRole::ParamHome,
                         param_index: Some(0),
                         param_name: Some("arg1".to_string()),
@@ -6875,7 +8514,7 @@ mod tests {
         let unknown_role = FunctionFacts::new(
             FunctionTypeFacts {
                 stack_slots: BTreeMap::from([(
-                    typed_slot.0.clone(),
+                    typed_slot.0,
                     crate::ExternalStackSlotSpec {
                         role: ExternalStackSlotRole::Unknown,
                         ..typed_slot.1.clone()
@@ -6984,14 +8623,12 @@ mod tests {
             kind: DecompileRouteKind::FallbackComment,
             reason: Some("typed refusal".to_string()),
             fallback_comment: Some("/* typed fallback */".to_string()),
-            skip_runtime_type_inference: true,
             use_prepared_semantic_view: false,
         };
         let standard_with_comment = DecompileRouteFacts {
             kind: DecompileRouteKind::Standard,
             reason: Some("must not render".to_string()),
             fallback_comment: Some("/* wrong route */".to_string()),
-            skip_runtime_type_inference: false,
             use_prepared_semantic_view: false,
         };
 

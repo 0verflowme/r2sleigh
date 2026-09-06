@@ -1,62 +1,25 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-#[cfg(test)]
-use std::sync::OnceLock;
 
 use r2ssa::{FunctionSSABlock, SSAVar, ValueId};
 use r2types::{CalleeFact, CalleeResolutionFacts, InterprocSummaryView, TypeOracle};
 
-use crate::ast::{CExpr, CType};
+use crate::ast::CExpr;
 
 pub(crate) type SSABlock = FunctionSSABlock;
 
-// Pass dependency invariant:
-// UseInfo -> (FlagInfo, StackInfo) -> PredicateSimplifier -> statement emit.
-pub(crate) mod flag_info;
 pub(crate) mod lower;
-pub(crate) mod ownership;
-pub(crate) mod predicate;
 pub(crate) mod prepared_semantic;
-pub(crate) mod stack_info;
-pub(crate) mod use_info;
 pub(crate) mod utils;
 
-pub(crate) use ownership::{
-    CallOwner, CallOwnerKind, CallOwnershipFact, CallSiteId, SemanticOwnershipFacts,
-};
-pub(crate) use predicate::{PredicateAnalysisView, PredicateSimplifier};
 pub(crate) use prepared_semantic::{
-    PreparedCallView, PreparedSemanticView, PreparedSemanticViewInputs,
+    PreparedCallView, PreparedRuntimeFactsError, PreparedSemanticView, PreparedSemanticViewInputs,
     build_prepared_runtime_facts_with_control,
 };
-
-#[cfg(test)]
-static EMPTY_CALLEE_FACTS: OnceLock<BTreeMap<u64, CalleeFact>> = OnceLock::new();
-
-#[cfg(test)]
-pub(crate) fn empty_callee_facts() -> &'static BTreeMap<u64, CalleeFact> {
-    EMPTY_CALLEE_FACTS.get_or_init(BTreeMap::new)
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct PtrArith {
-    pub(crate) base: SSAVar,
-    pub(crate) index: SSAVar,
-    pub(crate) element_size: u32,
-    pub(crate) is_sub: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum UseInfoAnalysisMode {
-    Full,
-    LocalStructAccesses,
-}
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub(crate) struct DecompilerFacts {
     pub(crate) use_info: UseInfo,
-    pub(crate) ownership: SemanticOwnershipFacts,
-    pub(crate) flag_info: FlagInfo,
     pub(crate) stack_info: StackInfo,
 }
 
@@ -64,27 +27,15 @@ impl DecompilerFacts {
     pub(crate) fn semantic(&self) -> &UseInfo {
         &self.use_info
     }
-
-    pub(crate) fn semantic_mut(&mut self) -> &mut UseInfo {
-        &mut self.use_info
-    }
-
-    pub(crate) fn flags(&self) -> &FlagInfo {
-        &self.flag_info
-    }
-
-    pub(crate) fn stack(&self) -> &StackInfo {
-        &self.stack_info
-    }
-
-    pub(crate) fn ownership(&self) -> &SemanticOwnershipFacts {
-        &self.ownership
-    }
 }
 
 #[allow(dead_code)]
 #[derive(Clone)]
+
 pub(crate) struct PassEnv<'a> {
+    /// The one renderer projection from BindingId to SymbolId. Analysis only
+    /// borrows it while translating exact ValueIds into references.
+    pub(crate) binding_names: Option<&'a crate::binding_plan::BindingNameResolution>,
     pub(crate) ptr_size: u32,
     pub(crate) sp_name: &'a str,
     pub(crate) fp_name: &'a str,
@@ -93,168 +44,39 @@ pub(crate) struct PassEnv<'a> {
     pub(crate) function_names: &'a HashMap<u64, String>,
     #[cfg(test)]
     pub(crate) strings: &'a HashMap<u64, String>,
+    /// What the binary calls the thing at an address, which is not a name this
+    /// rendering declares.
     #[cfg(test)]
-    pub(crate) symbols: &'a HashMap<u64, String>,
+    pub(crate) binary_symbols: &'a HashMap<u64, String>,
+    /// String literals the source recorded, for rendering a constant that
+    /// points at text as the text it points at.
+    pub(crate) string_literals: &'a BTreeMap<u64, String>,
     pub(crate) callee_facts: &'a BTreeMap<u64, CalleeFact>,
     pub(crate) callee_resolution: Option<&'a CalleeResolutionFacts>,
     pub(crate) summary_view: Option<&'a InterprocSummaryView>,
     pub(crate) arg_regs: &'a [String],
-    pub(crate) param_register_aliases: &'a HashMap<String, String>,
+    /// Where a rendered name is written down, so building a reference can mint one.
+    pub(crate) symbols: &'a std::cell::RefCell<crate::symbol::SymbolTable>,
     pub(crate) caller_saved_regs: &'a HashSet<String>,
-    pub(crate) type_hints: &'a HashMap<String, CType>,
     pub(crate) type_oracle: Option<&'a dyn TypeOracle>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct UseInfo {
-    pub(crate) value_ids_by_var: HashMap<SSAVar, ValueId>,
-    pub(crate) ambiguous_value_vars: HashSet<SSAVar>,
-    pub(crate) ambiguous_value_ids: BTreeSet<ValueId>,
-    pub(crate) value_ids_by_name: HashMap<String, ValueId>,
-    pub(crate) ambiguous_value_names: HashSet<String>,
-    pub(crate) vars_by_value_id: BTreeMap<ValueId, SSAVar>,
-    pub(crate) use_counts: HashMap<String, usize>,
-    pub(crate) use_counts_by_value: BTreeMap<ValueId, usize>,
-    pub(crate) definitions: HashMap<String, CExpr>,
-    pub(crate) definitions_by_value: BTreeMap<ValueId, CExpr>,
-    pub(crate) producers: HashMap<String, r2ssa::SSAOp>,
-    pub(crate) semantic_values: HashMap<String, SemanticValue>,
-    pub(crate) semantic_values_by_value: BTreeMap<ValueId, SemanticValue>,
-    pub(crate) frame_slot_merges: HashMap<String, FrameSlotMergeSummary>,
-    pub(crate) frame_object_field_roots: HashMap<FrameObjectFieldKey, SemanticValue>,
-    pub(crate) phi_sources: HashMap<String, Vec<SSAVar>>,
-    pub(crate) formatted_defs: HashMap<String, CExpr>,
-    pub(crate) copy_sources: HashMap<String, String>,
-    pub(crate) copy_sources_by_value: BTreeMap<ValueId, ValueId>,
-    pub(crate) memory_stores: HashMap<String, String>,
-    pub(crate) ptr_arith: HashMap<String, PtrArith>,
-    pub(crate) ptr_arith_by_value: BTreeMap<ValueId, PtrArith>,
-    pub(crate) ptr_members: HashMap<String, (r2ssa::SSAVar, i64)>,
-    pub(crate) condition_vars: HashSet<String>,
-    pub(crate) condition_values: BTreeSet<ValueId>,
+    identities: ExactValueIdentities,
     pub(crate) pinned: HashSet<String>,
-    pub(crate) call_args: HashMap<(u64, usize), Vec<CallArgBinding>>,
-    pub(crate) call_result_aliases: BTreeMap<(u64, usize), BTreeSet<String>>,
     pub(crate) call_result_exprs: BTreeMap<(u64, usize), CExpr>,
-    pub(crate) call_result_source_by_alias: HashMap<String, (u64, usize)>,
-    pub(crate) call_result_source_by_value: BTreeMap<ValueId, (u64, usize)>,
-    pub(crate) direct_call_result_aliases: HashSet<String>,
-    pub(crate) switch_selector_roots: BTreeMap<u64, SemanticValue>,
-    pub(crate) consumed_by_call: HashSet<String>,
-    pub(crate) inlined_call_results: HashSet<(u64, usize)>,
-    pub(crate) var_aliases: HashMap<String, String>,
-    pub(crate) type_hints: HashMap<String, CType>,
-    pub(crate) stack_slots: HashMap<String, StackSlotProvenance>,
-    pub(crate) stack_slots_by_value: BTreeMap<ValueId, StackSlotProvenance>,
-    pub(crate) stable_stack_values: HashMap<i64, SemanticValue>,
-    pub(crate) stable_memory_values: HashMap<String, SemanticValue>,
-    pub(crate) stable_memory_values_by_value: BTreeMap<ValueId, SemanticValue>,
-    pub(crate) forwarded_values: HashMap<String, ValueProvenance>,
     pub(crate) forwarded_values_by_value: BTreeMap<ValueId, ValueProvenance>,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum SemanticCallArg {
-    Semantic(SemanticValue),
-    StringAddr(u64),
-    FallbackExpr(CExpr),
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CallArgRole {
-    Input,
-    Result,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct CallArgBinding {
-    pub(crate) arg: SemanticCallArg,
-    pub(crate) role: CallArgRole,
-    pub(crate) stack_offset: Option<i64>,
-    pub(crate) source_call: Option<(u64, usize)>,
-    pub(crate) source_value_id: Option<ValueId>,
-    pub(crate) source_var_name: Option<String>,
-}
-
-impl CallArgBinding {
-    pub(crate) fn new(arg: SemanticCallArg, role: CallArgRole, stack_offset: Option<i64>) -> Self {
-        Self {
-            arg,
-            role,
-            stack_offset,
-            source_call: None,
-            source_value_id: None,
-            source_var_name: None,
-        }
-    }
-
-    pub(crate) fn input(arg: SemanticCallArg) -> Self {
-        Self::new(arg, CallArgRole::Input, None)
-    }
-
-    pub(crate) fn result(arg: SemanticCallArg) -> Self {
-        Self::new(arg, CallArgRole::Result, None)
-    }
-
-    pub(crate) fn with_stack_offset(mut self, stack_offset: i64) -> Self {
-        self.stack_offset = Some(stack_offset);
-        self
-    }
-
-    pub(crate) fn with_source_call(mut self, block_addr: u64, op_idx: usize) -> Self {
-        self.source_call = Some((block_addr, op_idx));
-        self
-    }
-
-    pub(crate) fn with_source_var(mut self, source_var: &SSAVar) -> Self {
-        self.source_var_name = Some(source_var.display_name());
-        self
-    }
-
-    pub(crate) fn with_source_value_id(mut self, value_id: ValueId) -> Self {
-        self.source_value_id = Some(value_id);
-        self
-    }
-
-    pub(crate) fn is_result(&self) -> bool {
-        self.role == CallArgRole::Result
-    }
-}
-
-impl From<SemanticCallArg> for CallArgBinding {
-    fn from(arg: SemanticCallArg) -> Self {
-        Self::input(arg)
-    }
-}
-
-impl From<CExpr> for CallArgBinding {
-    fn from(expr: CExpr) -> Self {
-        Self::input(SemanticCallArg::from(expr))
-    }
-}
-
-impl SemanticCallArg {
-    pub(crate) fn semantic(value: SemanticValue) -> Self {
-        Self::Semantic(value)
-    }
-
-    pub(crate) fn value_root(var: impl Into<ValueRef>) -> Self {
-        Self::Semantic(SemanticValue::Scalar(ScalarValue::Root(var.into())))
-    }
-
-    pub(crate) fn expr_only(expr: CExpr) -> Self {
-        Self::FallbackExpr(expr)
-    }
-}
-
-impl From<CExpr> for SemanticCallArg {
-    fn from(expr: CExpr) -> Self {
-        Self::expr_only(expr)
-    }
+    /// The first fact dropped because its variable had no exact value identity.
+    ///
+    /// Each writer below keys its fact by `ValueId`, and where the variable has
+    /// no exact one the fact used to be counted here and thrown away. Counting
+    /// a dropped fact is not accounting for it: the analysis then carries on
+    /// with a table that is missing something, and nothing downstream can tell.
+    ///
+    /// It is measured at zero on every corpus configuration, so recording the
+    /// first one and refusing costs nothing and stops the silent loss.
+    pub(crate) dropped_unkeyed_fact: Option<&'static str>,
 }
 
 #[allow(dead_code)]
@@ -270,17 +92,6 @@ impl ValueRef {
             value_id: None,
             var,
         }
-    }
-
-    pub(crate) fn with_value_id(value_id: ValueId, var: SSAVar) -> Self {
-        Self {
-            value_id: Some(value_id),
-            var,
-        }
-    }
-
-    pub(crate) fn display_name(&self) -> String {
-        self.var.display_name()
     }
 
     #[allow(dead_code)]
@@ -356,55 +167,9 @@ pub(crate) struct FrameObjectFieldKey {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Default)]
-pub(crate) struct FlagInfo {
-    pub(crate) flag_origins: HashMap<String, (String, String)>,
-    pub(crate) compare_provenance: HashMap<String, FlagCompareProvenance>,
-    pub(crate) sub_results: HashMap<String, (String, String)>,
-    pub(crate) flag_only_values: HashSet<String>,
-    pub(crate) predicate_exprs: HashMap<String, CExpr>,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FlagCompareKind {
-    Equality,
-    UnsignedLess,
-    SignedNegative,
-    Overflow,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct FlagCompareProvenance {
-    pub(crate) lhs: String,
-    pub(crate) rhs: String,
-    pub(crate) kind: FlagCompareKind,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct StackInfo {
     pub(crate) stack_vars: HashMap<i64, String>,
-    pub(crate) stack_arg_aliases: HashMap<i64, String>,
     pub(crate) definition_overrides: HashMap<String, CExpr>,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub(crate) enum StackSlotValueKind {
-    Scalar,
-    AddressLike,
-    #[default]
-    Unknown,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct StackSlotProvenance {
-    pub(crate) offset: i64,
-    pub(crate) predicate_carrier: bool,
-    pub(crate) return_carrier: bool,
-    pub(crate) value_kind: StackSlotValueKind,
 }
 
 #[allow(dead_code)]
@@ -416,169 +181,98 @@ pub(crate) struct ValueProvenance {
     pub(crate) stack_slot: Option<i64>,
 }
 
-impl StackSlotProvenance {
-    pub(crate) fn new(offset: i64) -> Self {
-        Self {
-            offset,
-            predicate_carrier: false,
-            return_carrier: false,
-            value_kind: StackSlotValueKind::Unknown,
-        }
-    }
-
-    pub(crate) fn merge(self, other: Self) -> Self {
-        if self.offset != other.offset {
-            return self;
-        }
-        Self {
-            offset: self.offset,
-            predicate_carrier: self.predicate_carrier || other.predicate_carrier,
-            return_carrier: self.return_carrier || other.return_carrier,
-            value_kind: match (self.value_kind, other.value_kind) {
-                (StackSlotValueKind::Unknown, kind) | (kind, StackSlotValueKind::Unknown) => kind,
-                (lhs, rhs) if lhs == rhs => lhs,
-                _ => StackSlotValueKind::Unknown,
-            },
-        }
-    }
-
-    pub(crate) fn is_scalar(self) -> bool {
-        self.value_kind == StackSlotValueKind::Scalar
-    }
-
-    pub(crate) fn is_address_like(self) -> bool {
-        self.value_kind == StackSlotValueKind::AddressLike
-    }
-
-    pub(crate) fn is_scalar_predicate_carrier(self) -> bool {
-        self.predicate_carrier && self.is_scalar()
-    }
-
-    pub(crate) fn is_scalar_return_carrier(self) -> bool {
-        self.return_carrier && self.is_scalar()
-    }
-}
-
-fn lookup_name_key<'a, T>(map: &'a HashMap<String, T>, name: &str) -> Option<&'a T> {
-    map.get(name)
-        .or_else(|| {
-            let lower = name.to_ascii_lowercase();
-            (lower != name).then(|| map.get(&lower)).flatten()
-        })
-        .or_else(|| {
-            name.rsplit_once('_').and_then(|(base, version)| {
-                let lower = format!("{}_{}", base.to_ascii_lowercase(), version);
-                map.get(&lower).or_else(|| {
-                    let upper = format!("{}_{}", base.to_ascii_uppercase(), version);
-                    (upper != lower).then(|| map.get(&upper)).flatten()
-                })
-            })
-        })
-}
-
-fn value_ref_references_any(value: &ValueRef, ids: &BTreeSet<ValueId>) -> bool {
-    value
-        .value_id
-        .is_some_and(|value_id| ids.contains(&value_id))
-}
-
-fn normalized_addr_references_any(addr: &NormalizedAddr, ids: &BTreeSet<ValueId>) -> bool {
-    matches!(&addr.base, BaseRef::Value(value) if value_ref_references_any(value, ids))
-        || addr
-            .index
-            .as_ref()
-            .is_some_and(|value| value_ref_references_any(value, ids))
-}
-
-fn semantic_value_references_any(value: &SemanticValue, ids: &BTreeSet<ValueId>) -> bool {
-    match value {
-        SemanticValue::Scalar(ScalarValue::Root(value)) => value_ref_references_any(value, ids),
-        SemanticValue::Scalar(ScalarValue::Expr(_)) | SemanticValue::Unknown => false,
-        SemanticValue::Address(addr) | SemanticValue::Load { addr, .. } => {
-            normalized_addr_references_any(addr, ids)
-        }
-    }
-}
-
-fn call_arg_references_any(arg: &CallArgBinding, ids: &BTreeSet<ValueId>) -> bool {
-    arg.source_value_id
-        .is_some_and(|value_id| ids.contains(&value_id))
-        || matches!(
-            &arg.arg,
-            SemanticCallArg::Semantic(value) if semantic_value_references_any(value, ids)
-        )
-}
-
 impl UseInfo {
-    #[allow(dead_code)]
-    pub(crate) fn analyze(blocks: &[SSABlock], env: &PassEnv<'_>) -> Self {
-        use_info::analyze(blocks, env)
-    }
-
-    pub(crate) fn analyze_with_control(
-        blocks: &[SSABlock],
-        env: &PassEnv<'_>,
-        control: crate::DecompileWorkControl<'_>,
-    ) -> Result<Self, crate::DecompileExecutionStop> {
-        use_info::analyze_with_control(blocks, env, control)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn analyze_for_local_struct_accesses(
-        blocks: &[SSABlock],
-        env: &PassEnv<'_>,
-    ) -> Self {
-        use_info::analyze_for_local_struct_accesses(blocks, env)
-    }
-
-    pub(crate) fn analyze_for_local_struct_accesses_with_control(
-        blocks: &[SSABlock],
-        env: &PassEnv<'_>,
-        control: crate::DecompileWorkControl<'_>,
-    ) -> Result<Self, crate::DecompileExecutionStop> {
-        use_info::analyze_for_local_struct_accesses_with_control(blocks, env, control)
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn analyze_with_definition_overrides(
-        blocks: &[SSABlock],
-        env: &PassEnv<'_>,
-        definition_overrides: &HashMap<String, CExpr>,
-    ) -> Self {
-        use_info::analyze_with_definition_overrides(blocks, env, definition_overrides)
-    }
-
-    pub(crate) fn analyze_with_definition_overrides_with_control(
-        blocks: &[SSABlock],
-        env: &PassEnv<'_>,
-        definition_overrides: &HashMap<String, CExpr>,
-        control: crate::DecompileWorkControl<'_>,
-    ) -> Result<Self, crate::DecompileExecutionStop> {
-        use_info::analyze_with_definition_overrides_with_control(
-            blocks,
-            env,
-            definition_overrides,
-            control,
-        )
-    }
-
-    pub(crate) fn preserve_authoritative_facts_from(&mut self, baseline: &UseInfo) {
-        use_info::preserve_authoritative_facts(self, baseline);
-    }
-
     pub(crate) fn bind_value_id(&mut self, var: &SSAVar, value_id: ValueId) -> Option<ValueId> {
+        match self.identities.bind(var, value_id) {
+            Bind::Bound(value_id) => Some(value_id),
+            Bind::Poisoned(values) => {
+                // The forwarding table is keyed by the same values, so a value
+                // that just lost its exact identity must lose its provenance
+                // with it -- both the entry for the value and any entry that
+                // names it as a source.
+                for value in &values {
+                    self.forwarded_values_by_value.remove(value);
+                }
+                self.forwarded_values_by_value.retain(|_, provenance| {
+                    provenance
+                        .source_value_id
+                        .is_none_or(|value_id| !values.contains(&value_id))
+                });
+                None
+            }
+        }
+    }
+
+    pub(crate) fn value_id_for_var(&self, var: &SSAVar) -> Option<ValueId> {
+        self.exact_value_id_for_var(var)
+    }
+
+    pub(crate) fn exact_value_id_for_var(&self, var: &SSAVar) -> Option<ValueId> {
+        self.identities.value_for_var(var)
+    }
+
+    pub(crate) fn forwarded_value_for_var(&self, var: &SSAVar) -> Option<&ValueProvenance> {
+        // Value first, as the definition accessors do. A name can be ambiguous
+        // and the identity relation says so; a value cannot. Where both stores
+        // hold an entry and they differ, the one keyed by identity is the one
+        // that is still about this value.
+        self.value_id_for_var(var)
+            .and_then(|value_id| self.forwarded_values_by_value.get(&value_id))
+    }
+}
+
+/// What a `bind` did.
+pub(crate) enum Bind {
+    /// The pair was exact and is now recorded.
+    Bound(ValueId),
+    /// The pair contradicted something already known, so every value in the
+    /// contradicted component is now poisoned. Callers holding tables keyed by
+    /// `ValueId` must drop these.
+    Poisoned(BTreeSet<ValueId>),
+}
+
+/// The exact one-to-one correspondence between a presentation variable and the
+/// value it names.
+///
+/// This is one relation, so it is one field. `by_value` is the stored
+/// direction, keyed by the identity the rest of the model uses. `by_var` is an
+/// index over the same pairs, and `poisoned_vars` is an index over
+/// `poisoned_values`; both exist because `UseInfo`'s accessors are asked
+/// questions in both directions and the project's own asymptotics rule says a
+/// lookup is not a scan. Neither is separately writable: `bind` is the only
+/// mutator, and it maintains all four together.
+///
+/// That is the whole point of the type. These were four `pub(crate)` fields of
+/// `UseInfo`, so a caller could read one direction, act on it, and be
+/// contradicted by the other -- one fact keyed several ways, each independently
+/// writable, which is the shape this rewrite exists to remove.
+///
+/// A contradicted pair is not repaired, it is poisoned. Both halves are removed
+/// and recorded, so a later `bind` of either half fails rather than re-creating
+/// a binding already proven ambiguous, and the poison spreads to the whole
+/// connected component rather than to the two names that happened to collide.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub(crate) struct ExactValueIdentities {
+    by_value: BTreeMap<ValueId, SSAVar>,
+    by_var: HashMap<SSAVar, ValueId>,
+    poisoned_values: BTreeSet<ValueId>,
+    poisoned_vars: HashSet<SSAVar>,
+}
+
+impl ExactValueIdentities {
+    pub(crate) fn bind(&mut self, var: &SSAVar, value_id: ValueId) -> Bind {
         let conflicting_value = self
-            .value_ids_by_var
+            .by_var
             .get(var)
             .copied()
             .filter(|existing| *existing != value_id);
         let conflicting_var = self
-            .vars_by_value_id
+            .by_value
             .get(&value_id)
             .filter(|existing| *existing != var)
             .cloned();
-        if self.ambiguous_value_vars.contains(var)
-            || self.ambiguous_value_ids.contains(&value_id)
+        if self.poisoned_vars.contains(var)
+            || self.poisoned_values.contains(&value_id)
             || conflicting_value.is_some()
             || conflicting_var.is_some()
         {
@@ -590,37 +284,49 @@ impl UseInfo {
             if let Some(conflicting_value) = conflicting_value {
                 values.insert(conflicting_value);
             }
-            self.invalidate_value_bindings(vars, values);
-            return None;
+            return Bind::Poisoned(self.poison(vars, values));
         }
-        self.value_ids_by_var.insert(var.clone(), value_id);
-
-        let display = var.display_name();
-        self.bind_value_name(display, value_id);
-        if var.version == 0 {
-            self.bind_value_name(var.name.clone(), value_id);
-        }
-        self.vars_by_value_id
-            .entry(value_id)
-            .or_insert_with(|| var.clone());
-        Some(value_id)
+        self.by_var.insert(var.clone(), value_id);
+        self.by_value.insert(value_id, var.clone());
+        Bind::Bound(value_id)
     }
 
-    fn invalidate_value_bindings(
+    /// The value this variable exactly names, if the pair is mutual and neither
+    /// half is poisoned.
+    pub(crate) fn value_for_var(&self, var: &SSAVar) -> Option<ValueId> {
+        if self.poisoned_vars.contains(var) {
+            return None;
+        }
+        let value_id = self.by_var.get(var).copied()?;
+        if self.poisoned_values.contains(&value_id) {
+            return None;
+        }
+        self.by_value
+            .get(&value_id)
+            .filter(|stored| *stored == var)
+            .map(|_| value_id)
+    }
+
+    /// Poison a contradicted component and return the values it covered.
+    ///
+    /// A contradiction is transitive: if two variables claim one value, every
+    /// value either of them claims is equally unproven, and so on. The fixpoint
+    /// closes over both directions before anything is removed.
+    fn poison(
         &mut self,
         mut vars: BTreeSet<SSAVar>,
         mut values: BTreeSet<ValueId>,
-    ) {
+    ) -> BTreeSet<ValueId> {
         loop {
             let prior_vars = vars.len();
             let prior_values = values.len();
             for var in vars.clone() {
-                if let Some(value) = self.value_ids_by_var.get(&var).copied() {
+                if let Some(value) = self.by_var.get(&var).copied() {
                     values.insert(value);
                 }
             }
             for value in values.clone() {
-                if let Some(var) = self.vars_by_value_id.get(&value).cloned() {
+                if let Some(var) = self.by_value.get(&value).cloned() {
                     vars.insert(var);
                 }
             }
@@ -630,419 +336,93 @@ impl UseInfo {
         }
 
         for value in &values {
-            self.vars_by_value_id.remove(value);
-            self.ambiguous_value_ids.insert(*value);
-            self.use_counts_by_value.remove(value);
-            self.definitions_by_value.remove(value);
-            self.semantic_values_by_value.remove(value);
-            self.copy_sources_by_value.remove(value);
-            self.ptr_arith_by_value.remove(value);
-            self.condition_values.remove(value);
-            self.call_result_source_by_value.remove(value);
-            self.stack_slots_by_value.remove(value);
-            self.stable_memory_values_by_value.remove(value);
-            self.forwarded_values_by_value.remove(value);
+            self.by_value.remove(value);
+            self.poisoned_values.insert(*value);
         }
-        self.copy_sources_by_value
-            .retain(|dst, src| !values.contains(dst) && !values.contains(src));
-        self.semantic_values_by_value
-            .retain(|_, value| !semantic_value_references_any(value, &values));
-        self.stable_memory_values_by_value
-            .retain(|_, value| !semantic_value_references_any(value, &values));
-        self.forwarded_values_by_value.retain(|_, provenance| {
-            provenance
-                .source_value_id
-                .is_none_or(|value_id| !values.contains(&value_id))
-        });
-        self.semantic_values
-            .retain(|_, value| !semantic_value_references_any(value, &values));
-        self.frame_object_field_roots
-            .retain(|_, value| !semantic_value_references_any(value, &values));
-        self.switch_selector_roots
-            .retain(|_, value| !semantic_value_references_any(value, &values));
-        self.stable_stack_values
-            .retain(|_, value| !semantic_value_references_any(value, &values));
-        self.stable_memory_values
-            .retain(|_, value| !semantic_value_references_any(value, &values));
-        self.forwarded_values.retain(|_, provenance| {
-            provenance
-                .source_value_id
-                .is_none_or(|value_id| !values.contains(&value_id))
-        });
-        self.call_args.retain(|_, args| {
-            args.iter()
-                .all(|arg| !call_arg_references_any(arg, &values))
-        });
         for var in vars {
-            self.value_ids_by_var.remove(&var);
-            self.ambiguous_value_vars.insert(var.clone());
-            self.invalidate_value_name(var.display_name());
-            if var.version == 0 {
-                self.invalidate_value_name(var.name);
-            }
+            self.by_var.remove(&var);
+            self.poisoned_vars.insert(var);
         }
+        values
     }
 
-    fn invalidate_value_name(&mut self, name: String) {
-        self.value_ids_by_name.remove(&name);
-        self.ambiguous_value_names.insert(name);
-    }
-
-    fn bind_value_name(&mut self, name: String, value_id: ValueId) {
-        if self.ambiguous_value_names.contains(&name) {
-            return;
-        }
-        if let Some(existing) = self.value_ids_by_name.get(&name).copied()
-            && existing != value_id
-        {
-            self.value_ids_by_name.remove(&name);
-            self.ambiguous_value_names.insert(name);
-            return;
-        }
-        self.value_ids_by_name.insert(name, value_id);
-    }
-
-    pub(crate) fn note_use_for_var(&mut self, var: &SSAVar) {
-        let display = var.display_name();
-        *self.use_counts.entry(display).or_insert(0) += 1;
-        if let Some(value_id) = self.exact_value_id_for_var(var) {
-            *self.use_counts_by_value.entry(value_id).or_insert(0) += 1;
-        }
-    }
-
-    pub(crate) fn note_condition_var(&mut self, var: &SSAVar) {
-        self.condition_vars.insert(var.display_name());
-        if let Some(value_id) = self.exact_value_id_for_var(var) {
-            self.condition_values.insert(value_id);
-        }
-    }
-
-    pub(crate) fn insert_definition_for_var(&mut self, var: &SSAVar, expr: CExpr) {
-        let display = var.display_name();
-        if let Some(value_id) = self.value_id_for_var(var) {
-            self.definitions_by_value.insert(value_id, expr.clone());
-        }
-        self.definitions.insert(display, expr);
-    }
-
-    pub(crate) fn insert_stack_slot_for_var(&mut self, var: &SSAVar, slot: StackSlotProvenance) {
-        if let Some(value_id) = self.exact_value_id_for_var(var) {
-            self.stack_slots_by_value.insert(value_id, slot);
-        }
-        self.stack_slots.insert(var.display_name(), slot);
-    }
-
+    /// Whether the two directions still describe the same set of pairs.
+    ///
+    /// They can only disagree if something other than `bind` wrote one of them,
+    /// which the privacy of the fields is what prevents. Asserted in tests
+    /// rather than trusted.
     #[cfg(test)]
-    pub(crate) fn insert_stack_slot_for_name(&mut self, name: &str, slot: StackSlotProvenance) {
-        if let Some(value_id) = self.value_id_for_name(name) {
-            self.stack_slots_by_value.insert(value_id, slot);
-        }
-        self.stack_slots.insert(name.to_string(), slot);
-    }
-
-    pub(crate) fn insert_ptr_arith_for_var(&mut self, var: &SSAVar, ptr: PtrArith) {
-        if let Some(value_id) = self.exact_value_id_for_var(var) {
-            self.ptr_arith_by_value.insert(value_id, ptr.clone());
-        }
-        self.ptr_arith.insert(var.display_name(), ptr);
-    }
-
-    pub(crate) fn insert_forwarded_value_for_var(
-        &mut self,
-        var: &SSAVar,
-        provenance: ValueProvenance,
-    ) {
-        if let Some(value_id) = self.exact_value_id_for_var(var) {
-            self.forwarded_values_by_value
-                .insert(value_id, provenance.clone());
-        }
-        self.forwarded_values.insert(var.display_name(), provenance);
-    }
-
-    pub(crate) fn insert_semantic_value_for_name(&mut self, name: &str, value: SemanticValue) {
-        if let Some(value_id) = self.value_id_for_name(name) {
-            self.semantic_values_by_value
-                .insert(value_id, value.clone());
-        }
-        self.semantic_values.insert(name.to_string(), value);
-    }
-
-    pub(crate) fn insert_call_result_source_alias(
-        &mut self,
-        alias: &str,
-        source_call: (u64, usize),
-    ) {
-        self.call_result_source_by_alias
-            .insert(alias.to_string(), source_call);
-        if let Some(value_id) = self.value_id_for_name(alias) {
-            self.call_result_source_by_value
-                .insert(value_id, source_call);
-        }
-    }
-
-    pub(crate) fn value_id_for_var(&self, var: &SSAVar) -> Option<ValueId> {
-        self.exact_value_id_for_var(var)
-    }
-
-    pub(crate) fn exact_value_id_for_var(&self, var: &SSAVar) -> Option<ValueId> {
-        if self.ambiguous_value_vars.contains(var) {
-            return None;
-        }
-        let value_id = self.value_ids_by_var.get(var).copied()?;
-        if self.ambiguous_value_ids.contains(&value_id) {
-            return None;
-        }
-        self.vars_by_value_id
-            .get(&value_id)
-            .filter(|stored| *stored == var)
-            .map(|_| value_id)
-    }
-
-    pub(crate) fn value_id_for_name(&self, name: &str) -> Option<ValueId> {
-        if self.ambiguous_value_names.contains(name) {
-            return None;
-        }
-        self.value_ids_by_name.get(name).copied()
-    }
-
-    pub(crate) fn var_for_value_id(&self, value_id: ValueId) -> Option<&SSAVar> {
-        if self.ambiguous_value_ids.contains(&value_id) {
-            return None;
-        }
-        self.vars_by_value_id.get(&value_id)
-    }
-
-    pub(crate) fn definition_for_var(&self, var: &SSAVar) -> Option<&CExpr> {
-        if self.ambiguous_value_vars.contains(var)
-            || self.ambiguous_value_names.contains(&var.display_name())
-        {
-            return None;
-        }
-        self.value_id_for_var(var)
-            .and_then(|value_id| self.definitions_by_value.get(&value_id))
-            .or_else(|| self.definitions.get(&var.display_name()))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn display_name_for_value_id(&self, value_id: ValueId) -> Option<String> {
-        self.var_for_value_id(value_id).map(SSAVar::display_name)
-    }
-
-    pub(crate) fn use_count_for_name(&self, name: &str) -> usize {
-        if self.ambiguous_value_names.contains(name) {
-            return 0;
-        }
-        self.value_id_for_name(name)
-            .and_then(|value_id| self.use_counts_by_value.get(&value_id).copied())
-            .or_else(|| lookup_name_key(&self.use_counts, name).copied())
-            .unwrap_or(0)
-    }
-
-    pub(crate) fn definition_for_value(&self, value_id: ValueId) -> Option<&CExpr> {
-        if self.ambiguous_value_ids.contains(&value_id) {
-            return None;
-        }
-        self.definitions_by_value.get(&value_id)
-    }
-
-    pub(crate) fn render_definition_for_value(&self, value_id: ValueId) -> Option<&CExpr> {
-        self.var_for_value_id(value_id)
-            .and_then(|var| lookup_name_key(&self.definitions, &var.display_name()))
-            .or_else(|| self.definition_for_value(value_id))
-    }
-
-    pub(crate) fn definition_for_name(&self, name: &str) -> Option<&CExpr> {
-        if self.ambiguous_value_names.contains(name) {
-            return None;
-        }
-        self.value_id_for_name(name)
-            .and_then(|value_id| self.definitions_by_value.get(&value_id))
-            .or_else(|| self.definitions.get(name))
-    }
-
-    pub(crate) fn render_definition_for_name(&self, name: &str) -> Option<&CExpr> {
-        lookup_name_key(&self.definitions, name).or_else(|| self.definition_for_name(name))
-    }
-
-    pub(crate) fn semantic_value_for_var(&self, var: &SSAVar) -> Option<&SemanticValue> {
-        if self.ambiguous_value_vars.contains(var)
-            || self.ambiguous_value_names.contains(&var.display_name())
-        {
-            return None;
-        }
-        self.semantic_values.get(&var.display_name()).or_else(|| {
-            self.value_id_for_var(var)
-                .and_then(|value_id| self.semantic_values_by_value.get(&value_id))
-        })
-    }
-
-    pub(crate) fn semantic_value_for_value(&self, value_id: ValueId) -> Option<&SemanticValue> {
-        if self.ambiguous_value_ids.contains(&value_id) {
-            return None;
-        }
-        self.semantic_values_by_value.get(&value_id)
-    }
-
-    pub(crate) fn render_semantic_value_for_value(
-        &self,
-        value_id: ValueId,
-    ) -> Option<&SemanticValue> {
-        self.var_for_value_id(value_id)
-            .and_then(|var| lookup_name_key(&self.semantic_values, &var.display_name()))
-            .or_else(|| self.semantic_value_for_value(value_id))
-    }
-
-    pub(crate) fn semantic_value_for_name(&self, name: &str) -> Option<&SemanticValue> {
-        if self.ambiguous_value_names.contains(name) {
-            return None;
-        }
-        self.semantic_values.get(name).or_else(|| {
-            self.value_id_for_name(name)
-                .and_then(|value_id| self.semantic_values_by_value.get(&value_id))
-        })
-    }
-
-    pub(crate) fn render_semantic_value_for_name(&self, name: &str) -> Option<&SemanticValue> {
-        lookup_name_key(&self.semantic_values, name).or_else(|| self.semantic_value_for_name(name))
-    }
-
-    pub(crate) fn forwarded_value_for_var(&self, var: &SSAVar) -> Option<&ValueProvenance> {
-        if self.ambiguous_value_vars.contains(var)
-            || self.ambiguous_value_names.contains(&var.display_name())
-        {
-            return None;
-        }
-        self.forwarded_values.get(&var.display_name()).or_else(|| {
-            self.value_id_for_var(var)
-                .and_then(|value_id| self.forwarded_values_by_value.get(&value_id))
-        })
-    }
-
-    pub(crate) fn forwarded_value_for_value(&self, value_id: ValueId) -> Option<&ValueProvenance> {
-        if self.ambiguous_value_ids.contains(&value_id) {
-            return None;
-        }
-        self.forwarded_values_by_value.get(&value_id)
-    }
-
-    pub(crate) fn render_forwarded_value_for_value(
-        &self,
-        value_id: ValueId,
-    ) -> Option<&ValueProvenance> {
-        self.var_for_value_id(value_id)
-            .and_then(|var| lookup_name_key(&self.forwarded_values, &var.display_name()))
-            .or_else(|| self.forwarded_value_for_value(value_id))
-    }
-
-    pub(crate) fn forwarded_value_for_name(&self, name: &str) -> Option<&ValueProvenance> {
-        if self.ambiguous_value_names.contains(name) {
-            return None;
-        }
-        self.forwarded_values.get(name).or_else(|| {
-            self.value_id_for_name(name)
-                .and_then(|value_id| self.forwarded_values_by_value.get(&value_id))
-        })
-    }
-
-    pub(crate) fn render_forwarded_value_for_name(&self, name: &str) -> Option<&ValueProvenance> {
-        lookup_name_key(&self.forwarded_values, name)
-            .or_else(|| self.forwarded_value_for_name(name))
-    }
-
-    pub(crate) fn render_copy_source_for_name(&self, name: &str) -> Option<String> {
-        lookup_name_key(&self.copy_sources, name).cloned()
-    }
-
-    pub(crate) fn has_renderable_named_fact(&self, name: &str) -> bool {
-        lookup_name_key(&self.definitions, name).is_some()
-            || lookup_name_key(&self.semantic_values, name).is_some()
-            || lookup_name_key(&self.copy_sources, name).is_some()
-            || lookup_name_key(&self.var_aliases, name).is_some()
-            || self.value_id_for_name(name).is_some_and(|value_id| {
-                self.definitions_by_value.contains_key(&value_id)
-                    || self.semantic_values_by_value.contains_key(&value_id)
-                    || self.copy_sources_by_value.contains_key(&value_id)
-            })
-    }
-
-    pub(crate) fn known_named_values(&self) -> Vec<String> {
-        let mut names = BTreeSet::new();
-        names.extend(self.definitions.keys().cloned());
-        names.extend(self.semantic_values.keys().cloned());
-        names.extend(self.copy_sources.keys().cloned());
-        names.extend(self.var_aliases.keys().cloned());
-        names.into_iter().collect()
-    }
-
-    pub(crate) fn stack_slot_for_name(&self, name: &str) -> Option<StackSlotProvenance> {
-        if self.ambiguous_value_names.contains(name) {
-            return None;
-        }
-        lookup_name_key(&self.stack_slots, name).copied()
-    }
-
-    pub(crate) fn stack_slots(&self) -> impl Iterator<Item = StackSlotProvenance> + '_ {
-        self.stack_slots.values().copied()
-    }
-
-    pub(crate) fn render_stack_slot_for_name(&self, name: &str) -> Option<StackSlotProvenance> {
-        self.stack_slot_for_name(name)
-    }
-
-    pub(crate) fn stack_slot_for_var(&self, var: &SSAVar) -> Option<StackSlotProvenance> {
-        if self.ambiguous_value_vars.contains(var)
-            || self.ambiguous_value_names.contains(&var.display_name())
-        {
-            return None;
-        }
-        self.stack_slot_for_name(&var.display_name()).or_else(|| {
-            self.value_id_for_var(var)
-                .and_then(|value_id| self.stack_slots_by_value.get(&value_id).copied())
-        })
-    }
-
-    pub(crate) fn ptr_arith_for_var(&self, var: &SSAVar) -> Option<&PtrArith> {
-        if self.ambiguous_value_vars.contains(var)
-            || self.ambiguous_value_names.contains(&var.display_name())
-        {
-            return None;
-        }
-        self.ptr_arith.get(&var.display_name()).or_else(|| {
-            self.value_id_for_var(var)
-                .and_then(|value_id| self.ptr_arith_by_value.get(&value_id))
-        })
-    }
-
-    pub(crate) fn is_condition_name(&self, name: &str) -> bool {
-        if self.ambiguous_value_names.contains(name) {
-            return false;
-        }
-        self.value_id_for_name(name)
-            .is_some_and(|value_id| self.condition_values.contains(&value_id))
-            || self.condition_vars.contains(name)
-    }
-
-    pub(crate) fn call_result_source_for_name(&self, name: &str) -> Option<(u64, usize)> {
-        if self.ambiguous_value_names.contains(name) {
-            return None;
-        }
-        lookup_name_key(&self.call_result_source_by_alias, name)
-            .copied()
-            .or_else(|| {
-                self.value_id_for_name(name)
-                    .and_then(|value_id| self.call_result_source_by_value.get(&value_id).copied())
-            })
+    pub(crate) fn directions_agree(&self) -> bool {
+        self.by_var.len() == self.by_value.len()
+            && self
+                .by_var
+                .iter()
+                .all(|(var, value)| self.by_value.get(value) == Some(var))
     }
 }
 
-impl FlagInfo {
-    pub(crate) fn analyze(blocks: &[SSABlock], use_info: &UseInfo, env: &PassEnv<'_>) -> Self {
-        flag_info::analyze(blocks, use_info, env)
-    }
-}
+impl StackInfo {}
 
-impl StackInfo {
-    pub(crate) fn analyze(blocks: &[SSABlock], use_info: &UseInfo, env: &PassEnv<'_>) -> Self {
-        stack_info::analyze(blocks, use_info, env)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn var(name: &str) -> SSAVar {
+        SSAVar::new(name, 1, 8)
+    }
+
+    #[test]
+    fn exact_identities_keep_both_directions_in_step() {
+        let mut identities = ExactValueIdentities::default();
+        for (name, value) in [("a", 1u32), ("b", 2), ("c", 3)] {
+            assert!(matches!(
+                identities.bind(&var(name), ValueId(value)),
+                Bind::Bound(_)
+            ));
+        }
+
+        assert!(identities.directions_agree());
+        assert_eq!(identities.value_for_var(&var("b")), Some(ValueId(2)));
+    }
+
+    #[test]
+    fn a_contradicted_pair_poisons_its_whole_component() {
+        let mut identities = ExactValueIdentities::default();
+        assert!(matches!(
+            identities.bind(&var("a"), ValueId(1)),
+            Bind::Bound(_)
+        ));
+        assert!(matches!(
+            identities.bind(&var("b"), ValueId(2)),
+            Bind::Bound(_)
+        ));
+
+        // `a` already names 1 and 2 already belongs to `b`, so neither pair is
+        // proven any more and the poison must reach `b` and 1 as well as the
+        // two halves that collided.
+        let Bind::Poisoned(values) = identities.bind(&var("a"), ValueId(2)) else {
+            panic!("a second value for one variable must poison the component");
+        };
+        assert_eq!(values, BTreeSet::from([ValueId(1), ValueId(2)]));
+
+        assert_eq!(identities.value_for_var(&var("a")), None);
+        assert_eq!(identities.value_for_var(&var("b")), None);
+        assert!(identities.directions_agree());
+    }
+
+    #[test]
+    fn poisoning_is_sticky_against_a_later_rebind() {
+        let mut identities = ExactValueIdentities::default();
+        identities.bind(&var("a"), ValueId(1));
+        identities.bind(&var("b"), ValueId(1));
+
+        // Re-asserting the original pair must not resurrect it: it was proven
+        // ambiguous, and forgetting that is how a wrong name reaches the output.
+        assert!(matches!(
+            identities.bind(&var("a"), ValueId(1)),
+            Bind::Poisoned(_)
+        ));
+        assert_eq!(identities.value_for_var(&var("a")), None);
+        assert!(identities.directions_agree());
     }
 }

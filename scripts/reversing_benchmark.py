@@ -6586,9 +6586,9 @@ def _fixed_performance_command_output_valid(
         if (
             not isinstance(schema_version, int)
             or isinstance(schema_version, bool)
-            or schema_version != 1
+            or schema_version != 2
         ):
-            return False, "SSA function report JSON schema version is not 1"
+            return False, "SSA function report JSON schema version is not 2"
         function_entry = metrics.get("entry")
         if not isinstance(function_entry, int) or isinstance(function_entry, bool):
             return False, "SSA function report JSON lacks its numeric entry"

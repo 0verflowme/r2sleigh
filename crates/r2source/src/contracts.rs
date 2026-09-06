@@ -27,7 +27,27 @@ pub struct CanonicalStorageId {
     pub size: u32,
 }
 
+/// Where a storage lives, without saying how much of it a write touched.
+///
+/// A `CanonicalStorageId` records a slice: `EAX` and `RAX` differ in it because
+/// they differ in size, which makes two writes to one register look like writes
+/// to two places. A location is the register, and the slice is what a
+/// particular access took of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct CanonicalLocation {
+    pub space: CanonicalStorageSpace,
+    pub offset: u64,
+}
+
 impl CanonicalStorageId {
+    /// The place this slice is a slice of.
+    pub const fn location(self) -> CanonicalLocation {
+        CanonicalLocation {
+            space: self.space,
+            offset: self.offset,
+        }
+    }
+
     pub const fn from_varnode(varnode: &r2il::Varnode) -> Self {
         let space = match varnode.space {
             r2il::SpaceId::Ram => CanonicalStorageSpace::Ram,
@@ -63,16 +83,98 @@ pub enum StackAddressBase {
     StackPointer,
 }
 
-pub const SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION: u32 = 10;
-pub const SOURCE_CALL_SITE_INTERFACE_SCHEMA_VERSION: u32 = 1;
+pub const SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION: u32 = 11;
+pub const SOURCE_CALL_SITE_INTERFACE_SCHEMA_VERSION: u32 = 3;
 pub const SOURCE_TYPE_GRAPH_SCHEMA_VERSION: u32 = 1;
+
+/// Typed classification of one source-owned calling-convention spelling.
+///
+/// The source spelling remains available for presentation, but semantic
+/// consumers use this closed value. Classification happens once when a source
+/// contract is constructed; consumers must not parse the spelling again.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+pub enum SourceAbiClass {
+    /// The source supplied no convention, or explicitly marked it unknown.
+    #[default]
+    Unknown,
+    /// The source supplied a convention outside the closed vocabulary below.
+    Other,
+    Microsoft,
+    MicrosoftX64,
+    SystemV,
+    SystemVAMD64,
+    Aapcs,
+    Aapcs64,
+    RiscV32,
+    RiscV64,
+    Cdecl,
+    Stdcall,
+    Fastcall,
+    Thiscall,
+    Vectorcall,
+}
+
+impl SourceAbiClass {
+    /// Classify an exact source spelling without architecture or symbol hints.
+    pub fn from_source_spelling(spelling: &str) -> Self {
+        let mut normalized = String::with_capacity(spelling.len());
+        for ch in spelling.trim().chars() {
+            if ch.is_ascii_alphanumeric() {
+                normalized.push(ch.to_ascii_lowercase());
+            } else if ch.is_ascii_whitespace() || matches!(ch, '-' | '_' | ':' | '.' | '/') {
+                continue;
+            } else {
+                return Self::Other;
+            }
+        }
+        match normalized.as_str() {
+            "" | "unknown" | "unspecified" | "default" | "none" => Self::Unknown,
+            "ms" | "msvc" | "microsoft" => Self::Microsoft,
+            "ms64" | "msx64" | "win64" | "windowsx64" | "microsoftx64" | "x64windows"
+            | "amd64windows" => Self::MicrosoftX64,
+            "sysv" | "systemv" => Self::SystemV,
+            "amd64" | "sysv64" | "sysvamd64" | "systemvamd64" | "amd64sysv" | "x8664sysv" => {
+                Self::SystemVAMD64
+            }
+            "aapcs" => Self::Aapcs,
+            "aapcs64" => Self::Aapcs64,
+            "riscv32" | "rv32" => Self::RiscV32,
+            "riscv64" | "rv64" => Self::RiscV64,
+            "cdecl" => Self::Cdecl,
+            "stdcall" => Self::Stdcall,
+            "fastcall" => Self::Fastcall,
+            "thiscall" => Self::Thiscall,
+            "vectorcall" => Self::Vectorcall,
+            _ => Self::Other,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum SourceTypeKind {
     SignedInteger,
     UnsignedInteger,
-    Pointer { target_type_id: u32 },
-    Struct { aggregate_id: u32 },
+    Pointer {
+        target_type_id: u32,
+    },
+    Struct {
+        aggregate_id: u32,
+    },
+    /// An object the graph does not describe. It has no size and no layout
+    /// and exists only as a pointer's target: it is how `void *` is placed
+    /// without inventing what it points at.
+    Void,
+    /// Code. Like `Void` it has no size and is only a pointer's target; the
+    /// signature is not carried, so a pointer to it is a function pointer
+    /// whose parameters the graph does not state.
+    Code,
+    /// An aggregate whose members all begin at its start and which is as
+    /// wide as its widest member.
+    Union {
+        aggregate_id: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -275,7 +377,6 @@ pub struct SourceTypeGraph {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceTypeGraphError {
-    Empty,
     InvalidType,
     InvalidAggregate,
     InvalidMember,
@@ -304,12 +405,25 @@ impl SourceTypeGraph {
     ) -> Result<Self, SourceTypeGraphError> {
         let types = types.into_iter().collect::<Vec<_>>();
         let aggregates = aggregates.into_iter().collect::<Vec<_>>();
-        if types.is_empty() {
-            return Err(SourceTypeGraphError::Empty);
-        }
+        // A function that mentions no type has an empty graph. That is a
+        // complete account of the types it uses, not an absent one, and
+        // rejecting it refused every function whose body needs nothing named.
         for (position, source_type) in types.iter().enumerate() {
-            if u32::try_from(position) != Ok(source_type.id)
-                || source_type.size_bits == 0
+            if u32::try_from(position) != Ok(source_type.id) {
+                return Err(SourceTypeGraphError::InvalidType);
+            }
+            // An opaque kind has no size and no alignment, by definition;
+            // every other kind is an object and has both.
+            if matches!(
+                source_type.kind,
+                SourceTypeKind::Void | SourceTypeKind::Code
+            ) {
+                if source_type.size_bits != 0 || source_type.align_bits != 0 {
+                    return Err(SourceTypeGraphError::InvalidType);
+                }
+                continue;
+            }
+            if source_type.size_bits == 0
                 || !source_type.size_bits.is_multiple_of(8)
                 || source_type.align_bits == 0
                 || !source_type.align_bits.is_multiple_of(8)
@@ -327,19 +441,19 @@ impl SourceTypeGraph {
                     }
                 }
                 SourceTypeKind::Pointer { target_type_id } => {
+                    // `char **argv` is ordinary C, and reachability already walks targets through a visited set
                     if !matches!(source_type.size_bits, 32 | 64)
                         || source_type.align_bits != source_type.size_bits
                         || usize::try_from(target_type_id)
                             .ok()
                             .and_then(|id| types.get(id))
-                            .is_none_or(|target| {
-                                matches!(target.kind, SourceTypeKind::Pointer { .. })
-                            })
+                            .is_none()
                     {
                         return Err(SourceTypeGraphError::InvalidType);
                     }
                 }
-                SourceTypeKind::Struct { aggregate_id } => {
+                SourceTypeKind::Struct { aggregate_id }
+                | SourceTypeKind::Union { aggregate_id } => {
                     if usize::try_from(aggregate_id)
                         .ok()
                         .is_none_or(|id| id >= aggregates.len())
@@ -347,23 +461,52 @@ impl SourceTypeGraph {
                         return Err(SourceTypeGraphError::InvalidType);
                     }
                 }
+                SourceTypeKind::Void | SourceTypeKind::Code => {}
             }
         }
         for (position, aggregate) in aggregates.iter().enumerate() {
-            if u32::try_from(position) != Ok(aggregate.id)
-                || usize::try_from(aggregate.type_id)
-                    .ok()
-                    .and_then(|id| types.get(id))
-                    .is_none_or(|source_type| {
-                        source_type.size_bits != aggregate.size_bits
-                            || source_type.align_bits != aggregate.align_bits
-                            || source_type.kind
-                                != (SourceTypeKind::Struct {
-                                    aggregate_id: aggregate.id,
-                                })
-                    })
-                || aggregate.members.is_empty()
-            {
+            let Some(owner) = usize::try_from(aggregate.type_id)
+                .ok()
+                .and_then(|id| types.get(id))
+                .filter(|source_type| {
+                    source_type.size_bits == aggregate.size_bits
+                        && source_type.align_bits == aggregate.align_bits
+                })
+            else {
+                r2il::refusal_evidence!(
+                    "type-graph",
+                    "aggregate {} ({}) has no owning type of its size and alignment: type {} size {} align {}",
+                    aggregate.id,
+                    aggregate.name,
+                    aggregate.type_id,
+                    aggregate.size_bits,
+                    aggregate.align_bits
+                );
+                return Err(SourceTypeGraphError::InvalidAggregate);
+            };
+            let is_union = match owner.kind {
+                SourceTypeKind::Struct { aggregate_id } if aggregate_id == aggregate.id => false,
+                SourceTypeKind::Union { aggregate_id } if aggregate_id == aggregate.id => true,
+                _ => {
+                    r2il::refusal_evidence!(
+                        "type-graph",
+                        "aggregate {} ({}) is owned by a type of another kind: {:?}",
+                        aggregate.id,
+                        aggregate.name,
+                        owner.kind
+                    );
+                    return Err(SourceTypeGraphError::InvalidAggregate);
+                }
+            };
+            if u32::try_from(position) != Ok(aggregate.id) || aggregate.members.is_empty() {
+                r2il::refusal_evidence!(
+                    "type-graph",
+                    "aggregate {} ({}) at position {} has {} members",
+                    aggregate.id,
+                    aggregate.name,
+                    position,
+                    aggregate.members.len()
+                );
                 return Err(SourceTypeGraphError::InvalidAggregate);
             }
             let mut cursor = 0u64;
@@ -372,35 +515,76 @@ impl SourceTypeGraph {
                 let Some(member_type) = usize::try_from(member.type_id)
                     .ok()
                     .and_then(|id| types.get(id))
+                    .filter(|member_type| {
+                        !matches!(
+                            member_type.kind,
+                            SourceTypeKind::Void | SourceTypeKind::Code
+                        )
+                    })
                 else {
                     return Err(SourceTypeGraphError::InvalidMember);
                 };
+                // Any type this graph already validated may be a member. What
+                // has to hold of a member is where it sits, not what it is:
+                // admitting only integers refused `struct state *next`, and
+                // with it every function that mentions an ordinary C struct.
+                // A member holds a whole number of its element type: one for a
+                // plain member, more for an array. Demanding exactly one refused
+                // every struct with an array in it, and refusing the struct lost
+                // the layout of its other members too, so a `VmState` holding
+                // `int32_t r[8]` reached the consumer with no layout at all.
                 if u32::try_from(member_position) != Ok(member.member_id)
-                    || !matches!(
-                        member_type.kind,
-                        SourceTypeKind::SignedInteger | SourceTypeKind::UnsignedInteger
-                    )
-                    || member.size_bits != member_type.size_bits
+                    || member.size_bits == 0
+                    || member_type.size_bits == 0
+                    || !member.size_bits.is_multiple_of(member_type.size_bits)
                     || !member.offset_bits.is_multiple_of(8)
-                    || source_align_up(cursor, member_type.align_bits) != Some(member.offset_bits)
                 {
                     return Err(SourceTypeGraphError::InvalidMember);
                 }
-                cursor = member
-                    .offset_bits
-                    .checked_add(member.size_bits)
-                    .ok_or(SourceTypeGraphError::InvalidMember)?;
+                // A struct lays its members out in order; a union lays every
+                // member at its start and is as wide as the widest.
+                if is_union {
+                    if member.offset_bits != 0 {
+                        return Err(SourceTypeGraphError::InvalidMember);
+                    }
+                    cursor = cursor.max(member.size_bits);
+                } else {
+                    if source_align_up(cursor, member_type.align_bits) != Some(member.offset_bits) {
+                        return Err(SourceTypeGraphError::InvalidMember);
+                    }
+                    cursor = member
+                        .offset_bits
+                        .checked_add(member.size_bits)
+                        .ok_or(SourceTypeGraphError::InvalidMember)?;
+                }
                 maximum_alignment = maximum_alignment.max(member_type.align_bits);
             }
             if maximum_alignment != aggregate.align_bits
                 || source_align_up(cursor, maximum_alignment) != Some(aggregate.size_bits)
             {
+                r2il::refusal_evidence!(
+                    "type-graph",
+                    "aggregate {} ({}) members end at {} with alignment {} but it claims size {} align {}",
+                    aggregate.id,
+                    aggregate.name,
+                    cursor,
+                    maximum_alignment,
+                    aggregate.size_bits,
+                    aggregate.align_bits
+                );
                 return Err(SourceTypeGraphError::InvalidAggregate);
             }
         }
+        // Every aggregate is owned by exactly one struct or union type, and
+        // every struct or union type owns exactly one aggregate.
         if types
             .iter()
-            .filter(|source_type| matches!(source_type.kind, SourceTypeKind::Struct { .. }))
+            .filter(|source_type| {
+                matches!(
+                    source_type.kind,
+                    SourceTypeKind::Struct { .. } | SourceTypeKind::Union { .. }
+                )
+            })
             .count()
             != aggregates.len()
         {
@@ -482,14 +666,18 @@ impl SourceTypeGraph {
                         worklist.push(target_type_id);
                     }
                 }
-                SourceTypeKind::Struct { aggregate_id } => {
+                SourceTypeKind::Struct { aggregate_id }
+                | SourceTypeKind::Union { aggregate_id } => {
                     for member in &self.aggregates[aggregate_id as usize].members {
                         if reachable.insert(member.type_id) {
                             worklist.push(member.type_id);
                         }
                     }
                 }
-                SourceTypeKind::SignedInteger | SourceTypeKind::UnsignedInteger => {}
+                SourceTypeKind::SignedInteger
+                | SourceTypeKind::UnsignedInteger
+                | SourceTypeKind::Void
+                | SourceTypeKind::Code => {}
             }
         }
         reachable.len() == self.types.len()
@@ -541,7 +729,7 @@ pub enum SourceReturnMechanism {
 /// storage by moving the architectural stack pointer away from its entry
 /// value. This is an ownership contract, not an inference from an architecture
 /// name, calling-convention string, or observed instruction spelling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub enum SourceStackGrowth {
     LowerAddresses,
     HigherAddresses,
@@ -556,7 +744,7 @@ pub enum SourceStackGrowth {
 /// independently prove that no intervening call or other source-declared
 /// invalidation can overwrite the implicit area while any certified value is
 /// live. Absence grants no allocation or implicit-stack authority.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct SourceStackAllocationContract {
     growth: SourceStackGrowth,
     implicit_active_sp_bytes: u32,
@@ -692,6 +880,10 @@ pub struct SourceStackSlotSpec {
     offset: i64,
     size_bytes: u32,
     role: SourceStackSlotRole,
+    /// The slot's declared type as a node of the interface's type graph.
+    /// Absent when the interface carries no graph or the graph could not
+    /// place the declaration; never a guess.
+    logical_type: Option<u32>,
 }
 
 impl SourceStackSlotSpec {
@@ -708,6 +900,7 @@ impl SourceStackSlotSpec {
             offset,
             size_bytes,
             role: SourceStackSlotRole::UnclassifiedResource,
+            logical_type: None,
         }
     }
 
@@ -723,6 +916,7 @@ impl SourceStackSlotSpec {
             offset,
             size_bytes,
             role: SourceStackSlotRole::Local,
+            logical_type: None,
         }
     }
 
@@ -743,7 +937,20 @@ impl SourceStackSlotSpec {
                 parameter_index,
                 home_storage,
             },
+            logical_type: None,
         }
+    }
+
+    /// The same slot with its declared type named as a graph node.
+    pub const fn with_logical_type(self, type_id: u32) -> Self {
+        Self {
+            logical_type: Some(type_id),
+            ..self
+        }
+    }
+
+    pub const fn logical_type(&self) -> Option<u32> {
+        self.logical_type
     }
 
     pub const fn base(&self) -> StackAddressBase {
@@ -765,6 +972,128 @@ impl SourceStackSlotSpec {
     pub const fn role(&self) -> SourceStackSlotRole {
         self.role
     }
+
+    /// The same slot stated against another base.
+    ///
+    /// A source declares a slot against the register it saw the code use,
+    /// and a consumer that identifies objects by their entry-relative
+    /// position has to restate a frame-pointer slot before the two can be
+    /// compared. Width and role are properties of the slot, not of the
+    /// coordinate, so they carry over unchanged.
+    pub const fn restated(
+        self,
+        base: StackAddressBase,
+        base_storage: CanonicalStorageId,
+        offset: i64,
+    ) -> Self {
+        Self {
+            base,
+            base_storage,
+            offset,
+            size_bytes: self.size_bytes,
+            role: self.role,
+            logical_type: self.logical_type,
+        }
+    }
+}
+
+/// The register names a source spells for the machine role carriers.
+///
+/// A name is the only part of a source-reported carrier that means the same
+/// thing to the architecture that gets lifted. Everything else about the
+/// carrier -- its offset above all -- is stated in the source's own register
+/// numbering and has to be re-derived from the name before it can be compared
+/// with anything the lift produced.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceRoleRegisterNames {
+    return_address: Option<SourceRegisterName>,
+    stack_pointer: Option<SourceRegisterName>,
+    frame_pointer: Option<SourceRegisterName>,
+}
+
+/// One register spelling, stored inline.
+///
+/// Register names are short by construction, and holding one inline keeps the
+/// carriers a machine states about itself copyable, which is what every
+/// consumer of them already assumes. A name too long for the buffer is refused
+/// rather than truncated: a truncated spelling would resolve to a different
+/// register, which is the exact failure this type exists to prevent.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct SourceRegisterName {
+    bytes: [u8; SOURCE_REGISTER_NAME_MAX],
+    len: u8,
+}
+
+/// Longest register spelling a source may state.
+pub const SOURCE_REGISTER_NAME_MAX: usize = 32;
+
+impl SourceRegisterName {
+    /// Take a spelling, refusing one that is empty, over-long, or not plain
+    /// ASCII -- a register name outside that set is not one this transport can
+    /// compare, and guessing at it would place the wrong register.
+    pub fn new(name: &str) -> Option<Self> {
+        if name.is_empty() || name.len() > SOURCE_REGISTER_NAME_MAX || !name.is_ascii() {
+            return None;
+        }
+        let mut bytes = [0u8; SOURCE_REGISTER_NAME_MAX];
+        bytes[..name.len()].copy_from_slice(name.as_bytes());
+        Some(Self {
+            bytes,
+            len: name.len() as u8,
+        })
+    }
+
+    pub fn as_str(&self) -> &str {
+        // The only constructor accepts ASCII, so the prefix is always UTF-8.
+        std::str::from_utf8(&self.bytes[..usize::from(self.len)]).unwrap_or("")
+    }
+}
+
+impl PartialEq for SourceRegisterName {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl Eq for SourceRegisterName {}
+
+impl SourceRoleRegisterNames {
+    /// A capture that spelled no carrier at all.
+    pub const fn none() -> Self {
+        Self {
+            return_address: None,
+            stack_pointer: None,
+            frame_pointer: None,
+        }
+    }
+
+    /// Record what the source called each carrier. An empty spelling is no
+    /// name: a carrier the source could not name is one the consumer must do
+    /// without, never one it may place by its offset.
+    pub fn new(
+        return_address: Option<&str>,
+        stack_pointer: Option<&str>,
+        frame_pointer: Option<&str>,
+    ) -> Self {
+        let spelled = |name: Option<&str>| name.and_then(SourceRegisterName::new);
+        Self {
+            return_address: spelled(return_address),
+            stack_pointer: spelled(stack_pointer),
+            frame_pointer: spelled(frame_pointer),
+        }
+    }
+
+    pub fn return_address(&self) -> Option<&str> {
+        self.return_address.as_ref().map(SourceRegisterName::as_str)
+    }
+
+    pub fn stack_pointer(&self) -> Option<&str> {
+        self.stack_pointer.as_ref().map(SourceRegisterName::as_str)
+    }
+
+    pub fn frame_pointer(&self) -> Option<&str> {
+        self.frame_pointer.as_ref().map(SourceRegisterName::as_str)
+    }
 }
 
 /// Coherent, revision-bound function interface injected by the source owner.
@@ -773,13 +1102,24 @@ pub struct SourceFunctionInterface {
     schema_version: u32,
     revision_identity: Box<[u8]>,
     calling_convention: String,
+    abi_class: SourceAbiClass,
     parameters: Box<[SourceAbiParameterSpec]>,
     return_kind: SourceFunctionReturn,
     return_address_storage: Option<CanonicalStorageId>,
     stack_pointer_storage: Option<CanonicalStorageId>,
     frame_pointer_storage: Option<CanonicalStorageId>,
+    /// How the source spells each role carrier's register.
+    ///
+    /// The source numbers registers in its own arena, which says nothing about
+    /// where the lifted architecture puts the same register: on arm64 the
+    /// source calls the link register offset zero and the architecture calls it
+    /// 16624. A storage taken from the source therefore names a different
+    /// register, or none, until it is resolved through the architecture's own
+    /// table -- and a comparison against a value's storage silently never
+    /// matched. The name is what survives that translation, so it is what the
+    /// capture carries.
+    role_register_names: SourceRoleRegisterNames,
     return_mechanism: Option<SourceReturnMechanism>,
-    stack_allocation_contract: Option<SourceStackAllocationContract>,
     stack_slots: Box<[SourceStackSlotSpec]>,
     parameter_logical_values: Box<[SourceLogicalValue]>,
     return_logical_value: Option<SourceLogicalValue>,
@@ -801,12 +1141,17 @@ pub enum SourceFunctionInterfaceError {
     InvalidStackPointerStorage,
     InvalidFramePointerStorage,
     InvalidReturnMechanism,
-    InvalidStackAllocationContract,
     OverlappingRegisterStorages,
     InvalidStackSlot,
     InvalidStackSlotRole,
     OverlappingStackSlots,
-    InvalidLogicalTypes,
+    /// The logical types do not describe the physical interface. The reason
+    /// names which of the five conditions failed: a consumer that only ever
+    /// saw the verdict had no way to tell a lane that overran its carrier
+    /// from a type nothing could reach.
+    InvalidLogicalTypes {
+        reason: &'static str,
+    },
 }
 
 impl std::fmt::Display for SourceFunctionInterfaceError {
@@ -926,6 +1271,7 @@ impl SourceFunctionInterface {
         if calling_convention.trim().is_empty() {
             return Err(SourceFunctionInterfaceError::EmptyCallingConvention);
         }
+        let abi_class = SourceAbiClass::from_source_spelling(&calling_convention);
         let parameters = parameters.into_iter().collect::<Vec<_>>();
         if parameters
             .iter()
@@ -953,9 +1299,10 @@ impl SourceFunctionInterface {
             return Err(SourceFunctionInterfaceError::OverlappingRegisterStorages);
         }
         let mut stack_slots = stack_slots.into_iter().collect::<Vec<_>>();
+        // size zero means the extent was never established, which only an exact role claim may refuse
         if stack_slots.iter().any(|slot| {
             !valid_register_storage(slot.base_storage)
-                || slot.size_bytes == 0
+                || (require_exact_stack_slot_roles && slot.size_bytes == 0)
                 || slot
                     .offset
                     .checked_add(i64::from(slot.size_bytes))
@@ -1014,32 +1361,75 @@ impl SourceFunctionInterface {
         match type_graph.as_ref() {
             None => {
                 if !parameter_logical_values.is_empty() || return_logical_value.is_some() {
-                    return Err(SourceFunctionInterfaceError::InvalidLogicalTypes);
+                    return Err(SourceFunctionInterfaceError::InvalidLogicalTypes {
+                        reason: "logical values without a type graph",
+                    });
+                }
+                if stack_slots.iter().any(|slot| slot.logical_type.is_some()) {
+                    return Err(SourceFunctionInterfaceError::InvalidLogicalTypes {
+                        reason: "a slot names a type without a type graph",
+                    });
                 }
             }
             Some(graph) => {
-                if parameter_logical_values.len() != parameters.len()
-                    || parameter_logical_values
-                        .iter()
-                        .zip(&parameters)
-                        .any(|(value, parameter)| {
-                            !graph.validates_logical_value(*value, parameter.storage.size)
-                        })
-                    || match (return_kind, return_logical_value) {
-                        (SourceFunctionReturn::Void, None) => false,
-                        (SourceFunctionReturn::Register { storage }, Some(value)) => {
-                            !graph.validates_logical_value(value, storage.size)
+                if parameter_logical_values.len() != parameters.len() {
+                    return Err(SourceFunctionInterfaceError::InvalidLogicalTypes {
+                        reason: "one logical value per parameter",
+                    });
+                }
+                if parameter_logical_values
+                    .iter()
+                    .zip(&parameters)
+                    .any(|(value, parameter)| {
+                        !graph.validates_logical_value(*value, parameter.storage.size)
+                    })
+                {
+                    return Err(SourceFunctionInterfaceError::InvalidLogicalTypes {
+                        reason: "a parameter's logical value does not fit its carrier",
+                    });
+                }
+                match (return_kind, return_logical_value) {
+                    (SourceFunctionReturn::Void, None) => {}
+                    (SourceFunctionReturn::Register { storage }, Some(value)) => {
+                        if !graph.validates_logical_value(value, storage.size) {
+                            return Err(SourceFunctionInterfaceError::InvalidLogicalTypes {
+                                reason: "the return's logical value does not fit its carrier",
+                            });
                         }
-                        _ => true,
                     }
-                    || !graph.all_types_reachable(
+                    _ => {
+                        return Err(SourceFunctionInterfaceError::InvalidLogicalTypes {
+                            reason: "return kind and return logical value disagree",
+                        });
+                    }
+                }
+                // A slot's declared type is a root like a parameter's: the
+                // graph holds every type the interface names, and the locals
+                // name types too.
+                if !graph.all_types_reachable(
+                    parameter_logical_values
+                        .iter()
+                        .map(|value| value.type_id())
+                        .chain(return_logical_value.map(SourceLogicalValue::type_id))
+                        .chain(stack_slots.iter().filter_map(|slot| slot.logical_type)),
+                ) {
+                    r2il::refusal_evidence!(
+                        "logical-types",
+                        "roots {:?} return {:?} slots {:?} against a graph of {} types",
                         parameter_logical_values
                             .iter()
                             .map(|value| value.type_id())
-                            .chain(return_logical_value.map(SourceLogicalValue::type_id)),
-                    )
-                {
-                    return Err(SourceFunctionInterfaceError::InvalidLogicalTypes);
+                            .collect::<Vec<_>>(),
+                        return_logical_value.map(SourceLogicalValue::type_id),
+                        stack_slots
+                            .iter()
+                            .filter_map(|slot| slot.logical_type)
+                            .collect::<Vec<_>>(),
+                        graph.types.len()
+                    );
+                    return Err(SourceFunctionInterfaceError::InvalidLogicalTypes {
+                        reason: "a logical type is not in the graph",
+                    });
                 }
             }
         }
@@ -1047,13 +1437,14 @@ impl SourceFunctionInterface {
             schema_version: SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION,
             revision_identity: revision_identity.into_boxed_slice(),
             calling_convention,
+            abi_class,
             parameters: parameters.into_boxed_slice(),
             return_kind,
             return_address_storage: None,
             stack_pointer_storage: None,
             frame_pointer_storage: None,
+            role_register_names: SourceRoleRegisterNames::none(),
             return_mechanism: None,
-            stack_allocation_contract: None,
             stack_slots: stack_slots.into_boxed_slice(),
             parameter_logical_values: parameter_logical_values.into_boxed_slice(),
             return_logical_value,
@@ -1076,6 +1467,10 @@ impl SourceFunctionInterface {
 
     pub fn calling_convention(&self) -> &str {
         &self.calling_convention
+    }
+
+    pub const fn abi_class(&self) -> SourceAbiClass {
+        self.abi_class
     }
 
     pub const fn parameters(&self) -> &[SourceAbiParameterSpec] {
@@ -1207,6 +1602,48 @@ impl SourceFunctionInterface {
         self.return_address_storage
     }
 
+    /// Record how the source spelled each role carrier.
+    pub const fn with_role_register_names(mut self, names: SourceRoleRegisterNames) -> Self {
+        self.role_register_names = names;
+        self
+    }
+
+    pub const fn role_register_names(&self) -> SourceRoleRegisterNames {
+        self.role_register_names
+    }
+
+    /// Replace the role carriers with the storages the lifted architecture
+    /// gives for the names the source spelled.
+    ///
+    /// This is the one place a source-numbered carrier becomes an
+    /// architecture-numbered one, and it runs before anything compares a
+    /// carrier with a value. A carrier the architecture cannot place is
+    /// dropped rather than kept at its source offset: an absent carrier costs
+    /// the certificates that need it, while a carrier at an offset belonging
+    /// to some other register is a false statement about the machine.
+    pub fn with_arch_resolved_role_carriers(
+        mut self,
+        return_address: Option<CanonicalStorageId>,
+        stack_pointer: Option<CanonicalStorageId>,
+        frame_pointer: Option<CanonicalStorageId>,
+    ) -> Result<Self, SourceFunctionInterfaceError> {
+        if return_address.is_some_and(|storage| !self.return_address_storage_is_valid(storage)) {
+            return Err(SourceFunctionInterfaceError::InvalidReturnAddressStorage);
+        }
+        if stack_pointer.is_some_and(|storage| !self.stack_pointer_storage_is_valid(storage)) {
+            return Err(SourceFunctionInterfaceError::InvalidStackPointerStorage);
+        }
+        self.return_address_storage = return_address;
+        self.stack_pointer_storage = stack_pointer;
+        // The frame pointer is validated against the carriers just installed,
+        // since its rule is that it overlaps neither of them.
+        if frame_pointer.is_some_and(|storage| !self.frame_pointer_storage_is_valid(storage)) {
+            return Err(SourceFunctionInterfaceError::InvalidFramePointerStorage);
+        }
+        self.frame_pointer_storage = frame_pointer;
+        Ok(self)
+    }
+
     /// Bind the source-owned full-width stack-pointer carrier. This identity
     /// is never inferred from stack resources or register names.
     pub fn with_stack_pointer_storage(
@@ -1216,15 +1653,8 @@ impl SourceFunctionInterface {
         if self
             .return_mechanism
             .is_some_and(|_| self.stack_pointer_storage != Some(storage))
-            || self
-                .stack_allocation_contract
-                .is_some_and(|_| self.stack_pointer_storage != Some(storage))
         {
-            return Err(if self.return_mechanism.is_some() {
-                SourceFunctionInterfaceError::InvalidReturnMechanism
-            } else {
-                SourceFunctionInterfaceError::InvalidStackAllocationContract
-            });
+            return Err(SourceFunctionInterfaceError::InvalidReturnMechanism);
         }
         if !self.stack_pointer_storage_is_valid(storage) {
             return Err(SourceFunctionInterfaceError::InvalidStackPointerStorage);
@@ -1308,28 +1738,6 @@ impl SourceFunctionInterface {
 
     pub const fn return_mechanism(&self) -> Option<SourceReturnMechanism> {
         self.return_mechanism
-    }
-
-    /// Bind the source-owned stack growth/allocation convention. The stack
-    /// pointer identity must already be exact; callers cannot manufacture
-    /// allocation authority from a direction alone.
-    pub fn with_stack_allocation_contract(
-        mut self,
-        contract: SourceStackAllocationContract,
-    ) -> Result<Self, SourceFunctionInterfaceError> {
-        if self.stack_pointer_storage.is_none()
-            || self
-                .stack_allocation_contract
-                .is_some_and(|bound| bound != contract)
-        {
-            return Err(SourceFunctionInterfaceError::InvalidStackAllocationContract);
-        }
-        self.stack_allocation_contract = Some(contract);
-        Ok(self)
-    }
-
-    pub const fn stack_allocation_contract(&self) -> Option<SourceStackAllocationContract> {
-        self.stack_allocation_contract
     }
 
     /// Return the unique full frame-pointer carrier from an exact stack-slot
@@ -1509,6 +1917,18 @@ pub enum SourceCallResult {
     Register { storage: CanonicalStorageId },
 }
 
+/// Source-owned rule that can prove how many arguments one variadic callsite
+/// passes.
+///
+/// This is deliberately attached to the exact callsite interface rather than
+/// to a callee type. A variadic prototype names only its fixed prefix; each
+/// call's literal format decides the length of its own tail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum SourceVariadicArgumentCountRule {
+    /// radare2's recovered prototype named this fixed parameter `format`.
+    Radare2FormatString { parameter_index: u32 },
+}
+
 /// Source-owned prototype and observed carrier contract for one exact raw
 /// callsite.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1518,10 +1938,20 @@ pub struct SourceCallSiteInterface {
     identity: SourceCallSiteIdentity,
     complete: bool,
     calling_convention: String,
+    abi_class: SourceAbiClass,
     arguments: Box<[SourceCallArgumentSpec]>,
     variadic: bool,
+    variadic_argument_count_rule: Option<SourceVariadicArgumentCountRule>,
     noreturn: bool,
     result: SourceCallResult,
+    /// Exact callee-owned interface recovered from a body in the same capture.
+    ///
+    /// This is a runtime projection rather than snapshot input, so it is
+    /// excluded from the source wire representation. The call-site carrier
+    /// contract above remains the admission gate; [`Self::with_exact_callee_interface`]
+    /// accepts this projection only when every carrier agrees.
+    #[serde(skip)]
+    exact_callee_interface: Option<Box<SourceFunctionInterface>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1532,7 +1962,10 @@ pub enum SourceCallSiteInterfaceError {
     InvalidArgumentOrder,
     InvalidRegisterStorage,
     OverlappingRegisterStorages,
+    VariadicCountRuleOnFixedPrototype,
+    InvalidFormatParameterIndex,
     NoreturnWithResult,
+    IncompatibleCalleeInterface,
 }
 
 impl std::fmt::Display for SourceCallSiteInterfaceError {
@@ -1566,6 +1999,7 @@ impl SourceCallSiteInterface {
         if calling_convention.trim().is_empty() {
             return Err(SourceCallSiteInterfaceError::EmptyCallingConvention);
         }
+        let abi_class = SourceAbiClass::from_source_spelling(&calling_convention);
         let arguments = arguments.into_iter().collect::<Vec<_>>();
         if arguments
             .iter()
@@ -1600,11 +2034,46 @@ impl SourceCallSiteInterface {
             identity,
             complete,
             calling_convention,
+            abi_class,
             arguments: arguments.into_boxed_slice(),
             variadic,
+            variadic_argument_count_rule: None,
             noreturn,
             result,
+            exact_callee_interface: None,
         })
+    }
+
+    /// Attach a callee-owned logical interface when its physical call
+    /// contract is exactly this call site's contract.
+    pub fn with_exact_callee_interface(
+        mut self,
+        callee: SourceFunctionInterface,
+    ) -> Result<Self, SourceCallSiteInterfaceError> {
+        let expected_result = match callee.return_kind() {
+            SourceFunctionReturn::Void => SourceCallResult::Void,
+            SourceFunctionReturn::Register { storage } => SourceCallResult::Register { storage },
+        };
+        let carriers_match = self.complete
+            && !self.variadic
+            && !self.noreturn
+            && self.abi_class == callee.abi_class()
+            && self.revision_identity() == callee.revision_identity()
+            && self.result == expected_result
+            && self.arguments.len() == callee.parameters().len()
+            && self
+                .arguments
+                .iter()
+                .zip(callee.parameters())
+                .all(|(argument, parameter)| {
+                    argument.index() == parameter.index()
+                        && argument.storage() == parameter.storage()
+                });
+        if !carriers_match {
+            return Err(SourceCallSiteInterfaceError::IncompatibleCalleeInterface);
+        }
+        self.exact_callee_interface = Some(Box::new(callee));
+        Ok(self)
     }
 
     pub const fn schema_version(&self) -> u32 {
@@ -1627,6 +2096,10 @@ impl SourceCallSiteInterface {
         &self.calling_convention
     }
 
+    pub const fn abi_class(&self) -> SourceAbiClass {
+        self.abi_class
+    }
+
     pub const fn arguments(&self) -> &[SourceCallArgumentSpec] {
         &self.arguments
     }
@@ -1635,12 +2108,41 @@ impl SourceCallSiteInterface {
         self.variadic
     }
 
+    /// Bind the format parameter identified by the source owner's recovered
+    /// prototype. The checked builder keeps an untrusted presentation name
+    /// from manufacturing an out-of-range semantic role.
+    pub fn with_radare2_format_parameter(
+        mut self,
+        parameter_index: u32,
+    ) -> Result<Self, SourceCallSiteInterfaceError> {
+        if !self.variadic {
+            return Err(SourceCallSiteInterfaceError::VariadicCountRuleOnFixedPrototype);
+        }
+        if usize::try_from(parameter_index)
+            .ok()
+            .is_none_or(|index| index >= self.arguments.len())
+        {
+            return Err(SourceCallSiteInterfaceError::InvalidFormatParameterIndex);
+        }
+        self.variadic_argument_count_rule =
+            Some(SourceVariadicArgumentCountRule::Radare2FormatString { parameter_index });
+        Ok(self)
+    }
+
+    pub const fn variadic_argument_count_rule(&self) -> Option<SourceVariadicArgumentCountRule> {
+        self.variadic_argument_count_rule
+    }
+
     pub const fn is_noreturn(&self) -> bool {
         self.noreturn
     }
 
     pub const fn result(&self) -> SourceCallResult {
         self.result
+    }
+
+    pub fn exact_callee_interface(&self) -> Option<&SourceFunctionInterface> {
+        self.exact_callee_interface.as_deref()
     }
 }
 
@@ -1680,6 +2182,207 @@ mod tests {
         .and_then(|interface| interface.with_return_address_storage(register_storage(80, 8)))
         .and_then(|interface| interface.with_stack_pointer_storage(register_storage(72, 8)))
         .expect("exact return carriers")
+    }
+
+    fn test_call_site(calling_convention: &str) -> SourceCallSiteInterface {
+        SourceCallSiteInterface::new(
+            b"abi-class-callsite".to_vec(),
+            SourceCallSiteIdentity::new(
+                0x1000,
+                0,
+                CanonicalStorageId {
+                    space: CanonicalStorageSpace::Constant,
+                    offset: 0x2000,
+                    size: 8,
+                },
+            ),
+            true,
+            calling_convention,
+            [],
+            false,
+            false,
+            SourceCallResult::Void,
+        )
+        .expect("test callsite")
+    }
+
+    #[test]
+    fn abi_class_synonyms_are_classified_once_on_each_source_contract() {
+        let slots = SourceConventionSlots::new("windows_x64", [], None).expect("slots");
+        assert_eq!(slots.abi_class(), SourceAbiClass::MicrosoftX64);
+        assert_eq!(slots.calling_convention(), "windows_x64");
+
+        let function = SourceFunctionInterface::new_exact(
+            b"abi-class-function".to_vec(),
+            "sysv-amd64",
+            [],
+            SourceFunctionReturn::Void,
+            [],
+        )
+        .expect("function interface");
+        assert_eq!(function.abi_class(), SourceAbiClass::SystemVAMD64);
+        assert_eq!(function.calling_convention(), "sysv-amd64");
+
+        let callsite = test_call_site("microsoft-x64");
+        assert_eq!(callsite.abi_class(), SourceAbiClass::MicrosoftX64);
+        assert_eq!(callsite.calling_convention(), "microsoft-x64");
+
+        assert_eq!(
+            SourceAbiClass::from_source_spelling("ms"),
+            SourceAbiClass::Microsoft
+        );
+
+        for spelling in ["win64", "windows-x64", "MS_X64"] {
+            assert_eq!(
+                SourceAbiClass::from_source_spelling(spelling),
+                SourceAbiClass::MicrosoftX64
+            );
+        }
+        for spelling in ["sysv64", "system-v-amd64", "x86_64_sysv"] {
+            assert_eq!(
+                SourceAbiClass::from_source_spelling(spelling),
+                SourceAbiClass::SystemVAMD64
+            );
+        }
+    }
+
+    #[test]
+    fn abi_class_preserves_renamed_other_spellings_as_presentation_only() {
+        let first = SourceConventionSlots::new("vendor-abi-a", [], None).expect("first slots");
+        let renamed =
+            SourceConventionSlots::new("renamed-vendor-abi", [], None).expect("renamed slots");
+
+        assert_eq!(first.abi_class(), SourceAbiClass::Other);
+        assert_eq!(renamed.abi_class(), SourceAbiClass::Other);
+        assert_ne!(first.calling_convention(), renamed.calling_convention());
+    }
+
+    #[test]
+    fn a_format_count_rule_is_checked_against_the_variadic_fixed_prefix() {
+        let identity = SourceCallSiteIdentity::new(
+            0x1000,
+            0,
+            CanonicalStorageId {
+                space: CanonicalStorageSpace::Constant,
+                offset: 0x2000,
+                size: 8,
+            },
+        );
+        let arguments = [
+            SourceCallArgumentSpec::new(0, register_storage(0, 8)),
+            SourceCallArgumentSpec::new(1, register_storage(8, 8)),
+        ];
+        let variadic = SourceCallSiteInterface::new(
+            b"format-rule".to_vec(),
+            identity,
+            true,
+            "sysv-amd64",
+            arguments,
+            true,
+            false,
+            SourceCallResult::Void,
+        )
+        .expect("variadic interface")
+        .with_radare2_format_parameter(1)
+        .expect("second fixed parameter is the format");
+        assert_eq!(
+            variadic.variadic_argument_count_rule(),
+            Some(SourceVariadicArgumentCountRule::Radare2FormatString { parameter_index: 1 })
+        );
+        assert_eq!(
+            variadic.clone().with_radare2_format_parameter(2),
+            Err(SourceCallSiteInterfaceError::InvalidFormatParameterIndex)
+        );
+
+        let fixed = SourceCallSiteInterface::new(
+            b"fixed-format-rule".to_vec(),
+            identity,
+            true,
+            "sysv-amd64",
+            arguments,
+            false,
+            false,
+            SourceCallResult::Void,
+        )
+        .expect("fixed interface");
+        assert_eq!(
+            fixed.with_radare2_format_parameter(1),
+            Err(SourceCallSiteInterfaceError::VariadicCountRuleOnFixedPrototype)
+        );
+    }
+
+    #[test]
+    fn abi_class_keeps_unknown_and_source_specific_spellings_honest() {
+        let absent = SourceConventionSlots::new("", [], None).expect("absent convention slots");
+        assert_eq!(absent.abi_class(), SourceAbiClass::Unknown);
+        assert_eq!(
+            SourceFunctionInterface::new_exact(
+                b"unknown-function-abi".to_vec(),
+                "unknown",
+                [],
+                SourceFunctionReturn::Void,
+                [],
+            )
+            .expect("unknown function convention")
+            .abi_class(),
+            SourceAbiClass::Unknown
+        );
+        assert_eq!(
+            test_call_site("default").abi_class(),
+            SourceAbiClass::Unknown
+        );
+        assert_eq!(
+            SourceAbiClass::from_source_spelling("amd64"),
+            SourceAbiClass::SystemVAMD64,
+            "radare2's exact callconv field uses amd64 for System V AMD64"
+        );
+        assert_eq!(
+            SourceAbiClass::from_source_spelling("aapcs64"),
+            SourceAbiClass::Aapcs64
+        );
+        assert_eq!(
+            SourceAbiClass::from_source_spelling("riscv64"),
+            SourceAbiClass::RiscV64
+        );
+    }
+
+    #[test]
+    fn slot_of_unestablished_extent_is_kept_without_an_exact_role_claim() {
+        let stack_pointer = register_storage(72, 8);
+        let slots = [
+            SourceStackSlotSpec::new(StackAddressBase::StackPointer, stack_pointer, -40, 0),
+            SourceStackSlotSpec::new(StackAddressBase::StackPointer, stack_pointer, -16, 8),
+        ];
+        let interface = SourceFunctionInterface::new(
+            b"revision".to_vec(),
+            "amd64",
+            [],
+            SourceFunctionReturn::Void,
+            slots,
+        )
+        .expect("a located slot of unknown extent is still a fact");
+        assert_eq!(interface.stack_slots().len(), 2);
+        assert!(!interface.stack_slot_roles_complete());
+    }
+
+    #[test]
+    fn exact_role_claim_refuses_a_slot_of_unestablished_extent() {
+        let stack_pointer = register_storage(72, 8);
+        assert_eq!(
+            SourceFunctionInterface::new_exact(
+                b"revision".to_vec(),
+                "amd64",
+                [],
+                SourceFunctionReturn::Void,
+                [SourceStackSlotSpec::new_local(
+                    StackAddressBase::StackPointer,
+                    stack_pointer,
+                    -40,
+                    0,
+                )],
+            ),
+            Err(SourceFunctionInterfaceError::InvalidStackSlot)
+        );
     }
 
     #[test]
@@ -2149,22 +2852,14 @@ mod tests {
     fn stack_allocation_contract_requires_exact_sp_and_owns_only_its_growth_interval() {
         let lower = SourceStackAllocationContract::new(SourceStackGrowth::LowerAddresses);
         let higher = SourceStackAllocationContract::new(SourceStackGrowth::HigherAddresses);
-        let base = SourceFunctionInterface::new_exact(
-            b"stack-allocation-contract".to_vec(),
-            "test-abi",
-            [],
-            SourceFunctionReturn::Void,
-            [],
-        )
-        .expect("exact interface");
+        let base = SourceMachineRoles::default();
         assert_eq!(
-            base.clone().with_stack_allocation_contract(lower),
-            Err(SourceFunctionInterfaceError::InvalidStackAllocationContract)
+            base.with_stack_allocation_contract(lower),
+            Err(SourceMachineRolesError::InvalidStackAllocationContract)
         );
 
-        let exact = base
-            .with_stack_pointer_storage(register_storage(72, 8))
-            .and_then(|interface| interface.with_stack_allocation_contract(lower))
+        let exact = SourceMachineRoles::new(None, Some(register_storage(72, 8)))
+            .and_then(|roles| roles.with_stack_allocation_contract(lower))
             .expect("exact downward stack allocation contract");
         assert_eq!(exact.stack_allocation_contract(), Some(lower));
         assert!(lower.owns_entry_relative_reservation(-16, 16));
@@ -2172,14 +2867,8 @@ mod tests {
         assert!(higher.owns_entry_relative_reservation(0, 16));
         assert!(!higher.owns_entry_relative_reservation(-16, 16));
         assert_eq!(
-            exact
-                .clone()
-                .with_stack_pointer_storage(register_storage(80, 8)),
-            Err(SourceFunctionInterfaceError::InvalidStackAllocationContract)
-        );
-        assert_eq!(
             exact.with_stack_allocation_contract(higher),
-            Err(SourceFunctionInterfaceError::InvalidStackAllocationContract)
+            Err(SourceMachineRolesError::InvalidStackAllocationContract)
         );
     }
 
@@ -2239,11 +2928,125 @@ mod tests {
 pub struct SourceMachineRoles {
     return_address_storage: Option<CanonicalStorageId>,
     stack_pointer_storage: Option<CanonicalStorageId>,
+    /// How the source spells these two carriers, for the same reason the
+    /// interface records it: the offsets beside them are in the source's
+    /// register numbering and mean nothing to the lifted architecture.
+    role_register_names: SourceRoleRegisterNames,
+    stack_allocation_contract: Option<SourceStackAllocationContract>,
+    call_preserved_carriers: Option<SourceCallPreservedCarriers>,
+}
+
+/// Whether a call leaves the carriers that address the frame where they were.
+///
+/// A convention fact, like the stack allocation contract beside it, and the
+/// source publishes it whether or not it recovered a prototype -- which is the
+/// point. Everything entry-relative about a frame depends on it: if a call may
+/// move the stack pointer, no offset taken before one means anything after, so
+/// a function that calls loses every fact about its own frame without it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceCallPreservedCarriers {
+    stack_pointer: bool,
+    frame_pointer: bool,
+}
+
+impl SourceCallPreservedCarriers {
+    pub const fn new(stack_pointer: bool, frame_pointer: bool) -> Self {
+        Self {
+            stack_pointer,
+            frame_pointer,
+        }
+    }
+
+    pub const fn stack_pointer(self) -> bool {
+        self.stack_pointer
+    }
+
+    pub const fn frame_pointer(self) -> bool {
+        self.frame_pointer
+    }
+
+    /// Whether both carriers that can address a frame survive a call.
+    pub const fn frame_survives_a_call(self) -> bool {
+        self.stack_pointer && self.frame_pointer
+    }
+}
+
+/// Where the calling convention would place arguments and the result.
+///
+/// This describes the convention, not the function. The slots are known even
+/// when no prototype was recovered, and they say where a caller *would* leave a
+/// value, never that this function takes one. A consumer recovering parameters
+/// from machine code intersects this candidate list against what the function
+/// reads before writing; without it there is nothing to intersect against, and
+/// importing a guessed prototype instead would defeat the purpose.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SourceConventionSlots {
+    calling_convention: String,
+    abi_class: SourceAbiClass,
+    argument_slots: Box<[CanonicalStorageId]>,
+    result_slot: Option<CanonicalStorageId>,
+}
+
+impl SourceConventionSlots {
+    /// Build the candidate slots, rejecting anything that is not a well-formed
+    /// register location or that names the same register twice.
+    pub fn new(
+        calling_convention: impl Into<String>,
+        argument_slots: impl IntoIterator<Item = CanonicalStorageId>,
+        result_slot: Option<CanonicalStorageId>,
+    ) -> Result<Self, SourceMachineRolesError> {
+        let calling_convention = calling_convention.into();
+        let abi_class = SourceAbiClass::from_source_spelling(&calling_convention);
+        let argument_slots = argument_slots.into_iter().collect::<Vec<_>>();
+        if argument_slots
+            .iter()
+            .any(|storage| !valid_register_storage(*storage))
+            || result_slot.is_some_and(|storage| !valid_register_storage(storage))
+        {
+            return Err(SourceMachineRolesError::InvalidRegisterStorage);
+        }
+        // A convention that named one register twice would make the candidate
+        // order meaningless, so it is refused rather than deduplicated.
+        for (index, storage) in argument_slots.iter().enumerate() {
+            if argument_slots[..index].contains(storage) {
+                return Err(SourceMachineRolesError::InvalidRegisterStorage);
+            }
+        }
+        Ok(Self {
+            calling_convention,
+            abi_class,
+            argument_slots: argument_slots.into_boxed_slice(),
+            result_slot,
+        })
+    }
+
+    /// Convention these candidates belong to, named even when no prototype was
+    /// recovered.
+    pub fn calling_convention(&self) -> &str {
+        &self.calling_convention
+    }
+
+    pub const fn abi_class(&self) -> SourceAbiClass {
+        self.abi_class
+    }
+
+    pub const fn argument_slots(&self) -> &[CanonicalStorageId] {
+        &self.argument_slots
+    }
+
+    pub const fn result_slot(&self) -> Option<CanonicalStorageId> {
+        self.result_slot
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.argument_slots.is_empty() && self.result_slot.is_none()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceMachineRolesError {
     InvalidRegisterStorage,
+    InvalidStackAllocationContract,
 }
 
 impl SourceMachineRoles {
@@ -2261,7 +3064,79 @@ impl SourceMachineRoles {
         Ok(Self {
             return_address_storage,
             stack_pointer_storage,
+            role_register_names: SourceRoleRegisterNames::none(),
+            stack_allocation_contract: None,
+            call_preserved_carriers: None,
         })
+    }
+
+    /// Record how the source spelled these carriers.
+    #[must_use]
+    pub const fn with_role_register_names(mut self, names: SourceRoleRegisterNames) -> Self {
+        self.role_register_names = names;
+        self
+    }
+
+    pub const fn role_register_names(&self) -> SourceRoleRegisterNames {
+        self.role_register_names
+    }
+
+    /// Replace the carriers with the storages the lifted architecture gives
+    /// for the names the source spelled, dropping one the architecture cannot
+    /// place. This mirrors the interface's resolution and exists for the same
+    /// reason: these offsets arrive in the source's numbering.
+    pub fn with_arch_resolved_carriers(
+        mut self,
+        return_address: Option<CanonicalStorageId>,
+        stack_pointer: Option<CanonicalStorageId>,
+    ) -> Result<Self, SourceMachineRolesError> {
+        if return_address.is_some_and(|storage| !valid_register_storage(storage))
+            || stack_pointer.is_some_and(|storage| !valid_register_storage(storage))
+        {
+            return Err(SourceMachineRolesError::InvalidRegisterStorage);
+        }
+        // The allocation contract is a statement about the stack pointer, so
+        // it cannot outlive a stack pointer the architecture would not place.
+        if stack_pointer.is_none() {
+            self.stack_allocation_contract = None;
+        }
+        self.return_address_storage = return_address;
+        self.stack_pointer_storage = stack_pointer;
+        Ok(self)
+    }
+
+    /// Bind what a call leaves the frame carriers holding. Like the allocation
+    /// contract, this is a convention fact and stays available when no exact
+    /// prototype was recovered.
+    #[must_use]
+    pub const fn with_call_preserved_carriers(
+        mut self,
+        carriers: SourceCallPreservedCarriers,
+    ) -> Self {
+        self.call_preserved_carriers = Some(carriers);
+        self
+    }
+
+    pub const fn call_preserved_carriers(&self) -> Option<SourceCallPreservedCarriers> {
+        self.call_preserved_carriers
+    }
+
+    /// Bind exact geometric ownership around the architectural stack pointer.
+    /// This is a machine/convention fact and remains available when no exact
+    /// function prototype was recovered.
+    pub fn with_stack_allocation_contract(
+        mut self,
+        contract: SourceStackAllocationContract,
+    ) -> Result<Self, SourceMachineRolesError> {
+        if self.stack_pointer_storage.is_none()
+            || self
+                .stack_allocation_contract
+                .is_some_and(|bound| bound != contract)
+        {
+            return Err(SourceMachineRolesError::InvalidStackAllocationContract);
+        }
+        self.stack_allocation_contract = Some(contract);
+        Ok(self)
     }
 
     pub const fn return_address_storage(&self) -> Option<CanonicalStorageId> {
@@ -2272,9 +3147,15 @@ impl SourceMachineRoles {
         self.stack_pointer_storage
     }
 
+    pub const fn stack_allocation_contract(&self) -> Option<SourceStackAllocationContract> {
+        self.stack_allocation_contract
+    }
+
     /// True when neither carrier is known, which is the state of a source that
     /// could not resolve its register aliases at all.
     pub const fn is_empty(&self) -> bool {
-        self.return_address_storage.is_none() && self.stack_pointer_storage.is_none()
+        self.return_address_storage.is_none()
+            && self.stack_pointer_storage.is_none()
+            && self.stack_allocation_contract.is_none()
     }
 }

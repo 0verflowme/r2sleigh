@@ -8,15 +8,34 @@
 //! Stable hashes remain diagnostics; exact authority is the retained `Arc`
 //! identity of one capture event.
 
+pub mod display_names;
+pub use display_names::DisplayNames;
+
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
 mod contracts;
-mod radare_abi138;
+/// Schema version of the function snapshot radare2 hands over.
+///
+/// Bumped whenever the wire layout in `snapshot_wire` changes, and asserted at
+/// the FFI boundary so a plugin and a radare2 built against different versions
+/// refuse rather than misread each other.
+///
+/// This is the one thing that outlived `radare_abi138`, the callback-based
+/// predecessor of the flat wire buffer. That module was 2,923 lines holding the
+/// largest concentration of `unsafe` in the tree, and nothing had called into
+/// it since the migration.
+pub const RADARE_FUNCTION_SNAPSHOT_SCHEMA_VERSION: u32 = 16;
+
+/// Version of the snapshot transport contract itself.
+pub const RADARE_SNAPSHOT_CONTRACT_VERSION: u32 = 1;
+
+/// Version of the accessor layout within a snapshot.
+pub const RADARE_SNAPSHOT_ACCESSOR_SCHEMA_VERSION: u32 = 5;
+
 pub mod snapshot_wire;
 
 pub use contracts::*;
-pub use radare_abi138::*;
 
 /// Endianness captured from the active analyzer configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -73,6 +92,9 @@ impl FunctionIdentity {
 pub struct FunctionPresentation {
     display_name: Box<str>,
     parameter_names: Box<[Box<str>]>,
+    stack_slot_names: Box<[SourceStackSlotName]>,
+    signature: Option<SourceSignaturePresentation>,
+    callee_signatures: Box<[(Box<str>, SourceSignaturePresentation)]>,
 }
 
 impl FunctionPresentation {
@@ -82,6 +104,173 @@ impl FunctionPresentation {
 
     pub fn parameter_names(&self) -> &[Box<str>] {
         &self.parameter_names
+    }
+
+    pub fn stack_slot_names(&self) -> &[SourceStackSlotName] {
+        &self.stack_slot_names
+    }
+
+    pub const fn signature(&self) -> Option<&SourceSignaturePresentation> {
+        self.signature.as_ref()
+    }
+
+    /// The prototype of each function this one calls, keyed by the name the
+    /// call renders with.
+    pub fn callee_signatures(&self) -> &[(Box<str>, SourceSignaturePresentation)] {
+        &self.callee_signatures
+    }
+}
+
+/// The prototype the source recovered, spelled the way the source spells it.
+///
+/// The interface says where each value lives; this says what it is called and
+/// what it is called *as*, which is the only place a spelling like `size_t`
+/// survives. It remains presentation unless trusted snapshot preparation
+/// promotes one uniquely named `format` parameter into the exact callsite
+/// interface. That narrow promotion is recorded as radare2 provenance; the
+/// presentation's arity remains independent of the ABI interface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceSignaturePresentation {
+    return_type: Option<Box<str>>,
+    calling_convention: Option<Box<str>>,
+    noreturn: bool,
+    parameters: Box<[SourceSignatureParameter]>,
+}
+
+impl SourceSignaturePresentation {
+    pub fn new(
+        return_type: Option<impl Into<Box<str>>>,
+        calling_convention: Option<impl Into<Box<str>>>,
+        noreturn: bool,
+        parameters: impl IntoIterator<Item = SourceSignatureParameter>,
+    ) -> Self {
+        Self {
+            return_type: return_type.map(Into::into),
+            calling_convention: calling_convention.map(Into::into),
+            noreturn,
+            parameters: parameters.into_iter().collect(),
+        }
+    }
+
+    pub fn return_type(&self) -> Option<&str> {
+        self.return_type.as_deref()
+    }
+
+    pub fn calling_convention(&self) -> Option<&str> {
+        self.calling_convention.as_deref()
+    }
+
+    pub const fn noreturn(&self) -> bool {
+        self.noreturn
+    }
+
+    pub fn parameters(&self) -> &[SourceSignatureParameter] {
+        &self.parameters
+    }
+
+    /// The parameters the prototype names, without the variadic tail.
+    ///
+    /// A prototype that ends in an ellipsis carries it as a trailing
+    /// parameter, so the parameter list on its own over-counts what the callee
+    /// is declared to take by one, and every caller that treated its length as
+    /// the arity said so for every call site of a variadic callee alike.
+    pub fn named_parameters(&self) -> &[SourceSignatureParameter] {
+        match self.parameters.split_last() {
+            Some((last, rest)) if last.is_variadic_tail() => rest,
+            _ => &self.parameters,
+        }
+    }
+
+    /// Whether the callee takes a variadic tail.
+    pub fn is_variadic(&self) -> bool {
+        self.parameters
+            .last()
+            .is_some_and(SourceSignatureParameter::is_variadic_tail)
+    }
+}
+
+/// One parameter of a recovered prototype: what it is called and its spelling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceSignatureParameter {
+    name: Option<Box<str>>,
+    type_spelling: Option<Box<str>>,
+}
+
+impl SourceSignatureParameter {
+    pub fn new(
+        name: Option<impl Into<Box<str>>>,
+        type_spelling: Option<impl Into<Box<str>>>,
+    ) -> Self {
+        Self {
+            name: name.map(Into::into),
+            type_spelling: type_spelling.map(Into::into),
+        }
+    }
+
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    pub fn type_spelling(&self) -> Option<&str> {
+        self.type_spelling.as_deref()
+    }
+
+    /// Whether this entry is the ellipsis rather than a parameter.
+    ///
+    /// This is how the source spells a variadic tail: a trailing entry called
+    /// `...`, which names no storage and stands for however many arguments a
+    /// call chooses to pass. Older captures put the ellipsis in the type half
+    /// instead, so both spellings are recognised -- the same two the source's
+    /// own `r_type_arg_is_vararg` accepts.
+    pub fn is_variadic_tail(&self) -> bool {
+        [self.name(), self.type_spelling()]
+            .into_iter()
+            .flatten()
+            .any(|spelling| spelling.trim() == "...")
+    }
+}
+
+/// One name the source gave a stack slot, keyed by where the slot sits.
+///
+/// The key is the identity because the interface sorts its inventory, so a
+/// position in this list means nothing on its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceStackSlotName {
+    base: StackAddressBase,
+    offset: i64,
+    name: Box<str>,
+    type_spelling: Option<Box<str>>,
+}
+
+impl SourceStackSlotName {
+    pub fn new(base: StackAddressBase, offset: i64, name: impl Into<Box<str>>) -> Self {
+        Self {
+            base,
+            offset,
+            name: name.into(),
+            type_spelling: None,
+        }
+    }
+
+    pub fn with_type_spelling(mut self, type_spelling: Option<impl Into<Box<str>>>) -> Self {
+        self.type_spelling = type_spelling.map(Into::into);
+        self
+    }
+
+    pub fn type_spelling(&self) -> Option<&str> {
+        self.type_spelling.as_deref()
+    }
+
+    pub const fn base(&self) -> StackAddressBase {
+        self.base
+    }
+
+    pub const fn offset(&self) -> i64 {
+        self.offset
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
     }
 }
 
@@ -156,12 +345,109 @@ pub struct OwnedFunctionImage {
     entry_address: u64,
     blocks: Box<[OwnedFunctionBlock]>,
     external_exits: Box<[u64]>,
+    /// String literals the function refers to, with the address each lives at.
+    ///
+    /// Display data: it tells a renderer what to print where a constant points
+    /// at text, and carries no claim about behaviour.
+    string_literals: Box<[(u64, String)]>,
+    /// Data objects radare2 already knows this function points at.
+    ///
+    /// The name is display data. An optional type spelling is a source-owned
+    /// analysis fact linked to the object's structural address; consumers must
+    /// still refuse a spelling their canonical type context cannot place.
+    data_symbols: Box<[SourceDataObject]>,
+    /// Tables of function pointers the function indexes, with the addresses
+    /// each table holds.
+    ///
+    /// A fact about memory, not about behaviour: it says what the table
+    /// contains, never which entry a given call reaches. That follows from the
+    /// range a caller can prove for the index.
+    code_pointer_tables: Box<[SourceCodePointerTable]>,
     total_source_bytes: usize,
+}
+
+/// One program data object referenced by a captured function.
+///
+/// Address is identity. Name is presentation. The optional spelling is the
+/// exact address-linked type radare2 supplied and is not machine-derived.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceDataObject {
+    address: u64,
+    name: Box<str>,
+    type_spelling: Option<Box<str>>,
+}
+
+impl SourceDataObject {
+    pub fn new(
+        address: u64,
+        name: impl Into<Box<str>>,
+        type_spelling: Option<impl Into<Box<str>>>,
+    ) -> Self {
+        Self {
+            address,
+            name: name.into(),
+            type_spelling: type_spelling.map(Into::into),
+        }
+    }
+
+    pub const fn address(&self) -> u64 {
+        self.address
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn type_spelling(&self) -> Option<&str> {
+        self.type_spelling.as_deref()
+    }
+}
+
+/// One table of function pointers, read where the function points at it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceCodePointerTable {
+    address: u64,
+    entry_size: u32,
+    targets: Box<[u64]>,
+}
+
+impl SourceCodePointerTable {
+    pub fn new(address: u64, entry_size: u32, targets: impl Into<Box<[u64]>>) -> Self {
+        Self {
+            address,
+            entry_size,
+            targets: targets.into(),
+        }
+    }
+
+    pub const fn address(&self) -> u64 {
+        self.address
+    }
+
+    pub const fn entry_size(&self) -> u32 {
+        self.entry_size
+    }
+
+    pub fn targets(&self) -> &[u64] {
+        &self.targets
+    }
 }
 
 impl OwnedFunctionImage {
     pub const fn entry_address(&self) -> u64 {
         self.entry_address
+    }
+
+    pub fn data_symbols(&self) -> &[SourceDataObject] {
+        &self.data_symbols
+    }
+
+    pub fn string_literals(&self) -> &[(u64, String)] {
+        &self.string_literals
+    }
+
+    pub fn code_pointer_tables(&self) -> &[SourceCodePointerTable] {
+        &self.code_pointer_tables
     }
 
     pub const fn blocks(&self) -> &[OwnedFunctionBlock] {
@@ -276,14 +562,37 @@ impl OwnedFunctionImage {
     }
 }
 
+/// How control reaches the callee at an advisory call site.
+///
+/// A call comes back; a tail transfer does not, and the callee's return is
+/// the caller's. The two tail forms differ in what names the callee. A jump
+/// names its target directly, and the source's function map says the target
+/// is where a function starts. A jump through a loaded value is licensed by
+/// the relocation on the slot the value was loaded from, so the site's target
+/// address is then that slot rather than any code address, and the machine
+/// still has to show that the jump reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AdvisoryCallTransfer {
+    Call,
+    TailJump,
+    TailSlot,
+}
+
 /// Advisory call metadata copied from the source snapshot. This projection
 /// does not claim exact call-site identity, so it cannot create a call
-/// certificate. It is retained only for diagnostics and future comparison
-/// with machine-derived call identities.
+/// certificate by itself. SSA preparation compares it with the lifted
+/// instruction and mints an identity only when the instruction address,
+/// transfer shape, and target all agree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdvisoryCallSite {
     instruction_address: u64,
     target_address: u64,
+    transfer: AdvisoryCallTransfer,
+    /// What radare2 calls the target. Absent when it has no name for it.
+    ///
+    /// This spells the call in rendered output and nothing more: it is not
+    /// evidence about what the callee does, and no analysis reads it.
+    target_name: Option<String>,
     /// The prototype radare2 recovered for this site. Present only when radare2
     /// reported the site as complete; absent means it described the call but
     /// not what it takes or returns.
@@ -317,6 +626,17 @@ impl AdvisoryCallSite {
 
     pub const fn target_address(&self) -> u64 {
         self.target_address
+    }
+
+    /// How control reaches the callee: by a call, or by a jump that never
+    /// comes back.
+    pub const fn transfer(&self) -> AdvisoryCallTransfer {
+        self.transfer
+    }
+
+    /// What radare2 calls the target, when it has a name for it.
+    pub fn target_name(&self) -> Option<&str> {
+        self.target_name.as_deref()
     }
 }
 
@@ -406,7 +726,7 @@ impl std::fmt::Display for SnapshotValidationError {
 
 impl std::error::Error for SnapshotValidationError {}
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct SnapshotState {
     machine: MachineProfile,
     function: FunctionIdentity,
@@ -414,8 +734,18 @@ struct SnapshotState {
     image: OwnedFunctionImage,
     advisory_calls: Box<[AdvisoryCallSite]>,
     source_revision_identity: Box<[u8]>,
+    /// This function's own payload identity, which the capture identity above
+    /// deliberately is not.
+    ///
+    /// A callee collected beside a root carries the root's revision, so a
+    /// consumer can tell the bodies were read together; that makes the same
+    /// callee reached from two callers carry two revisions. Its content
+    /// identity is its own, so it is recognisably one body. For the function
+    /// asked for, the two are equal.
+    source_content_identity: Box<[u8]>,
     function_interface: Option<SourceFunctionInterface>,
     machine_roles: SourceMachineRoles,
+    convention_slots: SourceConventionSlots,
     captured_fields: CapturedSourceFields,
     diagnostics: DiagnosticIdentity,
 }
@@ -442,6 +772,7 @@ impl OwnedFunctionSnapshot {
         source_revision_identity: Box<[u8]>,
         function_interface: Option<SourceFunctionInterface>,
         machine_roles: SourceMachineRoles,
+        convention_slots: SourceConventionSlots,
         captured_fields: CapturedSourceFields,
         diagnostics: DiagnosticIdentity,
     ) -> Result<Self, SnapshotValidationError> {
@@ -465,6 +796,21 @@ impl OwnedFunctionSnapshot {
         {
             return Err(SnapshotValidationError::InvalidPresentation);
         }
+        // A slot name has to name a slot this interface carries, and one slot
+        // cannot answer to two names.
+        let mut named_slots = BTreeSet::new();
+        if presentation.stack_slot_names.iter().any(|slot_name| {
+            slot_name.name().is_empty()
+                || slot_name.name().contains('\0')
+                || !named_slots.insert((slot_name.base(), slot_name.offset()))
+                || function_interface.as_ref().is_none_or(|interface| {
+                    !interface.stack_slots().iter().any(|slot| {
+                        slot.base() == slot_name.base() && slot.offset() == slot_name.offset()
+                    })
+                })
+        }) {
+            return Err(SnapshotValidationError::InvalidPresentation);
+        }
         if source_revision_identity.is_empty() {
             return Err(SnapshotValidationError::EmptyRevisionIdentity);
         }
@@ -482,14 +828,12 @@ impl OwnedFunctionSnapshot {
         // views of the function contradict each other.
         if let Some(interface) = &function_interface
             && !machine_roles.is_empty()
-        {
-            if interface.return_address_storage().is_some()
+            && (interface.return_address_storage().is_some()
                 && interface.return_address_storage() != machine_roles.return_address_storage()
                 || interface.stack_pointer_storage().is_some()
-                    && interface.stack_pointer_storage() != machine_roles.stack_pointer_storage()
-            {
-                return Err(SnapshotValidationError::InvalidFunctionInterface);
-            }
+                    && interface.stack_pointer_storage() != machine_roles.stack_pointer_storage())
+        {
+            return Err(SnapshotValidationError::InvalidFunctionInterface);
         }
         if let Some(interface) = &function_interface {
             if interface.revision_identity() != source_revision_identity.as_ref()
@@ -508,8 +852,6 @@ impl OwnedFunctionSnapshot {
                     .frame_pointer_storage()
                     .is_some_and(|storage| storage.size != machine.bits / 8)
                 || captured_fields.return_mechanism != interface.return_mechanism().is_some()
-                || captured_fields.stack_allocation_contract
-                    != interface.stack_allocation_contract().is_some()
             {
                 return Err(SnapshotValidationError::InvalidFunctionInterface);
             }
@@ -519,7 +861,11 @@ impl OwnedFunctionSnapshot {
             || captured_fields.stack_pointer_storage
             || captured_fields.frame_pointer_storage
             || captured_fields.return_mechanism
-            || captured_fields.stack_allocation_contract
+        {
+            return Err(SnapshotValidationError::InvalidFunctionInterface);
+        }
+        if captured_fields.stack_allocation_contract
+            != machine_roles.stack_allocation_contract().is_some()
         {
             return Err(SnapshotValidationError::InvalidFunctionInterface);
         }
@@ -544,12 +890,40 @@ impl OwnedFunctionSnapshot {
             presentation,
             image,
             advisory_calls,
+            source_content_identity: source_revision_identity.clone(),
             source_revision_identity,
             function_interface,
             machine_roles,
+            convention_slots,
             captured_fields,
             diagnostics,
         })))
+    }
+
+    /// Restate the machine role carriers in the numbering of the architecture
+    /// that was actually lifted.
+    ///
+    /// A capture reports its carriers as offsets into the producer's own
+    /// register arena. That arena is not the architecture's register space --
+    /// on arm64 the producer calls the link register offset zero where the
+    /// architecture calls it 16624 -- so a carrier is a spelling plus a number
+    /// that means nothing here until the spelling is looked up. Until this
+    /// runs, every comparison of a carrier against a value's storage fails
+    /// quietly and every certificate that depends on one is declined for a
+    /// reason that looks like the function's fault.
+    ///
+    /// This is the single point of translation; it is applied once, by the
+    /// lift, before anything reads a carrier.
+    #[must_use]
+    pub fn with_arch_resolved_role_carriers(
+        &self,
+        function_interface: Option<SourceFunctionInterface>,
+        machine_roles: SourceMachineRoles,
+    ) -> Self {
+        let mut state = (*self.0).clone();
+        state.function_interface = function_interface;
+        state.machine_roles = machine_roles;
+        Self(Arc::new(state))
     }
 
     pub fn machine(&self) -> &MachineProfile {
@@ -576,6 +950,24 @@ impl OwnedFunctionSnapshot {
         &self.0.source_revision_identity
     }
 
+    /// This function's own payload identity. See `source_content_identity` on
+    /// the state for why it is not the revision.
+    pub fn source_content_identity(&self) -> &[u8] {
+        &self.0.source_content_identity
+    }
+
+    /// Replace the content identity with the one the capture reported.
+    ///
+    /// Only the wire decoder calls this, because it is the only place that
+    /// learns a callee's own identity: everywhere else a snapshot is minted
+    /// from parts that cannot distinguish the two, and the mint defaults them
+    /// equal.
+    pub(crate) fn with_source_content_identity(mut self, identity: Box<[u8]>) -> Self {
+        let state = std::sync::Arc::make_mut(&mut self.0);
+        state.source_content_identity = identity;
+        self
+    }
+
     pub fn function_interface(&self) -> Option<&SourceFunctionInterface> {
         self.0.function_interface.as_ref()
     }
@@ -586,6 +978,12 @@ impl OwnedFunctionSnapshot {
     /// with no interface can still be reasoned about on its machine facts.
     pub fn machine_roles(&self) -> &SourceMachineRoles {
         &self.0.machine_roles
+    }
+
+    /// Where this function's calling convention would place arguments and the
+    /// result. Present regardless of whether a prototype was recovered.
+    pub fn convention_slots(&self) -> &SourceConventionSlots {
+        &self.0.convention_slots
     }
 
     pub fn captured_fields(&self) -> CapturedSourceFields {
@@ -637,8 +1035,14 @@ mod tests {
             FunctionPresentation {
                 display_name: "fixture".into(),
                 parameter_names: Box::new([]),
+                stack_slot_names: Box::new([]),
+                signature: None,
+                callee_signatures: Box::new([]),
             },
             OwnedFunctionImage {
+                string_literals: Box::new([]),
+                data_symbols: Box::new([]),
+                code_pointer_tables: Box::new([]),
                 entry_address: 0x1000,
                 blocks: vec![OwnedFunctionBlock {
                     address: 0x1000,
@@ -654,6 +1058,7 @@ mod tests {
             Box::from([7]),
             None,
             SourceMachineRoles::default(),
+            SourceConventionSlots::new("", [], None).expect("empty convention slots"),
             CapturedSourceFields {
                 bounded_function_image: true,
                 function_interface: false,
@@ -691,13 +1096,18 @@ mod tests {
         .and_then(|interface| interface.with_return_address_storage(register(16)))
         .and_then(|interface| interface.with_stack_pointer_storage(register(24)))
         .and_then(|interface| interface.with_frame_pointer_storage(register(32)))
-        .and_then(|interface| {
-            interface.with_stack_allocation_contract(SourceStackAllocationContract::new(
-                SourceStackGrowth::LowerAddresses,
-            ))
-        })
         .and_then(|interface| interface.with_exact_stacked_return(0, 8, 8, 8))
         .expect("exact interface")
+    }
+
+    fn exact_machine_roles() -> SourceMachineRoles {
+        SourceMachineRoles::new(Some(register(16)), Some(register(24)))
+            .and_then(|roles| {
+                roles.with_stack_allocation_contract(SourceStackAllocationContract::new(
+                    SourceStackGrowth::LowerAddresses,
+                ))
+            })
+            .expect("exact machine roles")
     }
 
     #[test]
@@ -744,6 +1154,7 @@ mod tests {
                 valid.source_revision_identity().into(),
                 valid.function_interface().cloned(),
                 *valid.machine_roles(),
+                valid.convention_slots().clone(),
                 valid.captured_fields(),
                 valid.diagnostic_identity(),
             ),
@@ -776,7 +1187,8 @@ mod tests {
             Box::new([]),
             Box::from([7]),
             Some(interface.clone()),
-            SourceMachineRoles::default(),
+            exact_machine_roles(),
+            SourceConventionSlots::new("", [], None).expect("empty convention slots"),
             captured_fields,
             valid.diagnostic_identity(),
         )
@@ -821,9 +1233,10 @@ mod tests {
                 Box::new([]),
                 Box::from([7]),
                 Some(wrong_machine_width),
-                SourceMachineRoles::default(),
+                exact_machine_roles(),
+                SourceConventionSlots::new("", [], None).expect("empty convention slots"),
                 narrow_fields,
-                valid.diagnostic_identity(),
+                valid.diagnostic_identity()
             ),
             Err(SnapshotValidationError::InvalidFunctionInterface)
         );
@@ -839,9 +1252,10 @@ mod tests {
                 Box::new([]),
                 Box::from([7]),
                 Some(interface.clone()),
-                SourceMachineRoles::default(),
+                exact_machine_roles(),
+                SourceConventionSlots::new("", [], None).expect("empty convention slots"),
                 missing_frame_pointer,
-                valid.diagnostic_identity(),
+                valid.diagnostic_identity()
             ),
             Err(SnapshotValidationError::InvalidFunctionInterface)
         );
@@ -857,9 +1271,10 @@ mod tests {
                 Box::new([]),
                 Box::from([7]),
                 Some(interface.clone()),
-                SourceMachineRoles::default(),
+                exact_machine_roles(),
+                SourceConventionSlots::new("", [], None).expect("empty convention slots"),
                 missing_stack_allocation_contract,
-                valid.diagnostic_identity(),
+                valid.diagnostic_identity()
             ),
             Err(SnapshotValidationError::InvalidFunctionInterface)
         );
@@ -880,11 +1295,6 @@ mod tests {
         )
         .and_then(|interface| interface.with_return_address_storage(register(16)))
         .and_then(|interface| interface.with_stack_pointer_storage(register(24)))
-        .and_then(|interface| {
-            interface.with_stack_allocation_contract(SourceStackAllocationContract::new(
-                SourceStackGrowth::LowerAddresses,
-            ))
-        })
         .and_then(|interface| interface.with_exact_stacked_return(0, 8, 8, 8))
         .expect("interface without explicit frame fact");
         assert_eq!(
@@ -900,9 +1310,10 @@ mod tests {
                 Box::new([]),
                 Box::from([7]),
                 Some(interface_without_frame_pointer.clone()),
-                SourceMachineRoles::default(),
+                exact_machine_roles(),
+                SourceConventionSlots::new("", [], None).expect("empty convention slots"),
                 captured_fields,
-                valid.diagnostic_identity(),
+                valid.diagnostic_identity()
             ),
             Err(SnapshotValidationError::InvalidFunctionInterface)
         );
@@ -916,7 +1327,8 @@ mod tests {
             Box::new([]),
             Box::from([7]),
             Some(interface_without_frame_pointer),
-            SourceMachineRoles::default(),
+            exact_machine_roles(),
+            SourceConventionSlots::new("", [], None).expect("empty convention slots"),
             fields_without_frame_pointer,
             valid.diagnostic_identity(),
         )
@@ -939,9 +1351,10 @@ mod tests {
                 Box::new([]),
                 Box::from([7]),
                 Some(interface.clone()),
-                SourceMachineRoles::default(),
+                exact_machine_roles(),
+                SourceConventionSlots::new("", [], None).expect("empty convention slots"),
                 missing_return_mechanism,
-                valid.diagnostic_identity(),
+                valid.diagnostic_identity()
             ),
             Err(SnapshotValidationError::InvalidFunctionInterface)
         );
@@ -958,8 +1371,9 @@ mod tests {
                 Box::from([7]),
                 None,
                 SourceMachineRoles::default(),
+                SourceConventionSlots::new("", [], None).expect("empty convention slots"),
                 mechanism_without_interface,
-                valid.diagnostic_identity(),
+                valid.diagnostic_identity()
             ),
             Err(SnapshotValidationError::InvalidFunctionInterface)
         );
@@ -976,8 +1390,9 @@ mod tests {
                 Box::from([7]),
                 None,
                 SourceMachineRoles::default(),
+                SourceConventionSlots::new("", [], None).expect("empty convention slots"),
                 frame_pointer_without_interface,
-                valid.diagnostic_identity(),
+                valid.diagnostic_identity()
             ),
             Err(SnapshotValidationError::InvalidFunctionInterface)
         );
@@ -1004,9 +1419,10 @@ mod tests {
                 Box::new([]),
                 Box::from([7]),
                 Some(wrong_revision),
-                SourceMachineRoles::default(),
+                exact_machine_roles(),
+                SourceConventionSlots::new("", [], None).expect("empty convention slots"),
                 captured_fields,
-                valid.diagnostic_identity(),
+                valid.diagnostic_identity()
             ),
             Err(SnapshotValidationError::InvalidFunctionInterface)
         );

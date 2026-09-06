@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 
 use r2ssa::SSAVar;
 
-use crate::constraint::{Constraint, ConstraintSource};
+use crate::constraint::{Constraint, ConstraintSource, SolverNode};
 use crate::lattice::TypeLattice;
 use crate::model::{Type, TypeArena, TypeId};
 
@@ -34,9 +34,9 @@ pub struct SolverDiagnostics {
 }
 
 #[derive(Debug, Clone)]
-pub struct SolvedTypes {
+pub struct SolvedTypes<K = SSAVar> {
     pub arena: TypeArena,
-    pub var_types: HashMap<SSAVar, TypeId>,
+    pub var_types: HashMap<K, TypeId>,
     pub diagnostics: SolverDiagnostics,
     pub top_id: TypeId,
 }
@@ -48,18 +48,18 @@ struct Assignment {
 }
 
 #[derive(Debug)]
-struct SolverState {
+struct SolverState<K> {
     arena: TypeArena,
     assignments: Vec<Option<Assignment>>,
-    vars: Vec<SSAVar>,
+    vars: Vec<K>,
     diagnostics: SolverDiagnostics,
     join_cache: HashMap<(TypeId, TypeId), TypeId>,
     meet_cache: HashMap<(TypeId, TypeId), TypeId>,
     changed_vars: Vec<VarId>,
 }
 
-impl SolverState {
-    fn new(arena: TypeArena, vars: Vec<SSAVar>) -> Self {
+impl<K: SolverNode> SolverState<K> {
+    fn new(arena: TypeArena, vars: Vec<K>) -> Self {
         let var_count = vars.len();
         Self {
             arena,
@@ -103,7 +103,7 @@ impl SolverState {
                 if existing.ty != ty {
                     self.diagnostics.conflicts.push(format!(
                         "{} overridden by higher-priority source ({})",
-                        self.vars[var].display_name(),
+                        self.vars[var].solver_label(),
                         priority
                     ));
                 }
@@ -137,12 +137,23 @@ impl SolverState {
         match constraint {
             CompactConstraint::SetType { var, ty, .. } => self.assign(*var, *ty, source_priority),
             CompactConstraint::Subtype { var, ty, .. } => {
-                if let Some(existing) = self.assignments[*var] {
-                    let tightened = self.meet_cached(existing.ty, *ty);
-                    self.assign(*var, tightened, source_priority.max(existing.priority))
-                } else {
-                    self.assign(*var, *ty, source_priority)
+                // An upper bound tightens: the intersection of two bounds is
+                // what both allow. Routing it through `assign` would join it
+                // back with what is already there, which is the opposite
+                // operation and would discard every refinement.
+                let Some(existing) = self.assignments[*var] else {
+                    return self.assign(*var, *ty, source_priority);
+                };
+                let tightened = self.meet_cached(existing.ty, *ty);
+                if tightened == existing.ty {
+                    return false;
                 }
+                self.assignments[*var] = Some(Assignment {
+                    ty: tightened,
+                    priority: existing.priority.max(source_priority),
+                });
+                mark_changed(&mut self.changed_vars, *var);
+                true
             }
             CompactConstraint::HasCapability { ptr, elem_ty, .. } => {
                 let ptr_ty = self.arena.ptr(*elem_ty);
@@ -225,19 +236,32 @@ impl TypeSolver {
         Self { config }
     }
 
-    pub fn solve(&self, arena: TypeArena, constraints: &[Constraint]) -> SolvedTypes {
+    pub fn solve<K: SolverNode>(
+        &self,
+        arena: TypeArena,
+        constraints: &[Constraint<K>],
+    ) -> SolvedTypes<K> {
         solve_worklist(arena, constraints, self.config.max_iterations)
     }
 }
 
-#[derive(Debug, Default)]
-struct VarInterner {
-    ids: HashMap<SSAVar, VarId>,
-    vars: Vec<SSAVar>,
+#[derive(Debug)]
+struct VarInterner<K> {
+    ids: HashMap<K, VarId>,
+    vars: Vec<K>,
 }
 
-impl VarInterner {
-    fn intern(&mut self, var: &SSAVar) -> VarId {
+impl<K> Default for VarInterner<K> {
+    fn default() -> Self {
+        Self {
+            ids: HashMap::new(),
+            vars: Vec::new(),
+        }
+    }
+}
+
+impl<K: SolverNode> VarInterner<K> {
+    fn intern(&mut self, var: &K) -> VarId {
         if let Some(id) = self.ids.get(var).copied() {
             return id;
         }
@@ -251,7 +275,7 @@ impl VarInterner {
         self.vars.len()
     }
 
-    fn into_vars(self) -> Vec<SSAVar> {
+    fn into_vars(self) -> Vec<K> {
         self.vars
     }
 }
@@ -366,10 +390,10 @@ impl CompactConstraint {
 }
 
 #[derive(Debug)]
-struct RewrittenConstraints {
+struct RewrittenConstraints<K> {
     constraints: Vec<CompactConstraint>,
     class_members: Vec<Vec<VarId>>,
-    vars: Vec<SSAVar>,
+    vars: Vec<K>,
 }
 
 #[derive(Debug)]
@@ -413,8 +437,10 @@ impl VarDsu {
     }
 }
 
-fn rewrite_equal_constraints(constraints: &[Constraint]) -> RewrittenConstraints {
-    let mut interner = VarInterner::default();
+fn rewrite_equal_constraints<K: SolverNode>(
+    constraints: &[Constraint<K>],
+) -> RewrittenConstraints<K> {
+    let mut interner = VarInterner::<K>::default();
     let mut raw = Vec::with_capacity(constraints.len());
 
     for constraint in constraints {
@@ -566,11 +592,11 @@ fn build_adjacency(var_count: usize, constraints: &[CompactConstraint]) -> Vec<V
     var_to_constraints
 }
 
-fn solve_worklist(
+fn solve_worklist<K: SolverNode>(
     arena: TypeArena,
-    constraints: &[Constraint],
+    constraints: &[Constraint<K>],
     max_iterations: usize,
-) -> SolvedTypes {
+) -> SolvedTypes<K> {
     let rewritten = rewrite_equal_constraints(constraints);
     let adjacency = build_adjacency(rewritten.vars.len(), &rewritten.constraints);
     let var_count = rewritten.vars.len();
@@ -631,14 +657,14 @@ fn solve_worklist(
     )
 }
 
-fn materialize_solution(
+fn materialize_solution<K: SolverNode>(
     arena: TypeArena,
     assignments: Vec<Option<Assignment>>,
     class_members: Vec<Vec<VarId>>,
-    vars: Vec<SSAVar>,
+    vars: Vec<K>,
     diagnostics: SolverDiagnostics,
-) -> SolvedTypes {
-    let mut var_types: HashMap<SSAVar, TypeId> = HashMap::new();
+) -> SolvedTypes<K> {
+    let mut var_types: HashMap<K, TypeId> = HashMap::new();
 
     for (representative, assignment) in assignments.iter().enumerate() {
         let Some(assignment) = assignment else {
@@ -717,11 +743,11 @@ fn field_access_is_noop(
 }
 
 #[cfg(test)]
-fn solve_reference(
+fn solve_reference<K: SolverNode>(
     arena: TypeArena,
-    constraints: &[Constraint],
+    constraints: &[Constraint<K>],
     max_iterations: usize,
-) -> SolvedTypes {
+) -> SolvedTypes<K> {
     let rewritten = rewrite_equal_constraints(constraints);
     let constraint_count = rewritten.constraints.len();
     let var_count = rewritten.vars.len();

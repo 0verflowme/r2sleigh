@@ -8,9 +8,10 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
+#[cfg(test)]
+use r2ssa::SSAOp;
 use r2ssa::{
-    BlockTerminator, CFGEdge, SSAFunction, SSAOp, SSAVar, SsaExecutionStopReason, SsaWorkControl,
-    domtree::DomTree,
+    BlockTerminator, CFGEdge, SSAFunction, SsaExecutionStopReason, SsaWorkControl, domtree::DomTree,
 };
 
 /// A control flow region.
@@ -200,13 +201,6 @@ struct NormalizedSwitchInfo {
 struct SwitchInfoCandidate {
     cases: Vec<(u64, u64)>,
     default: Option<u64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SwitchChainCase {
-    selector_key: String,
-    case_value: u64,
-    match_when_true: bool,
 }
 
 type LocalSwitchTargets = (Vec<(u64, u64)>, Option<u64>);
@@ -574,11 +568,6 @@ impl<'a> RegionAnalyzer<'a> {
             2 => {
                 // Conditional - prefer CFG edge polarity over successor order.
                 if let Some((true_target, false_target)) = self.resolve_conditional_targets(entry) {
-                    if let Some(switch_region) =
-                        self.detect_conditional_switch_chain(entry, true_target, false_target)
-                    {
-                        return switch_region;
-                    }
                     self.analyze_conditional(entry, true_target, false_target)
                 } else {
                     // Fallback: preserve existing successor order when labels are unavailable.
@@ -1082,87 +1071,6 @@ impl<'a> RegionAnalyzer<'a> {
         }
     }
 
-    fn detect_conditional_switch_chain(
-        &mut self,
-        entry: u64,
-        true_target: u64,
-        false_target: u64,
-    ) -> Option<Region> {
-        let mut processed_blocks = vec![entry];
-        let mut switch_cases = Vec::new();
-        let mut compare_block = entry;
-        let mut current_true = true_target;
-        let mut current_false = false_target;
-        let mut selector_key = None;
-
-        for _ in 0..16 {
-            if !self.poll() {
-                return None;
-            }
-            let compare = self.extract_switch_chain_case(compare_block)?;
-            if let Some(expected) = selector_key.as_ref() {
-                if expected != &compare.selector_key {
-                    return None;
-                }
-            } else {
-                selector_key = Some(compare.selector_key.clone());
-            }
-
-            let true_path = self.follow_branch_only_chain(current_true);
-            let false_path = self.follow_branch_only_chain(current_false);
-            let next_selector = selector_key.as_ref()?;
-            let true_compare = self
-                .extract_switch_chain_case(true_path)
-                .filter(|next| next.selector_key == *next_selector);
-            let false_compare = self
-                .extract_switch_chain_case(false_path)
-                .filter(|next| next.selector_key == *next_selector);
-
-            match (true_compare, false_compare) {
-                (Some(_), Some(_)) => return None,
-                (Some(_), None) => {
-                    switch_cases.push((compare.case_value, false_path));
-                    let (next_true, next_false) = self.resolve_conditional_targets(true_path)?;
-                    processed_blocks.push(true_path);
-                    compare_block = true_path;
-                    current_true = next_true;
-                    current_false = next_false;
-                }
-                (None, Some(_)) => {
-                    switch_cases.push((compare.case_value, true_path));
-                    let (next_true, next_false) = self.resolve_conditional_targets(false_path)?;
-                    processed_blocks.push(false_path);
-                    compare_block = false_path;
-                    current_true = next_true;
-                    current_false = next_false;
-                }
-                (None, None) => {
-                    let (case_target, default_target) = if compare.match_when_true {
-                        (true_path, false_path)
-                    } else {
-                        (false_path, true_path)
-                    };
-                    switch_cases.push((compare.case_value, case_target));
-                    if switch_cases.len() < 4 {
-                        return None;
-                    }
-                    switch_cases.sort_unstable_by_key(|(value, _)| *value);
-                    switch_cases.dedup_by_key(|(value, _)| *value);
-                    for block in processed_blocks {
-                        self.processed.insert(block);
-                    }
-                    return Some(self.analyze_switch_with_cases(
-                        entry,
-                        &switch_cases,
-                        Some(default_target),
-                    ));
-                }
-            }
-        }
-
-        None
-    }
-
     fn normalized_switch_info(&self, entry: u64) -> Option<NormalizedSwitchInfo> {
         if !self.poll() {
             return None;
@@ -1207,163 +1115,6 @@ impl<'a> RegionAnalyzer<'a> {
         let cases = self.canonical_switch_cases(&cases);
 
         Some(NormalizedSwitchInfo { cases, default })
-    }
-
-    fn follow_branch_only_chain(&self, start: u64) -> u64 {
-        let mut current = start;
-        let mut seen = HashSet::new();
-        while seen.insert(current) {
-            if !self.poll() {
-                break;
-            }
-            let Some(block) = self.func.get_block(current) else {
-                break;
-            };
-            let succs = self.func.successors(current);
-            if succs.len() != 1
-                || !block.phis.is_empty()
-                || !block
-                    .ops
-                    .iter()
-                    .all(|op| matches!(op, SSAOp::Branch { .. }))
-            {
-                break;
-            }
-            current = succs[0];
-        }
-        current
-    }
-
-    fn extract_switch_chain_case(&self, block_addr: u64) -> Option<SwitchChainCase> {
-        let block = self.func.get_block(block_addr)?;
-        let cond = block.ops.iter().rev().find_map(|op| match op {
-            SSAOp::CBranch { cond, .. } => Some(cond),
-            _ => None,
-        })?;
-        self.extract_switch_chain_case_from_var(block, cond, 0)
-    }
-
-    fn extract_switch_chain_case_from_var(
-        &self,
-        block: &r2ssa::FunctionSSABlock,
-        var: &SSAVar,
-        depth: usize,
-    ) -> Option<SwitchChainCase> {
-        if depth > 8 {
-            return None;
-        }
-        let defining_op = block.ops.iter().rev().find(|op| op.dst() == Some(var))?;
-        match defining_op {
-            SSAOp::Copy { src, .. }
-            | SSAOp::Cast { src, .. }
-            | SSAOp::New { src, .. }
-            | SSAOp::IntZExt { src, .. }
-            | SSAOp::IntSExt { src, .. }
-            | SSAOp::Subpiece { src, .. } => {
-                self.extract_switch_chain_case_from_var(block, src, depth + 1)
-            }
-            SSAOp::BoolNot { src, .. } => {
-                let mut compare = self.extract_switch_chain_case_from_var(block, src, depth + 1)?;
-                compare.match_when_true = !compare.match_when_true;
-                Some(compare)
-            }
-            SSAOp::IntEqual { a, b, .. } => {
-                self.extract_switch_chain_case_from_compare(block, a, b, true)
-            }
-            SSAOp::IntNotEqual { a, b, .. } => {
-                self.extract_switch_chain_case_from_compare(block, a, b, false)
-            }
-            _ => None,
-        }
-    }
-
-    fn extract_switch_chain_case_from_compare(
-        &self,
-        block: &r2ssa::FunctionSSABlock,
-        a: &SSAVar,
-        b: &SSAVar,
-        match_when_true: bool,
-    ) -> Option<SwitchChainCase> {
-        if let Some(raw) = crate::analysis::utils::parse_const_value(&a.name) {
-            return self
-                .extract_selector_root(block, b, 0)
-                .map(|selector_key| SwitchChainCase {
-                    selector_key,
-                    case_value: raw,
-                    match_when_true,
-                });
-        }
-        if let Some(raw) = crate::analysis::utils::parse_const_value(&b.name) {
-            if raw == 0
-                && let Some((selector_key, case_value)) =
-                    self.extract_selector_minus_const(block, a, 0)
-            {
-                return Some(SwitchChainCase {
-                    selector_key,
-                    case_value,
-                    match_when_true,
-                });
-            }
-            return self
-                .extract_selector_root(block, a, 0)
-                .map(|selector_key| SwitchChainCase {
-                    selector_key,
-                    case_value: raw,
-                    match_when_true,
-                });
-        }
-        None
-    }
-
-    fn extract_selector_minus_const(
-        &self,
-        block: &r2ssa::FunctionSSABlock,
-        var: &SSAVar,
-        depth: usize,
-    ) -> Option<(String, u64)> {
-        if depth > 8 {
-            return None;
-        }
-        let defining_op = block.ops.iter().rev().find(|op| op.dst() == Some(var))?;
-        match defining_op {
-            SSAOp::Copy { src, .. }
-            | SSAOp::Cast { src, .. }
-            | SSAOp::New { src, .. }
-            | SSAOp::IntZExt { src, .. }
-            | SSAOp::IntSExt { src, .. }
-            | SSAOp::Subpiece { src, .. } => {
-                self.extract_selector_minus_const(block, src, depth + 1)
-            }
-            SSAOp::IntSub { a, b, .. } => {
-                let raw = crate::analysis::utils::parse_const_value(&b.name)?;
-                let selector_key = self.extract_selector_root(block, a, depth + 1)?;
-                Some((selector_key, raw))
-            }
-            _ => None,
-        }
-    }
-
-    fn extract_selector_root(
-        &self,
-        block: &r2ssa::FunctionSSABlock,
-        var: &SSAVar,
-        depth: usize,
-    ) -> Option<String> {
-        if depth > 8 || crate::analysis::utils::parse_const_value(&var.name).is_some() {
-            return None;
-        }
-        let Some(defining_op) = block.ops.iter().rev().find(|op| op.dst() == Some(var)) else {
-            return Some(var.display_name());
-        };
-        match defining_op {
-            SSAOp::Copy { src, .. }
-            | SSAOp::Cast { src, .. }
-            | SSAOp::New { src, .. }
-            | SSAOp::IntZExt { src, .. }
-            | SSAOp::IntSExt { src, .. }
-            | SSAOp::Subpiece { src, .. } => self.extract_selector_root(block, src, depth + 1),
-            _ => Some(var.display_name()),
-        }
     }
 
     fn is_better_switch_candidate(
@@ -1546,6 +1297,7 @@ impl<'a> RegionAnalyzer<'a> {
             .copied()
             .filter(|id| reachable.contains(id))
             .collect();
+        let switch_arm_nodes = self.working_switch_arm_nodes(graph, &reachable);
 
         // Map from node → composed region.
         let mut region_map: HashMap<usize, Region> = HashMap::new();
@@ -1574,8 +1326,23 @@ impl<'a> RegionAnalyzer<'a> {
                         } else {
                             base
                         }
+                    } else if switch_arm_nodes.contains(&next) {
+                        // Keep switch arms as separate regions. The switch
+                        // renderer owns their exact fallthrough edges and
+                        // widens the later arm's guard to every reaching case.
+                        // Copying the later arm here would instead turn one
+                        // fallthrough chain into several guarded occurrences.
+                        base
+                    } else if self.working_join_requires_path_copy(next, graph, &reachable) {
+                        if let Some(next_region) = region_map.get(&next).cloned() {
+                            Self::sequence_merge(base, next_region)
+                        } else {
+                            base
+                        }
                     } else {
-                        // Multi-predecessor: don't absorb; leave next for its own composition.
+                        // A proper merge is emitted once by the condition it
+                        // post-dominates. A partial join must instead be copied
+                        // into each disjoint path that reaches it.
                         base
                     }
                 }
@@ -1595,12 +1362,19 @@ impl<'a> RegionAnalyzer<'a> {
                         .find(|node| graph.node_is_latch_transfer(*node))
                         .or_else(|| self.find_working_merge_point(true_succ, false_succ, graph));
                     let then_region = if Some(true_succ) != merge {
-                        region_map.remove(&true_succ).map(Box::new)
+                        self.take_working_path_region(true_succ, graph, &reachable, &mut region_map)
+                            .map(Box::new)
                     } else {
                         None
                     };
                     let else_region = if Some(false_succ) != merge {
-                        region_map.remove(&false_succ).map(Box::new)
+                        self.take_working_path_region(
+                            false_succ,
+                            graph,
+                            &reachable,
+                            &mut region_map,
+                        )
+                        .map(Box::new)
                     } else {
                         None
                     };
@@ -1827,6 +1601,16 @@ impl<'a> RegionAnalyzer<'a> {
         let mut common: Vec<usize> = true_reachable
             .into_iter()
             .filter(|id| false_reachable.contains(id))
+            .filter(|id| {
+                let Some(candidate) = graph.node_entry(*id) else {
+                    return false;
+                };
+                [true_target, false_target].into_iter().all(|target| {
+                    graph
+                        .node_entry(target)
+                        .is_some_and(|start| self.post_dominates(start, candidate))
+                })
+            })
             .collect();
         common.sort_by_key(|id| {
             let true_distance = self
@@ -1842,6 +1626,82 @@ impl<'a> RegionAnalyzer<'a> {
             )
         });
         common.into_iter().next()
+    }
+
+    /// Case entries are lexical boundaries even when an earlier case reaches
+    /// them by an ordinary one-successor edge. Collect their working nodes once
+    /// so iterative composition does not repeatedly rescan switch metadata.
+    fn working_switch_arm_nodes(
+        &self,
+        graph: &WorkingGraph,
+        reachable: &HashSet<usize>,
+    ) -> HashSet<usize> {
+        let mut arms = HashSet::new();
+        for block_addr in self.func.block_addrs() {
+            let Some(block) = self.func.cfg().get_block(*block_addr) else {
+                continue;
+            };
+            let BlockTerminator::Switch { cases, default } = &block.terminator else {
+                continue;
+            };
+            for target in cases
+                .iter()
+                .map(|(_, target)| *target)
+                .chain(default.iter().copied())
+            {
+                if let Some(node) = graph.node_for_block(target)
+                    && reachable.contains(&node)
+                {
+                    arms.insert(node);
+                }
+            }
+        }
+        arms
+    }
+
+    /// Whether a multi-predecessor node is reached only by some control paths
+    /// through one of its predecessors. Such a node is not a proper lexical
+    /// merge: placing it after an enclosing conditional would run it on paths
+    /// that bypass it, while placing it in only one arm would drop other paths.
+    fn working_join_requires_path_copy(
+        &self,
+        node: usize,
+        graph: &WorkingGraph,
+        reachable: &HashSet<usize>,
+    ) -> bool {
+        let predecessors = graph
+            .preds
+            .get(&node)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|predecessor| reachable.contains(predecessor))
+            .collect::<Vec<_>>();
+        if predecessors.len() < 2 {
+            return false;
+        }
+        let Some(join) = graph.node_entry(node) else {
+            return false;
+        };
+        predecessors.into_iter().any(|predecessor| {
+            graph
+                .node_entry(predecessor)
+                .is_some_and(|start| !self.post_dominates(start, join))
+        })
+    }
+
+    fn take_working_path_region(
+        &self,
+        node: usize,
+        graph: &WorkingGraph,
+        reachable: &HashSet<usize>,
+        region_map: &mut HashMap<usize, Region>,
+    ) -> Option<Region> {
+        if self.working_join_requires_path_copy(node, graph, reachable) {
+            region_map.get(&node).cloned()
+        } else {
+            region_map.remove(&node)
+        }
     }
 
     fn find_working_switch_merge(&self, targets: &[usize], graph: &WorkingGraph) -> Option<usize> {
@@ -2168,14 +2028,6 @@ impl WorkingGraph {
             return Err(());
         }
 
-        let absorbed_terminal_exit_nodes =
-            self.terminal_return_exit_nodes(analyzer, &internal_nodes);
-        let absorbed_terminal_exit_blocks = absorbed_terminal_exit_nodes
-            .iter()
-            .flat_map(|node_id| self.node_blocks(*node_id))
-            .collect::<HashSet<_>>();
-        internal_nodes.extend(absorbed_terminal_exit_nodes);
-
         let mut external_preds = HashSet::new();
         let mut all_external_succs = HashSet::new();
 
@@ -2242,12 +2094,7 @@ impl WorkingGraph {
             }
         }
 
-        let loop_region = self.make_loop_region(
-            analyzer,
-            loop_info,
-            &internal_nodes,
-            &absorbed_terminal_exit_blocks,
-        );
+        let loop_region = self.make_loop_region(analyzer, loop_info, &internal_nodes);
         let mut collapsed_blocks = BTreeSet::new();
         for node_id in &internal_nodes {
             if !analyzer.poll() {
@@ -2326,98 +2173,15 @@ impl WorkingGraph {
         Ok(())
     }
 
-    fn terminal_return_exit_nodes(
-        &self,
-        analyzer: &RegionAnalyzer<'_>,
-        internal_nodes: &HashSet<usize>,
-    ) -> HashSet<usize> {
-        let mut out = HashSet::new();
-        for node in internal_nodes {
-            if !analyzer.poll() {
-                return out;
-            }
-            for succ in self.sorted_succs(*node) {
-                if !analyzer.poll() {
-                    return out;
-                }
-                if internal_nodes.contains(&succ) || out.contains(&succ) {
-                    continue;
-                }
-                if let Some(chain) = self.terminal_return_exit_chain(analyzer, succ, internal_nodes)
-                {
-                    out.extend(chain);
-                }
-            }
-        }
-        out
-    }
-
-    fn terminal_return_exit_chain(
-        &self,
-        analyzer: &RegionAnalyzer<'_>,
-        start: usize,
-        internal_nodes: &HashSet<usize>,
-    ) -> Option<HashSet<usize>> {
-        let mut chain = HashSet::new();
-        let mut current = start;
-
-        loop {
-            if !analyzer.poll() {
-                return None;
-            }
-            if internal_nodes.contains(&current) || !self.nodes.contains_key(&current) {
-                return None;
-            }
-            if !self.preds.get(&current).is_some_and(|preds| {
-                preds
-                    .iter()
-                    .all(|pred| internal_nodes.contains(pred) || chain.contains(pred))
-            }) {
-                return None;
-            }
-            if !chain.insert(current) {
-                return None;
-            }
-            if self.node_is_terminal_return(analyzer, current) {
-                return Some(chain);
-            }
-
-            let succs = self.sorted_succs(current);
-            if succs.len() != 1 {
-                return None;
-            }
-            current = succs[0];
-        }
-    }
-
-    fn node_is_terminal_return(&self, analyzer: &RegionAnalyzer<'_>, node: usize) -> bool {
-        let Some(node_data) = self.nodes.get(&node) else {
-            return false;
-        };
-        if !self.sorted_succs(node).is_empty() || node_data.blocks.len() != 1 {
-            return false;
-        }
-        let Some(block) = node_data.blocks.iter().next().copied() else {
-            return false;
-        };
-        analyzer
-            .func
-            .cfg()
-            .get_block(block)
-            .is_some_and(|cfg_block| matches!(cfg_block.terminator, BlockTerminator::Return))
-    }
-
     fn make_loop_region(
         &self,
         analyzer: &mut RegionAnalyzer<'_>,
         loop_info: &LoopInfo,
         internal_nodes: &HashSet<usize>,
-        absorbed_terminal_exit_blocks: &HashSet<u64>,
     ) -> Region {
         let header = loop_info.header;
         let body = &loop_info.body;
-        let mut region_body = body.clone();
-        region_body.extend(absorbed_terminal_exit_blocks.iter().copied());
+        let region_body = body.clone();
         if let Some(body_entry) = analyzer.pretest_loop_body_entry(header, body) {
             let mut body_blocks = region_body.clone();
             body_blocks.remove(&header);
@@ -2711,7 +2475,7 @@ mod tests {
     use crate::fold::FoldingContext;
     use crate::structure::ControlFlowStructurer;
     use r2il::{R2ILBlock, R2ILOp, Varnode};
-    use r2ssa::{BlockTerminator, SSAFunction};
+    use r2ssa::{BlockTerminator, SSAFunction, SSAVar};
 
     // Note: Full tests would require constructing SSAFunctions
     // which requires r2il blocks. These are placeholder tests.
@@ -2980,6 +2744,162 @@ mod tests {
             Some(0x1004),
             "else branch should be false-target"
         );
+    }
+
+    fn explicit_block_occurrences(region: &Region, expected: u64) -> usize {
+        match region {
+            Region::Block(addr) => usize::from(*addr == expected),
+            Region::Sequence(regions) => regions
+                .iter()
+                .map(|region| explicit_block_occurrences(region, expected))
+                .sum(),
+            Region::IfThenElse {
+                then_region,
+                else_region,
+                ..
+            } => {
+                explicit_block_occurrences(then_region, expected)
+                    + else_region
+                        .as_deref()
+                        .map_or(0, |region| explicit_block_occurrences(region, expected))
+            }
+            Region::WhileLoop { body, .. }
+            | Region::DoWhileLoop { body, .. }
+            | Region::MultiExit { head: body, .. } => explicit_block_occurrences(body, expected),
+            Region::Switch { cases, default, .. } => {
+                cases
+                    .iter()
+                    .map(|(_, region)| explicit_block_occurrences(region, expected))
+                    .sum::<usize>()
+                    + default
+                        .as_deref()
+                        .map_or(0, |region| explicit_block_occurrences(region, expected))
+            }
+            Region::Transfer { .. } | Region::Irreducible { .. } => 0,
+        }
+    }
+
+    #[test]
+    fn iterative_composition_duplicates_partial_joins_on_disjoint_paths() {
+        let blocks = [
+            R2ILBlock::new(0x1000, 4),
+            R2ILBlock::new(0x1010, 4),
+            R2ILBlock::new(0x1020, 4),
+            R2ILBlock::new(0x1030, 4),
+            R2ILBlock::new(0x1040, 4),
+            R2ILBlock::new(0x1060, 4),
+            R2ILBlock::new(0x1080, 4),
+        ];
+        let mut func = SSAFunction::from_blocks_raw_no_arch(&blocks).expect("ssa function");
+        func.cfg_mut().set_terminator(
+            0x1000,
+            BlockTerminator::ConditionalBranch {
+                true_target: 0x1060,
+                false_target: 0x1010,
+            },
+        );
+        func.cfg_mut().set_terminator(
+            0x1010,
+            BlockTerminator::ConditionalBranch {
+                true_target: 0x1040,
+                false_target: 0x1020,
+            },
+        );
+        func.cfg_mut().set_terminator(
+            0x1020,
+            BlockTerminator::ConditionalBranch {
+                true_target: 0x1080,
+                false_target: 0x1030,
+            },
+        );
+        func.cfg_mut()
+            .set_terminator(0x1030, BlockTerminator::Branch { target: 0x1040 });
+        func.cfg_mut()
+            .set_terminator(0x1040, BlockTerminator::Branch { target: 0x1060 });
+        func.cfg_mut()
+            .set_terminator(0x1060, BlockTerminator::Branch { target: 0x1080 });
+        func.cfg_mut()
+            .set_terminator(0x1080, BlockTerminator::Return);
+        func.refresh_after_cfg_mutation();
+
+        let mut analyzer = RegionAnalyzer::new(&func);
+        let graph = WorkingGraph::from_function(&func);
+        let entry = graph.node_for_block(0x1000).expect("entry node");
+        let true_target = graph.node_for_block(0x1060).expect("true target");
+        let false_target = graph.node_for_block(0x1010).expect("false target");
+        assert_eq!(
+            analyzer
+                .find_working_merge_point(true_target, false_target, &graph)
+                .and_then(|node| graph.node_entry(node)),
+            Some(0x1080),
+            "a partial join reachable from both arms is not a merge unless it post-dominates both"
+        );
+        let topo = graph
+            .topological_order()
+            .expect("acyclic partial-join graph");
+
+        let region = analyzer.analyze_post_collapse_iterative(entry, &graph, &topo);
+
+        assert_eq!(
+            explicit_block_occurrences(&region, 0x1040),
+            2,
+            "the inner partial join executes on two disjoint paths"
+        );
+        assert_eq!(
+            explicit_block_occurrences(&region, 0x1060),
+            3,
+            "the outer partial join executes on three disjoint paths"
+        );
+        assert_eq!(
+            explicit_block_occurrences(&region, 0x1080),
+            1,
+            "the true post-dominating merge must remain a single continuation"
+        );
+    }
+
+    #[test]
+    fn iterative_composition_preserves_switch_fallthrough_boundaries() {
+        let blocks = [
+            R2ILBlock::new(0x1000, 4),
+            R2ILBlock::new(0x1010, 4),
+            R2ILBlock::new(0x1020, 4),
+            R2ILBlock::new(0x1030, 4),
+            R2ILBlock::new(0x1080, 4),
+        ];
+        let mut func = SSAFunction::from_blocks_raw_no_arch(&blocks).expect("ssa function");
+        func.cfg_mut().set_terminator(
+            0x1000,
+            BlockTerminator::Switch {
+                cases: vec![(1, 0x1010), (2, 0x1020), (3, 0x1030)],
+                default: Some(0x1080),
+            },
+        );
+        func.cfg_mut()
+            .set_terminator(0x1030, BlockTerminator::Branch { target: 0x1020 });
+        func.cfg_mut()
+            .set_terminator(0x1020, BlockTerminator::Branch { target: 0x1010 });
+        func.cfg_mut()
+            .set_terminator(0x1010, BlockTerminator::Branch { target: 0x1080 });
+        func.cfg_mut()
+            .set_terminator(0x1080, BlockTerminator::Return);
+        func.refresh_after_cfg_mutation();
+
+        let mut analyzer = RegionAnalyzer::new(&func);
+        let graph = WorkingGraph::from_function(&func);
+        let entry = graph.node_for_block(0x1000).expect("entry node");
+        let topo = graph
+            .topological_order()
+            .expect("acyclic switch-fallthrough graph");
+
+        let region = analyzer.analyze_post_collapse_iterative(entry, &graph, &topo);
+
+        for case_entry in [0x1010, 0x1020, 0x1030] {
+            assert_eq!(
+                explicit_block_occurrences(&region, case_entry),
+                1,
+                "the switch renderer, not generic path copying, owns fallthrough into case 0x{case_entry:x}"
+            );
+        }
     }
 
     fn build_latch_condition_loop_cfg() -> SSAFunction {
@@ -3481,11 +3401,15 @@ mod tests {
         let mut analyzer = RegionAnalyzer::new(&func);
 
         let region = analyzer.analyze();
-        let Region::DoWhileLoop { cond_block, .. } = region else {
-            panic!("expected latch-conditioned loop, got {region:?}");
+        // the block that returns after the loop is the loop's successor, not its body
+        let Region::Sequence(parts) = &region else {
+            panic!("expected the loop followed by its exit, got {region:?}");
+        };
+        let Some(Region::DoWhileLoop { cond_block, .. }) = parts.first() else {
+            panic!("expected latch-conditioned loop first, got {region:?}");
         };
 
-        assert_eq!(cond_block, 0x1020);
+        assert_eq!(*cond_block, 0x1020);
     }
 
     #[test]
@@ -3614,7 +3538,9 @@ mod tests {
 
         let ctx = FoldingContext::new(64);
         let mut structurer = ControlFlowStructurer::new(&func, &ctx);
-        let rendered = structurer.structure();
+        let rendered = structurer
+            .structure()
+            .expect("supported irreducible-region lowering");
         let proof_anchors = structurer
             .control_render_proofs()
             .iter()
@@ -3625,8 +3551,15 @@ mod tests {
             "predicate-less fixture must not mint loop render proofs, got {proof_anchors:x?}"
         );
         assert!(
-            stmt_contains_comment(&rendered, "r2dec residual: unresolved"),
-            "predicate-less fixture should residualize unresolved control, got {rendered:?}"
+            stmt_contains_comment(&rendered, "r2dec residual:"),
+            "predicate-less fixture should residualize, got {rendered:?}"
+        );
+        assert!(
+            stmt_contains_comment(
+                &rendered,
+                "missing canonical control facts for block 0x401490"
+            ),
+            "the refusal should name the first block lacking canonical facts, got {rendered:?}"
         );
     }
 
@@ -4360,59 +4293,47 @@ mod tests {
     }
 
     #[test]
-    fn detects_conditional_switch_chain_from_equality_ladder() {
+    fn equality_ladder_remains_nested_conditionals_without_switch_metadata() {
         let func = build_equality_switch_chain_cfg();
         let mut analyzer = RegionAnalyzer::new(&func);
 
-        let region = analyzer
-            .detect_conditional_switch_chain(0x1000, 0x1100, 0x1004)
-            .expect("switch chain region");
-        let Region::Switch {
-            switch_block,
-            cases,
-            default,
-            merge_block,
-        } = region
-        else {
-            panic!("expected switch region from equality ladder");
-        };
+        let region = analyzer.analyze_region_recursive(0x1000);
 
-        assert_eq!(switch_block, 0x1000);
-        let values: Vec<u64> = cases
-            .iter()
-            .map(|(value, _)| value.expect("case value"))
-            .collect();
-        assert_eq!(values, vec![0, 1, 2, 3]);
-        assert_eq!(default.map(|region| region.entry()), Some(0x1140));
-        assert_eq!(merge_block, Some(0x1200));
+        assert!(matches!(
+            &region,
+            Region::IfThenElse {
+                cond_block: 0x1000,
+                ..
+            }
+        ));
+        for cond_block in [0x1000, 0x1008, 0x1010, 0x1018] {
+            assert!(
+                region_contains_cond_block(&region, cond_block),
+                "equality ladder condition 0x{cond_block:x} must remain explicit"
+            );
+        }
     }
 
     #[test]
-    fn detects_conditional_switch_chain_from_flag_zero_ladder() {
+    fn flag_zero_ladder_remains_nested_conditionals_without_switch_metadata() {
         let func = build_flag_switch_chain_cfg();
         let mut analyzer = RegionAnalyzer::new(&func);
 
-        let region = analyzer
-            .detect_conditional_switch_chain(0x1000, 0x1100, 0x1004)
-            .expect("switch chain region");
-        let Region::Switch {
-            switch_block,
-            cases,
-            default,
-            merge_block,
-        } = region
-        else {
-            panic!("expected switch region from flag ladder");
-        };
+        let region = analyzer.analyze_region_recursive(0x1000);
 
-        assert_eq!(switch_block, 0x1000);
-        let values: Vec<u64> = cases
-            .iter()
-            .map(|(value, _)| value.expect("case value"))
-            .collect();
-        assert_eq!(values, vec![0, 1, 2, 3]);
-        assert_eq!(default.map(|region| region.entry()), Some(0x1140));
-        assert_eq!(merge_block, Some(0x1200));
+        assert!(matches!(
+            &region,
+            Region::IfThenElse {
+                cond_block: 0x1000,
+                ..
+            }
+        ));
+        for cond_block in [0x1000, 0x1008, 0x1010, 0x1018] {
+            assert!(
+                region_contains_cond_block(&region, cond_block),
+                "flag ladder condition 0x{cond_block:x} must remain explicit"
+            );
+        }
     }
 
     #[test]

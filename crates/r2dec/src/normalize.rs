@@ -1,24 +1,1237 @@
-use crate::analysis::PredicateAnalysisView;
-use crate::ast::CExpr;
 use crate::control::{DecompileExecutionStop, DecompileWorkControl, DecompileWorkPhase};
-use r2ssa::{SSAFunction, SSAOp, SsaExecutionControl};
-use std::collections::{HashMap, HashSet};
+use r2ssa::{
+    BlockId, InstId, SSAFunction, SSAOp, SsaArtifactAuthority, SsaExecutionControl, SsaGraph,
+    UseSite, ValueId,
+};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-pub(crate) enum NormalizeMode {
-    General,
-    Predicate,
+/// Certified role an original phi input has for one loop-carrier entity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum CertifiedPhiEdgeRole {
+    Entry,
+    Update,
+    DominatingInitializer,
 }
 
-pub(crate) fn normalize_expr(
-    view: &(impl PredicateAnalysisView + ?Sized),
-    expr: CExpr,
-    mode: NormalizeMode,
-) -> CExpr {
-    match mode {
-        NormalizeMode::General | NormalizeMode::Predicate => view.simplify_predicate_expr(expr),
+/// Exact source definition consumed by a materialized phi edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OriginalPhiDefinition {
+    pub(crate) inst: InstId,
+    pub(crate) value: ValueId,
+}
+
+/// Operand synthesized solely to preserve the old carrier off the guarded edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SyntheticPreserveOperand {
+    /// Input position in the synthetic `Select` (`cond`, `if_true`, `if_false`).
+    pub(crate) input_idx: usize,
+    pub(crate) value: ValueId,
+}
+
+/// Extra provenance required when an edge copy is represented as a `Select`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GuardedPhiEdgeOrigin {
+    pub(crate) guard: UseSite,
+    pub(crate) preserve: SyntheticPreserveOperand,
+}
+
+/// One inserted edge assignment and the exact original phi input it implements.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PhiEdgeOrigin {
+    pub(crate) definition: OriginalPhiDefinition,
+    pub(crate) incoming: UseSite,
+    pub(crate) incoming_value: ValueId,
+    pub(crate) predecessor: u64,
+    pub(crate) target: u64,
+    /// Operand in the normalized operation supplied by `incoming`.
+    pub(crate) incoming_input_idx: usize,
+    pub(crate) certified_entity: Option<r2ssa::SemanticId>,
+    pub(crate) certified_roles: Box<[CertifiedPhiEdgeRole]>,
+    pub(crate) guarded: Option<GuardedPhiEdgeOrigin>,
+}
+
+/// One certified initializer moved ahead of all equivalent entry edges.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RelocatedInitializerOrigin {
+    pub(crate) definition: OriginalPhiDefinition,
+    pub(crate) source_value: ValueId,
+    pub(crate) certified_entity: r2ssa::SemanticId,
+    /// Upstream post-loop phi input proving that this relocation is valid.
+    ///
+    /// This use remains live; it is evidence for the move, not one of the
+    /// header inputs the relocated copy replaces.
+    pub(crate) evidence_site: UseSite,
+    /// Exact header-phi inputs replaced by this one copy, in stable order.
+    pub(crate) replaced_sites: Box<[UseSite]>,
+}
+
+/// Exact origin of one operation in the normalized function.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NormalizedOpOrigin {
+    Original(InstId),
+    PhiEdgeCopy(PhiEdgeOrigin),
+    RelocatedInitializer(RelocatedInitializerOrigin),
+}
+
+/// Dense site of one operation in the normalized function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct NormalizedOpSite {
+    pub(crate) block: BlockId,
+    pub(crate) op_idx: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ForLoopNormalizedSites {
+    pub(crate) initializer: NormalizedOpSite,
+    pub(crate) update: NormalizedOpSite,
+}
+
+/// One normalized operand and the exact original graph uses it represents.
+///
+/// A synthetic preservation operand has an empty `uses` slice. A relocated
+/// initializer has several uses because one normalized expression replaces a
+/// sorted set of original phi inputs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NormalizedInputProjection {
+    pub(crate) value: ValueId,
+    pub(crate) uses: Box<[UseSite]>,
+}
+
+/// Exact original output represented by one normalized definition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NormalizedOutputProjection {
+    pub(crate) inst: InstId,
+    pub(crate) value: ValueId,
+}
+
+/// Name-free projection from one normalized operation to original graph cells.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NormalizedOpProjection {
+    pub(crate) inputs: Box<[NormalizedInputProjection]>,
+    pub(crate) output: Option<NormalizedOutputProjection>,
+    /// Address of the normalized block this operation is emitted in.
+    ///
+    /// Normalization materializes one phi definition as a copy on each incoming
+    /// edge, so several emitted operations project onto one original
+    /// instruction and each lives in the predecessor that supplies its edge; a
+    /// relocated initializer likewise lives where it was moved to. The original
+    /// `InstId` therefore says what an operation implements and not where it
+    /// is, so anything that needs the location has to be told it rather than
+    /// recover it from the instruction's own block.
+    pub(crate) block: u64,
+}
+
+/// Original phi instruction removed after all of its edges were materialized.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RemovedPhiOrigin {
+    pub(crate) definition: OriginalPhiDefinition,
+    /// Every original input of the removed phi, in canonical input order.
+    pub(crate) incoming_sites: Box<[UseSite]>,
+    /// Inputs whose value already equals the phi output and therefore require
+    /// no normalized operation, in stable order.
+    noop_sites: Box<[UseSite]>,
+}
+
+impl RemovedPhiOrigin {
+    /// Exact self/no-op inputs certified by normalization.
+    pub(crate) fn noop_sites(&self) -> &[UseSite] {
+        &self.noop_sites
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizationBlockOrigins {
+    address: u64,
+    rows: Vec<NormalizedOpOrigin>,
+}
+
+/// Validation failure for the sealed normalized-function sidecar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NormalizationOriginError {
+    SourceAuthority,
+    BlockTopology,
+    RowCount { block: u64 },
+    OriginalInstruction { block: u64, op_idx: usize },
+    OriginalCoverage,
+    PhiEdge { block: u64, op_idx: usize },
+    RelocatedInitializer { block: u64, op_idx: usize },
+    RemovedPhi,
+    RemovedPhiEdge,
+    InvalidCarrierCertificates,
+}
+
+impl std::fmt::Display for NormalizationOriginError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let reason = match self {
+            Self::SourceAuthority => "source authority mismatch",
+            Self::BlockTopology => "normalized block topology mismatch",
+            Self::RowCount { .. } => "normalized origin row count mismatch",
+            Self::OriginalInstruction { .. } => "invalid original instruction origin",
+            Self::OriginalCoverage => "incomplete original instruction coverage",
+            Self::PhiEdge { .. } => "invalid materialized phi-edge origin",
+            Self::RelocatedInitializer { .. } => "invalid relocated initializer origin",
+            Self::RemovedPhi => "invalid removed-phi origin",
+            Self::RemovedPhiEdge => "invalid removed-phi input disposition",
+            Self::InvalidCarrierCertificates => "invalid loop-carrier edge certificates",
+        };
+        f.write_str(reason)
+    }
+}
+
+/// Typed failure from normalization construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NormalizationFailure {
+    Execution(DecompileExecutionStop),
+    Origins(NormalizationOriginError),
+}
+
+impl From<DecompileExecutionStop> for NormalizationFailure {
+    fn from(error: DecompileExecutionStop) -> Self {
+        Self::Execution(error)
+    }
+}
+
+impl From<NormalizationOriginError> for NormalizationFailure {
+    fn from(error: NormalizationOriginError) -> Self {
+        Self::Origins(error)
+    }
+}
+
+impl std::fmt::Display for NormalizationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Execution(error) => error.fmt(f),
+            Self::Origins(error) => write!(f, "normalization origin refusal: {error}"),
+        }
+    }
+}
+
+/// Block-aligned, immutable origin rows for a normalized SSA function.
+///
+/// The fields are private so only normalization can mint or mutate rows. Every
+/// downstream lookup is by the exact normalized `(block, op_idx)`; consumers
+/// never recover a source use from variable names or operation shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NormalizationOrigins {
+    authority: Option<SsaArtifactAuthority>,
+    /// Indexed directly by the source graph's dense `BlockId`.
+    blocks: Vec<NormalizationBlockOrigins>,
+    /// Removed original phi instructions, sorted by their exact `InstId`.
+    removed_phis: Vec<RemovedPhiOrigin>,
+    /// Synthetic edge operations superseded by one relocated initializer.
+    /// Sorted by original incoming `UseSite`.
+    replaced_phi_edges: Vec<PhiEdgeOrigin>,
+}
+
+impl NormalizationOrigins {
+    fn from_source(
+        func: &SSAFunction,
+        graph: &SsaGraph,
+        authority: Option<SsaArtifactAuthority>,
+    ) -> Self {
+        let blocks = graph
+            .block_order
+            .iter()
+            .map(|block_id| {
+                let graph_block = graph
+                    .block(*block_id)
+                    .expect("source graph block order contains only valid blocks");
+                let block = func
+                    .get_block(graph_block.addr)
+                    .expect("source graph and SSA function have identical blocks");
+                let rows = (0..block.ops.len())
+                    .map(|op_idx| {
+                        NormalizedOpOrigin::Original(
+                            graph
+                                .inst_id_for_op_site(block.addr, op_idx)
+                                .expect("every source SSA operation has an exact graph InstId"),
+                        )
+                    })
+                    .collect();
+                NormalizationBlockOrigins {
+                    address: block.addr,
+                    rows,
+                }
+            })
+            .collect();
+        Self {
+            authority,
+            blocks,
+            removed_phis: Vec::new(),
+            replaced_phi_edges: Vec::new(),
+        }
+    }
+
+    pub(crate) fn for_unchanged(func: &SSAFunction, prepared: &r2ssa::SsaArtifact) -> Self {
+        Self::from_source(func, prepared.graph(), Some(prepared.authority().clone()))
+    }
+
+    /// O(1) lookup from an exact normalized site to its sealed origin.
+    pub(crate) fn origin(&self, site: NormalizedOpSite) -> Option<&NormalizedOpOrigin> {
+        self.blocks
+            .get(site.block.0 as usize)?
+            .rows
+            .get(site.op_idx)
+    }
+
+    /// Locate both operations a counted-loop certificate moves into a C
+    /// header in one traversal of the sealed origin rows.
+    pub(crate) fn for_loop_sites(
+        &self,
+        certificate: &r2ssa::ForLoopCertificate,
+        prepared: &r2ssa::SsaArtifact,
+    ) -> Option<ForLoopNormalizedSites> {
+        if self.authority.as_ref() != Some(prepared.authority())
+            || !certificate.initializer.validate(prepared.graph())
+        {
+            return None;
+        }
+        let initializer_inst = prepared.graph().def_inst(certificate.induction_init)?;
+        let update_inst = prepared.graph().def_inst(certificate.induction_update)?;
+        let mut initializer = None;
+        let mut update = None;
+        for (block_index, block) in self.blocks.iter().enumerate() {
+            for (op_idx, origin) in block.rows.iter().enumerate() {
+                let site = NormalizedOpSite {
+                    block: BlockId(u32::try_from(block_index).ok()?),
+                    op_idx,
+                };
+                match origin {
+                    NormalizedOpOrigin::Original(inst)
+                        if *inst == initializer_inst
+                            && block.address == certificate.initializer.predecessor =>
+                    {
+                        if initializer.replace(site).is_some() {
+                            return None;
+                        }
+                    }
+                    NormalizedOpOrigin::Original(inst)
+                        if *inst == update_inst && block.address == certificate.latch =>
+                    {
+                        if update.replace(site).is_some() {
+                            return None;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Some(ForLoopNormalizedSites {
+            initializer: initializer?,
+            update: update?,
+        })
+    }
+
+    /// Project one validated normalized row onto its original dense V/U/W keys.
+    ///
+    /// This method interprets only the sealed origin sidecar. It does not match
+    /// operation shapes or recover identity from an SSA variable name.
+    pub(crate) fn projection(
+        &self,
+        site: NormalizedOpSite,
+        prepared: &r2ssa::SsaArtifact,
+    ) -> Result<Option<NormalizedOpProjection>, NormalizationOriginError> {
+        if self.authority.as_ref() != Some(prepared.authority()) {
+            return Err(NormalizationOriginError::SourceAuthority);
+        }
+        Ok(self.projection_from_graph(site, prepared.graph()))
+    }
+
+    fn projection_from_graph(
+        &self,
+        site: NormalizedOpSite,
+        graph: &SsaGraph,
+    ) -> Option<NormalizedOpProjection> {
+        let emitted_block = self.blocks.get(site.block.0 as usize)?.address;
+        match self.origin(site)? {
+            NormalizedOpOrigin::Original(inst) => {
+                let source = graph.inst(*inst)?;
+                let inputs = source
+                    .inputs
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .map(|(input_idx, value)| NormalizedInputProjection {
+                        value,
+                        uses: vec![UseSite {
+                            inst: *inst,
+                            input_idx,
+                        }]
+                        .into_boxed_slice(),
+                    })
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice();
+                let output = source
+                    .output
+                    .map(|value| NormalizedOutputProjection { inst: *inst, value });
+                Some(NormalizedOpProjection {
+                    inputs,
+                    output,
+                    block: emitted_block,
+                })
+            }
+            NormalizedOpOrigin::PhiEdgeCopy(origin) => {
+                let highest_input = origin.guarded.map_or(origin.incoming_input_idx, |guarded| {
+                    origin.incoming_input_idx.max(guarded.preserve.input_idx)
+                });
+                let mut inputs = vec![None; highest_input.checked_add(1)?];
+                inputs[origin.incoming_input_idx] = Some(NormalizedInputProjection {
+                    value: origin.incoming_value,
+                    uses: vec![origin.incoming].into_boxed_slice(),
+                });
+                if let Some(guarded) = origin.guarded {
+                    let guard_value = graph
+                        .inst(guarded.guard.inst)?
+                        .inputs
+                        .get(guarded.guard.input_idx)
+                        .copied()?;
+                    inputs[0] = Some(NormalizedInputProjection {
+                        value: guard_value,
+                        uses: vec![guarded.guard].into_boxed_slice(),
+                    });
+                    inputs[guarded.preserve.input_idx] = Some(NormalizedInputProjection {
+                        value: guarded.preserve.value,
+                        uses: Box::new([]),
+                    });
+                }
+                let inputs = inputs
+                    .into_iter()
+                    .collect::<Option<Vec<_>>>()?
+                    .into_boxed_slice();
+                Some(NormalizedOpProjection {
+                    inputs,
+                    output: Some(NormalizedOutputProjection {
+                        inst: origin.definition.inst,
+                        value: origin.definition.value,
+                    }),
+                    block: emitted_block,
+                })
+            }
+            NormalizedOpOrigin::RelocatedInitializer(origin) => Some(NormalizedOpProjection {
+                inputs: vec![NormalizedInputProjection {
+                    value: origin.source_value,
+                    uses: origin.replaced_sites.clone(),
+                }]
+                .into_boxed_slice(),
+                output: Some(NormalizedOutputProjection {
+                    inst: origin.definition.inst,
+                    value: origin.definition.value,
+                }),
+                block: emitted_block,
+            }),
+        }
+    }
+
+    /// Original phi uses deliberately represented by no normalized operation.
+    pub(crate) fn noop_sites(&self) -> impl Iterator<Item = UseSite> + '_ {
+        self.removed_phis
+            .iter()
+            .flat_map(|origin| origin.noop_sites.iter().copied())
+    }
+
+    fn rows(&self, block: BlockId) -> Option<&[NormalizedOpOrigin]> {
+        Some(&self.blocks.get(block.0 as usize)?.rows)
+    }
+
+    fn rows_mut(&mut self, block: BlockId) -> Option<&mut Vec<NormalizedOpOrigin>> {
+        Some(&mut self.blocks.get_mut(block.0 as usize)?.rows)
+    }
+
+    /// Incoming phi inputs this normalization materialized as an edge copy.
+    ///
+    /// A removed phi has no standalone C operation once every edge it merged is
+    /// written by a copy on that edge: the state it carried is carried by those
+    /// copies. This reports which of its inputs are covered, so a consumer can
+    /// prove that rather than assume it.
+    pub(crate) fn materialized_phi_edges(&self, definition: InstId) -> BTreeSet<UseSite> {
+        self.blocks
+            .iter()
+            .flat_map(|block| block.rows.iter())
+            .flat_map(|origin| match origin {
+                // The edge's own copy.
+                NormalizedOpOrigin::PhiEdgeCopy(edge) if edge.definition.inst == definition => {
+                    vec![edge.incoming]
+                }
+                // One relocated initializer stands for a whole sorted set of
+                // header inputs, so those edges are written too.
+                NormalizedOpOrigin::RelocatedInitializer(origin)
+                    if origin.definition.inst == definition =>
+                {
+                    origin.replaced_sites.to_vec()
+                }
+                _ => Vec::new(),
+            })
+            .chain(
+                // Edge operations a relocated initializer superseded.
+                self.replaced_phi_edges
+                    .iter()
+                    .filter(|edge| edge.definition.inst == definition)
+                    .map(|edge| edge.incoming),
+            )
+            .collect()
+    }
+
+    pub(crate) fn removed_phis(&self) -> &[RemovedPhiOrigin] {
+        &self.removed_phis
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replaced_phi_edges(&self) -> &[PhiEdgeOrigin] {
+        &self.replaced_phi_edges
+    }
+
+    pub(crate) fn is_unconditional_phi_edge_copy(
+        &self,
+        site: NormalizedOpSite,
+        successor: u64,
+    ) -> bool {
+        let Some(block) = self.blocks.get(site.block.0 as usize) else {
+            return false;
+        };
+        matches!(
+            self.origin(site),
+            Some(NormalizedOpOrigin::PhiEdgeCopy(origin))
+                if origin.predecessor == block.address
+                    && origin.target == successor
+                    && origin.guarded.is_none()
+        )
+    }
+
+    /// Whether this exact normalized operation was introduced to materialize a
+    /// source phi edge.
+    ///
+    /// Operation shape is not evidence for synthetic origin: an original
+    /// program `Copy` may have the same source and destination binding after
+    /// carrier coalescing.  Consumers that suppress materialization plumbing
+    /// must consult this sealed sidecar instead of reclassifying the operation.
+    #[cfg(test)]
+    pub(crate) fn is_phi_edge_copy(&self, site: NormalizedOpSite) -> bool {
+        matches!(self.origin(site), Some(NormalizedOpOrigin::PhiEdgeCopy(_)))
+    }
+
+    pub(crate) fn validate(
+        &self,
+        normalized: &SSAFunction,
+        prepared: &r2ssa::SsaArtifact,
+        render_facts: Option<&r2types::FunctionRenderFacts>,
+    ) -> Result<(), NormalizationOriginError> {
+        if self.authority.as_ref() != Some(prepared.authority()) {
+            return Err(NormalizationOriginError::SourceAuthority);
+        }
+        self.validate_against_graph(normalized, prepared.graph(), render_facts)
+    }
+
+    fn validate_against_graph(
+        &self,
+        normalized: &SSAFunction,
+        graph: &SsaGraph,
+        render_facts: Option<&r2types::FunctionRenderFacts>,
+    ) -> Result<(), NormalizationOriginError> {
+        if normalized.num_blocks() != self.blocks.len()
+            || normalized.block_addrs().len() != graph.block_order.len()
+        {
+            return Err(NormalizationOriginError::BlockTopology);
+        }
+        let certificates = CarrierEdgeCertificates::build(graph, render_facts)
+            .ok_or(NormalizationOriginError::InvalidCarrierCertificates)?;
+        let mut seen_original = vec![false; graph.insts.len()];
+        for (dense_idx, block_id) in graph.block_order.iter().copied().enumerate() {
+            if block_id.0 as usize != dense_idx {
+                return Err(NormalizationOriginError::BlockTopology);
+            }
+            let graph_block = graph
+                .block(block_id)
+                .ok_or(NormalizationOriginError::BlockTopology)?;
+            let block_origins = self
+                .blocks
+                .get(dense_idx)
+                .ok_or(NormalizationOriginError::BlockTopology)?;
+            if block_origins.address != graph_block.addr
+                || normalized.block_addrs().get(dense_idx) != Some(&graph_block.addr)
+            {
+                return Err(NormalizationOriginError::BlockTopology);
+            }
+            let block = normalized
+                .get_block(graph_block.addr)
+                .ok_or(NormalizationOriginError::BlockTopology)?;
+            let rows = &block_origins.rows;
+            if rows.len() != block.ops.len() {
+                return Err(NormalizationOriginError::RowCount { block: block.addr });
+            }
+            for (op_idx, (op, origin)) in block.ops.iter().zip(rows).enumerate() {
+                let valid = match origin {
+                    NormalizedOpOrigin::Original(inst) => {
+                        let Some(seen) = seen_original.get_mut(inst.0 as usize) else {
+                            return Err(NormalizationOriginError::OriginalInstruction {
+                                block: block.addr,
+                                op_idx,
+                            });
+                        };
+                        if *seen {
+                            false
+                        } else {
+                            *seen = true;
+                            validate_original_origin(graph, block_id, op, *inst)
+                        }
+                    }
+                    NormalizedOpOrigin::PhiEdgeCopy(origin) => {
+                        validate_phi_edge_origin(graph, &certificates, block.addr, op, origin)
+                    }
+                    NormalizedOpOrigin::RelocatedInitializer(origin) => {
+                        validate_relocated_initializer_origin(
+                            graph,
+                            &certificates,
+                            normalized,
+                            op,
+                            origin,
+                        )
+                    }
+                };
+                if !valid {
+                    return Err(match origin {
+                        NormalizedOpOrigin::Original(_) => {
+                            NormalizationOriginError::OriginalInstruction {
+                                block: block.addr,
+                                op_idx,
+                            }
+                        }
+                        NormalizedOpOrigin::PhiEdgeCopy(_) => NormalizationOriginError::PhiEdge {
+                            block: block.addr,
+                            op_idx,
+                        },
+                        NormalizedOpOrigin::RelocatedInitializer(_) => {
+                            NormalizationOriginError::RelocatedInitializer {
+                                block: block.addr,
+                                op_idx,
+                            }
+                        }
+                    });
+                }
+            }
+        }
+        if graph.insts.iter().any(|inst| {
+            matches!(inst.payload, r2ssa::InstPayload::Op(_))
+                && !seen_original
+                    .get(inst.id.0 as usize)
+                    .copied()
+                    .unwrap_or(false)
+        }) {
+            return Err(NormalizationOriginError::OriginalCoverage);
+        }
+        if !validate_removed_phis(graph, normalized, &self.removed_phis) {
+            return Err(NormalizationOriginError::RemovedPhi);
+        }
+        if !validate_removed_phi_input_dispositions(self, graph, &certificates) {
+            return Err(NormalizationOriginError::RemovedPhiEdge);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EdgeCertificate {
+    entity: r2ssa::SemanticId,
+    roles: BTreeSet<CertifiedPhiEdgeRole>,
+}
+
+/// Dense index over the already-validated upstream loop-carrier evidence.
+struct CarrierEdgeCertificates {
+    by_inst: Vec<Vec<Option<EdgeCertificate>>>,
+    relocations_by_value: Vec<Option<RelocationCertificate>>,
+}
+
+#[derive(Clone)]
+struct RelocationCertificate {
+    definition: OriginalPhiDefinition,
+    source_value: ValueId,
+    initializer_predecessor: u64,
+    initializer_site: UseSite,
+    entries: Vec<r2ssa::LoopCarrierEdgeValue>,
+}
+
+impl CarrierEdgeCertificates {
+    fn build(
+        graph: &SsaGraph,
+        render_facts: Option<&r2types::FunctionRenderFacts>,
+    ) -> Option<Self> {
+        let mut result = Self {
+            by_inst: graph
+                .insts
+                .iter()
+                .map(|inst| vec![None; inst.inputs.len()])
+                .collect(),
+            relocations_by_value: vec![None; graph.values.len()],
+        };
+        let Some(render_facts) = render_facts else {
+            return Some(result);
+        };
+        let mut seen_entities = BTreeSet::new();
+        for entity in render_facts.loop_carriers() {
+            let r2types::CertifiedEntity::LoopCarrier {
+                id,
+                phi,
+                identity_values,
+                entries,
+                updates,
+                dominating_initializers,
+                ..
+            } = entity
+            else {
+                continue;
+            };
+            if *id != r2ssa::SemanticId::loop_carrier(*phi) || !seen_entities.insert(*id) {
+                return None;
+            }
+            for (site, role, valid) in entries
+                .iter()
+                .map(|edge| (edge.site, CertifiedPhiEdgeRole::Entry, edge.validate(graph)))
+                .chain(updates.iter().map(|edge| {
+                    (
+                        edge.site,
+                        CertifiedPhiEdgeRole::Update,
+                        edge.validate(graph),
+                    )
+                }))
+                .chain(dominating_initializers.iter().map(|edge| {
+                    (
+                        edge.site,
+                        CertifiedPhiEdgeRole::DominatingInitializer,
+                        edge.validate(graph),
+                    )
+                }))
+            {
+                if !valid {
+                    return None;
+                }
+                let slot = result
+                    .by_inst
+                    .get_mut(site.inst.0 as usize)?
+                    .get_mut(site.input_idx)?;
+                match slot {
+                    Some(existing) if existing.entity != *id => return None,
+                    Some(existing) => {
+                        existing.roles.insert(role);
+                    }
+                    None => {
+                        *slot = Some(EdgeCertificate {
+                            entity: *id,
+                            roles: BTreeSet::from([role]),
+                        });
+                    }
+                }
+            }
+            if identity_values.len() >= 2
+                && let [initializer] = dominating_initializers.as_slice()
+                && entries.iter().any(|entry| entry.value == initializer.value)
+            {
+                let definition = OriginalPhiDefinition {
+                    inst: graph.def_inst(*phi)?,
+                    value: *phi,
+                };
+                let relocation = result.relocations_by_value.get_mut(phi.0 as usize)?;
+                if relocation.is_some() {
+                    return None;
+                }
+                *relocation = Some(RelocationCertificate {
+                    definition,
+                    source_value: initializer.value,
+                    initializer_predecessor: initializer.predecessor,
+                    initializer_site: initializer.site,
+                    entries: entries.clone(),
+                });
+            }
+        }
+        Some(result)
+    }
+
+    fn get(&self, site: UseSite) -> Option<&EdgeCertificate> {
+        self.by_inst
+            .get(site.inst.0 as usize)?
+            .get(site.input_idx)?
+            .as_ref()
+    }
+
+    fn relocation(&self, entity: r2ssa::SemanticId) -> Option<&RelocationCertificate> {
+        let r2ssa::SemanticId::LoopCarrier(value) = entity else {
+            return None;
+        };
+        self.relocations_by_value.get(value.0 as usize)?.as_ref()
+    }
+}
+
+fn original_phi_definition(
+    graph: &SsaGraph,
+    phi: &r2ssa::PhiNode,
+) -> Option<OriginalPhiDefinition> {
+    let value = graph.value_by_var.get(&phi.dst).copied()?;
+    let inst = graph.def_inst(value)?;
+    let definition = graph.inst(inst)?;
+    matches!(definition.payload, r2ssa::InstPayload::Phi { .. })
+        .then_some(OriginalPhiDefinition { inst, value })
+}
+
+fn exact_phi_edge_origin(
+    graph: &SsaGraph,
+    certificates: &CarrierEdgeCertificates,
+    phi: &r2ssa::PhiNode,
+    input_idx: usize,
+    incoming_input_idx: usize,
+    guarded: Option<GuardedPhiEdgeOrigin>,
+) -> Option<PhiEdgeOrigin> {
+    let definition = original_phi_definition(graph, phi)?;
+    let (predecessor, source) = phi.sources.get(input_idx)?;
+    let incoming = UseSite {
+        inst: definition.inst,
+        input_idx,
+    };
+    let incoming_value = graph
+        .inst(definition.inst)?
+        .inputs
+        .get(input_idx)
+        .copied()?;
+    if graph.value(incoming_value).map(|value| &value.var) != Some(source) {
+        return None;
+    }
+    let certificate = certificates.get(incoming);
+    Some(PhiEdgeOrigin {
+        definition,
+        incoming,
+        incoming_value,
+        predecessor: *predecessor,
+        target: graph
+            .inst(definition.inst)
+            .and_then(|inst| graph.block(inst.block))?
+            .addr,
+        incoming_input_idx,
+        certified_entity: certificate.map(|certificate| certificate.entity),
+        certified_roles: certificate
+            .map(|certificate| certificate.roles.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default()
+            .into_boxed_slice(),
+        guarded,
+    })
+}
+
+fn validate_original_origin(graph: &SsaGraph, block: BlockId, op: &SSAOp, inst: InstId) -> bool {
+    let Some(original) = graph.inst(inst) else {
+        return false;
+    };
+    let r2ssa::InstPayload::Op(payload) = &original.payload else {
+        return false;
+    };
+    if original.block != block || payload != op || original.inputs.len() != op.sources().len() {
+        return false;
+    }
+    original
+        .inputs
+        .iter()
+        .copied()
+        .zip(op.sources())
+        .all(|(value, var)| graph.value(value).map(|source| &source.var) == Some(var))
+        && match (original.output, op.dst()) {
+            (None, None) => true,
+            (Some(value), Some(dst)) => graph.value(value).map(|value| &value.var) == Some(dst),
+            _ => false,
+        }
+}
+
+fn validate_phi_edge_source(
+    graph: &SsaGraph,
+    certificates: &CarrierEdgeCertificates,
+    origin: &PhiEdgeOrigin,
+) -> bool {
+    let Some(definition) = graph.inst(origin.definition.inst) else {
+        return false;
+    };
+    let r2ssa::InstPayload::Phi { predecessors } = &definition.payload else {
+        return false;
+    };
+    if definition.output != Some(origin.definition.value)
+        || origin.incoming.inst != origin.definition.inst
+        || definition.inputs.get(origin.incoming.input_idx) != Some(&origin.incoming_value)
+        || predecessors
+            .get(origin.incoming.input_idx)
+            .and_then(|block| graph.block(*block))
+            .map(|block| block.addr)
+            != Some(origin.predecessor)
+        || graph.block(definition.block).map(|block| block.addr) != Some(origin.target)
+        || !origin
+            .certified_roles
+            .windows(2)
+            .all(|roles| roles[0] < roles[1])
+    {
+        return false;
+    }
+    match certificates.get(origin.incoming) {
+        Some(certificate) => {
+            origin.certified_entity == Some(certificate.entity)
+                && origin.certified_roles.as_ref()
+                    == certificate
+                        .roles
+                        .iter()
+                        .copied()
+                        .collect::<Vec<_>>()
+                        .as_slice()
+        }
+        None => origin.certified_entity.is_none() && origin.certified_roles.is_empty(),
+    }
+}
+
+fn validate_phi_edge_origin(
+    graph: &SsaGraph,
+    certificates: &CarrierEdgeCertificates,
+    block: u64,
+    op: &SSAOp,
+    origin: &PhiEdgeOrigin,
+) -> bool {
+    if block != origin.predecessor || !validate_phi_edge_source(graph, certificates, origin) {
+        return false;
+    }
+    let Some(dst) = graph.value(origin.definition.value).map(|value| &value.var) else {
+        return false;
+    };
+    let Some(src) = graph.value(origin.incoming_value).map(|value| &value.var) else {
+        return false;
+    };
+    match (op, origin.guarded) {
+        (
+            SSAOp::Copy {
+                dst: copy_dst,
+                src: copy_src,
+            },
+            None,
+        ) => origin.incoming_input_idx == 0 && copy_dst == dst && copy_src == src,
+        (
+            SSAOp::Select {
+                dst: select_dst,
+                cond,
+                if_true,
+                if_false,
+            },
+            Some(guarded),
+        ) => {
+            let Some(guard_inst) = graph.inst(guarded.guard.inst) else {
+                return false;
+            };
+            let r2ssa::InstPayload::Op(SSAOp::CBranch {
+                cond: original_cond,
+                ..
+            }) = &guard_inst.payload
+            else {
+                return false;
+            };
+            let operands = [cond, if_true, if_false];
+            guarded.guard.input_idx == 1
+                && guard_inst.block
+                    == graph
+                        .block_id_for_addr(origin.predecessor)
+                        .unwrap_or(BlockId(u32::MAX))
+                && guard_inst
+                    .inputs
+                    .get(guarded.guard.input_idx)
+                    .and_then(|value| graph.value(*value))
+                    .map(|value| &value.var)
+                    == Some(original_cond)
+                && cond == original_cond
+                && select_dst == dst
+                && origin.incoming_input_idx < operands.len()
+                && guarded.preserve.input_idx < operands.len()
+                && origin.incoming_input_idx != guarded.preserve.input_idx
+                && origin.incoming_input_idx != 0
+                && guarded.preserve.input_idx != 0
+                && operands[origin.incoming_input_idx] == src
+                && graph.value(guarded.preserve.value).map(|value| &value.var) == Some(dst)
+                && operands[guarded.preserve.input_idx] == dst
+        }
+        _ => false,
+    }
+}
+
+fn validate_relocated_initializer_origin(
+    graph: &SsaGraph,
+    certificates: &CarrierEdgeCertificates,
+    normalized: &SSAFunction,
+    op: &SSAOp,
+    origin: &RelocatedInitializerOrigin,
+) -> bool {
+    let Some(dst) = graph.value(origin.definition.value).map(|value| &value.var) else {
+        return false;
+    };
+    let Some(src) = graph.value(origin.source_value).map(|value| &value.var) else {
+        return false;
+    };
+    if !matches!(op, SSAOp::Copy { dst: copy_dst, src: copy_src }
+        if copy_dst == dst && copy_src == src)
+        || origin.replaced_sites.is_empty()
+        || !origin
+            .replaced_sites
+            .windows(2)
+            .all(|sites| sites[0] < sites[1])
+    {
+        return false;
+    }
+    let Some(certificate) = certificates.relocation(origin.certified_entity) else {
+        return false;
+    };
+    let mut expected_replaced_sites = certificate
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry.value == certificate.source_value
+                && (entry.predecessor == certificate.initializer_predecessor
+                    || normalized.dominates(certificate.initializer_predecessor, entry.predecessor))
+        })
+        .map(|entry| entry.site)
+        .collect::<Vec<_>>();
+    expected_replaced_sites.sort_unstable();
+    expected_replaced_sites.dedup();
+    if certificate.definition != origin.definition
+        || certificate.source_value != origin.source_value
+        || certificate.initializer_site != origin.evidence_site
+        || expected_replaced_sites.as_slice() != origin.replaced_sites.as_ref()
+    {
+        return false;
+    }
+    let evidence_valid = graph
+        .inst(origin.evidence_site.inst)
+        .is_some_and(|inst| inst.output != Some(origin.definition.value))
+        && graph
+            .inst(origin.evidence_site.inst)
+            .and_then(|inst| inst.inputs.get(origin.evidence_site.input_idx))
+            == Some(&origin.source_value)
+        && certificates.get(origin.evidence_site).is_some_and(|edge| {
+            edge.entity == origin.certified_entity
+                && edge
+                    .roles
+                    .contains(&CertifiedPhiEdgeRole::DominatingInitializer)
+        });
+    evidence_valid
+        && origin.replaced_sites.iter().copied().all(|site| {
+            graph
+                .inst(site.inst)
+                .is_some_and(|inst| inst.output == Some(origin.definition.value))
+                && graph
+                    .inst(site.inst)
+                    .and_then(|inst| inst.inputs.get(site.input_idx))
+                    == Some(&origin.source_value)
+                && certificates.get(site).is_some_and(|edge| {
+                    edge.entity == origin.certified_entity
+                        && edge.roles.contains(&CertifiedPhiEdgeRole::Entry)
+                })
+        })
+}
+
+fn validate_removed_phis(
+    graph: &SsaGraph,
+    normalized: &SSAFunction,
+    removed: &[RemovedPhiOrigin],
+) -> bool {
+    if !removed
+        .windows(2)
+        .all(|pair| pair[0].definition.inst < pair[1].definition.inst)
+    {
+        return false;
+    }
+    let mut accounted = vec![false; graph.insts.len()];
+    let phi_inst_by_var = graph
+        .insts
+        .iter()
+        .filter_map(|inst| {
+            if !matches!(inst.payload, r2ssa::InstPayload::Phi { .. }) {
+                return None;
+            }
+            let value = graph.value(inst.output?)?;
+            Some((value.var.clone(), inst.id))
+        })
+        .collect::<HashMap<_, _>>();
+    for removed in removed {
+        let Some(inst) = graph.inst(removed.definition.inst) else {
+            return false;
+        };
+        let expected_noop_sites = inst
+            .inputs
+            .iter()
+            .enumerate()
+            .filter_map(|(input_idx, input)| {
+                (*input == removed.definition.value).then_some(UseSite {
+                    inst: removed.definition.inst,
+                    input_idx,
+                })
+            })
+            .collect::<Vec<_>>();
+        if inst.output != Some(removed.definition.value)
+            || !matches!(inst.payload, r2ssa::InstPayload::Phi { .. })
+            || removed.incoming_sites.len() != inst.inputs.len()
+            || !removed
+                .incoming_sites
+                .iter()
+                .enumerate()
+                .all(|(input_idx, site)| {
+                    *site
+                        == UseSite {
+                            inst: removed.definition.inst,
+                            input_idx,
+                        }
+                })
+            || removed.noop_sites.as_ref() != expected_noop_sites.as_slice()
+            || std::mem::replace(&mut accounted[removed.definition.inst.0 as usize], true)
+        {
+            return false;
+        }
+    }
+    for block in normalized.blocks() {
+        for phi in &block.phis {
+            let Some(inst_id) = phi_inst_by_var.get(&phi.dst).copied() else {
+                return false;
+            };
+            let Some(inst) = graph.inst(inst_id) else {
+                return false;
+            };
+            let Some(value) = inst.output else {
+                return false;
+            };
+            let r2ssa::InstPayload::Phi { predecessors } = &inst.payload else {
+                return false;
+            };
+            if inst.block
+                != graph
+                    .block_id_for_addr(block.addr)
+                    .unwrap_or(BlockId(u32::MAX))
+                || inst.output != Some(value)
+                || inst.inputs.len() != phi.sources.len()
+                || !inst
+                    .inputs
+                    .iter()
+                    .copied()
+                    .zip(predecessors)
+                    .zip(&phi.sources)
+                    .all(|((input, predecessor), (source_addr, source))| {
+                        graph.value(input).map(|value| &value.var) == Some(source)
+                            && graph.block(*predecessor).map(|block| block.addr)
+                                == Some(*source_addr)
+                    })
+                || std::mem::replace(&mut accounted[inst_id.0 as usize], true)
+            {
+                return false;
+            }
+        }
+    }
+    graph.insts.iter().all(|inst| {
+        !matches!(inst.payload, r2ssa::InstPayload::Phi { .. })
+            || accounted.get(inst.id.0 as usize).copied().unwrap_or(false)
+    })
+}
+
+/// Prove the inverse of the normalized phi-edge mapping.
+///
+/// Every input of every removed phi has exactly one disposition: a live edge
+/// operation, membership in one relocated initializer, or an explicit no-op
+/// because the input is already the phi output. The replaced-edge ledger is an
+/// inverse certificate for the relocated memberships, not a fourth disposition.
+fn validate_removed_phi_input_dispositions(
+    origins: &NormalizationOrigins,
+    graph: &SsaGraph,
+    certificates: &CarrierEdgeCertificates,
+) -> bool {
+    let mut disposition_count = graph
+        .insts
+        .iter()
+        .map(|inst| vec![None::<u8>; inst.inputs.len()])
+        .collect::<Vec<_>>();
+    for removed in &origins.removed_phis {
+        for site in removed.incoming_sites.iter().copied() {
+            let Some(slot) = disposition_count
+                .get_mut(site.inst.0 as usize)
+                .and_then(|counts| counts.get_mut(site.input_idx))
+            else {
+                return false;
+            };
+            if slot.replace(0).is_some() {
+                return false;
+            }
+        }
+    }
+
+    let bump = |site: UseSite, counts: &mut [Vec<Option<u8>>]| -> bool {
+        let Some(count) = counts
+            .get_mut(site.inst.0 as usize)
+            .and_then(|counts| counts.get_mut(site.input_idx))
+            .and_then(Option::as_mut)
+        else {
+            return false;
+        };
+        let Some(next) = count.checked_add(1) else {
+            return false;
+        };
+        *count = next;
+        next == 1
+    };
+
+    for removed in &origins.removed_phis {
+        for site in removed.noop_sites.iter().copied() {
+            if !bump(site, &mut disposition_count) {
+                return false;
+            }
+        }
+    }
+
+    let mut relocated_sites = graph
+        .insts
+        .iter()
+        .map(|inst| vec![false; inst.inputs.len()])
+        .collect::<Vec<_>>();
+    let mark = |site: UseSite, sites: &mut [Vec<bool>]| -> bool {
+        let Some(marked) = sites
+            .get_mut(site.inst.0 as usize)
+            .and_then(|sites| sites.get_mut(site.input_idx))
+        else {
+            return false;
+        };
+        !std::mem::replace(marked, true)
+    };
+    for row in origins.blocks.iter().flat_map(|block| block.rows.iter()) {
+        match row {
+            NormalizedOpOrigin::Original(_) => {}
+            NormalizedOpOrigin::PhiEdgeCopy(origin) => {
+                if !bump(origin.incoming, &mut disposition_count) {
+                    return false;
+                }
+            }
+            NormalizedOpOrigin::RelocatedInitializer(origin) => {
+                for site in origin.replaced_sites.iter().copied() {
+                    if !mark(site, &mut relocated_sites) || !bump(site, &mut disposition_count) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
+    if !origins
+        .replaced_phi_edges
+        .windows(2)
+        .all(|pair| pair[0].incoming < pair[1].incoming)
+    {
+        return false;
+    }
+    let mut replaced_sites = graph
+        .insts
+        .iter()
+        .map(|inst| vec![false; inst.inputs.len()])
+        .collect::<Vec<_>>();
+    for origin in &origins.replaced_phi_edges {
+        if !validate_phi_edge_source(graph, certificates, origin)
+            || !mark(origin.incoming, &mut replaced_sites)
+        {
+            return false;
+        }
+    }
+
+    relocated_sites == replaced_sites
+        && disposition_count
+            .iter()
+            .flatten()
+            .all(|count| count.is_none_or(|count| count == 1))
 }
 
 fn is_block_terminator(op: &SSAOp) -> bool {
@@ -38,11 +1251,16 @@ pub(crate) fn materialize_certified_loop_carriers(
     func: &SSAFunction,
     prepared: &r2ssa::SsaArtifact,
     render_facts: &r2types::FunctionRenderFacts,
-) -> SSAFunction {
+) -> Result<(SSAFunction, NormalizationOrigins), NormalizationOriginError> {
     let execution = SsaExecutionControl::default();
     let control = DecompileWorkControl::new(&execution, DecompileWorkPhase::Normalization);
-    materialize_certified_loop_carriers_with_control(func, prepared, render_facts, control)
-        .expect("default decompiler work control cannot stop")
+    match materialize_certified_loop_carriers_with_control(func, prepared, render_facts, control) {
+        Ok(result) => Ok(result),
+        Err(NormalizationFailure::Origins(error)) => Err(error),
+        Err(NormalizationFailure::Execution(error)) => {
+            panic!("default decompiler work control cannot stop: {error}")
+        }
+    }
 }
 
 pub(crate) fn materialize_certified_loop_carriers_with_control(
@@ -50,30 +1268,79 @@ pub(crate) fn materialize_certified_loop_carriers_with_control(
     prepared: &r2ssa::SsaArtifact,
     render_facts: &r2types::FunctionRenderFacts,
     control: DecompileWorkControl<'_>,
-) -> Result<SSAFunction, DecompileExecutionStop> {
-    materialize_phis_where_with_control(func, control, |phi| {
-        prepared
-            .graph()
-            .value_id_for_var(&phi.dst)
-            .is_some_and(|value| render_facts.loop_carrier_for_value(value).is_some())
-    })
+) -> Result<(SSAFunction, NormalizationOrigins), NormalizationFailure> {
+    // A merge whose destination is read has to be placed, whether or not it is
+    // a certified loop carrier. Admitting carriers alone left every other merge
+    // with no definition anywhere in the rendered body, and the fold cannot
+    // spell a value nothing wrote: it drops the term and renders the rest, so
+    // the output compiles and runs and is quietly wrong.
+    //
+    // `DeadPhis` already says which merges nothing observes; those stay merges
+    // and cost nothing.
+    let graph = prepared.graph();
+    let dead = prepared.unobserved_merges();
+    materialize_phis_where_with_control(
+        func,
+        graph,
+        Some(prepared.authority().clone()),
+        Some(render_facts),
+        control,
+        |phi| {
+            let Some(value) = graph.value_id_for_var(&phi.dst) else {
+                return false;
+            };
+            // Carrier identity is evidence about value equivalence, not proof
+            // that the post-loop merge has a surviving read. Deadness owns
+            // materialization admission and therefore has to win first.
+            if dead.contains(value) {
+                return false;
+            }
+            if render_facts.loop_carrier_for_value(value).is_some() {
+                return true;
+            }
+            // Every merge something observes is materialized. The rule used to
+            // exempt a merge at a plain join -- every predecessor leading only
+            // here -- on the ground that the fold could render it as an
+            // expression. It cannot, at least not always: `xxhash32`'s `RCX`
+            // merge sits at such a join, the fold rendered nothing for it, and
+            // its readers silently took the value from before the merge. The
+            // obligation ledger caught it and refused the function, which is
+            // the only reason it was not a wrong answer.
+            //
+            // Deadness still wins first, above, so a merge nothing observes
+            // still costs nothing.
+            true
+        },
+    )
 }
 
 fn materialize_phis_where_with_control(
     func: &SSAFunction,
+    graph: &SsaGraph,
+    authority: Option<SsaArtifactAuthority>,
+    render_facts: Option<&r2types::FunctionRenderFacts>,
     control: DecompileWorkControl<'_>,
     mut eligible: impl FnMut(&r2ssa::PhiNode) -> bool,
-) -> Result<SSAFunction, DecompileExecutionStop> {
+) -> Result<(SSAFunction, NormalizationOrigins), NormalizationFailure> {
     control.poll()?;
     let mut normalized = func.clone();
+    let mut origins = NormalizationOrigins::from_source(func, graph, authority);
+    let certificates = CarrierEdgeCertificates::build(graph, render_facts)
+        .ok_or(NormalizationOriginError::InvalidCarrierCertificates)?;
     let liveness = PhiEdgeLiveness::compute_with_control(func, control)?;
-    let mut copies_by_pred: HashMap<u64, Vec<SSAOp>> = HashMap::new();
-    let mut materialized_by_block = HashMap::<u64, HashSet<r2ssa::SSAVar>>::new();
+    let mut copies_by_pred = BTreeMap::<u64, Vec<PhiMove>>::new();
+    let mut materialized_by_block = BTreeMap::<u64, BTreeSet<r2ssa::SSAVar>>::new();
 
     for block in func.blocks() {
         control.poll()?;
         let mut moves_by_pred = HashMap::<u64, Vec<PhiMove>>::new();
         let mut complete = true;
+        // Keep every eligible SSA definition exact. Two phis can cover
+        // overlapping machine slices while remaining different values with
+        // different per-use projections. Collapsing them here by storage or
+        // width would make normalization a second owner of binding identity.
+        // The sealed BindingPlan and its upstream MachineProjection govern
+        // whether those exact values share one rendered C object.
         let selected = block
             .phis
             .iter()
@@ -82,30 +1349,68 @@ fn materialize_phis_where_with_control(
         if selected.is_empty() {
             continue;
         }
+        // One merge that cannot be placed used to abandon every merge in its
+        // block. They are independent -- each writes its own destination -- so
+        // the failure belongs to the one merge, and taking its block-mates down
+        // with it left them with no definition at all.
+        //
+        // `djb2` at x86-64 -O2 is where this showed: a Unique-space temp merge
+        // in the loop-exit block could not be placed, so the counter merge
+        // beside it was dropped too, and the remainder loop's `arg0 + rdx`
+        // became `arg0` -- re-reading the front of the buffer instead of the
+        // bytes the unrolled loop had not reached. It compiled, ran, and
+        // returned a plausible wrong hash.
+        let mut materialized_dsts = Vec::new();
         for phi in &selected {
             control.poll()?;
-            for (pred, src) in &phi.sources {
+            let mut staged = Vec::new();
+            let mut placed = true;
+            for (input_idx, (pred, src)) in phi.sources.iter().enumerate() {
                 control.poll()?;
                 if src == &phi.dst {
                     continue;
                 }
-                let Some(op) =
-                    materialized_phi_edge_op(func, &liveness, *pred, block.addr, &phi.dst, src)
-                else {
-                    complete = false;
+                let Some((op, guarded, incoming_input_idx)) = materialized_phi_edge_op(
+                    func, graph, &liveness, *pred, block.addr, &phi.dst, src,
+                ) else {
+                    if std::env::var_os("R2SLEIGH_TRACE_MAT").is_some() {
+                        eprintln!(
+                            "MATFAIL block={:#x} pred={pred:#x} dst={} src={}",
+                            block.addr,
+                            phi.dst.display_name(),
+                            src.display_name()
+                        );
+                    }
+                    placed = false;
                     break;
                 };
-                moves_by_pred.entry(*pred).or_default().push(PhiMove {
-                    dst: phi.dst.clone(),
-                    src: src.clone(),
-                    op,
-                });
+                staged.push((
+                    *pred,
+                    PhiMove {
+                        dst: phi.dst.clone(),
+                        src: src.clone(),
+                        op,
+                        origin: exact_phi_edge_origin(
+                            graph,
+                            &certificates,
+                            phi,
+                            input_idx,
+                            incoming_input_idx,
+                            guarded,
+                        )
+                        .ok_or(NormalizationOriginError::RemovedPhiEdge)?,
+                    },
+                ));
             }
-            if !complete {
-                break;
+            if !placed {
+                continue;
             }
+            for (pred, planned) in staged {
+                moves_by_pred.entry(pred).or_default().push(planned);
+            }
+            materialized_dsts.push(phi.dst.clone());
         }
-        if !complete {
+        if materialized_dsts.is_empty() {
             continue;
         }
         let mut scheduled = Vec::new();
@@ -118,15 +1423,42 @@ fn materialize_phis_where_with_control(
             scheduled.push((pred, moves));
         }
         if complete {
-            materialized_by_block.insert(
-                block.addr,
-                selected.iter().map(|phi| phi.dst.clone()).collect(),
-            );
+            materialized_by_block.insert(block.addr, materialized_dsts.into_iter().collect());
+            for phi in selected {
+                if !materialized_by_block[&block.addr].contains(&phi.dst) {
+                    continue;
+                }
+                let definition = original_phi_definition(graph, phi)
+                    .ok_or(NormalizationOriginError::RemovedPhi)?;
+                let incoming_sites = (0..phi.sources.len())
+                    .map(|input_idx| UseSite {
+                        inst: definition.inst,
+                        input_idx,
+                    })
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice();
+                let noop_sites = graph
+                    .inst(definition.inst)
+                    .ok_or(NormalizationOriginError::RemovedPhi)?
+                    .inputs
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(input_idx, input)| {
+                        (*input == definition.value).then_some(UseSite {
+                            inst: definition.inst,
+                            input_idx,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice();
+                origins.removed_phis.push(RemovedPhiOrigin {
+                    definition,
+                    incoming_sites,
+                    noop_sites,
+                });
+            }
             for (pred, moves) in scheduled {
-                copies_by_pred
-                    .entry(pred)
-                    .or_default()
-                    .extend(moves.into_iter().map(|planned| planned.op));
+                copies_by_pred.entry(pred).or_default().extend(moves);
             }
         }
     }
@@ -138,6 +1470,9 @@ fn materialize_phis_where_with_control(
         }
     }
 
+    origins
+        .removed_phis
+        .sort_unstable_by_key(|removed| removed.definition.inst);
     for (pred, copies) in copies_by_pred {
         control.poll()?;
         if copies.is_empty() {
@@ -149,78 +1484,130 @@ fn materialize_phis_where_with_control(
                 .iter()
                 .rposition(is_block_terminator)
                 .unwrap_or(block.ops.len());
-            block.ops.splice(insert_at..insert_at, copies);
+            let block_id = graph
+                .block_id_for_addr(pred)
+                .expect("normalized predecessor belongs to the source graph");
+            let (ops, inserted_origins): (Vec<_>, Vec<_>) = copies
+                .into_iter()
+                .map(|planned| (planned.op, NormalizedOpOrigin::PhiEdgeCopy(planned.origin)))
+                .unzip();
+            block.ops.splice(insert_at..insert_at, ops);
+            origins
+                .rows_mut(block_id)
+                .expect("origin rows exist for every normalized block")
+                .splice(insert_at..insert_at, inserted_origins);
         }
     }
 
     control.poll()?;
-    Ok(normalized)
+    origins.validate_against_graph(&normalized, graph, render_facts)?;
+    Ok((normalized, origins))
 }
 
 #[cfg(test)]
 fn materialize_all_phis(func: &SSAFunction) -> SSAFunction {
+    materialize_all_phis_with_origins(func).0
+}
+
+#[cfg(test)]
+fn materialize_all_phis_with_origins(
+    func: &SSAFunction,
+) -> (SSAFunction, NormalizationOrigins, SsaGraph) {
     let execution = SsaExecutionControl::default();
     let control = DecompileWorkControl::new(&execution, DecompileWorkPhase::Normalization);
-    materialize_phis_where_with_control(func, control, |_| true)
-        .expect("default decompiler work control cannot stop")
+    let graph = SsaGraph::from_function(func);
+    let (normalized, origins) =
+        materialize_phis_where_with_control(func, &graph, None, None, control, |_| true)
+            .expect("default decompiler work control cannot stop");
+    (normalized, origins, graph)
 }
 
 struct PhiMove {
     dst: r2ssa::SSAVar,
     src: r2ssa::SSAVar,
     op: SSAOp,
+    origin: PhiEdgeOrigin,
 }
 
 fn materialized_phi_edge_op(
     func: &SSAFunction,
+    graph: &SsaGraph,
     liveness: &PhiEdgeLiveness,
     pred: u64,
     target: u64,
     dst: &r2ssa::SSAVar,
     src: &r2ssa::SSAVar,
-) -> Option<SSAOp> {
+) -> Option<(SSAOp, Option<GuardedPhiEdgeOrigin>, usize)> {
     let successors = func.successors(pred);
     if successors.as_slice() == [target] {
-        return Some(SSAOp::Copy {
-            dst: dst.clone(),
-            src: src.clone(),
-        });
+        return Some((
+            SSAOp::Copy {
+                dst: dst.clone(),
+                src: src.clone(),
+            },
+            None,
+            0,
+        ));
     }
-    if can_materialize_unconditional_loop_backedge(func, liveness, pred, target, dst) {
-        return Some(SSAOp::Copy {
-            dst: dst.clone(),
-            src: src.clone(),
-        });
+    if can_materialize_on_branch_edge(func, liveness, pred, target, dst) {
+        return Some((
+            SSAOp::Copy {
+                dst: dst.clone(),
+                src: src.clone(),
+            },
+            None,
+            0,
+        ));
     }
-    guarded_loop_backedge_phi_op(func, pred, target, dst, src)
+    guarded_loop_backedge_phi_op(func, graph, pred, target, dst, src)
 }
 
 fn guarded_loop_backedge_phi_op(
     func: &SSAFunction,
+    graph: &SsaGraph,
     pred: u64,
     target: u64,
     dst: &r2ssa::SSAVar,
     src: &r2ssa::SSAVar,
-) -> Option<SSAOp> {
+) -> Option<(SSAOp, Option<GuardedPhiEdgeOrigin>, usize)> {
     let successors = func.successors(pred);
     if successors.len() != 2 || !successors.contains(&target) || !func.dominates(target, pred) {
         return None;
     }
-    let cond = match func.get_block(pred)?.ops.last()? {
+    let source_block = func.get_block(pred)?;
+    let terminator_idx = source_block.ops.len().checked_sub(1)?;
+    let cond = match source_block.ops.get(terminator_idx)? {
         SSAOp::CBranch { cond, .. } if cond != dst => cond.clone(),
         _ => return None,
     };
-    let (if_true, if_false) = match func.edge_type(pred, target)? {
-        r2ssa::CFGEdge::True => (src.clone(), dst.clone()),
-        r2ssa::CFGEdge::False => (dst.clone(), src.clone()),
-        r2ssa::CFGEdge::Normal | r2ssa::CFGEdge::Back => return None,
+    let guard_inst = graph.inst_id_for_op_site(pred, terminator_idx)?;
+    let guard = UseSite {
+        inst: guard_inst,
+        input_idx: 1,
     };
-    Some(SSAOp::Select {
-        dst: dst.clone(),
-        cond,
-        if_true,
-        if_false,
-    })
+    let preserve_value = graph.value_id_for_var(dst)?;
+    let (if_true, if_false, incoming_input_idx, preserve_input_idx) =
+        match func.edge_type(pred, target)? {
+            r2ssa::CFGEdge::True => (src.clone(), dst.clone(), 1, 2),
+            r2ssa::CFGEdge::False => (dst.clone(), src.clone(), 2, 1),
+            r2ssa::CFGEdge::Normal | r2ssa::CFGEdge::Back => return None,
+        };
+    Some((
+        SSAOp::Select {
+            dst: dst.clone(),
+            cond,
+            if_true,
+            if_false,
+        },
+        Some(GuardedPhiEdgeOrigin {
+            guard,
+            preserve: SyntheticPreserveOperand {
+                input_idx: preserve_input_idx,
+                value: preserve_value,
+            },
+        }),
+        incoming_input_idx,
+    ))
 }
 
 /// Order out-of-SSA moves without changing the simultaneous semantics of a
@@ -376,7 +1763,19 @@ fn edge_live_in(
     live
 }
 
-fn can_materialize_unconditional_loop_backedge(
+/// Whether a merge's copy can sit at the end of a two-way predecessor.
+///
+/// The copy runs on every edge out of the block, not only the one the merge
+/// came in on, so it is sound exactly when nothing on the other edges can tell:
+/// the terminator must not read the destination, and the destination must not
+/// be live along any other successor.
+///
+/// This once also required the target to dominate the predecessor, which
+/// confined it to loop backedges. Soundness never depended on that, and the
+/// restriction refused every merge on a loop *exit* edge -- leaving those
+/// destinations with no definition at all, which is how `djb2` at x86-64 -O2
+/// lost the counter its remainder loop starts from.
+fn can_materialize_on_branch_edge(
     func: &SSAFunction,
     liveness: &PhiEdgeLiveness,
     pred: u64,
@@ -386,7 +1785,6 @@ fn can_materialize_unconditional_loop_backedge(
     let successors = func.successors(pred);
     successors.len() > 1
         && successors.contains(&target)
-        && func.dominates(target, pred)
         && !func
             .get_block(pred)
             .and_then(|block| block.ops.last())
@@ -395,6 +1793,31 @@ fn can_materialize_unconditional_loop_backedge(
             .into_iter()
             .filter(|successor| *successor != target)
             .all(|successor| !liveness.live_on_edge(pred, successor).contains(dst))
+}
+
+fn remove_phi_edge_operation(
+    ops: &mut Vec<SSAOp>,
+    rows: &mut Vec<NormalizedOpOrigin>,
+    definition: OriginalPhiDefinition,
+    entity: r2ssa::SemanticId,
+    site: UseSite,
+) -> Option<PhiEdgeOrigin> {
+    if ops.len() != rows.len() {
+        return None;
+    }
+    let row_idx = rows.iter().position(|origin| {
+        matches!(origin, NormalizedOpOrigin::PhiEdgeCopy(edge)
+            if edge.incoming == site
+                && edge.definition == definition
+                && edge.certified_entity == Some(entity))
+    })?;
+    ops.remove(row_idx);
+    match rows.remove(row_idx) {
+        NormalizedOpOrigin::PhiEdgeCopy(origin) => Some(origin),
+        NormalizedOpOrigin::Original(_) | NormalizedOpOrigin::RelocatedInitializer(_) => {
+            unreachable!("selected row was sealed as a phi-edge operation")
+        }
+    }
 }
 
 /// Coalesce certified loop carriers across zero-iteration exits.
@@ -407,30 +1830,42 @@ fn can_materialize_unconditional_loop_backedge(
 #[allow(dead_code)]
 pub(crate) fn materialize_certified_loop_carrier_initializers(
     func: &mut SSAFunction,
+    origins: &mut NormalizationOrigins,
     prepared: &r2ssa::SsaArtifact,
     render_facts: &r2types::FunctionRenderFacts,
-) {
+) -> Result<(), NormalizationOriginError> {
     let execution = SsaExecutionControl::default();
     let control = DecompileWorkControl::new(&execution, DecompileWorkPhase::Normalization);
-    materialize_certified_loop_carrier_initializers_with_control(
+    match materialize_certified_loop_carrier_initializers_with_control(
         func,
+        origins,
         prepared,
         render_facts,
         control,
-    )
-    .expect("default decompiler work control cannot stop");
+    ) {
+        Ok(()) => Ok(()),
+        Err(NormalizationFailure::Origins(error)) => Err(error),
+        Err(NormalizationFailure::Execution(error)) => {
+            panic!("default decompiler work control cannot stop: {error}")
+        }
+    }
 }
 
 pub(crate) fn materialize_certified_loop_carrier_initializers_with_control(
     func: &mut SSAFunction,
+    origins: &mut NormalizationOrigins,
     prepared: &r2ssa::SsaArtifact,
     render_facts: &r2types::FunctionRenderFacts,
     control: DecompileWorkControl<'_>,
-) -> Result<(), DecompileExecutionStop> {
+) -> Result<(), NormalizationFailure> {
     control.poll()?;
+    CarrierEdgeCertificates::build(prepared.graph(), Some(render_facts))
+        .ok_or(NormalizationOriginError::InvalidCarrierCertificates)?;
+    origins.validate(func, prepared, Some(render_facts))?;
     for entity in render_facts.loop_carriers() {
         control.poll()?;
         let r2types::CertifiedEntity::LoopCarrier {
+            id,
             phi,
             identity_values,
             entries,
@@ -449,77 +1884,222 @@ pub(crate) fn materialize_certified_loop_carrier_initializers_with_control(
         if !entries.iter().any(|entry| entry.value == initializer.value) {
             continue;
         }
-        let Some(dst) = prepared.value_var(*phi).cloned() else {
-            continue;
-        };
-        let Some(src) = prepared.value_var(initializer.value).cloned() else {
-            continue;
-        };
+        let dst = prepared
+            .value_var(*phi)
+            .cloned()
+            .ok_or(NormalizationOriginError::InvalidCarrierCertificates)?;
+        let src = prepared
+            .value_var(initializer.value)
+            .cloned()
+            .ok_or(NormalizationOriginError::InvalidCarrierCertificates)?;
         if dst.size != src.size {
+            return Err(NormalizationOriginError::InvalidCarrierCertificates.into());
+        }
+
+        let mut relocated_entry_sites = entries
+            .iter()
+            .filter(|entry| {
+                entry.value == initializer.value
+                    && (entry.predecessor == initializer.predecessor
+                        || prepared
+                            .function()
+                            .dominates(initializer.predecessor, entry.predecessor))
+            })
+            .map(|entry| entry.site)
+            .collect::<Vec<_>>();
+        relocated_entry_sites.sort_unstable();
+        relocated_entry_sites.dedup();
+        if relocated_entry_sites.is_empty() {
+            continue;
+        }
+        let definition = OriginalPhiDefinition {
+            inst: prepared
+                .graph()
+                .def_inst(*phi)
+                .ok_or(NormalizationOriginError::InvalidCarrierCertificates)?,
+            value: *phi,
+        };
+        let mut initializer_entry_site = None;
+        let mut fully_located = true;
+        let mut located = Vec::new();
+        for site in &relocated_entry_sites {
+            control.poll()?;
+            let predecessor = prepared
+                .graph()
+                .inst(site.inst)
+                .and_then(|inst| match &inst.payload {
+                    r2ssa::InstPayload::Phi { predecessors } => {
+                        predecessors.get(site.input_idx).copied()
+                    }
+                    r2ssa::InstPayload::Op(_) => None,
+                })
+                .and_then(|block| prepared.graph().block(block))
+                .map(|block| block.addr)
+                .ok_or(NormalizationOriginError::InvalidCarrierCertificates)?;
+            let block_id = prepared
+                .graph()
+                .block_id_for_addr(predecessor)
+                .ok_or(NormalizationOriginError::InvalidCarrierCertificates)?;
+            let Some(_row_idx) = origins.rows(block_id).and_then(|rows| {
+                rows.iter().position(|origin| {
+                    matches!(origin, NormalizedOpOrigin::PhiEdgeCopy(edge)
+                        if edge.incoming == *site
+                            && edge.definition == definition
+                            && edge.certified_entity == Some(*id))
+                })
+            }) else {
+                fully_located = false;
+                break;
+            };
+            if predecessor == initializer.predecessor {
+                initializer_entry_site = Some(*site);
+            }
+            located.push((block_id, predecessor, *site));
+        }
+        if !fully_located {
             continue;
         }
 
-        for entry in entries {
-            control.poll()?;
-            if entry.value != initializer.value
-                || entry.predecessor == initializer.predecessor
-                || !prepared
-                    .function()
-                    .dominates(initializer.predecessor, entry.predecessor)
-            {
+        // Remove by sealed origin rather than operation shape. An unrelated
+        // byte-identical copy is a different normalized operation and remains.
+        located.sort_unstable_by_key(|(block, _, site)| (*block, *site));
+        for (block_id, predecessor, site) in &located {
+            if Some(*site) == initializer_entry_site {
                 continue;
             }
-            if let Some(block) = func.get_block_mut(entry.predecessor) {
-                block.ops.retain(|op| {
-                    !matches!(op, SSAOp::Copy { dst: copy_dst, src: copy_src }
-                        if copy_dst == &dst && copy_src == &src)
-                });
-            }
+            let removed_edge = remove_phi_edge_operation(
+                &mut func
+                    .get_block_mut(*predecessor)
+                    .ok_or(NormalizationOriginError::BlockTopology)?
+                    .ops,
+                origins
+                    .rows_mut(*block_id)
+                    .ok_or(NormalizationOriginError::BlockTopology)?,
+                definition,
+                *id,
+                *site,
+            )
+            .ok_or(NormalizationOriginError::RemovedPhiEdge)?;
+            origins.replaced_phi_edges.push(removed_edge);
         }
 
-        let Some(block) = func.get_block_mut(initializer.predecessor) else {
-            continue;
-        };
-        if block.ops.iter().any(|op| {
-            matches!(op, SSAOp::Copy { dst: copy_dst, src: copy_src }
-                if copy_dst == &dst && copy_src == &src)
-        }) {
-            continue;
+        let relocated = NormalizedOpOrigin::RelocatedInitializer(RelocatedInitializerOrigin {
+            definition,
+            source_value: initializer.value,
+            certified_entity: *id,
+            evidence_site: initializer.site,
+            replaced_sites: relocated_entry_sites.into_boxed_slice(),
+        });
+        let initializer_block_id = prepared
+            .graph()
+            .block_id_for_addr(initializer.predecessor)
+            .ok_or(NormalizationOriginError::InvalidCarrierCertificates)?;
+        let initializer_row = initializer_entry_site
+            .map(|initializer_entry_site| {
+                origins
+                    .rows(initializer_block_id)
+                    .and_then(|rows| {
+                        rows.iter().position(|origin| {
+                            matches!(origin, NormalizedOpOrigin::PhiEdgeCopy(edge)
+                            if edge.incoming == initializer_entry_site
+                                && edge.definition == definition)
+                        })
+                    })
+                    .ok_or(NormalizationOriginError::RemovedPhiEdge)
+            })
+            .transpose()?;
+        if let Some(row_idx) = initializer_row {
+            let replaced = std::mem::replace(
+                &mut origins
+                    .rows_mut(initializer_block_id)
+                    .ok_or(NormalizationOriginError::BlockTopology)?[row_idx],
+                relocated,
+            );
+            let NormalizedOpOrigin::PhiEdgeCopy(replaced) = replaced else {
+                unreachable!("initializer row was sealed as a phi-edge operation")
+            };
+            origins.replaced_phi_edges.push(replaced);
+        } else {
+            let block = func
+                .get_block_mut(initializer.predecessor)
+                .ok_or(NormalizationOriginError::BlockTopology)?;
+            let insert_at = block
+                .ops
+                .iter()
+                .rposition(is_block_terminator)
+                .unwrap_or(block.ops.len());
+            block.ops.insert(insert_at, SSAOp::Copy { dst, src });
+            origins
+                .rows_mut(initializer_block_id)
+                .ok_or(NormalizationOriginError::BlockTopology)?
+                .insert(insert_at, relocated);
         }
-        let insert_at = block
-            .ops
-            .iter()
-            .rposition(is_block_terminator)
-            .unwrap_or(block.ops.len());
-        block.ops.insert(insert_at, SSAOp::Copy { dst, src });
     }
+    origins
+        .replaced_phi_edges
+        .sort_unstable_by_key(|edge| edge.incoming);
     control.poll()?;
+    origins.validate(func, prepared, Some(render_facts))?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
-    use crate::ast::{BinaryOp, UnaryOp};
-    use crate::fold::FoldingContext;
     use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, Varnode};
     use r2ssa::{PhiNode, SSAFunction, SSAVar};
 
     #[test]
-    fn normalization_is_idempotent_for_predicates() {
-        let ctx = FoldingContext::new(64);
-        let expr = CExpr::unary(
-            UnaryOp::Not,
-            CExpr::binary(
-                BinaryOp::Eq,
-                CExpr::binary(BinaryOp::Sub, CExpr::Var("x".to_string()), CExpr::IntLit(0)),
-                CExpr::IntLit(0),
-            ),
-        );
+    fn initializer_removal_uses_exact_origin_not_duplicate_copy_shape() {
+        let dst = SSAVar::new("RAX", 2, 8);
+        let src = SSAVar::new("RAX", 1, 8);
+        let op = SSAOp::Copy {
+            dst: dst.clone(),
+            src: src.clone(),
+        };
+        let definition = OriginalPhiDefinition {
+            inst: InstId(10),
+            value: ValueId(2),
+        };
+        let entity = r2ssa::SemanticId::loop_carrier(ValueId(2));
+        let edge = |input_idx| {
+            NormalizedOpOrigin::PhiEdgeCopy(PhiEdgeOrigin {
+                definition,
+                incoming: UseSite {
+                    inst: definition.inst,
+                    input_idx,
+                },
+                incoming_value: ValueId(1),
+                predecessor: 0x1000 + input_idx as u64 * 4,
+                target: 0x1010,
+                incoming_input_idx: 0,
+                certified_entity: Some(entity),
+                certified_roles: vec![CertifiedPhiEdgeRole::Entry].into_boxed_slice(),
+                guarded: None,
+            })
+        };
+        let mut ops = vec![op.clone(), op];
+        let mut rows = vec![edge(0), edge(1)];
 
-        let once = normalize_expr(&ctx, expr.clone(), NormalizeMode::Predicate);
-        let twice = normalize_expr(&ctx, once.clone(), NormalizeMode::Predicate);
-        assert_eq!(once, twice, "Predicate normalization must be idempotent");
+        let removed = remove_phi_edge_operation(
+            &mut ops,
+            &mut rows,
+            definition,
+            entity,
+            UseSite {
+                inst: definition.inst,
+                input_idx: 0,
+            },
+        )
+        .expect("certified occurrence");
+
+        assert_eq!(removed.incoming.input_idx, 0);
+        assert_eq!(ops.len(), 1, "one byte-identical copy must remain");
+        assert!(matches!(
+            rows.as_slice(),
+            [NormalizedOpOrigin::PhiEdgeCopy(origin)] if origin.incoming.input_idx == 1
+        ));
     }
 
     #[test]
@@ -561,12 +2141,225 @@ mod tests {
         let with_phis = func.blocks().any(|b| !b.phis.is_empty());
         assert!(with_phis, "fixture should include phi nodes");
 
-        let normalized = materialize_all_phis(&func);
+        let (normalized, origins, graph) = materialize_all_phis_with_origins(&func);
+        origins
+            .validate_against_graph(&normalized, &graph, None)
+            .expect("materialized joins have exact dense origins");
+        let materialized_sites = origins
+            .blocks
+            .iter()
+            .enumerate()
+            .flat_map(|(block_idx, block)| {
+                block
+                    .rows
+                    .iter()
+                    .enumerate()
+                    .filter_map(move |(op_idx, origin)| {
+                        matches!(origin, NormalizedOpOrigin::PhiEdgeCopy(_)).then_some((
+                            BlockId(block_idx as u32),
+                            block.address,
+                            op_idx,
+                        ))
+                    })
+            })
+            .collect::<Vec<_>>();
+        let &(block_id, block_addr, op_idx) = materialized_sites
+            .first()
+            .expect("fixture materializes phi inputs");
+
+        let mut duplicate_function = normalized.clone();
+        let duplicate_op = duplicate_function
+            .get_block(block_addr)
+            .expect("materialized predecessor")
+            .ops[op_idx]
+            .clone();
+        duplicate_function
+            .get_block_mut(block_addr)
+            .expect("materialized predecessor")
+            .ops
+            .insert(op_idx, duplicate_op.clone());
+        let mut duplicate_origins = origins.clone();
+        let duplicate_origin = duplicate_origins
+            .rows(block_id)
+            .expect("materialized predecessor origins")[op_idx]
+            .clone();
+        duplicate_origins
+            .rows_mut(block_id)
+            .expect("materialized predecessor origins")
+            .insert(op_idx, duplicate_origin.clone());
+        assert_eq!(
+            duplicate_origins.validate_against_graph(&duplicate_function, &graph, None),
+            Err(NormalizationOriginError::RemovedPhiEdge),
+            "two individually valid rows cannot claim one original input"
+        );
+
+        let mut omitted_function = normalized.clone();
+        omitted_function
+            .get_block_mut(block_addr)
+            .expect("materialized predecessor")
+            .ops
+            .remove(op_idx);
+        let mut omitted_origins = origins.clone();
+        omitted_origins
+            .rows_mut(block_id)
+            .expect("materialized predecessor origins")
+            .remove(op_idx);
+        assert_eq!(
+            omitted_origins.validate_against_graph(&omitted_function, &graph, None),
+            Err(NormalizationOriginError::RemovedPhiEdge),
+            "every removed phi input needs one explicit disposition"
+        );
+
+        let &(omitted_block_id, omitted_block_addr, omitted_op_idx) = materialized_sites
+            .get(1)
+            .expect("join fixture has a second incoming edge");
+        assert_ne!(block_id, omitted_block_id);
+        let mut duplicate_and_omitted_function = normalized.clone();
+        duplicate_and_omitted_function
+            .get_block_mut(block_addr)
+            .expect("duplicated predecessor")
+            .ops
+            .insert(op_idx, duplicate_op);
+        duplicate_and_omitted_function
+            .get_block_mut(omitted_block_addr)
+            .expect("omitted predecessor")
+            .ops
+            .remove(omitted_op_idx);
+        let mut duplicate_and_omitted_origins = origins.clone();
+        duplicate_and_omitted_origins
+            .rows_mut(block_id)
+            .expect("duplicated predecessor origins")
+            .insert(op_idx, duplicate_origin);
+        duplicate_and_omitted_origins
+            .rows_mut(omitted_block_id)
+            .expect("omitted predecessor origins")
+            .remove(omitted_op_idx);
+        assert_eq!(
+            duplicate_and_omitted_origins.validate_against_graph(
+                &duplicate_and_omitted_function,
+                &graph,
+                None,
+            ),
+            Err(NormalizationOriginError::RemovedPhiEdge),
+            "equal row counts cannot hide one duplicated and one omitted input"
+        );
         let any_phi = normalized.blocks().any(|b| !b.phis.is_empty());
         assert!(
             !any_phi,
             "phis should be removed when all edges materialize"
         );
+    }
+
+    #[test]
+    fn overlapping_register_alias_phis_keep_exact_ssa_identities() {
+        let wide_storage = r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset: 0,
+            size: 8,
+        };
+        let narrow_storage = r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset: 0,
+            size: 4,
+        };
+        let mut arch = ArchSpec::new("overlapping-alias-phi-test");
+        arch.addr_size = 8;
+        arch.add_register(RegisterDef::new("RAX", 0, 8));
+        arch.add_register(RegisterDef::new("EAX", 0, 4));
+
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::register(0, 8),
+            src: Varnode::constant(1, 8),
+        });
+        entry.push(R2ILOp::Copy {
+            dst: Varnode::register(0, 4),
+            src: Varnode::constant(2, 4),
+        });
+        entry.push(R2ILOp::Branch {
+            target: Varnode::constant(0x1004, 8),
+        });
+        let mut header = R2ILBlock::new(0x1004, 4);
+        header.push(R2ILOp::CBranch {
+            target: Varnode::constant(0x100c, 8),
+            cond: Varnode::constant(1, 1),
+        });
+        let mut latch = R2ILBlock::new(0x1008, 4);
+        latch.push(R2ILOp::IntAdd {
+            dst: Varnode::register(0, 8),
+            a: Varnode::register(0, 8),
+            b: Varnode::constant(1, 8),
+        });
+        latch.push(R2ILOp::IntAdd {
+            dst: Varnode::register(0, 4),
+            a: Varnode::register(0, 4),
+            b: Varnode::constant(1, 4),
+        });
+        latch.push(R2ILOp::Branch {
+            target: Varnode::constant(0x1004, 8),
+        });
+        let mut exit = R2ILBlock::new(0x100c, 4);
+        exit.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        let func = SSAFunction::from_blocks_raw(&[entry, header, latch, exit], Some(&arch))
+            .expect("source-derived overlapping alias SSA");
+        let header = func.get_block(0x1004).expect("header");
+        let wide_phi = header
+            .phis
+            .iter()
+            .find(|phi| phi.canonical_storage == Some(wide_storage))
+            .expect("wide source-derived phi")
+            .dst
+            .clone();
+        let narrow_phi = header
+            .phis
+            .iter()
+            .find(|phi| phi.canonical_storage == Some(narrow_storage))
+            .expect("narrow source-derived phi")
+            .dst
+            .clone();
+
+        let (normalized, origins, graph) = materialize_all_phis_with_origins(&func);
+        origins
+            .validate_against_graph(&normalized, &graph, None)
+            .expect("each overlapping alias phi keeps an exact origin ledger");
+        assert!(
+            normalized
+                .get_block(0x1004)
+                .is_some_and(|header| header.phis.is_empty()),
+            "renderer normalization must not discard the narrow phi in favor of the widest alias"
+        );
+
+        let wide_value = graph
+            .value_id_for_var(&wide_phi)
+            .expect("wide phi has an exact ValueId");
+        let narrow_value = graph
+            .value_id_for_var(&narrow_phi)
+            .expect("narrow phi has an exact ValueId");
+        assert_ne!(wide_value, narrow_value);
+        let removed = origins
+            .removed_phis()
+            .iter()
+            .map(|origin| origin.definition.value)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            removed,
+            BTreeSet::from([wide_value, narrow_value]),
+            "normalization records both SSA definitions instead of choosing a carrier by width"
+        );
+
+        for phi in [&wide_phi, &narrow_phi] {
+            let copies = normalized
+                .blocks()
+                .flat_map(|block| block.ops.iter())
+                .filter(|op| matches!(op, SSAOp::Copy { dst, .. } if dst == phi))
+                .count();
+            assert_eq!(
+                copies, 2,
+                "each exact phi gets one entry-edge and one backedge assignment"
+            );
+        }
     }
 
     #[test]
@@ -611,7 +2404,7 @@ mod tests {
             },
         ];
         func.get_block_mut(0x100c).expect("exit").ops = vec![SSAOp::Return {
-            target: SSAVar::new("RIP", 1, 8),
+            target: SSAVar::new("const:0", 0, 8),
         }];
 
         let normalized = materialize_all_phis(&func);
@@ -628,6 +2421,57 @@ mod tests {
                 SSAOp::Copy { dst, src } if dst == &hash_2 && src == &hash_4
             )),
             "a value dead on every exit edge may be updated before the branch"
+        );
+    }
+
+    #[test]
+    fn self_phi_input_is_projected_as_an_explicit_noop_use() {
+        let entry_value = SSAVar::new("RAX", 1, 8);
+        let phi_value = SSAVar::new("RAX", 2, 8);
+        let mut func = loop_backedge_phi_fixture();
+        func.get_block_mut(0x1000).expect("entry").ops = vec![
+            SSAOp::Copy {
+                dst: entry_value.clone(),
+                src: SSAVar::new("const:1", 0, 8),
+            },
+            SSAOp::Branch {
+                target: SSAVar::new("ram:1004", 0, 8),
+            },
+        ];
+        func.get_block_mut(0x1004).expect("header").phis = vec![PhiNode {
+            dst: phi_value.clone(),
+            sources: vec![(0x1000, entry_value), (0x1008, phi_value.clone())],
+            canonical_storage: None,
+        }];
+        func.get_block_mut(0x1004).expect("header").ops = vec![SSAOp::Branch {
+            target: SSAVar::new("ram:1008", 0, 8),
+        }];
+        func.get_block_mut(0x1008).expect("latch").ops = vec![SSAOp::CBranch {
+            target: SSAVar::new("ram:1004", 0, 8),
+            cond: SSAVar::new("const:1", 0, 1),
+        }];
+
+        let (normalized, origins, graph) = materialize_all_phis_with_origins(&func);
+        origins
+            .validate_against_graph(&normalized, &graph, None)
+            .expect("self input has one explicit noop disposition");
+        let phi_inst = graph
+            .insts
+            .iter()
+            .find(|inst| {
+                inst.output.is_some_and(|output| {
+                    graph
+                        .value(output)
+                        .is_some_and(|value| value.var == phi_value)
+                })
+            })
+            .expect("phi instruction");
+        assert_eq!(
+            origins.noop_sites().collect::<Vec<_>>(),
+            vec![UseSite {
+                inst: phi_inst.id,
+                input_idx: 1,
+            }]
         );
     }
 
@@ -678,11 +2522,14 @@ mod tests {
                 src: hash_2.clone(),
             },
             SSAOp::Return {
-                target: SSAVar::new("RIP", 1, 8),
+                target: SSAVar::new("const:0", 0, 8),
             },
         ];
 
-        let normalized = materialize_all_phis(&func);
+        let (normalized, origins, graph) = materialize_all_phis_with_origins(&func);
+        origins
+            .validate_against_graph(&normalized, &graph, None)
+            .expect("guarded normalization has exact dense origins");
         assert!(
             normalized
                 .get_block(0x1004)
@@ -690,6 +2537,70 @@ mod tests {
             "an exact guarded backedge move should eliminate the loop-header phi"
         );
         let latch = normalized.get_block(0x1008).expect("latch");
+        let latch_id = graph.block_id_for_addr(0x1008).expect("latch graph id");
+        let select_idx = latch
+            .ops
+            .iter()
+            .position(|op| matches!(op, SSAOp::Select { dst, .. } if dst == &hash_2))
+            .expect("guarded edge select");
+        let NormalizedOpOrigin::PhiEdgeCopy(edge) = origins
+            .origin(NormalizedOpSite {
+                block: latch_id,
+                op_idx: select_idx,
+            })
+            .expect("dense select origin")
+        else {
+            panic!("guarded select must stay typed synthetic")
+        };
+        assert!(origins.is_phi_edge_copy(NormalizedOpSite {
+            block: latch_id,
+            op_idx: select_idx,
+        }));
+        assert_eq!(
+            edge.incoming.input_idx, 1,
+            "backedge is the second phi input"
+        );
+        assert_eq!(edge.incoming_input_idx, 1, "true arm carries the update");
+        let guarded = edge.guarded.expect("guard use and preserve operand");
+        assert_eq!(guarded.guard.input_idx, 1, "CBranch condition use");
+        assert_eq!(guarded.preserve.input_idx, 2, "false arm preserves carrier");
+        let original_terminator = graph
+            .inst_id_for_op_site(0x1008, 2)
+            .expect("source branch InstId");
+        assert!(matches!(
+            origins.origin(NormalizedOpSite {
+                block: latch_id,
+                op_idx: latch.ops.len() - 1,
+            }),
+            Some(NormalizedOpOrigin::Original(inst)) if *inst == original_terminator
+        ));
+        assert!(
+            !origins.is_phi_edge_copy(NormalizedOpSite {
+                block: latch_id,
+                op_idx: latch.ops.len() - 1,
+            }),
+            "an original operation must never be reclassified from its shape"
+        );
+        let mut forged = origins.clone();
+        forged.rows_mut(latch_id).expect("latch origin rows").pop();
+        assert_eq!(
+            forged.validate_against_graph(&normalized, &graph, None),
+            Err(NormalizationOriginError::RowCount { block: 0x1008 })
+        );
+        let mut forged_site = origins.clone();
+        let NormalizedOpOrigin::PhiEdgeCopy(forged_edge) =
+            &mut forged_site.rows_mut(latch_id).expect("latch origin rows")[select_idx]
+        else {
+            panic!("select origin")
+        };
+        forged_edge.incoming.input_idx = 0;
+        assert_eq!(
+            forged_site.validate_against_graph(&normalized, &graph, None),
+            Err(NormalizationOriginError::PhiEdge {
+                block: 0x1008,
+                op_idx: select_idx,
+            })
+        );
         assert!(
             latch.ops.iter().any(|op| matches!(
                 op,
@@ -705,6 +2616,13 @@ mod tests {
             )),
             "the backedge update must execute only when its branch edge is taken"
         );
+
+        let (normalized_again, origins_again, graph_again) =
+            materialize_all_phis_with_origins(&func);
+        assert_eq!(origins, origins_again, "origin allocation is deterministic");
+        origins_again
+            .validate_against_graph(&normalized_again, &graph_again, None)
+            .expect("repeated normalization validates identically");
     }
 
     #[test]
@@ -713,9 +2631,15 @@ mod tests {
         let value_2 = SSAVar::new("RAX", 2, 8);
         let value_4 = SSAVar::new("RAX", 4, 8);
         let mut func = loop_backedge_phi_fixture();
-        func.get_block_mut(0x1000).expect("entry").ops = vec![SSAOp::Branch {
-            target: SSAVar::new("ram:1004", 0, 8),
-        }];
+        func.get_block_mut(0x1000).expect("entry").ops = vec![
+            SSAOp::Copy {
+                dst: value_1.clone(),
+                src: SSAVar::new("const:1", 0, 8),
+            },
+            SSAOp::Branch {
+                target: SSAVar::new("ram:1004", 0, 8),
+            },
+        ];
         func.get_block_mut(0x1004).expect("header").phis = vec![PhiNode {
             dst: value_2.clone(),
             sources: vec![(0x1000, value_1), (0x1008, value_4.clone())],
@@ -759,6 +2683,19 @@ mod tests {
         let a = SSAVar::new("RAX", 2, 8);
         let b = SSAVar::new("RBX", 2, 8);
         let mut func = loop_backedge_phi_fixture();
+        func.get_block_mut(0x1000).expect("entry").ops = vec![
+            SSAOp::Copy {
+                dst: SSAVar::new("RAX", 1, 8),
+                src: SSAVar::new("const:1", 0, 8),
+            },
+            SSAOp::Copy {
+                dst: SSAVar::new("RBX", 1, 8),
+                src: SSAVar::new("const:2", 0, 8),
+            },
+            SSAOp::Branch {
+                target: SSAVar::new("ram:1004", 0, 8),
+            },
+        ];
         func.get_block_mut(0x1004).expect("header").phis = vec![
             PhiNode {
                 dst: a.clone(),
@@ -869,15 +2806,132 @@ mod tests {
         )
         .expect("source-owned loop analysis");
         let render_facts = analysis.function_facts().render_facts();
-        let mut normalized = materialize_certified_loop_carriers(
+        let mut invalid_render_facts = render_facts.clone();
+        let r2types::CertifiedEntity::LoopCarrier { entries, .. } = invalid_render_facts
+            .certified_entities
+            .get_mut(&carrier.id)
+            .expect("render facts retain the upstream carrier")
+        else {
+            panic!("carrier identity must resolve to a loop carrier")
+        };
+        entries
+            .first_mut()
+            .expect("certified carrier has an entry")
+            .site
+            .input_idx = usize::MAX;
+        assert!(matches!(
+            materialize_certified_loop_carriers(
+                prepared.function(),
+                prepared.as_ref(),
+                &invalid_render_facts,
+            ),
+            Err(NormalizationOriginError::InvalidCarrierCertificates)
+        ));
+
+        let (mut normalized, mut origins) = materialize_certified_loop_carriers(
             prepared.function(),
             prepared.as_ref(),
             render_facts,
-        );
+        )
+        .expect("certified carrier geometry has valid exact origins");
         materialize_certified_loop_carrier_initializers(
             &mut normalized,
+            &mut origins,
             prepared.as_ref(),
             render_facts,
+        )
+        .expect("certified initializer has valid exact origins");
+        origins
+            .validate(&normalized, prepared.as_ref(), Some(render_facts))
+            .expect("normalization origins remain sealed after relocation");
+        let (relocated_site, relocated) = origins
+            .blocks
+            .iter()
+            .enumerate()
+            .flat_map(|(block_idx, block)| {
+                block.rows.iter().enumerate().map(move |(op_idx, origin)| {
+                    (
+                        NormalizedOpSite {
+                            block: BlockId(block_idx as u32),
+                            op_idx,
+                        },
+                        origin,
+                    )
+                })
+            })
+            .find_map(|(site, origin)| match origin {
+                NormalizedOpOrigin::RelocatedInitializer(origin)
+                    if origin.definition.value == carrier.phi =>
+                {
+                    Some((site, origin))
+                }
+                _ => None,
+            })
+            .expect("certified initializer has a typed relocated origin");
+        let replaced_sites = origins
+            .replaced_phi_edges()
+            .iter()
+            .filter(|edge| edge.definition.value == carrier.phi)
+            .map(|edge| edge.incoming)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            relocated.evidence_site,
+            carrier.dominating_initializers[0].site
+        );
+        assert_eq!(relocated.replaced_sites.as_ref(), replaced_sites.as_slice());
+        assert!(
+            relocated
+                .replaced_sites
+                .windows(2)
+                .all(|sites| sites[0] < sites[1])
+        );
+        assert!(!relocated.replaced_sites.contains(&relocated.evidence_site));
+        let projection = origins
+            .projection(relocated_site, prepared.as_ref())
+            .expect("source authority matches")
+            .expect("relocated row projects");
+        assert_eq!(projection.inputs.len(), 1);
+        assert_eq!(projection.inputs[0].value, relocated.source_value);
+        assert_eq!(
+            projection.inputs[0].uses.as_ref(),
+            relocated.replaced_sites.as_ref(),
+            "one relocated input fans out to every replaced original use"
+        );
+        assert!(!projection.inputs[0].uses.contains(&relocated.evidence_site));
+        assert_eq!(
+            projection.output,
+            Some(NormalizedOutputProjection {
+                inst: relocated.definition.inst,
+                value: relocated.definition.value,
+            })
+        );
+        let mut foreign_block = R2ILBlock::new(0x3000, 4);
+        foreign_block.push(R2ILOp::Return {
+            target: Varnode::constant(0, 8),
+        });
+        let foreign = r2ssa::SsaArtifact::for_decompile(&[foreign_block], None)
+            .expect("independent artifact");
+        assert_eq!(
+            origins.projection(relocated_site, &foreign),
+            Err(NormalizationOriginError::SourceAuthority),
+            "projection lookup is sealed to the exact source authority"
+        );
+        assert!(
+            origins
+                .replaced_phi_edges()
+                .iter()
+                .all(|edge| edge.incoming != relocated.evidence_site),
+            "the upstream initializer use is retained as evidence, not claimed as replaced"
+        );
+        assert!(
+            origins
+                .blocks
+                .iter()
+                .flat_map(|block| block.rows.iter())
+                .any(|origin| matches!(origin,
+                    NormalizedOpOrigin::PhiEdgeCopy(edge)
+                        if edge.incoming == relocated.evidence_site)),
+            "the genuine post-loop evidence use remains a live exact-origin edge"
         );
 
         let entry = normalized.get_block(0x2000).expect("entry");
@@ -890,6 +2944,201 @@ mod tests {
             op,
             SSAOp::Copy { dst, src } if dst == &phi && src == &init
         )));
+    }
+
+    #[test]
+    fn post_loop_carrier_edges_stay_before_destructive_register_reuse() {
+        let mut entry = R2ILBlock::new(0x3000, 4);
+        entry.push(R2ILOp::CBranch {
+            cond: Varnode::constant(1, 1),
+            target: Varnode::constant(0x3010, 8),
+        });
+        let mut preheader = R2ILBlock::new(0x3004, 4);
+        preheader.push(R2ILOp::Branch {
+            target: Varnode::constant(0x3008, 8),
+        });
+        let mut loop_block = R2ILBlock::new(0x3008, 8);
+        loop_block.push(R2ILOp::IntAdd {
+            dst: Varnode::register(0, 8),
+            a: Varnode::register(0, 8),
+            b: Varnode::constant(4, 8),
+        });
+        loop_block.push(R2ILOp::CBranch {
+            cond: Varnode::constant(1, 1),
+            target: Varnode::constant(0x3008, 8),
+        });
+        let mut exit = R2ILBlock::new(0x3010, 8);
+        exit.push(R2ILOp::Copy {
+            dst: Varnode::register(16, 8),
+            src: Varnode::register(0, 8),
+        });
+        exit.push(R2ILOp::IntSub {
+            dst: Varnode::register(0, 8),
+            a: Varnode::register(8, 8),
+            b: Varnode::register(0, 8),
+        });
+        exit.push(R2ILOp::Load {
+            dst: Varnode::register(24, 8),
+            space: r2il::SpaceId::Ram,
+            addr: Varnode::register(16, 8),
+        });
+        exit.push(R2ILOp::Return {
+            target: Varnode::register(24, 8),
+        });
+
+        let mut arch = ArchSpec::new("x86-64");
+        arch.addr_size = 8;
+        arch.add_register(RegisterDef::new("RDI", 0, 8));
+        arch.add_register(RegisterDef::new("RSI", 8, 8));
+        arch.add_register(RegisterDef::new("RCX", 16, 8));
+        arch.add_register(RegisterDef::new("RAX", 24, 8));
+        arch.add_register(RegisterDef::new("RSP", 32, 8));
+        arch.add_register(RegisterDef::new("RIP", 40, 8));
+        let storage = |offset| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let interface = r2ssa::SourceFunctionInterface::new_exact(
+            b"r2dec-normalize-post-loop-reuse".to_vec(),
+            "sysv64",
+            std::iter::empty::<r2ssa::SourceAbiParameterSpec>(),
+            r2ssa::SourceFunctionReturn::Register {
+                storage: storage(24),
+            },
+            std::iter::empty::<r2ssa::SourceStackSlotSpec>(),
+        )
+        .and_then(|interface| interface.with_stack_pointer_storage(storage(32)))
+        .and_then(|interface| interface.with_return_address_storage(storage(40)))
+        .expect("exact post-loop reuse interface");
+        let prepared = std::sync::Arc::new(
+            r2ssa::SsaArtifact::for_decompile_with_interface(
+                &[entry, preheader, loop_block, exit],
+                Some(&arch),
+                interface,
+            )
+            .expect("post-loop register-reuse fixture"),
+        );
+        let post_loop_phi = prepared
+            .function()
+            .get_block(0x3010)
+            .and_then(|block| block.phis.iter().find(|phi| phi.dst.name == "RDI"))
+            .expect("exit merges the skipped-loop and loop-carried pointers");
+        let loop_phi = prepared
+            .function()
+            .get_block(0x3008)
+            .and_then(|block| block.phis.iter().find(|phi| phi.dst.name == "RDI"))
+            .expect("loop header owns the pointer carrier");
+        let post_loop_value = prepared
+            .graph()
+            .value_id_for_var(&post_loop_phi.dst)
+            .expect("post-loop phi has a stable value identity");
+        let loop_value = prepared
+            .graph()
+            .value_id_for_var(&loop_phi.dst)
+            .expect("loop header phi has a stable value identity");
+        let analysis = r2types::build_source_owned_type_writeback_analysis(
+            r2types::TypeWritebackAnalysisRequest::new(
+                std::sync::Arc::clone(&prepared),
+                r2types::ParsedExternalContext::default(),
+            )
+            .expect("matching source assumptions"),
+        )
+        .expect("source-owned post-loop analysis");
+        let render_facts = analysis.function_facts().render_facts();
+        assert!(
+            render_facts
+                .loop_carrier_for_value(post_loop_value)
+                .is_some(),
+            "the upstream certificate must own the post-loop identity value"
+        );
+        assert!(render_facts.loop_carrier_for_value(loop_value).is_some());
+
+        let (mut normalized, mut origins) = materialize_certified_loop_carriers(
+            prepared.function(),
+            prepared.as_ref(),
+            render_facts,
+        )
+        .expect("certified carriers have exact origins");
+        materialize_certified_loop_carrier_initializers(
+            &mut normalized,
+            &mut origins,
+            prepared.as_ref(),
+            render_facts,
+        )
+        .expect("initializer relocation remains source-sealed");
+        origins
+            .validate(&normalized, prepared.as_ref(), Some(render_facts))
+            .expect("post-loop edge dispositions remain complete");
+
+        let (relocated_block, relocated_op) = origins
+            .blocks
+            .iter()
+            .enumerate()
+            .find_map(|(block_idx, block)| {
+                block.rows.iter().enumerate().find_map(|(op_idx, origin)| {
+                    matches!(origin,
+                        NormalizedOpOrigin::RelocatedInitializer(relocated)
+                            if relocated.definition.value == loop_value)
+                    .then_some((block_idx, op_idx))
+                })
+            })
+            .expect("the certified loop initializer relocates ahead of the zero-iteration split");
+        assert_eq!(origins.blocks[relocated_block].address, 0x3000);
+        assert!(matches!(
+            normalized
+                .get_block(0x3000)
+                .and_then(|block| block.ops.get(relocated_op)),
+            Some(SSAOp::Copy { dst, .. }) if dst == &loop_phi.dst
+        ));
+
+        let mut edge_predecessors = origins
+            .blocks
+            .iter()
+            .flat_map(|block| block.rows.iter())
+            .filter_map(|origin| match origin {
+                NormalizedOpOrigin::PhiEdgeCopy(edge)
+                    if edge.definition.value == post_loop_value =>
+                {
+                    Some(edge.predecessor)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        edge_predecessors.sort_unstable();
+        assert_eq!(edge_predecessors, vec![0x3000, 0x3008]);
+        assert!(origins.blocks.iter().flat_map(|block| &block.rows).all(
+            |origin| !matches!(origin,
+                NormalizedOpOrigin::RelocatedInitializer(relocated)
+                    if relocated.definition.value == post_loop_value)
+        ));
+        assert!(
+            normalized
+                .get_block(0x3010)
+                .expect("exit block")
+                .ops
+                .iter()
+                .all(|op| op.dst() != Some(&post_loop_phi.dst)),
+            "the saved pointer must be selected on its exact incoming edges, before RDI is reused"
+        );
+        let exit_ops = &normalized.get_block(0x3010).expect("exit block").ops;
+        let preserve = exit_ops
+            .iter()
+            .position(|op| {
+                matches!(op,
+                SSAOp::Copy { dst, src }
+                    if dst.name == "RCX" && src == &post_loop_phi.dst)
+            })
+            .expect("the exact post-loop pointer is preserved");
+        let reuse = exit_ops
+            .iter()
+            .position(|op| matches!(op, SSAOp::IntSub { dst, .. } if dst.name == "RDI"))
+            .expect("RDI is reused for the byte-count computation");
+        let dereference = exit_ops
+            .iter()
+            .position(|op| matches!(op, SSAOp::Load { addr, .. } if addr.name == "RCX"))
+            .expect("the tail load uses the preserved pointer carrier");
+        assert!(preserve < reuse && reuse < dereference);
     }
 
     fn loop_backedge_phi_fixture() -> SSAFunction {

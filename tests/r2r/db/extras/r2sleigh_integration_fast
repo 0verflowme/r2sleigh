@@ -120,7 +120,7 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 wx 4883c001000000000000000000000000
 s 0 >/dev/null
-a:sla.debug.ssa | jq -c '(.schema_version==1) and ([.operations[]|select(.op=="IntAdd")]|length)==1 and ([.operations[]|select(.op=="IntAdd")][0].dst=="RAX_1") and (([.operations[]|select(.op=="IntAdd")][0].sources|index("RAX_0"))!=null)'
+a:sla.debug.ssa | jq -c '(.schema_version==2) and ([.operations[]|select(.op=="IntAdd")]|length)==1 and ([.operations[]|select(.op=="IntAdd")][0].dst=="RAX_1") and (([.operations[]|select(.op=="IntAdd")][0].sources|index("RAX_0"))!=null)'
 EOF_CMDS
 RUN
 
@@ -185,7 +185,7 @@ EOF_EXPECT
 CMDS=<<EOF_CMDS
 s `isq~check_secret[0]` >/dev/null
 af
-a:sla.debug.ssa.func | jq -c --argjson target `?vi $$` --arg target_hex `?v $$` '(.schema_version==1) and (.entry==$target) and (.entry_hex==$target_hex) and has("blocks") and (.blocks|type=="array") and ((.blocks|length)>0) and ((.blocks|map(has("phis"))|all)) and (.prepared|has("formal_parameters") and has("parameter_addresses"))'
+a:sla.debug.ssa.func | jq -c --argjson target `?vi $$` --arg target_hex `?v $$` '(.schema_version==2) and (.entry==$target) and (.entry_hex==$target_hex) and has("blocks") and (.blocks|type=="array") and ((.blocks|length)>0) and ((.blocks|map(has("phis"))|all)) and (.prepared|has("formal_parameters") and has("parameter_addresses"))'
 EOF_CMDS
 RUN
 
@@ -348,4 +348,43 @@ a:sla.debug.cfg.json > /tmp/r2sleigh_large_block_cfg.json
 a:sla.debug.ssa.func > /tmp/r2sleigh_large_block_ssa.json
 jq -n -c --slurpfile cfg /tmp/r2sleigh_large_block_cfg.json --slurpfile ssa /tmp/r2sleigh_large_block_ssa.json "(\$cfg[0].blocks[0].size > 256) and ((\$cfg[0].blocks[0].successors | length) > 0) and (\$cfg[0].num_blocks > 1) and (\$ssa[0].num_blocks > 1) and ((\$ssa[0].blocks | length) > 1)"
 EOF_CMDS
+RUN
+
+NAME=pdd renders C for a function the kernel did not certify
+FILE=bins/r2sleigh_vuln_test_x86_64_macho_O2_v1
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF
+sla: loaded architecture 'x86-64'
+int dbg.complex_check(int a, int b)
+{
+    /* r2dec proof: no individual construct is marked */
+    return (a + b ^ 100 | a - b ^ 20) == 0;
+}
+
+EOF
+CMDS=<<EOF
+a:sla
+aaa
+s dbg.complex_check
+pdd
+EOF
+RUN
+
+NAME=pdd says when a render produced no statements rather than showing empty braces
+FILE=bins/r2sleigh_vuln_test_x86_64_macho_O2_v1
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF
+sla: loaded architecture 'x86-64'
+/* unknown */ sym.imp.tcgetattr(void)
+{
+    /* r2dec proof: rendering produced no statements */
+}
+
+EOF
+CMDS=<<EOF
+a:sla
+aaa
+s 0x1000019bc
+pdd
+EOF
 RUN

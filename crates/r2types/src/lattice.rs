@@ -1,4 +1,45 @@
-use std::collections::BTreeMap;
+//! Ordering and combination of types, over *regular trees*.
+//!
+//! A source type graph is cyclic in ordinary C: zlib declares
+//! `z_stream.state : internal_state *` and `inflate_state.strm : z_streamp`, so
+//! the two refer to each other. Read as finite trees those types have no finite
+//! representation, and the structural recursion this file used to do had no
+//! reason to stop -- `join(Ptr a, Ptr b) = Ptr(join a b)` on a cyclic pair walks
+//! forever, interning one fresh node per step. The ascending chain
+//!
+//! ```text
+//! Ptr(Bottom) < Ptr(Struct{.. Ptr(Bottom) ..}) < Ptr(Struct{.. Ptr(Struct{..}) ..}) < ..
+//! ```
+//!
+//! is strictly increasing and infinite, so the lattice does not satisfy the
+//! ascending chain condition and the solver's Kleene iteration cannot converge.
+//! Measured: one 126-byte, 11-block zlib function -- the one that walks
+//! `strm->state->strm` -- did not finish in ten minutes, and the arena grew
+//! until the kernel killed the process.
+//!
+//! So a type here is a regular tree: an infinite unfolding with finitely many
+//! distinct subtrees, held as a finite graph that may contain back edges. Two
+//! consequences, and they are what makes this terminate.
+//!
+//! `is_subtype` is coinductive. It carries the set of pairs it has already
+//! assumed related and answers `true` on meeting one again, which is the
+//! greatest-fixpoint reading of the rule rather than the least. Termination is
+//! immediate: the assumption set only grows and is bounded by the square of the
+//! carrier, so the recursion is O(n^2). This is the Amadio-Cardelli algorithm.
+//!
+//! `join` and `meet` are product constructions. A state of the result is a
+//! *pair* of input states, each pair is built once and memoised, and the id is
+//! reserved before its children are computed so a back edge has something to
+//! point at. The result therefore has at most |A|x|B| nodes, again by
+//! construction rather than by any depth parameter.
+//!
+//! One thing the construction cannot do is invent recursion: a cycle in a
+//! product exists only where both components return to a state they have
+//! already visited, so every cycle in the result is a cycle in an operand. The
+//! check that says so is kept anyway, and refuses that one value rather than
+//! asserting a recursive type no declaration backs.
+
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::model::{Signedness, StructField, StructShape, Type, TypeArena, TypeId};
 
@@ -17,7 +58,27 @@ impl TypeLattice {
     }
 
     pub fn is_subtype(arena: &TypeArena, sub: TypeId, sup: TypeId) -> bool {
+        let mut assumed = BTreeSet::new();
+        Self::is_subtype_coinductive(arena, sub, sup, &mut assumed)
+    }
+
+    /// `sub <= sup` read as a greatest fixpoint.
+    ///
+    /// `assumed` holds the pairs this derivation has already taken as related.
+    /// Meeting one again means the obligation has come back to itself, which
+    /// under the coinductive reading is discharged rather than infinite -- and
+    /// it is what stops a cyclic type from being walked forever. The set only
+    /// grows and is bounded by the carrier squared, so this is O(n^2).
+    fn is_subtype_coinductive(
+        arena: &TypeArena,
+        sub: TypeId,
+        sup: TypeId,
+        assumed: &mut BTreeSet<(TypeId, TypeId)>,
+    ) -> bool {
         if sub == sup {
+            return true;
+        }
+        if !assumed.insert((sub, sup)) {
             return true;
         }
 
@@ -44,7 +105,9 @@ impl TypeLattice {
                     )
             }
             (Type::Float { bits: a_bits }, Type::Float { bits: b_bits }) => a_bits <= b_bits,
-            (Type::Ptr(a_inner), Type::Ptr(b_inner)) => Self::is_subtype(arena, *a_inner, *b_inner),
+            (Type::Ptr(a_inner), Type::Ptr(b_inner)) => {
+                Self::is_subtype_coinductive(arena, *a_inner, *b_inner, assumed)
+            }
             (
                 Type::Array {
                     elem: a_elem,
@@ -62,23 +125,47 @@ impl TypeLattice {
                     (Some(x), Some(y)) => x == y,
                     (None, Some(_)) => false,
                 };
-                len_ok && Self::is_subtype(arena, *a_elem, *b_elem)
+                len_ok && Self::is_subtype_coinductive(arena, *a_elem, *b_elem, assumed)
             }
             (Type::Struct(a), Type::Struct(b)) => b.fields.iter().all(|(off, b_field)| {
-                a.fields
-                    .get(off)
-                    .is_some_and(|a_field| Self::is_subtype(arena, a_field.ty, b_field.ty))
+                a.fields.get(off).is_some_and(|a_field| {
+                    Self::is_subtype_coinductive(arena, a_field.ty, b_field.ty, assumed)
+                })
             }),
             _ => false,
         }
     }
 
+    /// The least upper bound, or `Top` where the construction refuses.
     pub fn join(arena: &mut TypeArena, a: TypeId, b: TypeId) -> TypeId {
+        Self::try_join(arena, a, b).unwrap_or_else(|| arena.top())
+    }
+
+    /// The least upper bound, refusing rather than asserting invented recursion.
+    ///
+    /// `None` says the result would have contained a cycle that neither operand
+    /// contains. A product cycle needs both components to return to a state
+    /// they have already visited, so this cannot happen by construction; the
+    /// check states the invariant and keeps the refusal per value if it is ever
+    /// wrong, instead of emitting a recursive type no declaration backs.
+    pub fn try_join(arena: &mut TypeArena, a: TypeId, b: TypeId) -> Option<TypeId> {
+        let mut state = ProductState::default();
+        let id = Self::join_pair(arena, a, b, &mut state);
+        state.settle(arena).then_some(id)
+    }
+
+    fn join_pair(arena: &mut TypeArena, a: TypeId, b: TypeId, state: &mut ProductState) -> TypeId {
         if Self::is_subtype(arena, a, b) {
             return b;
         }
         if Self::is_subtype(arena, b, a) {
             return a;
+        }
+        if let Some(existing) = state.pairs.get(&(a, b)).copied() {
+            // The derivation has come back to a pair it is still building, so
+            // this edge is the cycle. Pointing at the reserved id closes it.
+            state.closed.insert(existing);
+            return existing;
         }
 
         match (arena.get(a).clone(), arena.get(b).clone()) {
@@ -109,13 +196,15 @@ impl TypeLattice {
                 arena.float(a_bits.max(b_bits))
             }
             (Type::Ptr(a_inner), Type::Ptr(b_inner)) => {
-                let inner = Self::join(arena, a_inner, b_inner);
-                arena.ptr(inner)
+                let slot = state.open(arena, a, b);
+                let inner = Self::join_pair(arena, a_inner, b_inner, state);
+                state.close(arena, slot, Type::Ptr(inner), a, b)
             }
             (Type::Ptr(inner), Type::Int { .. }) | (Type::Int { .. }, Type::Ptr(inner)) => {
                 let top = arena.top();
-                let merged = Self::join(arena, inner, top);
-                arena.ptr(merged)
+                let slot = state.open(arena, a, b);
+                let merged = Self::join_pair(arena, inner, top, state);
+                state.close(arena, slot, Type::Ptr(merged), a, b)
             }
             (
                 Type::Array {
@@ -129,32 +218,31 @@ impl TypeLattice {
                     stride: b_stride,
                 },
             ) => {
-                let elem = Self::join(arena, a_elem, b_elem);
+                let slot = state.open(arena, a, b);
+                let elem = Self::join_pair(arena, a_elem, b_elem, state);
                 let len = if a_len == b_len { a_len } else { None };
                 let stride = if a_stride == b_stride { a_stride } else { None };
-                arena.array(elem, len, stride)
+                state.close(arena, slot, Type::Array { elem, len, stride }, a, b)
             }
             (Type::Struct(a_shape), Type::Struct(b_shape)) => {
+                let slot = state.open(arena, a, b);
                 let mut merged = StructShape {
-                    name: a_shape.name.or(b_shape.name),
+                    name: a_shape.name.clone().or_else(|| b_shape.name.clone()),
                     fields: BTreeMap::new(),
                 };
-
                 for (off, a_field) in &a_shape.fields {
                     if let Some(b_field) = b_shape.fields.get(off) {
-                        let ty = Self::join(arena, a_field.ty, b_field.ty);
+                        let ty = Self::join_pair(arena, a_field.ty, b_field.ty, state);
                         let name = a_field.name.clone().or_else(|| b_field.name.clone());
                         merged.fields.insert(*off, StructField { name, ty });
                     } else {
                         merged.fields.insert(*off, a_field.clone());
                     }
                 }
-
                 for (off, b_field) in &b_shape.fields {
                     merged.fields.entry(*off).or_insert_with(|| b_field.clone());
                 }
-
-                arena.intern(Type::Struct(merged))
+                state.close(arena, slot, Type::Struct(merged), a, b)
             }
             (
                 Type::Function {
@@ -168,27 +256,94 @@ impl TypeLattice {
                     variadic: b_var,
                 },
             ) if a_params.len() == b_params.len() => {
+                let slot = state.open(arena, a, b);
                 let params = a_params
                     .iter()
                     .zip(b_params.iter())
-                    .map(|(a_param, b_param)| Self::meet(arena, *a_param, *b_param))
+                    .map(|(a_param, b_param)| Self::meet_pair(arena, *a_param, *b_param, state))
                     .collect();
-                let ret = Self::join(arena, a_ret, b_ret);
-                arena.function(params, ret, a_var || b_var)
+                let ret = Self::join_pair(arena, a_ret, b_ret, state);
+                state.close(
+                    arena,
+                    slot,
+                    Type::Function {
+                        params,
+                        ret,
+                        variadic: a_var || b_var,
+                    },
+                    a,
+                    b,
+                )
             }
             (Type::UnknownAlias(a_name), Type::UnknownAlias(b_name)) if a_name == b_name => {
-                arena.unknown_alias(a_name)
+                arena.unknown_alias(&a_name)
             }
             _ => arena.top(),
         }
     }
 
+    /// The greatest lower bound, or `Bottom` where the construction refuses.
     pub fn meet(arena: &mut TypeArena, a: TypeId, b: TypeId) -> TypeId {
+        Self::try_meet(arena, a, b).unwrap_or_else(|| arena.bottom())
+    }
+
+    /// The greatest lower bound, refusing rather than inventing recursion.
+    pub fn try_meet(arena: &mut TypeArena, a: TypeId, b: TypeId) -> Option<TypeId> {
+        let mut state = ProductState::default();
+        let id = Self::meet_pair(arena, a, b, &mut state);
+        state.settle(arena).then_some(id)
+    }
+
+    /// Whether the graph rooted at `id` reaches itself.
+    ///
+    /// Asked only when a product actually closed a cycle, which is rare, so the
+    /// walk is paid for by the case that needs it rather than by every join.
+    fn is_cyclic(arena: &TypeArena, id: TypeId) -> bool {
+        fn walk(
+            arena: &TypeArena,
+            id: TypeId,
+            path: &mut BTreeSet<TypeId>,
+            done: &mut BTreeSet<TypeId>,
+        ) -> bool {
+            if path.contains(&id) {
+                return true;
+            }
+            if !done.insert(id) {
+                return false;
+            }
+            path.insert(id);
+            let children: Vec<TypeId> = match arena.get(id) {
+                Type::Ptr(inner) => vec![*inner],
+                Type::Array { elem, .. } => vec![*elem],
+                Type::Struct(shape) => shape.fields.values().map(|field| field.ty).collect(),
+                Type::Function { params, ret, .. } => params
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(*ret))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            let cyclic = children
+                .into_iter()
+                .any(|child| walk(arena, child, path, done));
+            path.remove(&id);
+            cyclic
+        }
+        let mut path = BTreeSet::new();
+        let mut done = BTreeSet::new();
+        walk(arena, id, &mut path, &mut done)
+    }
+
+    fn meet_pair(arena: &mut TypeArena, a: TypeId, b: TypeId, state: &mut ProductState) -> TypeId {
         if Self::is_subtype(arena, a, b) {
             return a;
         }
         if Self::is_subtype(arena, b, a) {
             return b;
+        }
+        if let Some(existing) = state.pairs.get(&(a, b)).copied() {
+            state.closed.insert(existing);
+            return existing;
         }
 
         match (arena.get(a).clone(), arena.get(b).clone()) {
@@ -213,14 +368,75 @@ impl TypeLattice {
                 }
             }
             (Type::Ptr(a_inner), Type::Ptr(b_inner)) => {
-                let inner = Self::meet(arena, a_inner, b_inner);
-                arena.ptr(inner)
+                let slot = state.open(arena, a, b);
+                let inner = Self::meet_pair(arena, a_inner, b_inner, state);
+                state.close(arena, slot, Type::Ptr(inner), a, b)
             }
             (Type::Float { bits: a_bits }, Type::Float { bits: b_bits }) => {
                 arena.float(a_bits.min(b_bits))
             }
             _ => arena.bottom(),
         }
+    }
+}
+
+/// The pair table a product construction is built from.
+///
+/// `pairs` maps a pair of input states to the id standing for it, so each pair
+/// is built once and the whole construction is bounded by |A|x|B|. `open`
+/// reserves that id before the children are known, which is what gives a back
+/// edge something to point at; `closed` records the ids something actually
+/// pointed back at, so the ones nothing did can be interned normally and keep
+/// the id-equality that the rest of the solver relies on for acyclic types.
+#[derive(Debug, Default)]
+struct ProductState {
+    pairs: BTreeMap<(TypeId, TypeId), TypeId>,
+    slots: BTreeMap<TypeId, (TypeId, TypeId)>,
+    closed: BTreeSet<TypeId>,
+}
+
+impl ProductState {
+    /// Reserve the id for a pair before its children are known.
+    fn open(&mut self, arena: &mut TypeArena, a: TypeId, b: TypeId) -> TypeId {
+        let slot = arena.reserve();
+        self.pairs.insert((a, b), slot);
+        self.slots.insert(slot, (a, b));
+        slot
+    }
+
+    /// Give a reserved id its shape, or intern the shape if nothing pointed back.
+    ///
+    /// Only a node some descendant actually closed onto has to keep its
+    /// reserved identity; every other node is acyclic and is interned, so two
+    /// equal acyclic types keep one id and the reserved slot is left as an
+    /// unreferenced hole. Without this every join would mint fresh ids for
+    /// ordinary types and the identity the rest of the solver compares on would
+    /// stop meaning anything.
+    fn close(
+        &mut self,
+        arena: &mut TypeArena,
+        slot: TypeId,
+        ty: Type,
+        a: TypeId,
+        b: TypeId,
+    ) -> TypeId {
+        if self.closed.contains(&slot) {
+            arena.define(slot, ty);
+            return slot;
+        }
+        self.slots.remove(&slot);
+        let id = arena.intern(ty);
+        self.pairs.insert((a, b), id);
+        id
+    }
+
+    /// Whether every cycle this construction created was already in an operand.
+    fn settle(&self, arena: &TypeArena) -> bool {
+        self.closed.iter().all(|slot| {
+            self.slots.get(slot).is_none_or(|(a, b)| {
+                TypeLattice::is_cyclic(arena, *a) || TypeLattice::is_cyclic(arena, *b)
+            })
+        })
     }
 }
 

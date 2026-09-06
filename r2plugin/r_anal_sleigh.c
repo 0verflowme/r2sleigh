@@ -16,21 +16,19 @@
 #include <string.h>
 #include "r2sleigh_api_v2.h"
 #include "snapshot_wire.h"
+#include "snapshot_capture.h"
 
-/* Support is decided by the presence of the immutable function-snapshot API and
- * by the transport's own contract, never by radare2's ABI number: that number
- * moves for unrelated reasons and pinning it broke this plugin on every bump. */
+/* Support is decided by whether radare2 exposes the function-snapshot API, and
+ * by nothing else. Pinning a number -- the ABI number or the schema number --
+ * says the plugin needs one particular revision when what it needs is one
+ * particular capability, and those numbers move for unrelated reasons: the
+ * schema last moved for two booleans on a struct no consumer can see, and stood
+ * still through three changes to the struct every consumer reads. The guards
+ * that actually hold are the linker, which cannot resolve an accessor that is
+ * not there, and the wire conformance test, which compares writer against
+ * reader byte for byte. */
 #ifndef R_ANAL_FUNCTION_SNAPSHOT_SCHEMA_VERSION
 #error "r2sleigh requires a radare2 exposing the immutable function-snapshot API"
-#endif
-#if R2SLEIGH_RADARE_SNAPSHOT_CONTRACT_V2 != 1
-#error "r2sleigh generated V2 header must target snapshot transport contract 1"
-#endif
-#if R_ANAL_FUNCTION_SNAPSHOT_SCHEMA_VERSION != 13
-#error "r2sleigh borrowed snapshot transport requires function snapshot schema 13"
-#endif
-#if R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2 != 13
-#error "r2sleigh generated V2 header must target function snapshot schema 13"
 #endif
 
 
@@ -146,9 +144,7 @@ static const R2SleighApiV2 *sleigh_lift_api_v2(void) {
 		|| !api->lift_context_set_semantic_metadata || !api->lift_block_free
 		|| !api->lift_block_validate || !api->lift_block_set_switch_info
 		|| !api->lift_block_op_count || !api->lift_block_direct_call_identity
-		|| !api->lift_block_size || !api->lift_block_addr
-		|| !api->lift_block_mnemonic || !api->lift_block_type
-		|| !api->lift_block_jump || !api->lift_block_fail
+		|| !api->lift_block_view || !api->lift_block_mnemonic
 		|| !api->owned_bytes_view || !api->owned_bytes_free
 		|| !api->analysis_render
 		|| !api->analysis_query || !api->analysis_result_view
@@ -469,12 +465,12 @@ static uint32_t sleigh_v2_block_op_count(const R2ILBlock *block, size_t *count) 
 		: R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
 }
 
-static uint32_t sleigh_v2_block_size(const R2ILBlock *block, uint32_t *value) {
+static uint32_t sleigh_v2_block_view(const R2ILBlock *block, R2SleighBlockViewV2 *view) {
 	const R2SleighApiV2 *api = sleigh_lift_api_v2 ();
-	if (value) {
-		*value = 0;
+	if (!api || !api->lift_block_view) {
+		return R2SLEIGH_STATUS_ABI_MISMATCH_V2;
 	}
-	return api && block && value? api->lift_block_size (block, value)
+	return api && block && view? api->lift_block_view (block, view)
 		: R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
 }
 
@@ -506,32 +502,8 @@ static uint32_t sleigh_v2_block_mnemonic(const R2ILContext *context, const unsig
 	return sleigh_lift_owned_bytes_copy (api, mnemonic, text);
 }
 
-static uint32_t sleigh_v2_block_type(const R2ILBlock *block, uint32_t *value) {
-	const R2SleighApiV2 *api = sleigh_lift_api_v2 ();
-	if (value) {
-		*value = 0;
-	}
-	return api && block && value? api->lift_block_type (block, value)
-		: R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
-}
 
-static uint32_t sleigh_v2_block_jump(const R2ILBlock *block, uint64_t *value) {
-	const R2SleighApiV2 *api = sleigh_lift_api_v2 ();
-	if (value) {
-		*value = 0;
-	}
-	return api && block && value? api->lift_block_jump (block, value)
-		: R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
-}
 
-static uint32_t sleigh_v2_block_fail(const R2ILBlock *block, uint64_t *value) {
-	const R2SleighApiV2 *api = sleigh_lift_api_v2 ();
-	if (value) {
-		*value = 0;
-	}
-	return api && block && value? api->lift_block_fail (block, value)
-		: R2SLEIGH_STATUS_INVALID_ARGUMENT_V2;
-}
 
 static uint32_t sleigh_v2_analysis_render(uint32_t kind, const R2ILContext *context,
 	const R2ILBlock *const *blocks, size_t num_blocks, size_t op_index,
@@ -630,6 +602,248 @@ static bool sleigh_v2_analysis_result_release(R2SleighAnalysisResultV2 **result)
  * single-threaded radare2 usage. If radare2 becomes multi-threaded,
  * this code must be updated with proper synchronization (e.g., mutex).
  */
+/* Where the analysis callbacks spend their time.
+ *
+ * `sla.profilej` reports per function and only for the stages a decompile
+ * walks. The analysis callbacks are a different population: `op` runs per
+ * instruction and several times over for one byte, `analyze_fcn` and
+ * `get_data_refs` run per function, and none of the three had ever been
+ * separated from the others. Measured on bzip2recover, they are together
+ * about five times the proof sweep, so knowing only their sum is knowing the
+ * wrong thing.
+ *
+ * One counter and one accumulator per site, printed once at `fini` when
+ * `R2SLEIGH_TIMING` asks. Reading the clock twice per instruction is the whole
+ * cost when the switch is off, and the alternative -- deriving a per-callback
+ * figure by differencing whole-binary runs -- is the method this project has
+ * already had to withdraw a conclusion for. */
+typedef enum {
+	SLEIGH_CB_OP = 0,
+	SLEIGH_CB_OP_CONTEXT,
+	SLEIGH_CB_OP_LIFT,
+	SLEIGH_CB_OP_DISASM,
+	SLEIGH_CB_OP_ESIL,
+	SLEIGH_CB_OP_VAL,
+	SLEIGH_CB_ANALYZE_FCN,
+	SLEIGH_CB_DATA_REFS,
+	SLEIGH_CB_POST_ANALYSIS,
+	SLEIGH_CB_ELIGIBLE,
+	SLEIGH_CB_CONTEXT_CREATE,
+	SLEIGH_CB_REG_PROFILE,
+	SLEIGH_CB_SNAPSHOT_WALK,
+	SLEIGH_CB_SNAPSHOT_REUSE,
+	SLEIGH_CB_PROOF_ENGINE,
+	SLEIGH_CB_COUNT
+} SleighCallbackSite;
+
+static const char *const sleigh_callback_names[SLEIGH_CB_COUNT] = {
+	"op", "op.context", "op.lift", "op.disasm", "op.esil", "op.val",
+	"analyze_fcn", "get_data_refs", "post_analysis",
+	"eligible", "context.create", "context.regprofile",
+	"snapshot.walk", "snapshot.reuse", "proof.engine"
+};
+
+static ut64 sleigh_callback_calls[SLEIGH_CB_COUNT];
+static ut64 sleigh_callback_us[SLEIGH_CB_COUNT];
+
+static bool sleigh_callback_timing_enabled(void) {
+	static int enabled = -1;
+	if (enabled < 0) {
+		enabled = r_sys_getenv ("R2SLEIGH_TIMING")? 1: 0;
+	}
+	return enabled == 1;
+}
+
+static ut64 sleigh_callback_start(void) {
+	return sleigh_callback_timing_enabled ()? r_time_now_mono (): 0;
+}
+
+static void sleigh_callback_end(SleighCallbackSite site, ut64 started) {
+	if (!started) {
+		return;
+	}
+	sleigh_callback_calls[site]++;
+	sleigh_callback_us[site] += r_time_now_mono () - started;
+}
+
+static void sleigh_callback_report(void) {
+	if (!sleigh_callback_timing_enabled ()) {
+		return;
+	}
+	size_t i;
+	for (i = 0; i < SLEIGH_CB_COUNT; i++) {
+		if (!sleigh_callback_calls[i]) {
+			continue;
+		}
+		eprintf ("r2sleigh callback timing: %-14s calls=%-8"PFMT64u" total=%"PFMT64u"us mean=%"PFMT64u"ns\n",
+			sleigh_callback_names[i], sleigh_callback_calls[i],
+			sleigh_callback_us[i],
+			(sleigh_callback_us[i] * 1000) / sleigh_callback_calls[i]);
+		sleigh_callback_calls[i] = 0;
+		sleigh_callback_us[i] = 0;
+	}
+}
+
+/* One function's snapshot, taken once and read by everything that needs it.
+ *
+ * `r2sleigh_function_snapshot_take` collects the function, its blocks, its bytes,
+ * its type graph and the bodies of everything it calls. Three separate places
+ * asked for one per function and each threw away all but the part it wanted:
+ * `sleigh_artifact_plan_init` walked the whole thing to read one 64-bit
+ * revision, once for the proof plan and again for the taint plan, and
+ * `sleigh_proven_facts_json` walked it a third time for the wire buffer.
+ * Measured on bzip2recover: 60 walks costing 3.04 seconds for the revision
+ * alone, plus 22 more costing 0.98 seconds for the buffer, against a
+ * post-analysis pass of about three seconds when the machine is quiet.
+ *
+ * One entry, because the three readers are consecutive for one function and a
+ * per-program cache of whole snapshots would hold the program twice over for
+ * no extra hit. It is keyed by the address together with both dirty epochs, so
+ * anything that edits the function or the type graph invalidates it by
+ * changing the key rather than by anyone remembering to.
+ *
+ * The wire buffer is always built. The walk is the cost -- 44.5ms with the
+ * buffer against 50.6ms without it, which is the same number twice -- so
+ * making it conditional would only add a way for the entry to miss. */
+typedef struct {
+	bool valid;
+	ut64 addr;
+	ut64 function_epoch;
+	ut64 type_epoch;
+	ut64 revision;
+	uint8_t *wire;
+	size_t wire_len;
+} SleighFunctionCapture;
+
+static SleighFunctionCapture sleigh_held_capture;
+
+static void sleigh_function_capture_release(void) {
+	free (sleigh_held_capture.wire);
+	memset (&sleigh_held_capture, 0, sizeof (sleigh_held_capture));
+}
+
+/* Whether the engine will decline this function on size, asked before anything
+ * is collected.
+ *
+ * The engine has always declined a function past its block and operation caps,
+ * but only after the whole snapshot had been built, serialized to the wire and
+ * decoded again -- so the memory was spent regardless of the answer. On zlib
+ * built at -O2 that reached three to six gigabytes resident and the kernel
+ * killed r2, which costs every function in the binary rather than the one that
+ * was too big: five of zlib's seven binaries reported no functions at all.
+ *
+ * radare2's own basic blocks and instruction total are a floor for what lifting
+ * produces -- lifting splits blocks and expands one instruction into several
+ * operations, never the reverse -- so nothing refused here would have been
+ * accepted after the walk. */
+static bool sleigh_function_exceeds_engine_limits(RAnalFunction *fcn) {
+	if (!fcn) {
+		return false;
+	}
+	size_t blocks = 0;
+	size_t ops = 0;
+	RListIter *iter;
+	RAnalBlock *bb;
+	r_list_foreach (fcn->bbs, iter, bb) {
+		if (!bb) {
+			continue;
+		}
+		blocks++;
+		if (bb->ninstr > 0) {
+			ops += (size_t)bb->ninstr;
+		}
+	}
+	return r2sleigh_engine_complexity_limit_exceeded_v2 (blocks, ops) != 0;
+}
+
+/* The snapshot for this function, walking for it only when what is held is not
+ * already exactly it. Returns NULL when the walk refused or when the analysis
+ * changed underneath it, which is the same fail-closed answer the three
+ * callers gave before. */
+static const SleighFunctionCapture *sleigh_function_capture(RAnal *anal, RAnalFunction *fcn) {
+	if (!anal || !fcn) {
+		return NULL;
+	}
+	RCore *core = anal->coreb.core;
+	if (!core) {
+		return NULL;
+	}
+	/* Ask radare2 how big this is before collecting anything. The engine
+	 * declines a function past its block and operation caps, and until now it
+	 * did so only after the whole snapshot had been built, serialized and
+	 * decoded -- so the memory was spent regardless. On zlib built at -O2 that
+	 * reached three to six gigabytes resident and the kernel killed r2, which
+	 * costs every function in the binary instead of the one that was too big;
+	 * five of zlib's seven binaries reported no functions at all for that
+	 * reason. radare2's own block count and instruction total are a floor for
+	 * what lifting produces, so nothing refused here would have been accepted. */
+	if (sleigh_function_exceeds_engine_limits (fcn)) {
+		R_LOG_ERROR ("r2sleigh: capture refused '%s': the function exceeds the engine complexity limit",
+			r_str_get (fcn->name));
+		return NULL;
+	}
+	const ut64 function_epoch = r_anal_function_dirty_epoch (fcn);
+	const ut64 type_epoch = r_anal_types_dirty_epoch (anal);
+	SleighFunctionCapture *held = &sleigh_held_capture;
+	if (held->valid && held->addr == fcn->addr
+			&& held->function_epoch == function_epoch
+			&& held->type_epoch == type_epoch) {
+		const ut64 reuse_started = sleigh_callback_start ();
+		sleigh_callback_end (SLEIGH_CB_SNAPSHOT_REUSE, reuse_started);
+		return held;
+	}
+	sleigh_function_capture_release ();
+	const ut64 walk_started = sleigh_callback_start ();
+	const char *refusal = NULL;
+	RAnalFunctionSnapshot *snapshot = r2sleigh_function_snapshot_take (core, fcn->addr, &refusal);
+	const bool snapshot_taken = snapshot != NULL;
+	if (!snapshot) {
+		/* The capture names what it refused; dropping that name left every
+		 * refused function reporting only that it could not be captured. */
+		R_LOG_ERROR ("r2sleigh: capture refused '%s': %s", r_str_get (fcn->name),
+			refusal? refusal: "no reason recorded");
+	}
+	uint8_t *wire = NULL;
+	size_t wire_len = 0;
+	ut64 revision = 0;
+	if (snapshot) {
+		revision = snapshot->revision_identity;
+		R2SleighWireWriter *writer = r2sleigh_wire_writer_new ();
+		if (writer) {
+			if (r2sleigh_wire_write_snapshot (writer, snapshot)) {
+				wire = r2sleigh_wire_writer_finish (writer, &wire_len);
+			}
+			r2sleigh_wire_writer_free (writer);
+		}
+		r2sleigh_function_snapshot_free (snapshot);
+	}
+	sleigh_callback_end (SLEIGH_CB_SNAPSHOT_WALK, walk_started);
+	if (!wire || !revision
+			|| r_anal_function_dirty_epoch (fcn) != function_epoch
+			|| r_anal_types_dirty_epoch (anal) != type_epoch) {
+		/* Four conditions end here and the caller sees only that the capture
+		 * is absent; name the one that failed. */
+		if (snapshot_taken) {
+			R_LOG_ERROR ("r2sleigh: capture refused '%s': %s", r_str_get (fcn->name),
+				!wire? "the snapshot could not be serialized"
+				: !revision? "the snapshot carries no revision identity"
+				: r_anal_function_dirty_epoch (fcn) != function_epoch
+					? "the function changed during capture"
+					: "the type database changed during capture");
+		}
+		free (wire);
+		return NULL;
+	}
+	held->valid = true;
+	held->addr = fcn->addr;
+	held->function_epoch = function_epoch;
+	held->type_epoch = type_epoch;
+	held->revision = revision;
+	held->wire = wire;
+	held->wire_len = wire_len;
+	return held;
+}
+
 static R2ILContext *sleigh_ctx = NULL;
 static char *sleigh_arch = NULL;
 static char *sleigh_reg_profile = NULL;
@@ -698,6 +912,7 @@ static size_t sleigh_profile_cap = 0;
 #define SLEIGH_CALLER_PROP_SAMPLE_MAX 5
 #define SLEIGH_TAINT_LABEL_MAX 6
 #define SLEIGH_COMMENT_PREFIX_SEMANTIC "sla:"
+#define SLEIGH_COMMENT_PREFIX_PROOF "sla.proof:"
 #define SLEIGH_COMMENT_PREFIX_TAINT "sla.taint:"
 #define SLEIGH_COMMENT_PREFIX_TAINT_RISK "sla.taint.risk:"
 
@@ -764,49 +979,7 @@ static void sleigh_engine_v2_log_error(
 	R_LOG_ERROR ("r2sleigh: V2 engine request failed (%u)", status);
 }
 
-static const char *sleigh_engine_v2_phase_name(uint32_t phase) {
-	switch (phase) {
-	case R2SLEIGH_PHASE_SNAPSHOT_CONTEXT_V2:
-		return "snapshot_context";
-	case R2SLEIGH_PHASE_LIFT_NORMALIZE_V2:
-		return "lift_normalize";
-	case R2SLEIGH_PHASE_SSA_V2:
-		return "ssa";
-	case R2SLEIGH_PHASE_OBLIGATIONS_V2:
-		return "obligations";
-	case R2SLEIGH_PHASE_SYMBOLIC_V2:
-		return "symbolic";
-	case R2SLEIGH_PHASE_TYPES_V2:
-		return "types";
-	case R2SLEIGH_PHASE_CERTIFICATION_V2:
-		return "certification";
-	case R2SLEIGH_PHASE_STRUCTURING_V2:
-		return "structuring";
-	case R2SLEIGH_PHASE_NORMALIZATION_V2:
-		return "normalization";
-	case R2SLEIGH_PHASE_RENDERING_V2:
-		return "rendering";
-	case R2SLEIGH_PHASE_FFI_CONVERSION_V2:
-		return "ffi_conversion";
-	default:
-		return "unknown";
-	}
-}
 
-static const char *sleigh_engine_v2_phase_status_name(uint32_t status) {
-	switch (status) {
-	case R2SLEIGH_PHASE_STATUS_NOT_EXECUTED_V2:
-		return "not_executed";
-	case R2SLEIGH_PHASE_STATUS_EXECUTED_V2:
-		return "executed";
-	case R2SLEIGH_PHASE_STATUS_FOLDED_V2:
-		return "folded";
-	case R2SLEIGH_PHASE_STATUS_REFUSED_V2:
-		return "refused";
-	default:
-		return "unknown";
-	}
-}
 
 static bool sleigh_engine_v2_phase_status_is_valid(uint32_t status) {
 	switch (status) {
@@ -848,15 +1021,6 @@ static char *sleigh_engine_v2_error_json(const char *state, uint32_t status, con
 	return pj_drain (pj);
 }
 
-static char *sleigh_engine_v2_session_error_copy(const R2SleighApiV2 *api, const R2SleighSessionV2 *session, uint32_t status) {
-	R2SleighByteViewV2 error = {0};
-	if (api && session && api->session_error
-		&& api->session_error (session, &error) == R2SLEIGH_STATUS_OK_V2
-		&& error.data && error.len) {
-		return sleigh_byte_view_v2_copy (error);
-	}
-	return r_str_newf ("V2 engine request failed (%u)", status);
-}
 
 static bool sleigh_json_is_single_object(const char *text, size_t len) {
 	if (!text || !len) {
@@ -919,6 +1083,8 @@ static bool sleigh_json_is_single_object(const char *text, size_t len) {
 #define SLEIGH_SEMANTIC_KERNEL_WARNING_LIMIT 8
 #define SLEIGH_SEMANTIC_KERNEL_WARNING_BYTES 4096
 #define SLEIGH_ENGINE_DIAGNOSTICS_BYTES (1024 * 1024)
+#define SLEIGH_BINDING_AUDIT_ENV "R2SLEIGH_BINDING_AUDIT"
+#define SLEIGH_BINDING_AUDIT_PREFIX "R2SLEIGH_BINDING_AUDIT__"
 
 static void sleigh_engine_v2_log_semantic_kernel_warnings(R2SleighByteViewV2 view) {
 	if (!view.data || !view.len || view.len > SLEIGH_ENGINE_DIAGNOSTICS_BYTES
@@ -960,65 +1126,66 @@ static void sleigh_engine_v2_log_semantic_kernel_warnings(R2SleighByteViewV2 vie
 	free (text);
 }
 
-static char *sleigh_engine_v2_response_json(const R2SleighResponseInfoV2 *info, R2SleighByteViewV2 bytes) {
-	if (!info || !info->diagnostics_json.data || !info->diagnostics_json.len) {
-		return NULL;
+// Emit the independent typed audits only for explicit diagnostic runs.
+// Keeping the sidecar out of ordinary pdd output preserves the user-facing
+// renderer bytes; the corpus enables it and associates the one JSON record with
+// its surrounding function markers.
+static void sleigh_engine_v2_emit_binding_audit(R2SleighByteViewV2 view) {
+	if (!r_sys_getenv_asbool (SLEIGH_BINDING_AUDIT_ENV)
+		|| !view.data || !view.len || view.len > SLEIGH_ENGINE_DIAGNOSTICS_BYTES
+		|| !sleigh_json_is_single_object ((const char *)view.data, view.len)) {
+		return;
 	}
-	if (!sleigh_json_is_single_object (
-		(const char *)info->diagnostics_json.data, info->diagnostics_json.len)) {
-		return NULL;
+	char *text = sleigh_byte_view_v2_copy (view);
+	if (!text) {
+		return;
 	}
-	char *output = sleigh_byte_view_v2_copy (bytes);
-	char *diagnostics_text = sleigh_byte_view_v2_copy (info->diagnostics_json);
-	if (!output || !diagnostics_text) {
-		free (output);
-		free (diagnostics_text);
-		return NULL;
+	RJson *diagnostics = r_json_parse (text);
+	const RJson *outcome = diagnostics && diagnostics->type == R_JSON_OBJECT
+		? r_json_get (diagnostics, "outcome")
+		: NULL;
+	const RJson *audit = diagnostics && diagnostics->type == R_JSON_OBJECT
+		? r_json_get (diagnostics, "binding_audit")
+		: NULL;
+	const RJson *effect_obligations = diagnostics && diagnostics->type == R_JSON_OBJECT
+		? r_json_get (diagnostics, "effect_obligations")
+		: NULL;
+	const RJson *placement_audit = diagnostics && diagnostics->type == R_JSON_OBJECT
+		? r_json_get (diagnostics, "placement_audit")
+		: NULL;
+	const RJson *render_refusal = diagnostics && diagnostics->type == R_JSON_OBJECT
+		? r_json_get (diagnostics, "render_refusal")
+		: NULL;
+	if (outcome && outcome->type == R_JSON_STRING && outcome->str_value
+		&& (!strcmp (outcome->str_value, "completed")
+			|| !strcmp (outcome->str_value, "refused"))
+		&& audit && audit->type == R_JSON_OBJECT
+		&& effect_obligations && effect_obligations->type == R_JSON_OBJECT
+		&& placement_audit && placement_audit->type == R_JSON_OBJECT
+		&& render_refusal && render_refusal->type == R_JSON_OBJECT) {
+		PJ *pj = pj_new ();
+		if (pj) {
+			pj_o (pj);
+			pj_kn (pj, "schema_version", 5);
+			pj_ks (pj, "request_status", outcome->str_value);
+			pj_k (pj, "audit");
+			pj_rj (pj, (RJson *)audit);
+			pj_k (pj, "effect_obligations");
+			pj_rj (pj, (RJson *)effect_obligations);
+			pj_k (pj, "placement_audit");
+			pj_rj (pj, (RJson *)placement_audit);
+			pj_k (pj, "render_refusal");
+			pj_rj (pj, (RJson *)render_refusal);
+			pj_end (pj);
+			char *json = pj_drain (pj);
+			if (json) {
+				fprintf (stderr, "%s%s\n", SLEIGH_BINDING_AUDIT_PREFIX, json);
+				free (json);
+			}
+		}
 	}
-	RJson *diagnostics = r_json_parsedup (diagnostics_text);
-	free (diagnostics_text);
-	if (!diagnostics || diagnostics->type != R_JSON_OBJECT) {
-		r_json_free (diagnostics);
-		free (output);
-		return NULL;
-	}
-	PJ *pj = pj_new ();
-	if (!pj) {
-		r_json_free (diagnostics);
-		free (output);
-		return NULL;
-	}
-	pj_o (pj);
-	pj_kn (pj, "schema_version", SLEIGH_DECJ_SCHEMA_VERSION);
-	pj_ks (pj, "request_kind", "decompile");
-	pj_kn (pj, "request_kind_code", info->request_kind);
-	pj_ks (pj, "outcome", info->outcome == R2SLEIGH_OUTCOME_REFUSED_V2
-		? "refused": "completed");
-	pj_kn (pj, "outcome_code", info->outcome);
-	pj_ks (pj, "rendered_output", output);
-	pj_k (pj, "diagnostics");
-	pj_rj (pj, diagnostics);
-	pj_ka (pj, "phase_timings");
-	size_t i = 0;
-	for (; i < info->num_phase_timings; i++) {
-		const R2SleighPhaseTimingV2 *timing = &info->phase_timings[i];
-		pj_o (pj);
-		pj_kn (pj, "phase", timing->phase);
-		pj_ks (pj, "name", sleigh_engine_v2_phase_name (timing->phase));
-		pj_kn (pj, "status", timing->status);
-		pj_ks (pj, "status_name", sleigh_engine_v2_phase_status_name (timing->status));
-		pj_kn (pj, "elapsed_us", timing->elapsed_us);
-		pj_end (pj);
-	}
-	pj_end (pj);
-	pj_kn (pj, "ffi_conversion_elapsed_us", info->ffi_conversion_elapsed_us);
-	pj_kb (pj, "refused", info->outcome == R2SLEIGH_OUTCOME_REFUSED_V2);
-	pj_knull (pj, "error");
-	pj_end (pj);
-	char *json = pj_drain (pj);
 	r_json_free (diagnostics);
-	free (output);
-	return json;
+	free (text);
 }
 
 static uint32_t sleigh_engine_v2_release_handles(const R2SleighApiV2 *api,
@@ -1070,16 +1237,9 @@ static uint32_t sleigh_engine_v2_retry_pending(const R2SleighApiV2 *api) {
 		&sleigh_pending_engine_response, &sleigh_pending_engine_session);
 }
 
-static char *sleigh_engine_v2_cleanup_error(bool json_projection, uint32_t status) {
-	return json_projection
-		? sleigh_engine_v2_error_json ("owner_cleanup", status,
-			"failed to release V2 engine ownership")
-		: NULL;
-}
-
 // Returns a malloc-owned NUL-terminated projection. Every borrowed response
 // view is consumed before response_free releases the opaque Rust owner.
-static char *sleigh_engine_execute_v2_project(uint32_t kind, uint64_t required_capability, const R2SleighEngineRequestPayloadV2 *payload, bool json_projection) {
+static char *sleigh_engine_execute_v2(uint32_t kind, uint64_t required_capability, const R2SleighEngineRequestPayloadV2 *payload) {
 	required_capability |= R2SLEIGH_CAP_OPAQUE_RADARE_SNAPSHOT_V2
 		| R2SLEIGH_CAP_RESPONSE_INFO_V2
 		| R2SLEIGH_CAP_EXECUTION_CONTROL_V2;
@@ -1099,24 +1259,16 @@ static char *sleigh_engine_execute_v2_project(uint32_t kind, uint64_t required_c
 		|| !api->response_bytes || !api->response_info
 		|| !api->response_free || !api->session_error) {
 		R_LOG_ERROR ("r2sleigh: incompatible V2 engine API table");
-		return json_projection
-			? sleigh_engine_v2_error_json ("incompatible_api",
-				R2SLEIGH_STATUS_ABI_MISMATCH_V2,
-				"incompatible V2 engine API table")
-			: NULL;
+		return NULL;
 	}
 	uint32_t status = sleigh_engine_v2_retry_pending (api);
 	if (status != R2SLEIGH_STATUS_OK_V2) {
-		return sleigh_engine_v2_cleanup_error (json_projection, status);
+		return NULL;
 	}
 	if (!payload || payload->abi_version != R2SLEIGH_ABI_V2
 		|| payload->struct_size != sizeof (*payload)) {
 		R_LOG_ERROR ("r2sleigh: invalid native V2 request graph");
-		return json_projection
-			? sleigh_engine_v2_error_json ("invalid_request",
-				R2SLEIGH_STATUS_INVALID_ARGUMENT_V2,
-				"invalid native V2 request graph")
-			: NULL;
+		return NULL;
 	}
 
 	R2SleighSessionConfigV2 config = {
@@ -1130,12 +1282,9 @@ static char *sleigh_engine_execute_v2_project(uint32_t kind, uint64_t required_c
 		R_LOG_ERROR ("r2sleigh: failed to create V2 engine session (%u)", status);
 		uint32_t free_status = sleigh_engine_v2_release_or_preserve (api, NULL, &session);
 		if (free_status != R2SLEIGH_STATUS_OK_V2) {
-			return sleigh_engine_v2_cleanup_error (json_projection, free_status);
+			return NULL;
 		}
-		return json_projection
-			? sleigh_engine_v2_error_json ("session_create", status,
-				"failed to create V2 engine session")
-			: NULL;
+		return NULL;
 	}
 
 	R2SleighRequestV2 request = {
@@ -1149,19 +1298,8 @@ static char *sleigh_engine_execute_v2_project(uint32_t kind, uint64_t required_c
 	status = api->execute (session, &request, &response);
 	if (status != R2SLEIGH_STATUS_OK_V2 || !response) {
 		sleigh_engine_v2_log_error (api, session, status);
-		char *message = json_projection
-			? sleigh_engine_v2_session_error_copy (api, session, status)
-			: NULL;
 		uint32_t free_status = sleigh_engine_v2_release_or_preserve (api, &response, &session);
-		if (free_status != R2SLEIGH_STATUS_OK_V2) {
-			free (message);
-			return sleigh_engine_v2_cleanup_error (json_projection, free_status);
-		}
-		if (json_projection) {
-			char *json = sleigh_engine_v2_error_json ("execute", status, message);
-			free (message);
-			return json;
-		}
+		(void)free_status;
 		return NULL;
 	}
 	R2SleighResponseInfoV2 info = {0};
@@ -1178,13 +1316,9 @@ static char *sleigh_engine_execute_v2_project(uint32_t kind, uint64_t required_c
 		sleigh_engine_v2_log_error (api, session, status);
 		uint32_t free_status = sleigh_engine_v2_release_or_preserve (api, &response, &session);
 		if (free_status != R2SLEIGH_STATUS_OK_V2) {
-			return sleigh_engine_v2_cleanup_error (json_projection, free_status);
+			return NULL;
 		}
-		return json_projection
-			? sleigh_engine_v2_error_json ("response_info",
-				R2SLEIGH_STATUS_ENGINE_ERROR_V2,
-				"invalid or missing V2 response metadata")
-			: NULL;
+		return NULL;
 	}
 	size_t phase_index;
 	for (phase_index = 0; phase_index < info.num_phase_timings; phase_index++) {
@@ -1193,13 +1327,9 @@ static char *sleigh_engine_execute_v2_project(uint32_t kind, uint64_t required_c
 			R_LOG_ERROR ("r2sleigh: invalid V2 engine phase metadata");
 			uint32_t free_status = sleigh_engine_v2_release_or_preserve (api, &response, &session);
 			if (free_status != R2SLEIGH_STATUS_OK_V2) {
-				return sleigh_engine_v2_cleanup_error (json_projection, free_status);
+				return NULL;
 			}
-			return json_projection
-				? sleigh_engine_v2_error_json ("phase_metadata",
-					R2SLEIGH_STATUS_ENGINE_ERROR_V2,
-					"invalid V2 engine phase metadata")
-				: NULL;
+			return NULL;
 		}
 	}
 	if (info.phase_timings[R2SLEIGH_PHASE_FFI_CONVERSION_V2].status
@@ -1209,13 +1339,9 @@ static char *sleigh_engine_execute_v2_project(uint32_t kind, uint64_t required_c
 		R_LOG_ERROR ("r2sleigh: invalid V2 FFI conversion metadata");
 		uint32_t free_status = sleigh_engine_v2_release_or_preserve (api, &response, &session);
 		if (free_status != R2SLEIGH_STATUS_OK_V2) {
-			return sleigh_engine_v2_cleanup_error (json_projection, free_status);
+			return NULL;
 		}
-		return json_projection
-			? sleigh_engine_v2_error_json ("ffi_conversion_metadata",
-				R2SLEIGH_STATUS_ENGINE_ERROR_V2,
-				"invalid V2 FFI conversion metadata")
-			: NULL;
+		return NULL;
 	}
 
 	R2SleighByteViewV2 bytes = {0};
@@ -1223,31 +1349,18 @@ static char *sleigh_engine_execute_v2_project(uint32_t kind, uint64_t required_c
 	char *result = NULL;
 	if (status == R2SLEIGH_STATUS_OK_V2 && bytes.len < SIZE_MAX
 		&& (!bytes.len || bytes.data)) {
-		result = json_projection
-			? sleigh_engine_v2_response_json (&info, bytes)
-			: sleigh_byte_view_v2_copy (bytes);
+		result = sleigh_byte_view_v2_copy (bytes);
 	} else {
 		sleigh_engine_v2_log_error (api, session, status);
 	}
-	if (json_projection && !result) {
-		result = sleigh_engine_v2_error_json ("response_projection",
-			R2SLEIGH_STATUS_ENGINE_ERROR_V2,
-			"invalid output or diagnostics in V2 response");
-	}
-	if (!json_projection) {
-		sleigh_engine_v2_log_semantic_kernel_warnings (info.diagnostics_json);
-	}
+	sleigh_engine_v2_log_semantic_kernel_warnings (info.diagnostics_json);
+	sleigh_engine_v2_emit_binding_audit (info.diagnostics_json);
 	uint32_t free_status = sleigh_engine_v2_release_or_preserve (api, &response, &session);
 	if (free_status != R2SLEIGH_STATUS_OK_V2) {
 		free (result);
-		return sleigh_engine_v2_cleanup_error (json_projection, free_status);
+		return NULL;
 	}
 	return result;
-}
-
-static char *sleigh_engine_execute_v2(uint32_t kind, uint64_t required_capability, const R2SleighEngineRequestPayloadV2 *payload) {
-	return sleigh_engine_execute_v2_project (
-		kind, required_capability, payload, false);
 }
 
 static void block_array_init(BlockArray *arr) {
@@ -1794,22 +1907,34 @@ typedef struct {
 	size_t capacity;
 } TaintSummaryMap;
 
+/* One published annotation. These used to be radare2's artifact records; they
+ * are the plugin's own now, because what reaches radare2 is an ordinary comment
+ * or flag in the plugin's space. */
 typedef struct {
-	ut64 revision;
-	bool captured;
-} SleighArtifactRevision;
+	ut64 addr;
+	const char *prefix;
+	const char *text;
+} SleighArtifactComment;
+
+typedef struct {
+	const char *name;
+	ut64 addr;
+	ut64 size;
+} SleighArtifactFlag;
 
 typedef struct {
 	RCore *core;
 	const char *domain_id;
+	char *space_name;
 	ut64 scope_id;
+	ut64 scope_min;
+	ut64 scope_max;
 	ut64 function_epoch;
 	ut64 type_epoch;
-	ut64 snapshot_revision;
-	RCoreAnalArtifactComment *comments;
+	SleighArtifactComment *comments;
 	size_t comment_count;
 	size_t comment_capacity;
-	RCoreAnalArtifactFlag *flags;
+	SleighArtifactFlag *flags;
 	size_t flag_count;
 	size_t flag_capacity;
 	RAnalRef *xrefs;
@@ -1817,17 +1942,6 @@ typedef struct {
 	size_t xref_capacity;
 	bool failed;
 } SleighArtifactPlan;
-
-static bool sleigh_artifact_revision_cb(const RAnalFunctionSnapshot *snapshot, void *user) {
-	SleighArtifactRevision *result = user;
-	RAnalFunctionSnapshotView view = {0};
-	if (!r_anal_function_snapshot_view (snapshot, &view)) {
-		return false;
-	}
-	result->revision = view.revision_identity;
-	result->captured = true;
-	return true;
-}
 
 static bool sleigh_artifact_plan_init(SleighArtifactPlan *plan, RAnal *anal,
 		RAnalFunction *fcn, const char *domain_id) {
@@ -1839,22 +1953,20 @@ static bool sleigh_artifact_plan_init(SleighArtifactPlan *plan, RAnal *anal,
 	if (!core) {
 		return false;
 	}
-	const ut64 function_epoch = r_anal_function_dirty_epoch (fcn);
-	const ut64 type_epoch = r_anal_types_dirty_epoch (anal);
-	SleighArtifactRevision revision = {0};
-	if (!r_core_function_snapshot_at (core, fcn->addr,
-			sleigh_artifact_revision_cb, &revision, NULL)
-			|| !revision.captured || !revision.revision
-			|| r_anal_function_dirty_epoch (fcn) != function_epoch
-			|| r_anal_types_dirty_epoch (anal) != type_epoch) {
+	/* One space per domain, so clearing what this run publishes cannot touch
+	 * another domain's annotations or a user's own. */
+	char *space_name = r_str_newf ("sla.%s", domain_id);
+	if (!space_name) {
 		return false;
 	}
 	plan->core = core;
 	plan->domain_id = domain_id;
+	plan->space_name = space_name;
 	plan->scope_id = fcn->addr;
-	plan->function_epoch = function_epoch;
-	plan->type_epoch = type_epoch;
-	plan->snapshot_revision = revision.revision;
+	plan->scope_min = r_anal_function_min_addr (fcn);
+	plan->scope_max = r_anal_function_max_addr (fcn);
+	plan->function_epoch = r_anal_function_dirty_epoch (fcn);
+	plan->type_epoch = r_anal_types_dirty_epoch (anal);
 	return true;
 }
 
@@ -1895,7 +2007,7 @@ static bool sleigh_artifact_plan_add_comment(SleighArtifactPlan *plan, ut64 addr
 	}
 	size_t i;
 	for (i = 0; i < plan->comment_count; i++) {
-		RCoreAnalArtifactComment *comment = &plan->comments[i];
+		SleighArtifactComment *comment = &plan->comments[i];
 		if (comment->addr == addr && !strcmp (comment->prefix, prefix)) {
 			char *replacement = strdup (text);
 			if (!replacement) {
@@ -1917,7 +2029,7 @@ static bool sleigh_artifact_plan_add_comment(SleighArtifactPlan *plan, ut64 addr
 		plan->failed = true;
 		return false;
 	}
-	plan->comments[plan->comment_count++] = (RCoreAnalArtifactComment) {
+	plan->comments[plan->comment_count++] = (SleighArtifactComment) {
 		.addr = addr,
 		.prefix = owned_prefix,
 		.text = owned_text,
@@ -1935,7 +2047,7 @@ static bool sleigh_artifact_plan_add_flag(SleighArtifactPlan *plan, const char *
 	}
 	size_t i;
 	for (i = 0; i < plan->flag_count; i++) {
-		RCoreAnalArtifactFlag *flag = &plan->flags[i];
+		SleighArtifactFlag *flag = &plan->flags[i];
 		if (!strcmp (flag->name, name)) {
 			if (flag->addr != addr || flag->size != size) {
 				plan->failed = true;
@@ -1952,7 +2064,7 @@ static bool sleigh_artifact_plan_add_flag(SleighArtifactPlan *plan, const char *
 		plan->failed = true;
 		return false;
 	}
-	plan->flags[plan->flag_count++] = (RCoreAnalArtifactFlag) {
+	plan->flags[plan->flag_count++] = (SleighArtifactFlag) {
 		.name = owned_name,
 		.addr = addr,
 		.size = size,
@@ -1993,29 +2105,67 @@ static bool sleigh_artifact_plan_add_xref(SleighArtifactPlan *plan, ut64 from,
 }
 
 static bool sleigh_artifact_plan_submit(SleighArtifactPlan *plan) {
-	if (!plan || plan->failed || !plan->core || !plan->domain_id) {
+	if (!plan || plan->failed || !plan->core || !plan->space_name) {
 		return false;
 	}
-	RCoreAnalArtifactReplacement replacement = {
-		.provider_id = "sla",
-		.domain_id = plan->domain_id,
-		.scope_id = plan->scope_id,
-		.expected_function_epoch = plan->function_epoch,
-		.expected_type_epoch = plan->type_epoch,
-		.expected_snapshot_revision = plan->snapshot_revision,
-		.comments = plan->comments,
-		.comment_count = plan->comment_count,
-		.flags = plan->flags,
-		.flag_count = plan->flag_count,
-		.xrefs = plan->xrefs,
-		.xref_count = plan->xref_count,
-	};
-	RCoreAnalArtifactReplaceResult result = r_core_anal_artifacts_replace (
-		plan->core, &replacement, 1);
-	if (result.status != R_CORE_ANAL_ARTIFACT_REPLACE_OK) {
-		R_LOG_WARN ("r2sleigh: cannot replace %s artifacts at 0x%08"PFMT64x": %u",
-			plan->domain_id, plan->scope_id, result.status);
+	RCore *core = plan->core;
+	RAnal *anal = core->anal;
+	RAnalFunction *fcn = r_anal_get_function_at (anal, plan->scope_id);
+	/* The epochs were read when the plan opened. If either moved, the analysis
+	 * this describes is not the analysis on screen, and publishing it would
+	 * annotate a function that has since changed. */
+	if (!fcn || r_anal_function_dirty_epoch (fcn) != plan->function_epoch
+			|| r_anal_types_dirty_epoch (anal) != plan->type_epoch) {
 		return false;
+	}
+	/* Comments go in the plugin's meta space. Clearing that space over the
+	 * function's own range first is what makes a re-run a replacement: an
+	 * annotation this run no longer produces does not survive it, and nothing
+	 * outside the space is touched. */
+	RSpace *previous = r_spaces_current (&anal->meta_spaces);
+	const char *previous_name = previous? previous->name: NULL;
+	char *restore = previous_name? strdup (previous_name): NULL;
+	if (previous_name && !restore) {
+		return false;
+	}
+	bool ok = r_spaces_set (&anal->meta_spaces, plan->space_name) != NULL;
+	if (ok && plan->scope_max > plan->scope_min) {
+		r_meta_del (anal, R_META_TYPE_COMMENT, plan->scope_min,
+			plan->scope_max - plan->scope_min);
+	}
+	size_t i;
+	for (i = 0; ok && i < plan->comment_count; i++) {
+		const SleighArtifactComment *comment = &plan->comments[i];
+		ok = r_meta_set_string (anal, R_META_TYPE_COMMENT, comment->addr, comment->text);
+	}
+	r_spaces_set (&anal->meta_spaces, restore);
+	free (restore);
+	if (!ok) {
+		R_LOG_WARN ("r2sleigh: cannot publish %s comments at 0x%08"PFMT64x,
+			plan->domain_id, plan->scope_id);
+		return false;
+	}
+	/* Flags carry their own space, so they need no current-space juggling. A
+	 * name this run reuses is replaced in place; one it drops is left, since a
+	 * flag is addressed by name rather than by range. */
+	for (i = 0; i < plan->flag_count; i++) {
+		const SleighArtifactFlag *flag = &plan->flags[i];
+		if (!r_flag_set_inspace (core->flags, plan->space_name, flag->name,
+				flag->addr, (ut32)flag->size)) {
+			R_LOG_WARN ("r2sleigh: cannot publish %s flag %s", plan->domain_id, flag->name);
+			return false;
+		}
+	}
+	/* Xrefs have no space to own them. Setting one is keyed on (from, to), so
+	 * a re-run replaces rather than accumulates; an edge this run no longer
+	 * finds is the one thing that outlives it. */
+	for (i = 0; i < plan->xref_count; i++) {
+		const RAnalRef *xref = &plan->xrefs[i];
+		if (!r_anal_xrefs_set (anal, xref->at, xref->addr, xref->type)) {
+			R_LOG_WARN ("r2sleigh: cannot publish %s xref 0x%08"PFMT64x" -> 0x%08"PFMT64x,
+				plan->domain_id, xref->at, xref->addr);
+			return false;
+		}
 	}
 	return true;
 }
@@ -2035,6 +2185,7 @@ static void sleigh_artifact_plan_fini(SleighArtifactPlan *plan) {
 	free (plan->comments);
 	free (plan->flags);
 	free (plan->xrefs);
+	free (plan->space_name);
 	memset (plan, 0, sizeof (*plan));
 }
 
@@ -3138,60 +3289,250 @@ static bool release_sleigh_context(void) {
 	return true;
 }
 
+/* ---------------------------------------------------------------------------
+ * Machine evidence -> Sleigh language
+ *
+ * One decision, one implementation. Both entry points (the anal plugin, which
+ * reads asm.arch/asm.bits/asm.cpu/asm.abi/cfg.bigendian, and the arch plugin,
+ * which reads the binary's own headers) funnel their evidence through
+ * SleighMachine and get the same answer.
+ *
+ * A NULL answer is a refusal, and refusing is the correct output whenever no
+ * bundled language matches the evidence. Loading a neighbouring language
+ * instead yields well-formed, confidently wrong disassembly, which is worse
+ * than none.
+ * ------------------------------------------------------------------------ */
+
+typedef struct {
+	const char *arch;	/* asm.arch or RBinInfo.arch */
+	int bits;		/* 16 means Thumb on ARM, real mode on x86 */
+	bool big_endian;
+	const char *cpu;	/* asm.cpu or RBinInfo.cpu, may be NULL */
+	const char *abi;	/* asm.abi or RBinInfo.abi, may be NULL */
+} SleighMachine;
+
+/* ARMv6 introduced BE8: only data is big-endian, instructions stay
+ * little-endian. Pre-v6 big-endian ARM (BE32) fetches instructions big-endian
+ * too. Ghidra draws exactly this line -- ARM:LEBE:32:v8LEInstruction uses
+ * ARM8_le.sla while ARM:BE:32:v8 uses ARM8_be.sla -- and the ELF e_flags bit
+ * is the only evidence, which radare2 surfaces as " be8" inside the ABI
+ * string. */
+static bool sleigh_arm_instructions_are_big_endian(const SleighMachine *m) {
+	if (!m->big_endian) {
+		return false;
+	}
+	return !(m->abi && strstr (m->abi, "be8"));
+}
+
+static const char *sleigh_language_for_arm(const SleighMachine *m) {
+	if (m->bits == 64) {
+		/* Data endianness follows the slaspec, so a big-endian AArch64 image
+		 * needs the big-endian language even though the encoding is fixed. */
+		return m->big_endian? "arm64be": "arm64";
+	}
+	/* radare2 spells Thumb as asm.bits=16; asm.cpu=cortex is Thumb-only. */
+	const bool thumb = (m->bits == 16)
+		|| (m->cpu && !r_str_casecmp (m->cpu, "cortex"));
+	const bool be = sleigh_arm_instructions_are_big_endian (m);
+	if (thumb) {
+		return be? "thumbbe": "thumb";
+	}
+	return be? "armbe": "arm";
+}
+
+/* MIPS release 6 re-encoded and removed instructions the pre-R6 languages
+ * still accept, so it needs its own slaspec rather than the base one. */
+static bool sleigh_mips_cpu_is_r6(const char *cpu) {
+	const size_t len = strlen (cpu);
+	return len >= 2 && !r_str_casecmp (cpu + len - 2, "r6");
+}
+
+/* Set when a machine we otherwise support carries a variant no bundled
+ * language covers. A bare refusal reads as a missing backend, so the caller
+ * says this once instead of leaving `invalid` unexplained. Left NULL for
+ * architectures this build simply does not carry, which stay quiet so other
+ * plugins can take over. */
+static const char *sleigh_refusal_reason = NULL;
+
+static const char *sleigh_refuse(const char *why) {
+	sleigh_refusal_reason = why;
+	return NULL;
+}
+
+static const char *sleigh_language_for_mips(const SleighMachine *m) {
+	const char *arch = m->arch;
+	bool is64 = m->bits >= 64
+		|| !strcmp (arch, "mips64")
+		|| !strcmp (arch, "mips64be")
+		|| !strcmp (arch, "mips64le")
+		|| !strcmp (arch, "mips64el");
+	bool be = m->big_endian;
+	if (!strcmp (arch, "mipsel") || !strcmp (arch, "mips32le")
+			|| !strcmp (arch, "mips32el")
+			|| !strcmp (arch, "mips64le")
+			|| !strcmp (arch, "mips64el")) {
+		be = false;
+	} else if (!strcmp (arch, "mips32be") || !strcmp (arch, "mipsbe")
+			|| !strcmp (arch, "mipseb") || !strcmp (arch, "mips64be")) {
+		be = true;
+	}
+	if (m->cpu) {
+		/* microMIPS and MIPS16e are distinct encodings selected by the
+		 * ISA_MODE context bit. sleigh-config bundles mips32micro.pspec, but
+		 * it only clears RELP: every micromips constructor is additionally
+		 * gated on ISA_MODE=1, which no bundled pspec sets and the lift API
+		 * offers no way to override. Under the base MIPS32 language these
+		 * images decode as real mnemonics at misaligned offsets interleaved
+		 * with `invalid`, so refuse. */
+		if (!r_str_casecmp (m->cpu, "micro") || strstr (m->cpu, "micromips")) {
+			return sleigh_refuse ("microMIPS decoding needs the ISA_MODE context bit, which no bundled processor spec sets");
+		}
+		if (strstr (m->cpu, "mips16") || !r_str_casecmp (m->cpu, "16")) {
+			return sleigh_refuse ("MIPS16e decoding needs the ISA_MODE context bit, which no bundled processor spec sets");
+		}
+		if (sleigh_mips_cpu_is_r6 (m->cpu)) {
+			if (is64) {
+				/* mips64R6.pspec is bundled but no MIPS64 R6 slaspec is. */
+				return sleigh_refuse ("no MIPS64 release-6 slaspec is bundled");
+			}
+			return be? "mips32r6be": "mips32r6le";
+		}
+	}
+	if (is64) {
+		return be? "mips64be": "mips64le";
+	}
+	return be? "mips32be": "mips32le";
+}
+
+static const char *sleigh_language_for_machine(const SleighMachine *m) {
+	sleigh_refusal_reason = NULL;
+	if (!m->arch || !*m->arch) {
+		return NULL;
+	}
+	const char *arch = m->arch;
+	if (!strcmp (arch, "x86")) {
+		if (m->big_endian) {
+			return sleigh_refuse ("no big-endian x86 language exists");
+		}
+		if (m->bits == 16) {
+			return sleigh_refuse ("x86-16 ships a processor spec but no slaspec");
+		}
+		return (m->bits == 64)? "x86-64": "x86";
+	}
+	if (!strcmp (arch, "arm") || !strcmp (arch, "thumb")) {
+		return sleigh_language_for_arm (m);
+	}
+	if (!strcmp (arch, "arm64") || !strcmp (arch, "aarch64")) {
+		SleighMachine wide = *m;
+		wide.bits = 64;
+		return sleigh_language_for_arm (&wide);
+	}
+	if (!strcmp (arch, "riscv") || !strcmp (arch, "riscv32")
+			|| !strcmp (arch, "riscv64") || !strcmp (arch, "rv32")
+			|| !strcmp (arch, "rv64")) {
+		if (m->big_endian) {
+			return sleigh_refuse ("only the little-endian RISC-V languages are bundled");
+		}
+		if (!strcmp (arch, "riscv32") || !strcmp (arch, "rv32")) {
+			return "riscv32";
+		}
+		if (!strcmp (arch, "riscv64") || !strcmp (arch, "rv64")) {
+			return "riscv64";
+		}
+		return (m->bits >= 64)? "riscv64": "riscv32";
+	}
+	if (!strncmp (arch, "mips", 4)) {
+		return sleigh_language_for_mips (m);
+	}
+	return NULL; /* unsupported architecture */
+}
+
+/* The arch plugin's route: decide from the binary's own headers. */
+const char *r2sleigh_language_for_bin_info(RBinInfo *info) {
+	if (!info || !info->arch) {
+		return NULL;
+	}
+	SleighMachine machine = {
+		.arch = info->arch,
+		.bits = info->bits,
+		.big_endian = info->big_endian != 0,
+		.cpu = info->cpu,
+		.abi = info->abi,
+	};
+	return sleigh_language_for_machine (&machine);
+}
+
+/* asm.arch=r2sleigh names this plugin, not a machine. The decoder still
+ * reaches a language through the binary's headers, so answer from that same
+ * evidence rather than reporting nothing loaded. */
+static bool sleigh_arch_is_not_a_machine(const char *arch) {
+	return !strcmp (arch, "r2sleigh") || !strcmp (arch, "null")
+		|| !strcmp (arch, "any");
+}
+
+static const char *sleigh_language_for_anal(RAnal *anal) {
+	RBinInfo *info = anal->binb.bin? r_bin_get_info (anal->binb.bin): NULL;
+	if (sleigh_arch_is_not_a_machine (anal->config->arch)) {
+		return r2sleigh_language_for_bin_info (info);
+	}
+	SleighMachine machine = {
+		.arch = anal->config->arch,
+		.bits = anal->config->bits,
+		.big_endian = R_ARCH_CONFIG_IS_BIG_ENDIAN (anal->config),
+		.cpu = anal->config->cpu,
+		.abi = anal->config->abi,
+	};
+	/* The session config is authoritative, but it carries no BE8 flag of its
+	 * own when the user never set asm.abi; borrow that one fact from the
+	 * headers rather than guessing BE32. */
+	if (!machine.abi && info && info->abi && info->arch
+			&& !strcmp (info->arch, machine.arch)) {
+		machine.abi = info->abi;
+	}
+	return sleigh_language_for_machine (&machine);
+}
+
+static void sleigh_report_refusal(RAnal *anal) {
+	if (!sleigh_refusal_reason) {
+		return;
+	}
+	static char *last = NULL;
+	char *what = r_str_newf ("%s|%d|%s", anal->config->arch, anal->config->bits,
+		anal->config->cpu? anal->config->cpu: "-");
+	if (!what) {
+		return;
+	}
+	if (last && !strcmp (last, what)) {
+		free (what);
+		return;
+	}
+	free (last);
+	last = what;
+	R_LOG_WARN ("r2sleigh: refusing to disassemble: %s", sleigh_refusal_reason);
+}
+
 R2ILContext *get_context(RAnal *anal) {
 	if (!anal || !anal->config || !anal->config->arch[0]) {
 		return NULL;
 	}
-	const char *arch = anal->config->arch;
-	int bits = anal->config->bits;
-
-	/* Determine sleigh arch string */
-	const char *sleigh_arch_str;
-	if (sleigh_arch_override) {
-		sleigh_arch_str = sleigh_arch_override;
-	} else if (!strcmp (arch, "x86")) {
-		sleigh_arch_str = (bits == 64) ? "x86-64" : "x86";
-	} else if (!strcmp (arch, "arm")) {
-		sleigh_arch_str = (bits == 64) ? "arm64" : "arm";
-	} else if (!strcmp (arch, "arm64") || !strcmp (arch, "aarch64")) {
-		sleigh_arch_str = "arm64";
-	} else if (!strcmp (arch, "riscv")) {
-		sleigh_arch_str = (bits >= 64) ? "riscv64" : "riscv32";
-	} else if (!strcmp (arch, "riscv32") || !strcmp (arch, "rv32")) {
-		sleigh_arch_str = "riscv32";
-	} else if (!strcmp (arch, "riscv64") || !strcmp (arch, "rv64")) {
-		sleigh_arch_str = "riscv64";
-	} else if (!strcmp (arch, "mips") || !strcmp (arch, "mips32")
-			|| !strcmp (arch, "mips32be") || !strcmp (arch, "mipsbe")
-			|| !strcmp (arch, "mipseb") || !strcmp (arch, "mipsel")
-			|| !strcmp (arch, "mips32le") || !strcmp (arch, "mips32el")
-			|| !strcmp (arch, "mips64") || !strcmp (arch, "mips64be")
-			|| !strcmp (arch, "mips64le") || !strcmp (arch, "mips64el")) {
-		bool is64 = bits >= 64
-			|| !strcmp (arch, "mips64")
-			|| !strcmp (arch, "mips64be")
-			|| !strcmp (arch, "mips64le")
-			|| !strcmp (arch, "mips64el");
-		bool big_endian = R_ARCH_CONFIG_IS_BIG_ENDIAN (anal->config);
-		if (!strcmp (arch, "mipsel") || !strcmp (arch, "mips32le")
-				|| !strcmp (arch, "mips32el")
-				|| !strcmp (arch, "mips64le")
-				|| !strcmp (arch, "mips64el")) {
-			big_endian = false;
-		} else if (!strcmp (arch, "mips32be") || !strcmp (arch, "mipsbe")
-				|| !strcmp (arch, "mipseb") || !strcmp (arch, "mips64be")) {
-			big_endian = true;
-		}
-		sleigh_arch_str = is64
-			? (big_endian ? "mips64be" : "mips64le")
-			: (big_endian ? "mips32be" : "mips32le");
-	} else {
-		return NULL; /* unsupported arch */
+	const char *sleigh_arch_str = sleigh_arch_override
+		? sleigh_arch_override
+		: sleigh_language_for_anal (anal);
+	if (!sleigh_arch_str) {
+		/* No bundled language matches this machine. Say why once when the
+		 * architecture itself is one we carry, so a refusal is not mistaken
+		 * for a missing backend; stay quiet otherwise so other plugins can
+		 * take over without noise. */
+		sleigh_report_refusal (anal);
+		return NULL;
 	}
 
 	/* Check if we need to reinitialize */
 	if (sleigh_ctx && sleigh_arch && !strcmp (sleigh_arch, sleigh_arch_str)) {
-		if (!install_context_reg_profile (anal, sleigh_ctx)) {
+		const ut64 profile_started = sleigh_callback_start ();
+		const bool installed = install_context_reg_profile (anal, sleigh_ctx);
+		sleigh_callback_end (SLEIGH_CB_REG_PROFILE, profile_started);
+		if (!installed) {
 			R_LOG_DEBUG ("r2sleigh: cached register profile installation failed for %s", sleigh_arch_str);
 			return NULL;
 		}
@@ -3208,7 +3549,9 @@ R2ILContext *get_context(RAnal *anal) {
 	sleigh_arch = NULL;
 
 	/* Initialize new context */
+	const ut64 create_started = sleigh_callback_start ();
 	uint32_t status = sleigh_v2_context_create (sleigh_arch_str, &sleigh_ctx);
+	sleigh_callback_end (SLEIGH_CB_CONTEXT_CREATE, create_started);
 	if (status != R2SLEIGH_STATUS_OK_V2 || !sleigh_ctx) {
 		/* Optional-arch builds are expected to miss some backends; stay silent
 		 * so unsupported architectures fall back to other anal plugins. */
@@ -3253,8 +3596,12 @@ R2ILContext *get_context(RAnal *anal) {
 int sleigh_op(RAnal *anal, RAnalOp *op, ut64 addr, const ut8 *data, int len, RAnalOpMask mask) {
 	R_RETURN_VAL_IF_FAIL (anal && op && data, -1);
 
+	const ut64 op_started = sleigh_callback_start ();
+	const ut64 context_started = sleigh_callback_start ();
 	R2ILContext *ctx = get_context (anal);
+	sleigh_callback_end (SLEIGH_CB_OP_CONTEXT, context_started);
 	if (!ctx) {
+		sleigh_callback_end (SLEIGH_CB_OP, op_started);
 		return -1;
 	}
 
@@ -3271,42 +3618,45 @@ int sleigh_op(RAnal *anal, RAnalOp *op, ut64 addr, const ut8 *data, int len, RAn
 	}
 
 	R2ILBlock *block = NULL;
-	if (sleigh_v2_lift_instruction (sleigh_ctx, use_data, use_len, addr, &block)
-		!= R2SLEIGH_STATUS_OK_V2 || !block) {
+	const ut64 lift_started = sleigh_callback_start ();
+	const uint32_t lift_status = sleigh_v2_lift_instruction (
+		sleigh_ctx, use_data, use_len, addr, &block);
+	sleigh_callback_end (SLEIGH_CB_OP_LIFT, lift_started);
+	if (lift_status != R2SLEIGH_STATUS_OK_V2 || !block) {
+		sleigh_callback_end (SLEIGH_CB_OP, op_started);
 		return -1;
 	}
 
 	op->addr = addr;
-	uint32_t block_size = 0;
-	uint32_t block_type = 0;
-	if (sleigh_v2_block_size (block, &block_size) != R2SLEIGH_STATUS_OK_V2
-		|| sleigh_v2_block_type (block, &block_type) != R2SLEIGH_STATUS_OK_V2) {
+	R2SleighBlockViewV2 view = {0};
+	if (sleigh_v2_block_view (block, &view) != R2SLEIGH_STATUS_OK_V2
+		|| view.struct_size != sizeof (view)) {
 		(void)sleigh_v2_block_release (&block);
+		sleigh_callback_end (SLEIGH_CB_OP, op_started);
 		return -1;
 	}
-	op->size = block_size;
-	op->type = block_type;
-	ut64 jump_addr = 0;
-	(void)sleigh_v2_block_jump (block, &jump_addr);
-	if (jump_addr != 0) {
-		op->jump = jump_addr;
+	op->size = view.size;
+	op->type = view.block_type;
+	if (view.jump != 0) {
+		op->jump = view.jump;
 	}
-	ut64 fail_addr = 0;
-	(void)sleigh_v2_block_fail (block, &fail_addr);
-	if (fail_addr != 0) {
-		op->fail = fail_addr;
+	if (view.fail != 0) {
+		op->fail = view.fail;
 	}
 
 	if (mask & R_ARCH_OP_MASK_DISASM) {
+		const ut64 disasm_started = sleigh_callback_start ();
 		char *mnem = NULL;
 		(void)sleigh_v2_block_mnemonic (ctx, use_data, use_len, addr, &mnem);
 		if (mnem) {
 			op->mnemonic = strdup (mnem);
 			free (mnem);
 		}
+		sleigh_callback_end (SLEIGH_CB_OP_DISASM, disasm_started);
 	}
 
 	if (mask & R_ARCH_OP_MASK_ESIL) {
+		const ut64 esil_started = sleigh_callback_start ();
 		char *esil = NULL;
 		const R2ILBlock *blocks[] = { block };
 		(void)sleigh_v2_analysis_render (R2SLEIGH_ANALYSIS_BLOCK_ESIL_V2,
@@ -3315,15 +3665,19 @@ int sleigh_op(RAnal *anal, RAnalOp *op, ut64 addr, const ut8 *data, int len, RAn
 			r_strbuf_set (&op->esil, esil);
 			free (esil);
 		}
+		sleigh_callback_end (SLEIGH_CB_OP_ESIL, esil_started);
 	}
 
 	if (mask & R_ARCH_OP_MASK_VAL) {
+		const ut64 val_started = sleigh_callback_start ();
 		RVecRArchValue_clear (&op->srcs);
 		RVecRArchValue_clear (&op->dsts);
 		fill_op_values_enhanced (anal, op, ctx, block);
+		sleigh_callback_end (SLEIGH_CB_OP_VAL, val_started);
 	}
 
 	(void)sleigh_v2_block_release (&block);
+	sleigh_callback_end (SLEIGH_CB_OP, op_started);
 	return op->size;
 }
 
@@ -3335,6 +3689,10 @@ static bool sleigh_init(RAnal *anal) {
 
 static bool sleigh_fini(RAnal *anal) {
 	(void)anal;
+	/* Also here, not only after post-analysis: an `aa` run never reaches the
+	 * sweep, and `aa` is where most of the callback cost turned out to be. */
+	sleigh_callback_report ();
+	sleigh_function_capture_release ();
 	const R2SleighApiV2 *api = sleigh_lift_api_v2 ();
 	uint32_t status = sleigh_v2_owned_bytes_release (api, &sleigh_pending_owned_bytes);
 	if (status != R2SLEIGH_STATUS_OK_V2) {
@@ -3431,34 +3789,59 @@ static char *sleigh_decompile_execute(RAnal *anal, RAnalFunction *fcn, bool json
 		: NULL;
 }
 
-static RCodeMeta *sleigh_decompile(const RAnalFunctionSnapshot *snapshot) {
-	R_RETURN_VAL_IF_FAIL (snapshot, NULL);
-	/* Serialize once and hand the engine one buffer. The accessor table stays
-	 * wired as the fallback while the two paths are compared; when it goes, so
-	 * do its callbacks and their size handshakes. */
-	size_t buffer_len = 0;
-	uint8_t *buffer = NULL;
-	R2SleighWireWriter *writer = r2sleigh_wire_writer_new ();
-	if (writer) {
-		if (r2sleigh_wire_write_snapshot (writer, snapshot)) {
-			buffer = r2sleigh_wire_writer_finish (writer, &buffer_len);
+/* The deadline one engine call gets, derived from the engine's own budget for a
+ * program this size.
+ *
+ * Both call sites passed zero, which made `deadline` None in the boundary and
+ * every poll inside the engine a no-op: a single function could run without end.
+ * That cost far more than itself, because the benchmark harness decompiles every
+ * function of a binary in one process, so one unbounded function lost the whole
+ * binary. Bounding a call by what the entire sweep was allotted cannot refuse
+ * anything the sweep would have finished anyway. */
+static ut64 sleigh_engine_call_deadline_us(RAnal *anal) {
+	const size_t function_count = (anal && anal->fcns)
+		? (size_t)r_list_length (anal->fcns): 0;
+	return r2sleigh_engine_budget_usec_v2 (function_count);
+}
+
+static RCodeMeta *sleigh_decompile(RAnal *anal, RAnalFunction *fcn) {
+	R_RETURN_VAL_IF_FAIL (anal && fcn, NULL);
+	if (sleigh_function_exceeds_engine_limits (fcn)) {
+		/* In band, and in the shape every other refusal takes. Returning
+		 * nothing here would leave the function neither rendered nor declined,
+		 * which reads downstream as a function nobody asked about. */
+		char *refusal = r_str_newf (
+			"/* r2dec fallback: skipped decompilation for %s "
+			"(engine refusal: function exceeds the engine complexity limit) */\n",
+			r_str_get (fcn->name));
+		if (!refusal) {
+			return NULL;
 		}
-		r2sleigh_wire_writer_free (writer);
+		RCodeMeta *declined = r_codemeta_new (refusal);
+		free (refusal);
+		return declined;
 	}
+	const SleighFunctionCapture *held = sleigh_function_capture (anal, fcn);
+	if (!held || !held->wire) {
+		R_LOG_ERROR ("r2sleigh: cannot capture '%s'", r_str_get (fcn->name));
+		return NULL;
+	}
+	/* The buffer comes from the held capture rather than a walk of this
+	 * function's own: the proof path has usually taken one already, and
+	 * walking twice for the same bytes is pure cost. */
 	const R2SleighEngineRequestPayloadV2 payload = {
 		.abi_version = R2SLEIGH_ABI_V2,
 		.struct_size = sizeof (payload),
-		.timeout_us = 0,
-		.snapshot_buffer = buffer,
-		.snapshot_buffer_len = buffer_len,
+		.timeout_us = sleigh_engine_call_deadline_us (anal),
+		.snapshot_buffer = held->wire,
+		.snapshot_buffer_len = held->wire_len,
 	};
 	char *result = sleigh_engine_execute_v2 (
 		R2SLEIGH_REQUEST_DECOMPILE_V2,
 		R2SLEIGH_CAP_DECOMPILE_V2 | R2SLEIGH_CAP_OPAQUE_RADARE_SNAPSHOT_V2,
 		&payload);
-	free (buffer);
 	if (!result) {
-		R_LOG_ERROR ("r2sleigh: borrowed snapshot decompilation was refused");
+		R_LOG_ERROR ("r2sleigh: decompilation was refused");
 		return NULL;
 	}
 	RCodeMeta *metadata = r_codemeta_new (result);
@@ -3477,6 +3860,13 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 
 	RCore *core = anal->coreb.core;
 	RCons *cons = core ? core->cons : NULL;
+	/* Every print below goes through cons. Without one a command answers with
+	 * an empty string, which reads as "nothing to report" rather than "could
+	 * not report". Say which. */
+	if (!cons) {
+		R_LOG_ERROR ("r2sleigh: no console bound; '%s' cannot print", cmd);
+		return strdup ("");
+	}
 
 	if (r_str_startswith (cmd, "sla.debug.")) {
 		int n = snprintf (debug_cmd, sizeof (debug_cmd), "sla.%s", cmd + strlen ("sla.debug."));
@@ -3521,6 +3911,15 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 	}
 	if (!is_sla_debug_ns) {
 		if (sleigh_direct_sla_debug_only_command (cmd)) {
+			// Engine inspection lives under the debug namespace. Returning an
+			// empty string here left the bare spelling looking like a command
+			// that ran and had nothing to say.
+			R_LOG_ERROR ("r2sleigh: '%s' is engine inspection; use 'a:sla.debug.%s'",
+				cmd, cmd + strlen ("sla."));
+			if (cons) {
+				r_cons_printf (cons, "r2sleigh: use a:sla.debug.%s\n",
+					cmd + strlen ("sla."));
+			}
 			return strdup ("");
 		}
 	}
@@ -3529,6 +3928,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 		if (cons) {
 			r_cons_println (cons, "| a:sla        - Show r2sleigh status");
 			r_cons_println (cons, "| pdd - decompile through the borrowed-snapshot provider");
+			r_cons_println (cons, "| a:sla.debug.* - engine inspection (ssa, defuse, dom, cfg, taint, regs, mem, vars)");
 			r_cons_println (cons, "| a:sla.dec / a:sla.decj - unavailable outside that provider");
 			r_cons_println (cons, "| a:sym.* - unavailable without the borrowed function snapshot provider");
 		}
@@ -3651,12 +4051,9 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 			if (ctx) {
 				(void)sleigh_v2_context_arch_name (ctx, &name);
 			}
+			const char *loaded = ctx? (sleigh_arch? sleigh_arch: name): NULL;
 			if (cons) {
-				if (name) {
-					r_cons_printf (cons, "%s\n", name);
-				} else {
-					r_cons_println (cons, "none");
-				}
+				r_cons_println (cons, loaded? loaded: "none");
 			}
 			free (name);
 		}
@@ -3666,10 +4063,14 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
 	if (!strcmp (cmd, "sla") || !strcmp (cmd, "sla.info")) {
 		R2ILContext *ctx = get_context (anal);
 		if (ctx) {
+			/* Report the language key that actually selected the slaspec and
+			 * pspec, not the coarser ArchSpec name: "ARM" alone cannot say
+			 * whether A32 or Thumb, little- or big-endian, is in use. */
 			char *name = NULL;
 			(void)sleigh_v2_context_arch_name (ctx, &name);
+			const char *loaded = sleigh_arch? sleigh_arch: (name? name: "unknown");
 			if (cons) {
-				r_cons_printf (cons, "sla: loaded architecture '%s'\n", name ? name : "unknown");
+				r_cons_printf (cons, "sla: loaded architecture '%s'\n", loaded);
 			}
 			free (name);
 		} else {
@@ -4259,7 +4660,7 @@ static char *sleigh_cmd(RAnal *anal, const char *cmd) {
  * ============================================================================ */
 
 /* Called after function analysis completes */
-static bool sleigh_analyze_fcn(RAnal *anal, RAnalFunction *fcn) {
+static bool sleigh_analyze_fcn_inner(RAnal *anal, RAnalFunction *fcn) {
 	if (!fcn || !anal) {
 		return false;
 	}
@@ -4370,7 +4771,27 @@ static bool collect_data_refs_from_typed(
 }
 
 /* Called during reference analysis (aar) */
+static bool sleigh_analyze_fcn(RAnal *anal, RAnalFunction *fcn) {
+	const ut64 started = sleigh_callback_start ();
+	const bool ok = sleigh_analyze_fcn_inner (anal, fcn);
+	sleigh_callback_end (SLEIGH_CB_ANALYZE_FCN, started);
+	return ok;
+}
+
+static bool sleigh_get_data_refs_inner(RAnal *anal, RAnalFunction *fcn, R_OUT RVecAnalRef **refs);
+
 static bool sleigh_get_data_refs(RAnal *anal, RAnalFunction *fcn, R_OUT RVecAnalRef **refs) {
+	const ut64 started = sleigh_callback_start ();
+	const bool ok = sleigh_get_data_refs_inner (anal, fcn, refs);
+	sleigh_callback_end (SLEIGH_CB_DATA_REFS, started);
+	return ok;
+}
+
+static bool sleigh_get_data_refs_inner(RAnal *anal, RAnalFunction *fcn, R_OUT RVecAnalRef **refs) {
+	if (!refs) {
+		return false;
+	}
+	*refs = NULL;
 	if (!refs) {
 		return false;
 	}
@@ -4396,7 +4817,7 @@ static bool sleigh_get_data_refs(RAnal *anal, RAnalFunction *fcn, R_OUT RVecAnal
 		return false;
 	}
 
-	bool success = false;
+	RVecAnalRef *found = NULL;
 	RVecAnalRef *result = NULL;
 	R2SleighAnalysisResultV2 *typed_refs = NULL;
 	R2SleighAnalysisResultViewV2 typed_view = {0};
@@ -4408,7 +4829,6 @@ static bool sleigh_get_data_refs(RAnal *anal, RAnalFunction *fcn, R_OUT RVecAnal
 	}
 	size_t typed_count = typed_view.primary_count;
 	if (!typed_count) {
-		success = true;
 		goto beach;
 	}
 	const R2SleighDataRef *typed_items = (const R2SleighDataRef *)typed_view.primary;
@@ -4421,7 +4841,6 @@ static bool sleigh_get_data_refs(RAnal *anal, RAnalFunction *fcn, R_OUT RVecAnal
 		goto beach;
 	}
 	if (!ref_count) {
-		success = true;
 		goto beach;
 	}
 	result = RVecAnalRef_new ();
@@ -4434,14 +4853,14 @@ static bool sleigh_get_data_refs(RAnal *anal, RAnalFunction *fcn, R_OUT RVecAnal
 			|| written != ref_count) {
 		goto beach;
 	}
-	*refs = result;
+	found = result;
 	result = NULL;
-	success = true;
 beach:
 	RVecAnalRef_free (result);
 	(void)sleigh_v2_analysis_result_release (&typed_refs);
 	block_array_free (&blocks);
-	return success;
+	*refs = found;
+	return found != NULL;
 }
 
 typedef struct {
@@ -4458,6 +4877,198 @@ static void sleigh_taint_plan_stats_fini(SleighTaintPlanStats *stats) {
 	}
 	free (stats->best_sink_label);
 	memset (stats, 0, sizeof (*stats));
+}
+
+/* Whether a function has anything for the prover to work on.
+ *
+ * Proving costs a snapshot capture and an engine round trip per function, and
+ * on a statically linked binary that is hundreds of them. What the prover
+ * contributes is targets for transfers radare2 could not follow and blocks
+ * nothing reaches, so a function whose every transfer already has a known
+ * target has nothing here to find. The deep pass takes them all regardless. */
+/* Address of a block's last instruction, or the block's own address when
+ * radare2 recorded no instruction positions for it. */
+static ut64 sleigh_block_last_instruction(const RAnalBlock *bb) {
+	if (!bb) {
+		return UT64_MAX;
+	}
+	if (bb->ninstr > 1 && bb->op_pos) {
+		return bb->addr + bb->op_pos[bb->ninstr - 2];
+	}
+	return bb->addr;
+}
+
+/* Does this block end in a transfer radare2 could not resolve?
+ *
+ * The predicate this replaces asked whether the block had no successor, which
+ * reads as "radare2 did not know where this goes" and is not what it means: a
+ * block ending in `ret` has no successor either. Every function has a return
+ * block, so the filter admitted every function, `skipped` was 0 on every
+ * binary, and the proof sweep lifted and proved the whole program at `aaa`
+ * time. Measured on bzip2recover, that took analysis from 0.68 seconds to
+ * 11.98 and then refused the remainder against its own ten-second budget.
+ *
+ * What the prover actually reads is a dispatch it can resolve and radare2
+ * cannot, so ask the instruction, not the edge. */
+static bool sleigh_block_ends_unresolved(RAnal *anal, const RAnalBlock *bb) {
+	if (!anal || !bb || bb->size == 0) {
+		return false;
+	}
+	ut64 at = sleigh_block_last_instruction (bb);
+	if (at == UT64_MAX) {
+		return false;
+	}
+	ut8 buf[32] = {0};
+	int len = (int)R_MIN ((ut64)sizeof (buf), bb->addr + bb->size - at);
+	if (len <= 0 || !anal->iob.read_at || !anal->iob.read_at (anal->iob.io, at, buf, len)) {
+		return false;
+	}
+	RAnalOp op = {0};
+	r_anal_op_init (&op);
+	bool unresolved = false;
+	if (r_anal_op (anal, &op, at, buf, len, R_ARCH_OP_MASK_BASIC) > 0) {
+		/* The register, indirect and conditional bits are modifiers on a base
+		 * type, so strip them and compare the base rather than enumerating
+		 * every combination and missing one. A jump whose target is read from
+		 * memory keeps the MEM bit instead, and is the import-thunk shape the
+		 * prover resolves, so it counts too. */
+		const ut32 type = (ut32)(op.type & R_ANAL_OP_TYPE_MASK);
+		const ut32 base = type & ~(ut32)(R_ANAL_OP_TYPE_REG
+			| R_ANAL_OP_TYPE_IND | R_ANAL_OP_TYPE_COND);
+		unresolved = base == R_ANAL_OP_TYPE_UJMP
+			|| base == R_ANAL_OP_TYPE_UCALL
+			|| base == (R_ANAL_OP_TYPE_JMP | R_ANAL_OP_TYPE_MEM)
+			|| base == (R_ANAL_OP_TYPE_CALL | R_ANAL_OP_TYPE_MEM);
+	}
+	r_anal_op_fini (&op);
+	return unresolved;
+}
+
+static bool sleigh_function_may_prove(RAnal *anal, RAnalFunction *fcn) {
+	if (!fcn || !fcn->bbs) {
+		return false;
+	}
+	RListIter *iter;
+	RAnalBlock *bb;
+	r_list_foreach (fcn->bbs, iter, bb) {
+		if (!bb) {
+			continue;
+		}
+		if (bb->switch_op) {
+			return true;
+		}
+		if (sleigh_block_ends_unresolved (anal, bb)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/* The buffer comes from the capture rather than from a walk of this function's
+ * own. The proof plan has already taken one for its revision, and walking again
+ * for the same bytes was 0.98 seconds of bzip2recover's post-analysis. */
+static char *sleigh_proven_facts_json(RAnal *anal, RAnalFunction *fcn) {
+	const SleighFunctionCapture *capture = sleigh_function_capture (anal, fcn);
+	if (!capture || !capture->wire) {
+		return NULL;
+	}
+	const R2SleighEngineRequestPayloadV2 payload = {
+		.abi_version = R2SLEIGH_ABI_V2,
+		.struct_size = sizeof (payload),
+		.timeout_us = sleigh_engine_call_deadline_us (anal),
+		.snapshot_buffer = capture->wire,
+		.snapshot_buffer_len = capture->wire_len,
+	};
+	const ut64 engine_started = sleigh_callback_start ();
+	char *json = sleigh_engine_execute_v2 (R2SLEIGH_REQUEST_PROVEN_FACTS_V2,
+		R2SLEIGH_CAP_OPAQUE_RADARE_SNAPSHOT_V2, &payload);
+	sleigh_callback_end (SLEIGH_CB_PROOF_ENGINE, engine_started);
+	return json;
+}
+
+/* Turn the proofs into the xrefs and comments radare2 stores.
+ *
+ * A resolved dispatch becomes one call xref per entry the index can select,
+ * which is what makes the callees reachable to every later pass. The comment
+ * next to it names the table and the count so a reader can check the claim
+ * instead of taking it. */
+static bool collect_proof_artifacts_for_function(SleighArtifactPlan *plan,
+		RAnal *anal, RAnalFunction *fcn, size_t *out_xrefs, size_t *out_dead) {
+	char *json = sleigh_proven_facts_json (anal, fcn);
+	if (!json) {
+		// Refusing is the fail-closed path, so say which function and move on.
+		R_LOG_DEBUG ("r2sleigh: no proofs for 0x%08"PFMT64x, fcn->addr);
+		return false;
+	}
+	R_LOG_DEBUG ("r2sleigh: proofs at 0x%08"PFMT64x": %s", fcn->addr, json);
+	RJson *facts = r_json_parse (json);
+	if (!facts) {
+		free (json);
+		return false;
+	}
+	bool ok = true;
+	const RJson *calls = r_json_get (facts, "indirect_calls");
+	if (calls && calls->type == R_JSON_ARRAY) {
+		const RJson *call;
+		for (call = calls->children.first; call && ok; call = call->next) {
+			const RJson *block = r_json_get (call, "block");
+			const RJson *table = r_json_get (call, "table");
+			const RJson *targets = r_json_get (call, "targets");
+			if (!block || !table || !targets || targets->type != R_JSON_ARRAY) {
+				continue;
+			}
+			size_t count = 0;
+			const RJson *target;
+			for (target = targets->children.first; target; target = target->next) {
+				if (!sleigh_artifact_plan_add_xref (plan, block->num.u_value,
+						target->num.u_value, R_ANAL_REF_TYPE_CALL)) {
+					ok = false;
+					break;
+				}
+				count++;
+			}
+			if (!ok || !count) {
+				continue;
+			}
+			char *note = r_str_newf (
+				SLEIGH_COMMENT_PREFIX_PROOF
+				" dispatch through table 0x%08"PFMT64x
+				" reaches exactly %zu of its entries",
+				table->num.u_value, count);
+			if (!note || !sleigh_artifact_plan_add_comment (plan,
+					block->num.u_value, SLEIGH_COMMENT_PREFIX_PROOF, note)) {
+				ok = false;
+			}
+			free (note);
+			if (out_xrefs) {
+				*out_xrefs += count;
+			}
+		}
+	}
+	const RJson *dead = r_json_get (facts, "unreachable_blocks");
+	if (ok && dead && dead->type == R_JSON_ARRAY) {
+		const RJson *entry;
+		for (entry = dead->children.first; entry && ok; entry = entry->next) {
+			const RJson *addr = r_json_get (entry, "addr");
+			const RJson *reason = r_json_get (entry, "reason");
+			if (!addr || !reason || reason->type != R_JSON_STRING) {
+				continue;
+			}
+			char *note = r_str_newf (SLEIGH_COMMENT_PREFIX_PROOF
+				" unreachable, %s", reason->str_value);
+			if (!note || !sleigh_artifact_plan_add_comment (plan,
+					addr->num.u_value, SLEIGH_COMMENT_PREFIX_PROOF, note)) {
+				ok = false;
+			}
+			free (note);
+			if (out_dead) {
+				*out_dead += 1;
+			}
+		}
+	}
+	r_json_free (facts);
+	free (json);
+	return ok;
 }
 
 static bool collect_taint_artifacts_for_function(SleighArtifactPlan *plan,
@@ -4712,7 +5323,9 @@ cleanup:
 
 /* Eligibility/priority callback: score > 0 = eligible with priority, < 0 = ineligible */
 static int sleigh_eligible(RAnal *anal) {
+	const ut64 started = sleigh_callback_start ();
 	R2ILContext *ctx = get_context (anal);
+	sleigh_callback_end (SLEIGH_CB_ELIGIBLE, started);
 	return ctx ? 10 : -1;
 }
 
@@ -4728,11 +5341,16 @@ static bool sleigh_pre_analysis(RAnal *anal) {
 }
 
 /* Called at end of aaaa for global post-analysis passes */
-static bool sleigh_post_analysis(RAnal *anal) {
+static bool sleigh_post_analysis_inner(RAnal *anal) {
 	R2ILContext *ctx = get_context (anal);
 	size_t taint_comments = 0;
 	size_t taint_flags = 0;
 	size_t taint_xrefs = 0;
+	size_t proof_xrefs = 0;
+	size_t proof_dead_blocks = 0;
+	int proof_fcns = 0;
+	int proof_refused = 0;
+	int proof_skipped = 0;
 	int taint_parse_failures = 0;
 	int taint_fcns_eligible = 0;
 	int taint_fcns_skipped = 0;
@@ -4789,6 +5407,24 @@ static bool sleigh_post_analysis(RAnal *anal) {
 		}
 		if (!fcn) {
 			continue;
+		}
+		/* Proofs run for every function, not just the ones taint looks at.
+		 * They are what the analysis pass is here to contribute, and the work
+		 * is the engine's rather than ours. */
+		SleighArtifactPlan proof_plan;
+		const bool proof_eligible = post_mode >= SLEIGH_MODE_FULL
+			|| sleigh_function_may_prove (anal, fcn);
+		if (proof_eligible && sleigh_artifact_plan_init (&proof_plan, anal, fcn, "proof")) {
+			if (collect_proof_artifacts_for_function (&proof_plan, anal, fcn,
+					&proof_xrefs, &proof_dead_blocks)
+					&& sleigh_artifact_plan_submit (&proof_plan)) {
+				proof_fcns++;
+			} else {
+				proof_refused++;
+			}
+			sleigh_artifact_plan_fini (&proof_plan);
+		} else if (!proof_eligible) {
+			proof_skipped++;
 		}
 		int bb_count = fcn->bbs? r_list_length (fcn->bbs): 0;
 		bool auto_callback_allowed = !taint_enabled || auto_callback_allows_function (
@@ -4881,8 +5517,11 @@ static bool sleigh_post_analysis(RAnal *anal) {
 	R_LOG_INFO ("r2sleigh: post-analysis taint enabled=%d eligible=%d skipped=%d comments=%zu flags=%zu xrefs=%zu sink_hits=%zu parse_failures=%d",
 		taint_enabled? 1: 0, taint_fcns_eligible, taint_fcns_skipped, taint_comments, taint_flags, taint_xrefs,
 		taint_sink_hits, taint_parse_failures);
+	R_LOG_INFO ("r2sleigh: post-analysis proofs fcns=%d skipped=%d refused=%d call_targets=%zu unreachable_blocks=%zu",
+		proof_fcns, proof_skipped, proof_refused, proof_xrefs, proof_dead_blocks);
 	R_LOG_INFO ("r2sleigh: post-analysis risk summary: critical=%d high=%d medium=%d low=%d",
 		taint_risk_critical, taint_risk_high, taint_risk_medium, taint_risk_low);
+	sleigh_function_capture_release ();
 	R_LOG_INFO ("r2sleigh: post-analysis summary fcns=%d budget_exhausted=%d",
 		num_fcns, post_budget_exhausted? 1: 0);
 	if (best_sink_label) {
@@ -4891,6 +5530,14 @@ static bool sleigh_post_analysis(RAnal *anal) {
 		free (best_sink_label);
 	}
 	return true;
+}
+
+static bool sleigh_post_analysis(RAnal *anal) {
+	const ut64 started = sleigh_callback_start ();
+	const bool ok = sleigh_post_analysis_inner (anal);
+	sleigh_callback_end (SLEIGH_CB_POST_ANALYSIS, started);
+	sleigh_callback_report ();
+	return ok;
 }
 
 RAnalPlugin r_anal_plugin_sleigh = {

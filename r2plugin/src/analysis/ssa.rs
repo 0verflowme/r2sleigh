@@ -4,6 +4,7 @@ use crate::{
     ExportFormat, InstructionAction, InstructionExportInput, R2ILBlock, R2ILContext,
     SSA_JSON_SCHEMA_VERSION, SSAOpInfo, export_instruction, ssa_op_to_info,
 };
+use r2sleigh_export::{SSAPhiInfo, ssa_phi_to_info};
 use serde::Serialize;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
@@ -74,17 +75,11 @@ pub(crate) fn r2il_block_defuse_json(
 }
 
 #[derive(Serialize)]
-struct PhiNodeJson {
-    dst: String,
-    sources: Vec<(String, String)>,
-}
-
-#[derive(Serialize)]
 struct SSABlockJson {
     addr: u64,
     addr_hex: String,
     size: u32,
-    phis: Vec<PhiNodeJson>,
+    phis: Vec<SSAPhiInfo>,
     ops: Vec<SSAOpInfo>,
 }
 
@@ -98,22 +93,30 @@ struct SSAFunctionBodyJson {
 }
 
 #[derive(Serialize)]
+struct PreparedGraphValueJson {
+    value_id: u32,
+    value: r2ssa::SSAVar,
+    canonical_storage: Option<r2ssa::CanonicalStorageId>,
+}
+
+#[derive(Serialize)]
 struct PreparedFormalParameterJson {
-    value: String,
+    #[serde(flatten)]
+    value: PreparedGraphValueJson,
     parameter: usize,
 }
 
 #[derive(Serialize)]
 struct PreparedAddressTermJson {
-    value_id: u32,
-    value: String,
+    #[serde(flatten)]
+    value: PreparedGraphValueJson,
     coefficient: i64,
 }
 
 #[derive(Serialize)]
 struct PreparedParameterAddressJson {
-    value_id: u32,
-    value: String,
+    #[serde(flatten)]
+    value: PreparedGraphValueJson,
     parameter: usize,
     terms: Vec<PreparedAddressTermJson>,
     offset: i64,
@@ -133,22 +136,23 @@ struct PreparedSSAFunctionJson {
     prepared: PreparedSsaFactsJson,
 }
 
+fn prepared_graph_value_json(
+    graph: &r2ssa::SsaGraph,
+    value_id: r2ssa::ValueId,
+) -> Option<PreparedGraphValueJson> {
+    let value = graph.value(value_id)?;
+    Some(PreparedGraphValueJson {
+        value_id: value_id.0,
+        value: value.var.clone(),
+        canonical_storage: value.canonical_storage,
+    })
+}
+
 fn build_ssa_function_json(ssa_func: &r2ssa::SSAFunction) -> SSAFunctionBodyJson {
     let mut json_blocks = Vec::new();
     for &addr in ssa_func.block_addrs() {
         if let Some(block) = ssa_func.get_block(addr) {
-            let phis = block
-                .phis
-                .iter()
-                .map(|phi| PhiNodeJson {
-                    dst: phi.dst.display_name(),
-                    sources: phi
-                        .sources
-                        .iter()
-                        .map(|(pred, var)| (format!("0x{:x}", pred), var.display_name()))
-                        .collect(),
-                })
-                .collect();
+            let phis = block.phis.iter().map(ssa_phi_to_info).collect();
             let ops = block.ops.iter().map(ssa_op_to_info).collect();
             json_blocks.push(SSABlockJson {
                 addr,
@@ -175,28 +179,28 @@ fn prepared_ssa_function_json_string(artifact: &r2ssa::SsaArtifact) -> Option<St
         .decompile_prep_facts()
         .into_iter()
         .flat_map(|facts| &facts.formal_parameters)
-        .map(|(value, parameter)| PreparedFormalParameterJson {
-            value: value.display_name(),
-            parameter: *parameter,
+        .map(|(value, parameter)| {
+            let value_id = graph.value_id_for_var(value)?;
+            Some(PreparedFormalParameterJson {
+                value: prepared_graph_value_json(graph, value_id)?,
+                parameter: *parameter,
+            })
         })
-        .collect();
+        .collect::<Option<Vec<_>>>()?;
     let parameter_addresses = artifact
         .addresses()
         .parameter_expressions
         .iter()
         .map(|(value_id, expression)| {
-            let value = graph.value(*value_id)?;
             Some(PreparedParameterAddressJson {
-                value_id: value_id.0,
-                value: value.var.display_name(),
+                value: prepared_graph_value_json(graph, *value_id)?,
                 parameter: expression.parameter,
                 terms: expression
                     .terms
                     .iter()
                     .map(|term| {
                         Some(PreparedAddressTermJson {
-                            value_id: term.value.0,
-                            value: graph.value(term.value)?.var.display_name(),
+                            value: prepared_graph_value_json(graph, term.value)?,
                             coefficient: term.coefficient,
                         })
                     })
@@ -250,11 +254,6 @@ struct SSAOptStatsJson {
     sccp_blocks_removed: usize,
     constants_propagated: usize,
     ops_simplified: usize,
-    copies_propagated: usize,
-    phis_simplified: usize,
-    cse_replacements: usize,
-    dce_removed_ops: usize,
-    dce_removed_phis: usize,
 }
 
 #[derive(Serialize)]
@@ -296,11 +295,6 @@ pub(crate) fn r2ssa_function_opt_json(
             sccp_blocks_removed: stats.sccp_blocks_removed,
             constants_propagated: stats.constants_propagated,
             ops_simplified: stats.ops_simplified,
-            copies_propagated: stats.copies_propagated,
-            phis_simplified: stats.phis_simplified,
-            cse_replacements: stats.cse_replacements,
-            dce_removed_ops: stats.dce_removed_ops,
-            dce_removed_phis: stats.dce_removed_phis,
         },
         function: build_ssa_function_json(&ssa_func),
     };
@@ -640,6 +634,33 @@ pub(crate) fn r2ssa_backward_slice_json(
 mod tests {
     use super::*;
 
+    fn typed_phi(size: u32) -> r2ssa::PhiNode {
+        r2ssa::PhiNode {
+            dst: r2ssa::SSAVar::new("tmp:2cb00", 2, size),
+            sources: vec![
+                (0x1000, r2ssa::SSAVar::new("tmp:2cb00", 0, size)),
+                (0x2000, r2ssa::SSAVar::new("tmp:2cb00", 1, size)),
+            ],
+            canonical_storage: Some(r2ssa::CanonicalStorageId {
+                space: r2ssa::CanonicalStorageSpace::Unique,
+                offset: 0x2cb00,
+                size,
+            }),
+        }
+    }
+
+    fn prepared_value(value_id: u32, version: u32, size: u32) -> PreparedGraphValueJson {
+        PreparedGraphValueJson {
+            value_id,
+            value: r2ssa::SSAVar::new("tmp:2cb00", version, size),
+            canonical_storage: Some(r2ssa::CanonicalStorageId {
+                space: r2ssa::CanonicalStorageSpace::Unique,
+                offset: 0x2cb00,
+                size,
+            }),
+        }
+    }
+
     fn function_body_with_one_op() -> SSAFunctionBodyJson {
         let op = r2ssa::SSAOp::Copy {
             dst: r2ssa::SSAVar::new("dst", 1, 8),
@@ -658,6 +679,71 @@ mod tests {
                 ops: vec![ssa_op_to_info(&op)],
             }],
         }
+    }
+
+    #[test]
+    fn function_payload_keeps_same_presentation_phi_identities_distinct() {
+        let narrow = typed_phi(4);
+        let wide = typed_phi(8);
+        assert_eq!(narrow.dst.display_name(), wide.dst.display_name());
+
+        let value = serde_json::to_value(PreparedSSAFunctionJson {
+            schema_version: SSA_JSON_SCHEMA_VERSION,
+            function: SSAFunctionBodyJson {
+                name: Some("typed_phi".to_string()),
+                entry: 0x3000,
+                entry_hex: "0x3000".to_string(),
+                num_blocks: 1,
+                blocks: vec![SSABlockJson {
+                    addr: 0x3000,
+                    addr_hex: "0x3000".to_string(),
+                    size: 1,
+                    phis: vec![ssa_phi_to_info(&narrow), ssa_phi_to_info(&wide)],
+                    ops: Vec::new(),
+                }],
+            },
+            prepared: PreparedSsaFactsJson {
+                formal_parameters: vec![PreparedFormalParameterJson {
+                    value: prepared_value(7, 0, 8),
+                    parameter: 0,
+                }],
+                parameter_addresses: vec![PreparedParameterAddressJson {
+                    value: prepared_value(8, 1, 8),
+                    parameter: 0,
+                    terms: vec![PreparedAddressTermJson {
+                        value: prepared_value(9, 0, 4),
+                        coefficient: 4,
+                    }],
+                    offset: 16,
+                }],
+            },
+        })
+        .expect("prepared SSA function payload");
+
+        let phis = value["blocks"][0]["phis"].as_array().expect("typed phis");
+        assert_eq!(phis.len(), 2);
+        assert_eq!(phis[0]["dst"]["name"], phis[1]["dst"]["name"]);
+        assert_eq!(phis[0]["dst"]["version"], phis[1]["dst"]["version"]);
+        assert_eq!(phis[0]["dst"]["size"], 4);
+        assert_eq!(phis[1]["dst"]["size"], 8);
+        assert_eq!(phis[0]["canonical_storage"]["size"], 4);
+        assert_eq!(phis[1]["canonical_storage"]["size"], 8);
+        assert!(phis.iter().all(|phi| phi["dst"].is_object()));
+        assert_ne!(phis[0], phis[1]);
+
+        let formal = &value["prepared"]["formal_parameters"][0];
+        assert_eq!(formal["value_id"], 7);
+        assert_eq!(formal["value"]["name"], "tmp:2cb00");
+        assert_eq!(formal["value"]["size"], 8);
+        assert_eq!(formal["canonical_storage"]["size"], 8);
+        assert!(formal["value"].is_object());
+
+        let address = &value["prepared"]["parameter_addresses"][0];
+        assert_eq!(address["value_id"], 8);
+        assert_eq!(address["value"]["size"], 8);
+        assert_eq!(address["terms"][0]["value_id"], 9);
+        assert_eq!(address["terms"][0]["value"]["size"], 4);
+        assert_eq!(address["terms"][0]["canonical_storage"]["size"], 4);
     }
 
     #[test]
@@ -688,11 +774,6 @@ mod tests {
                 sccp_blocks_removed: 0,
                 constants_propagated: 0,
                 ops_simplified: 0,
-                copies_propagated: 0,
-                phis_simplified: 0,
-                cse_replacements: 0,
-                dce_removed_ops: 0,
-                dce_removed_phis: 0,
             },
             function: function_body_with_one_op(),
         })

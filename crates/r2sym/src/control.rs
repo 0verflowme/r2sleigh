@@ -99,18 +99,4 @@ impl SymExecutionControl {
     pub fn poll(&self) -> Result<(), SymExecutionStopReason> {
         self.stop_reason().map_or(Ok(()), Err)
     }
-
-    /// Milliseconds remaining until the deadline, rounded up for solver APIs.
-    pub(crate) fn remaining_timeout_ms(&self) -> Option<u32> {
-        let remaining = self.deadline?.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Some(1);
-        }
-        Some(
-            remaining
-                .as_millis()
-                .saturating_add(1)
-                .min(u32::MAX as u128) as u32,
-        )
-    }
 }

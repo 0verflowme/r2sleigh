@@ -11,6 +11,8 @@ use petgraph::visit::EdgeRef;
 use r2il::{R2ILBlock, R2ILOp, SwitchInfo};
 use serde::{Deserialize, Serialize};
 
+use crate::function::CFGRiskSummary;
+
 /// A basic block in the control flow graph.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BasicBlock {
@@ -28,6 +30,19 @@ pub struct BasicBlock {
     /// Address attributed to the final operation by the source lifter. When
     /// metadata is absent this falls back to the block address.
     terminal_instruction_addr: Option<u64>,
+    /// Source instruction each operation was lifted from, parallel to `ops`.
+    ///
+    /// One machine instruction lifts to several operations, and the boundary
+    /// between two of them is not recoverable from the operations themselves.
+    /// Anything reasoning about what a whole instruction did -- as opposed to
+    /// what one operation did -- needs that boundary, and the lifter is the
+    /// only thing that ever saw it.
+    ///
+    /// Empty, or `None` at an index, where the lifter attached no metadata.
+    /// Nothing may then claim to know where an instruction begins, which is
+    /// the honest answer rather than assuming the block is one.
+    #[serde(default)]
+    op_instruction_addrs: Vec<Option<u64>>,
 }
 
 /// How a basic block terminates.
@@ -71,6 +86,7 @@ impl BasicBlock {
             terminator: BlockTerminator::None,
             switch_info: None,
             terminal_instruction_addr: None,
+            op_instruction_addrs: Vec::new(),
         }
     }
 
@@ -105,6 +121,14 @@ impl BasicBlock {
                     .and_then(|metadata| metadata.instruction_addr)
                     .unwrap_or(block.addr)
             }),
+            op_instruction_addrs: (0..block.ops.len())
+                .map(|index| {
+                    block
+                        .op_metadata
+                        .get(&index)
+                        .and_then(|metadata| metadata.instruction_addr)
+                })
+                .collect(),
         }
     }
 
@@ -112,6 +136,14 @@ impl BasicBlock {
     /// the lifter did not attach per-operation instruction metadata.
     pub const fn terminal_instruction_addr(&self) -> Option<u64> {
         self.terminal_instruction_addr
+    }
+
+    /// Source instruction the operation at this index was lifted from.
+    ///
+    /// `None` where the lifter attached no metadata for it, and then no caller
+    /// may treat the operation as beginning or continuing an instruction.
+    pub fn op_instruction_addr(&self, index: usize) -> Option<u64> {
+        self.op_instruction_addrs.get(index).copied().flatten()
     }
 
     /// Analyze the operations to determine the block terminator.
@@ -420,13 +452,7 @@ impl CFG {
             cfg.add_block(bb);
         }
 
-        // Second pass: add edges based on terminators
-        let mut addrs: Vec<u64> = cfg.addr_to_node.keys().copied().collect();
-        addrs.sort_unstable();
-        for addr in addrs {
-            cfg.add_edges_for_block(addr);
-        }
-
+        cfg.rebuild_edges();
         Some(cfg)
     }
 
@@ -436,6 +462,19 @@ impl CFG {
         let idx = self.graph.add_node(block);
         self.addr_to_node.insert(addr, idx);
         idx
+    }
+
+    /// Recompute every edge from the terminators the blocks currently carry.
+    ///
+    /// Edges are a function of the terminators, so a caller that assembles
+    /// blocks itself gets the same graph the block reader builds rather than a
+    /// second way of connecting them.
+    pub fn rebuild_edges(&mut self) {
+        let mut addrs: Vec<u64> = self.addr_to_node.keys().copied().collect();
+        addrs.sort_unstable();
+        for addr in addrs {
+            self.add_edges_for_block(addr);
+        }
     }
 
     /// Add edges for a block based on its terminator.
@@ -624,6 +663,92 @@ impl CFG {
             for succ_addr in self.successors(self.graph[node].addr).into_iter().rev() {
                 if let Some(succ) = self.get_node(succ_addr) {
                     stack.push((succ, false));
+                }
+            }
+        }
+    }
+
+    /// Summarize the control-flow features a decompiler preflight consults.
+    ///
+    /// Every field here is a property of the graph alone, so a caller deciding
+    /// whether a function is worth preparing can ask before paying for the
+    /// preparation. Reading the same numbers off renamed SSA would make the
+    /// question cost more than the answer can save.
+    pub fn risk_summary(&self) -> CFGRiskSummary {
+        let back_edges = self.collect_back_edges();
+        let mut switch_block_count = 0usize;
+        let mut max_switch_cases = 0usize;
+
+        // Only blocks the entry can reach are counted, because that is the
+        // domain the back-edge walk above already reports over and the domain
+        // SSA preparation retains.
+        for addr in self.reverse_postorder() {
+            let Some(block) = self.get_block(addr) else {
+                continue;
+            };
+            let BlockTerminator::Switch { cases, default } = &block.terminator else {
+                continue;
+            };
+            switch_block_count += 1;
+            max_switch_cases = max_switch_cases.max(cases.len() + usize::from(default.is_some()));
+        }
+
+        CFGRiskSummary {
+            block_count: self.num_blocks(),
+            loop_count: back_edges.len(),
+            back_edge_count: back_edges.values().map(Vec::len).sum(),
+            switch_block_count,
+            max_switch_cases,
+        }
+    }
+
+    /// Group every back edge under the loop header it re-enters.
+    pub(crate) fn collect_back_edges(&self) -> HashMap<u64, Vec<u64>> {
+        let mut visited = HashSet::new();
+        let mut in_stack = HashSet::new();
+        let mut back_edges = HashMap::new();
+        self.dfs_back_edges(self.entry, &mut visited, &mut in_stack, &mut back_edges);
+        back_edges
+    }
+
+    fn dfs_back_edges(
+        &self,
+        block: u64,
+        visited: &mut HashSet<u64>,
+        in_stack: &mut HashSet<u64>,
+        back_edges: &mut HashMap<u64, Vec<u64>>,
+    ) {
+        enum DfsStep {
+            Enter(u64),
+            ExamineEdge { from: u64, to: u64 },
+            Exit(u64),
+        }
+
+        let mut stack = vec![DfsStep::Enter(block)];
+        while let Some(step) = stack.pop() {
+            match step {
+                DfsStep::Enter(block) => {
+                    if !visited.insert(block) {
+                        continue;
+                    }
+                    in_stack.insert(block);
+                    stack.push(DfsStep::Exit(block));
+                    for succ in self.successors(block).into_iter().rev() {
+                        stack.push(DfsStep::ExamineEdge {
+                            from: block,
+                            to: succ,
+                        });
+                    }
+                }
+                DfsStep::ExamineEdge { from, to } => {
+                    if in_stack.contains(&to) {
+                        back_edges.entry(to).or_default().push(from);
+                    } else {
+                        stack.push(DfsStep::Enter(to));
+                    }
+                }
+                DfsStep::Exit(block) => {
+                    in_stack.remove(&block);
                 }
             }
         }

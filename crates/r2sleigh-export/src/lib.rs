@@ -1,7 +1,7 @@
 //! Unified instruction export pipeline for r2sleigh.
 
 use r2il::{ArchSpec, R2ILBlock, R2ILOp, SpaceId, Varnode, validate_block_full};
-use r2sleigh_lift::{Disassembler, format_op, op_to_esil};
+use r2sleigh_lift::{Disassembler, block_to_esil, format_op, op_to_esil};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashSet;
@@ -12,7 +12,7 @@ use thiserror::Error;
 ///
 /// This is one exact schema, not a compatibility selector. Consumers must
 /// reject any value other than this constant.
-pub const SSA_JSON_SCHEMA_VERSION: u32 = 1;
+pub const SSA_JSON_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstructionAction {
@@ -176,15 +176,7 @@ fn export_lift(
             }
             Ok(out)
         }
-        ExportFormat::Esil => {
-            let lines = input
-                .block
-                .ops
-                .iter()
-                .map(|op| op_to_esil(input.disasm, op))
-                .collect::<Vec<_>>();
-            Ok(lines.join("\n"))
-        }
+        ExportFormat::Esil => Ok(block_to_esil(input.disasm, input.block)),
         ExportFormat::R2Cmd => {
             let mut out = Vec::new();
             for (idx, op) in input.block.ops.iter().enumerate() {
@@ -422,6 +414,28 @@ pub struct SSAOpInfo {
     pub operation: r2ssa::SSAOp,
 }
 
+/// Exact exported identity for one predecessor input of an SSA phi.
+///
+/// The value stays typed all the way through serialization.  A presentation
+/// string such as `tmp:100_2` cannot distinguish values that share a display
+/// name and version while differing in width or rename discriminator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SSAPhiSourceInfo {
+    pub predecessor: u64,
+    pub value: r2ssa::SSAVar,
+}
+
+/// Exact exported SSA phi identity.
+///
+/// `r2ssa::PhiNode` owns the facts.  This type only fixes their public JSON
+/// shape without rebuilding identity from display names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SSAPhiInfo {
+    pub dst: r2ssa::SSAVar,
+    pub sources: Vec<SSAPhiSourceInfo>,
+    pub canonical_storage: Option<r2ssa::CanonicalStorageId>,
+}
+
 #[derive(Serialize)]
 struct SSAJsonDocument {
     schema_version: u32,
@@ -441,11 +455,69 @@ pub fn ssa_op_to_info(op: &r2ssa::SSAOp) -> SSAOpInfo {
     }
 }
 
+pub fn ssa_phi_to_info(phi: &r2ssa::PhiNode) -> SSAPhiInfo {
+    SSAPhiInfo {
+        dst: phi.dst.clone(),
+        sources: phi
+            .sources
+            .iter()
+            .map(|(predecessor, value)| SSAPhiSourceInfo {
+                predecessor: *predecessor,
+                value: value.clone(),
+            })
+            .collect(),
+        canonical_storage: phi.canonical_storage,
+    }
+}
+
 #[derive(Serialize)]
 struct DefUseInfoJson {
     inputs: Vec<String>,
     outputs: Vec<String>,
     live: Vec<String>,
+}
+
+#[cfg(test)]
+mod phi_export_contract_tests {
+    use super::*;
+    use r2ssa::{CanonicalStorageId, CanonicalStorageSpace, PhiNode, SSAVar};
+
+    fn phi(size: u32) -> PhiNode {
+        let storage = CanonicalStorageId {
+            space: CanonicalStorageSpace::Unique,
+            offset: 0x2cb00,
+            size,
+        };
+        PhiNode {
+            dst: SSAVar::new("tmp:2cb00", 2, size),
+            sources: vec![
+                (0x1000, SSAVar::new("tmp:2cb00", 0, size)),
+                (0x2000, SSAVar::new("tmp:2cb00", 1, size)),
+            ],
+            canonical_storage: Some(storage),
+        }
+    }
+
+    #[test]
+    fn phi_export_keeps_same_name_and_version_widths_distinct() {
+        let narrow = phi(4);
+        let wide = phi(8);
+        assert_eq!(narrow.dst.display_name(), wide.dst.display_name());
+
+        let value = serde_json::to_value([ssa_phi_to_info(&narrow), ssa_phi_to_info(&wide)])
+            .expect("typed phi export JSON");
+
+        assert_eq!(value[0]["dst"]["name"], "tmp:2cb00");
+        assert_eq!(value[0]["dst"]["version"], 2);
+        assert_eq!(value[0]["dst"]["size"], 4);
+        assert_eq!(value[1]["dst"]["size"], 8);
+        assert_eq!(value[0]["sources"][0]["predecessor"], 0x1000);
+        assert_eq!(value[0]["sources"][0]["value"]["size"], 4);
+        assert_eq!(value[1]["sources"][0]["value"]["size"], 8);
+        assert_eq!(value[0]["canonical_storage"]["size"], 4);
+        assert_eq!(value[1]["canonical_storage"]["size"], 8);
+        assert_ne!(value[0], value[1]);
+    }
 }
 
 #[cfg(feature = "dec")]

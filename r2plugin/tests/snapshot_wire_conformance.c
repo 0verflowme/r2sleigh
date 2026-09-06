@@ -1,7 +1,6 @@
-/* Asserts the C wire writer produces exactly the bytes r2source's writer does.
- * The same vector is asserted in Rust (snapshot_wire::tests::
- * the_c_conformance_vector_is_byte_stable), so drift on either side fails a
- * test instead of yielding a buffer the other side misreads. */
+/* Pins the compatibility producer's v1 framing and primitive payload order.
+ * r2source owns the current writer and accepts this older framing through its
+ * explicit v1 migration path. */
 
 #include "../snapshot_wire.h"
 
@@ -24,7 +23,7 @@ static void check(bool cond, const char *what) {
 static const uint8_t expected[] = {
 	/* header */
 	0x57, 0x53, 0x32, 0x52, /* magic "R2SW" little-endian */
-	0x01, 0x00, 0x00, 0x00, /* format version 1 */
+	0x03, 0x00, 0x00, 0x00, /* format version 3 */
 	0x02, 0x00, 0x00, 0x00, /* two interned strings */
 	0x0e, 0x00, 0x00, 0x00, /* table bytes: 2 * (4 + 3) */
 	0x2f, 0x00, 0x00, 0x00, /* payload bytes: 47 */

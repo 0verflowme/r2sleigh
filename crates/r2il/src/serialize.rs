@@ -4,6 +4,7 @@
 //! storage and loading of architecture specifications.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::mem::size_of;
 use std::path::Path;
 use thiserror::Error;
@@ -24,7 +25,7 @@ pub enum SerializeError {
     #[error("Invalid architecture specification: {0}")]
     Validation(#[from] crate::ValidationError),
 
-    #[error("Invalid format discriminator: expected R2PSTC06")]
+    #[error("Invalid format discriminator: expected R2PSTC07")]
     InvalidMagic,
 
     #[error("Truncated r2il representation")]
@@ -73,6 +74,383 @@ impl RegisterDef {
             parent: Some(parent.into()),
         }
     }
+
+    /// Return the name-free storage occupied by this register declaration.
+    pub const fn storage(&self) -> RegisterStorage {
+        RegisterStorage {
+            offset: self.offset,
+            size: self.size,
+        }
+    }
+}
+
+/// One byte range in the architecture's register address space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct RegisterStorage {
+    /// Byte offset in register space.
+    pub offset: u64,
+    /// Width in bytes.
+    pub size: u32,
+}
+
+impl RegisterStorage {
+    /// Return the exclusive byte end, or `None` when the range is invalid.
+    pub fn checked_end(self) -> Option<u64> {
+        (self.size != 0)
+            .then(|| self.offset.checked_add(u64::from(self.size)))
+            .flatten()
+    }
+
+    /// Whether this valid storage completely contains another valid storage.
+    pub fn contains(self, other: Self) -> bool {
+        self.offset <= other.offset
+            && self
+                .checked_end()
+                .zip(other.checked_end())
+                .is_some_and(|(carrier_end, written_end)| written_end <= carrier_end)
+    }
+}
+
+/// The exact bit range a register access occupies in its canonical carrier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct RegisterBitSlice {
+    /// Least-significant bit offset in the carrier.
+    pub lsb_bit_offset: u64,
+    /// Width in bits.
+    pub size_bits: u64,
+}
+
+/// Why source-owned register geometry could not certify a projection.
+///
+/// These are geometry failures only. Architectural write effects are properties
+/// of lifted definitions and deliberately do not appear in this contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum RegisterProjectionRefusal {
+    /// A declared byte range is empty or its exclusive end overflows.
+    InvalidStorageRange,
+    /// No declared carrier contains this storage.
+    NoContainingCarrier,
+    /// More than one incomparable carrier could own this storage.
+    AmbiguousContainingCarrier,
+    /// Two declarations for one storage supplied incompatible geometry.
+    ConflictingDeclarations,
+    /// Declared register ranges overlap without either containing the other.
+    PartialOverlap,
+    /// The source did not provide the byte significance needed for a bit slice.
+    MissingRegisterEndianness,
+}
+
+/// Either an exact carrier projection or a typed geometry refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum RegisterProjectionDisposition {
+    /// Exact source-owned carrier and bit slice.
+    Bound {
+        carrier: RegisterStorage,
+        slice: RegisterBitSlice,
+    },
+    /// Geometry was present but could not be certified.
+    Refused { reason: RegisterProjectionRefusal },
+}
+
+/// Canonical projection for one unique declared register storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct RegisterProjection {
+    /// The accessed register storage this entry describes.
+    pub written: RegisterStorage,
+    /// Its certified carrier geometry or explicit refusal.
+    pub disposition: RegisterProjectionDisposition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegisterByteOrder {
+    Little,
+    Big,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegisterProjectionComponentDisposition {
+    Bound {
+        carrier: RegisterStorage,
+        byte_order: Option<RegisterByteOrder>,
+    },
+    Refused {
+        reason: RegisterProjectionRefusal,
+    },
+}
+
+/// One validated register component used to project observed, unnamed slices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RegisterProjectionComponent {
+    start: u64,
+    end: u64,
+    disposition: RegisterProjectionComponentDisposition,
+}
+
+/// Canonical query over one validated source-owned register geometry table.
+///
+/// Architecture tables contain one entry per declared register. Lifted P-code
+/// may additionally address an unnamed lane inside a declared carrier. This
+/// query derives that lane from the same validated laminar component and the
+/// source register-space byte order (or, when legacy hand-built specs omit it,
+/// the declared slices' unique orientation). Consumers do not repeat
+/// containment or endian policy.
+/// Construction is one `O(n log n)` pass. Exact declared lookups and component
+/// lookups are `O(log n)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisterProjectionQuery {
+    exact: Vec<RegisterProjection>,
+    components: Vec<RegisterProjectionComponent>,
+}
+
+impl RegisterProjectionQuery {
+    /// Build the canonical query, or return `None` when source geometry is
+    /// explicitly unavailable.
+    pub fn from_arch(arch: &ArchSpec) -> std::result::Result<Option<Self>, crate::ValidationError> {
+        crate::validate_register_geometry(arch)?;
+        if arch.register_projections.is_empty() {
+            return Ok(None);
+        }
+
+        let mut ordered = arch.register_projections.iter().collect::<Vec<_>>();
+        ordered.sort_by(|left, right| {
+            let left_end = left
+                .written
+                .checked_end()
+                .expect("validated register storage");
+            let right_end = right
+                .written
+                .checked_end()
+                .expect("validated register storage");
+            left.written
+                .offset
+                .cmp(&right.written.offset)
+                .then_with(|| right_end.cmp(&left_end))
+                .then_with(|| left.written.cmp(&right.written))
+        });
+
+        let register_byte_order = source_register_byte_order(arch);
+
+        let mut components = Vec::new();
+        let mut start = 0;
+        while start < ordered.len() {
+            let component_start = ordered[start].written.offset;
+            let mut component_end = ordered[start]
+                .written
+                .checked_end()
+                .expect("validated register storage");
+            let mut limit = start + 1;
+            while limit < ordered.len() && ordered[limit].written.offset < component_end {
+                component_end = component_end.max(
+                    ordered[limit]
+                        .written
+                        .checked_end()
+                        .expect("validated register storage"),
+                );
+                limit += 1;
+            }
+            let members = &ordered[start..limit];
+            let disposition = projection_component_disposition(members, register_byte_order);
+            components.push(RegisterProjectionComponent {
+                start: component_start,
+                end: component_end,
+                disposition,
+            });
+            start = limit;
+        }
+
+        Ok(Some(Self {
+            exact: arch.register_projections.clone(),
+            components,
+        }))
+    }
+
+    /// Project one observed register-space range through its unique validated
+    /// carrier. The returned entry always names the queried `written` range.
+    pub fn project(&self, written: RegisterStorage) -> RegisterProjection {
+        let refused = |reason| RegisterProjection {
+            written,
+            disposition: RegisterProjectionDisposition::Refused { reason },
+        };
+        let Some(written_end) = written.checked_end() else {
+            return refused(RegisterProjectionRefusal::InvalidStorageRange);
+        };
+        if let Ok(index) = self
+            .exact
+            .binary_search_by_key(&written, |projection| projection.written)
+        {
+            return self.exact[index];
+        }
+
+        let insertion = self
+            .components
+            .partition_point(|component| component.start <= written.offset);
+        let Some(component) = insertion
+            .checked_sub(1)
+            .and_then(|index| self.components.get(index))
+        else {
+            return refused(RegisterProjectionRefusal::NoContainingCarrier);
+        };
+        if written_end > component.end {
+            return refused(RegisterProjectionRefusal::NoContainingCarrier);
+        }
+
+        let RegisterProjectionComponentDisposition::Bound {
+            carrier,
+            byte_order,
+        } = component.disposition
+        else {
+            let RegisterProjectionComponentDisposition::Refused { reason } = component.disposition
+            else {
+                unreachable!("component disposition is exhaustive")
+            };
+            return refused(reason);
+        };
+        if !carrier.contains(written) {
+            return refused(RegisterProjectionRefusal::NoContainingCarrier);
+        }
+        let Some(byte_order) = byte_order else {
+            return refused(RegisterProjectionRefusal::MissingRegisterEndianness);
+        };
+        let carrier_end = carrier
+            .checked_end()
+            .expect("validated carrier storage has an end");
+        let byte_offset = match byte_order {
+            RegisterByteOrder::Little => written.offset.checked_sub(carrier.offset),
+            RegisterByteOrder::Big => carrier_end.checked_sub(written_end),
+        };
+        let Some(lsb_bit_offset) = byte_offset.and_then(|offset| offset.checked_mul(8)) else {
+            return refused(RegisterProjectionRefusal::InvalidStorageRange);
+        };
+        RegisterProjection {
+            written,
+            disposition: RegisterProjectionDisposition::Bound {
+                carrier,
+                slice: RegisterBitSlice {
+                    lsb_bit_offset,
+                    size_bits: u64::from(written.size) * 8,
+                },
+            },
+        }
+    }
+}
+
+fn source_register_byte_order(
+    arch: &ArchSpec,
+) -> std::result::Result<Option<RegisterByteOrder>, RegisterProjectionRefusal> {
+    let mut byte_order = None;
+    for space in arch
+        .spaces
+        .iter()
+        .filter(|space| space.id == crate::SpaceId::Register)
+    {
+        let declared = match space.endianness {
+            Some(Endianness::Little) => RegisterByteOrder::Little,
+            Some(Endianness::Big) => RegisterByteOrder::Big,
+            Some(Endianness::Mixed | Endianness::Custom) => {
+                return Err(RegisterProjectionRefusal::MissingRegisterEndianness);
+            }
+            None => continue,
+        };
+        match byte_order {
+            Some(existing) if existing != declared => {
+                return Err(RegisterProjectionRefusal::ConflictingDeclarations);
+            }
+            Some(_) => {}
+            None => byte_order = Some(declared),
+        }
+    }
+    Ok(byte_order)
+}
+
+fn projection_component_disposition(
+    members: &[&RegisterProjection],
+    source_byte_order: std::result::Result<Option<RegisterByteOrder>, RegisterProjectionRefusal>,
+) -> RegisterProjectionComponentDisposition {
+    let refusals = members
+        .iter()
+        .filter_map(|projection| match projection.disposition {
+            RegisterProjectionDisposition::Refused { reason } => Some(reason),
+            RegisterProjectionDisposition::Bound { .. } => None,
+        })
+        .collect::<BTreeSet<_>>();
+    if let Some(reason) = refusals.iter().next().copied() {
+        return RegisterProjectionComponentDisposition::Refused {
+            reason: if refusals.len() == 1 {
+                reason
+            } else {
+                RegisterProjectionRefusal::AmbiguousContainingCarrier
+            },
+        };
+    }
+
+    let carriers = members
+        .iter()
+        .filter_map(|projection| match projection.disposition {
+            RegisterProjectionDisposition::Bound { carrier, .. } => Some(carrier),
+            RegisterProjectionDisposition::Refused { .. } => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let Some(carrier) = carriers.iter().next().copied() else {
+        return RegisterProjectionComponentDisposition::Refused {
+            reason: RegisterProjectionRefusal::NoContainingCarrier,
+        };
+    };
+    if carriers.len() != 1 {
+        return RegisterProjectionComponentDisposition::Refused {
+            reason: RegisterProjectionRefusal::AmbiguousContainingCarrier,
+        };
+    }
+
+    let carrier_end = carrier
+        .checked_end()
+        .expect("validated carrier storage has an end");
+    let mut little_possible = true;
+    let mut big_possible = true;
+    for projection in members {
+        let RegisterProjectionDisposition::Bound { slice, .. } = projection.disposition else {
+            unreachable!("validated component cannot mix bound and refused projections")
+        };
+        let written_end = projection
+            .written
+            .checked_end()
+            .expect("validated written storage has an end");
+        let little_offset = projection
+            .written
+            .offset
+            .checked_sub(carrier.offset)
+            .and_then(|offset| offset.checked_mul(8));
+        let big_offset = carrier_end
+            .checked_sub(written_end)
+            .and_then(|offset| offset.checked_mul(8));
+        little_possible &= little_offset == Some(slice.lsb_bit_offset);
+        big_possible &= big_offset == Some(slice.lsb_bit_offset);
+    }
+    let inferred_byte_order = match (little_possible, big_possible) {
+        (true, false) => Some(RegisterByteOrder::Little),
+        (false, true) => Some(RegisterByteOrder::Big),
+        (true, true) | (false, false) => None,
+    };
+    let byte_order = match source_byte_order {
+        Err(reason) => {
+            return RegisterProjectionComponentDisposition::Refused { reason };
+        }
+        Ok(Some(RegisterByteOrder::Little)) if !little_possible => {
+            return RegisterProjectionComponentDisposition::Refused {
+                reason: RegisterProjectionRefusal::ConflictingDeclarations,
+            };
+        }
+        Ok(Some(RegisterByteOrder::Big)) if !big_possible => {
+            return RegisterProjectionComponentDisposition::Refused {
+                reason: RegisterProjectionRefusal::ConflictingDeclarations,
+            };
+        }
+        Ok(Some(byte_order)) => Some(byte_order),
+        Ok(None) => inferred_byte_order,
+    };
+    RegisterProjectionComponentDisposition::Bound {
+        carrier,
+        byte_order,
+    }
 }
 
 /// Instruction pattern and its semantic definition.
@@ -112,6 +490,51 @@ pub struct ArchSpec {
 
     /// Register definitions
     pub registers: Vec<RegisterDef>,
+
+    /// Name-free register carrier geometry, sorted by `written` storage.
+    ///
+    /// An empty table means the architecture source did not provide this
+    /// contract. A non-empty table covers every unique declared register
+    /// storage exactly once.
+    pub register_projections: Vec<RegisterProjection>,
+
+    /// Registers this architecture's calling convention returns a value in, in
+    /// preference order.
+    ///
+    /// A consumer asking which register holds a returned value has three
+    /// sources: the recovered function interface, the recovered convention, and
+    /// failing both, the architecture itself. Without this last one there is no
+    /// answer at all for a binary whose ABI was never recovered, and the only
+    /// remaining option is a hand-written list of register spellings that knows
+    /// the architectures somebody thought of.
+    #[serde(default)]
+    pub return_registers: Vec<RegisterDef>,
+
+    /// The register the processor specification names as the program counter.
+    ///
+    /// Which register holds a machine role is a fact the specification states --
+    /// `<programcounter register="pc"/>` -- and reading it is the difference
+    /// between knowing the answer and guessing it from a list of spellings that
+    /// happens to match the architectures somebody thought of. That guessing has
+    /// misfired here before: `r14` is ARM's link register and x86-64's sixth
+    /// general register, and `s8` is MIPS's frame pointer and AArch64's 32-bit
+    /// SIMD register.
+    ///
+    /// Empty when the specification does not say, and then nothing downstream
+    /// may claim to know.
+    #[serde(default)]
+    pub program_counter: Option<String>,
+
+    /// The names of the language's user-defined p-code operations, indexed by
+    /// the identifier a `CallOther` carries.
+    ///
+    /// A `CallOther` states only that index, and the index is assigned by the
+    /// compiled specification and moves with it, so nothing can say which
+    /// operation an instruction invoked without this list. An empty table means
+    /// the architecture source did not provide one, and every `CallOther` then
+    /// stays unidentified rather than being guessed at.
+    #[serde(default)]
+    pub user_ops: Vec<String>,
 }
 
 impl ArchSpec {
@@ -126,7 +549,20 @@ impl ArchSpec {
             alignment: 1,
             spaces: Vec::new(),
             registers: Vec::new(),
+            register_projections: Vec::new(),
+            return_registers: Vec::new(),
+            program_counter: None,
+            user_ops: Vec::new(),
         }
+    }
+
+    /// State which registers this architecture returns a value in.
+    pub fn with_return_registers(
+        mut self,
+        registers: impl IntoIterator<Item = RegisterDef>,
+    ) -> Self {
+        self.return_registers = registers.into_iter().collect();
+        self
     }
 
     /// Set instruction endianness.
@@ -152,6 +588,19 @@ impl ArchSpec {
     /// Look up a register by name.
     pub fn get_register(&self, name: &str) -> Option<&RegisterDef> {
         self.registers.iter().find(|r| r.name == name)
+    }
+
+    /// Look up source-owned register geometry in `O(log n)` time.
+    ///
+    /// Returns `None` when geometry is unavailable or the storage was not
+    /// declared. Validation guarantees that a non-empty table is sorted and
+    /// complete.
+    pub fn register_projection(&self, written: RegisterStorage) -> Option<&RegisterProjection> {
+        let index = self
+            .register_projections
+            .binary_search_by_key(&written, |projection| projection.written)
+            .ok()?;
+        self.register_projections.get(index)
     }
 }
 
@@ -266,6 +715,30 @@ mod tests {
 
         arch.add_register(RegisterDef::new("RAX", 0, 8));
         arch.add_register(RegisterDef::sub("EAX", 0, 4, "RAX"));
+        let rax = RegisterStorage { offset: 0, size: 8 };
+        let eax = RegisterStorage { offset: 0, size: 4 };
+        arch.register_projections = vec![
+            RegisterProjection {
+                written: eax,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier: rax,
+                    slice: RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits: 32,
+                    },
+                },
+            },
+            RegisterProjection {
+                written: rax,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier: rax,
+                    slice: RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits: 64,
+                    },
+                },
+            },
+        ];
 
         arch.add_space(AddressSpace::ram(8));
         arch.add_space(AddressSpace::register());
@@ -279,6 +752,19 @@ mod tests {
         assert_eq!(loaded.memory_endianness, Endianness::Little);
         assert_eq!(loaded.addr_size, 8);
         assert_eq!(loaded.registers.len(), 2);
+        assert_eq!(loaded.register_projections, arch.register_projections);
+        assert_eq!(
+            loaded.register_projection(eax),
+            Some(&arch.register_projections[0])
+        );
+        assert_eq!(
+            loaded.register_projection(rax),
+            Some(&arch.register_projections[1])
+        );
+        assert_eq!(
+            loaded.register_projection(RegisterStorage { offset: 8, size: 8 }),
+            None
+        );
         assert_eq!(loaded.spaces.len(), 2);
         assert_eq!(&bytes[..MAGIC.len()], MAGIC);
     }
@@ -293,11 +779,277 @@ mod tests {
     #[test]
     fn previous_format_discriminator_is_rejected() {
         let mut bytes = to_bytes(&valid_arch("previous-format")).expect("serialize fixture");
-        bytes[..MAGIC.len()].copy_from_slice(b"R2PSTC05");
+        bytes[..MAGIC.len()].copy_from_slice(b"R2PSTC06");
         assert!(matches!(
             from_bytes(&bytes),
             Err(SerializeError::InvalidMagic)
         ));
+    }
+
+    #[test]
+    fn current_roundtrip_preserves_typed_geometry_refusals() {
+        let mut arch = valid_arch("projection-refusal");
+        let first = RegisterStorage { offset: 0, size: 4 };
+        let second = RegisterStorage { offset: 2, size: 4 };
+        arch.add_register(RegisterDef::new("first", first.offset, first.size));
+        arch.add_register(RegisterDef::new("second", second.offset, second.size));
+        arch.register_projections = vec![
+            RegisterProjection {
+                written: first,
+                disposition: RegisterProjectionDisposition::Refused {
+                    reason: RegisterProjectionRefusal::PartialOverlap,
+                },
+            },
+            RegisterProjection {
+                written: second,
+                disposition: RegisterProjectionDisposition::Refused {
+                    reason: RegisterProjectionRefusal::PartialOverlap,
+                },
+            },
+        ];
+
+        let loaded = from_bytes(&to_bytes(&arch).expect("serialize")).expect("deserialize");
+        assert_eq!(loaded.register_projections, arch.register_projections);
+    }
+
+    #[test]
+    fn canonical_projection_query_certifies_unnamed_little_endian_lanes() {
+        let q0 = RegisterStorage {
+            offset: 0x5000,
+            size: 16,
+        };
+        let s0 = RegisterStorage {
+            offset: 0x5000,
+            size: 4,
+        };
+        let q4 = RegisterStorage {
+            offset: 0x5040,
+            size: 16,
+        };
+        let b4 = RegisterStorage {
+            offset: 0x5040,
+            size: 1,
+        };
+        let mut arch = valid_arch("aarch64-vector-lanes");
+        for (name, storage) in [("q0", q0), ("s0", s0), ("q4", q4), ("b4", b4)] {
+            arch.add_register(RegisterDef::new(name, storage.offset, storage.size));
+        }
+        arch.register_projections = vec![
+            RegisterProjection {
+                written: s0,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier: q0,
+                    slice: RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits: 32,
+                    },
+                },
+            },
+            RegisterProjection {
+                written: q0,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier: q0,
+                    slice: RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits: 128,
+                    },
+                },
+            },
+            RegisterProjection {
+                written: b4,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier: q4,
+                    slice: RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits: 8,
+                    },
+                },
+            },
+            RegisterProjection {
+                written: q4,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier: q4,
+                    slice: RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits: 128,
+                    },
+                },
+            },
+        ];
+
+        let query = RegisterProjectionQuery::from_arch(&arch)
+            .expect("valid source geometry")
+            .expect("available source geometry");
+        let word_lane = RegisterStorage {
+            offset: 0x5004,
+            size: 4,
+        };
+        assert_eq!(
+            query.project(word_lane),
+            RegisterProjection {
+                written: word_lane,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier: q0,
+                    slice: RegisterBitSlice {
+                        lsb_bit_offset: 32,
+                        size_bits: 32,
+                    },
+                },
+            }
+        );
+        let byte_lane = RegisterStorage {
+            offset: 0x5041,
+            size: 1,
+        };
+        assert_eq!(
+            query.project(byte_lane),
+            RegisterProjection {
+                written: byte_lane,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier: q4,
+                    slice: RegisterBitSlice {
+                        lsb_bit_offset: 8,
+                        size_bits: 8,
+                    },
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn canonical_projection_query_refuses_unproved_subranges() {
+        let carrier = RegisterStorage { offset: 0, size: 8 };
+        let mut missing_orientation = valid_arch("missing-register-byte-order");
+        missing_orientation.add_register(RegisterDef::new("carrier", 0, 8));
+        missing_orientation.register_projections = vec![RegisterProjection {
+            written: carrier,
+            disposition: RegisterProjectionDisposition::Bound {
+                carrier,
+                slice: RegisterBitSlice {
+                    lsb_bit_offset: 0,
+                    size_bits: 64,
+                },
+            },
+        }];
+        let query = RegisterProjectionQuery::from_arch(&missing_orientation)
+            .expect("valid geometry")
+            .expect("available geometry");
+        assert_eq!(
+            query.project(RegisterStorage { offset: 1, size: 1 }),
+            RegisterProjection {
+                written: RegisterStorage { offset: 1, size: 1 },
+                disposition: RegisterProjectionDisposition::Refused {
+                    reason: RegisterProjectionRefusal::MissingRegisterEndianness,
+                },
+            }
+        );
+
+        let mut source_certified = missing_orientation.clone();
+        source_certified.name = "source-certified-register-byte-order".to_string();
+        source_certified
+            .spaces
+            .iter_mut()
+            .find(|space| space.id == crate::SpaceId::Register)
+            .expect("register space")
+            .endianness = Some(Endianness::Little);
+        let query = RegisterProjectionQuery::from_arch(&source_certified)
+            .expect("valid source-certified geometry")
+            .expect("available source-certified geometry");
+        assert_eq!(
+            query.project(RegisterStorage { offset: 1, size: 1 }),
+            RegisterProjection {
+                written: RegisterStorage { offset: 1, size: 1 },
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier,
+                    slice: RegisterBitSlice {
+                        lsb_bit_offset: 8,
+                        size_bits: 8,
+                    },
+                },
+            }
+        );
+
+        let mut contradictory = source_certified;
+        contradictory.name = "contradictory-register-byte-order".to_string();
+        contradictory
+            .spaces
+            .iter_mut()
+            .find(|space| space.id == crate::SpaceId::Register)
+            .expect("register space")
+            .endianness = Some(Endianness::Big);
+        contradictory.register_projections.push(RegisterProjection {
+            written: RegisterStorage { offset: 0, size: 4 },
+            disposition: RegisterProjectionDisposition::Bound {
+                carrier,
+                slice: RegisterBitSlice {
+                    lsb_bit_offset: 0,
+                    size_bits: 32,
+                },
+            },
+        });
+        contradictory.add_register(RegisterDef::new("low", 0, 4));
+        contradictory
+            .register_projections
+            .sort_by_key(|projection| projection.written);
+        let query = RegisterProjectionQuery::from_arch(&contradictory)
+            .expect("internally valid but source-contradictory geometry")
+            .expect("available source-contradictory geometry");
+        assert_eq!(
+            query
+                .project(RegisterStorage { offset: 1, size: 1 })
+                .disposition,
+            RegisterProjectionDisposition::Refused {
+                reason: RegisterProjectionRefusal::ConflictingDeclarations,
+            }
+        );
+        assert_eq!(
+            query
+                .project(RegisterStorage {
+                    offset: u64::MAX,
+                    size: 2,
+                })
+                .disposition,
+            RegisterProjectionDisposition::Refused {
+                reason: RegisterProjectionRefusal::InvalidStorageRange,
+            }
+        );
+        assert_eq!(
+            query
+                .project(RegisterStorage {
+                    offset: 0x100,
+                    size: 1,
+                })
+                .disposition,
+            RegisterProjectionDisposition::Refused {
+                reason: RegisterProjectionRefusal::NoContainingCarrier,
+            }
+        );
+
+        let first = RegisterStorage { offset: 0, size: 8 };
+        let second = RegisterStorage { offset: 4, size: 8 };
+        let mut partial = valid_arch("partial-overlap");
+        partial.add_register(RegisterDef::new("first", 0, 8));
+        partial.add_register(RegisterDef::new("second", 4, 8));
+        partial.register_projections = [first, second]
+            .into_iter()
+            .map(|written| RegisterProjection {
+                written,
+                disposition: RegisterProjectionDisposition::Refused {
+                    reason: RegisterProjectionRefusal::PartialOverlap,
+                },
+            })
+            .collect();
+        let query = RegisterProjectionQuery::from_arch(&partial)
+            .expect("typed partial-overlap geometry")
+            .expect("available refused geometry");
+        assert_eq!(
+            query
+                .project(RegisterStorage { offset: 5, size: 1 })
+                .disposition,
+            RegisterProjectionDisposition::Refused {
+                reason: RegisterProjectionRefusal::PartialOverlap,
+            }
+        );
     }
 
     #[test]

@@ -12,9 +12,8 @@ use crate::context::{
     ExternalRegisterParamSpec, ExternalStackBase, ExternalStackSlotRole, ExternalStackVarSpec,
     ParsedExternalContext, StackSlotKey, apply_main_signature_override,
     canonical_main_signature_spec, is_generic_arg_name,
-    stack_slots_from_legacy_external_stack_vars,
 };
-use crate::convert::CTypeLike;
+use crate::convert::{CTypeLike, parse_c_type_like, render_c_type_like};
 use crate::external::{
     ExternalField, ExternalStruct, ExternalTypeDb, ExternalUnion, normalize_external_type_name,
 };
@@ -28,12 +27,13 @@ use crate::facts::{
     InterprocFactDiagnostics, LocalFieldAccessFact, OutParamCertificate,
     OutParamCertificateEvidence, OutParamCertificateSource, ScalarArrayRenderCandidate,
     SignatureCertificate, SignatureCertificateSource, SignatureProjectionResult,
-    SignatureProjectionSource, VisibleBinding, VisibleBindingKind, parse_type_like_spec,
+    SignatureProjectionSource, VisibleBinding, VisibleBindingKind,
 };
 use crate::function_facts::{FunctionFacts, InterprocSummaryView, SourceOwnedFunctionFacts};
 use crate::inferred_signature_from_signature_spec;
 use crate::model::Signedness;
 use crate::prepare::recover_vars_arch_profile;
+use crate::prepare::ssa_var_block_key;
 use crate::signedness::{ScalarSignednessEvidence, infer_scalar_signedness};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,11 +137,34 @@ pub struct RecoveredVariable {
     pub reg: Option<String>,
 }
 
+impl RecoveredVariable {
+    /// The recovered type, parsed once with the canonical parser.
+    ///
+    /// The spelling is radare2's, so it stays a `String` on the wire -- this is
+    /// what radare2 told us, not something we decided. What should not happen
+    /// is each consumer taking the spelling apart its own way, which is how one
+    /// of them came to test for a pointer with `contains('*')`.
+    pub fn recovered_type(&self, ptr_bits: u32) -> Option<CTypeLike> {
+        parse_c_type_like(&self.var_type, ptr_bits)
+    }
+
+    /// Whether the recovered spelling is `void *`, however it was spaced.
+    ///
+    /// No target width is needed: `parse_c_type_like` consults `ptr_bits` only
+    /// for the integer names whose width is a property of the target, and the
+    /// shape of a pointer is not one of them.
+    pub fn recovered_type_is_void_pointer(&self) -> bool {
+        self.recovered_type(64)
+            .is_some_and(|ty| ty.is_void_pointer())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructFieldCandidate {
     pub name: String,
     pub offset: u64,
-    pub field_type: String,
+    /// The field's type, as a type.
+    pub field_type: CTypeLike,
     pub confidence: u8,
 }
 
@@ -157,7 +180,13 @@ pub struct StructDeclCandidate {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GlobalTypeLinkCandidate {
     pub addr: u64,
-    pub target_type: String,
+    /// The type this address is linked to, as a type.
+    ///
+    /// Rendered only where it leaves for radare2 or a JSON payload. It used to
+    /// be built here with `format!("struct {} *", ..)` and taken apart again
+    /// downstream with `strip_prefix`/`strip_suffix`, which is what made the
+    /// pointer's spacing something three components each had an opinion about.
+    pub target_type: CTypeLike,
     pub confidence: u8,
     pub source: WritebackSource,
 }
@@ -167,7 +196,10 @@ pub struct VarTypeCandidate {
     pub name: String,
     pub kind: String,
     pub delta: i64,
-    pub var_type: String,
+    /// The type this variable is being given, as a type.
+    ///
+    /// Rendered only where it leaves for radare2 or a JSON payload.
+    pub var_type: CTypeLike,
     pub isarg: bool,
     pub reg: Option<String>,
     pub size: u32,
@@ -207,6 +239,13 @@ pub struct LocalStructArtifacts {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeWritebackPlan {
+    /// The target's pointer width.
+    ///
+    /// The plan carries types now, and a type only becomes a C spelling
+    /// against a target: `long` and `size_t` are the width of a pointer, and
+    /// which width that is belongs to the function being written back, not to
+    /// whichever renderer happens to run.
+    pub ptr_bits: u32,
     pub signature: InferredSignature,
     pub var_type_candidates: Vec<VarTypeCandidate>,
     pub var_rename_candidates: Vec<VarRenameCandidate>,
@@ -729,8 +768,10 @@ fn type_writeback_mutation_plan_with_policy(
         };
 
         for candidate in &plan.var_type_candidates {
-            let apply_type = canonicalize_writeback_apply_type_name(&candidate.var_type)
-                .unwrap_or_else(|| candidate.var_type.clone());
+            let apply_type = crate::signature_infer::render_writeback_apply_type(
+                &candidate.var_type,
+                plan.ptr_bits,
+            );
             let type_materialization_key = writeback_type_materialization_key(&apply_type);
             let type_materialization_required = type_materialization_required_for_type(
                 &apply_type,
@@ -819,8 +860,10 @@ fn type_writeback_mutation_plan_with_policy(
         }
 
         for candidate in plan.global_type_links.iter().take(budget.global_max_links) {
-            let apply_type = canonicalize_writeback_apply_type_name(&candidate.target_type)
-                .unwrap_or_else(|| candidate.target_type.clone());
+            let apply_type = crate::signature_infer::render_writeback_apply_type(
+                &candidate.target_type,
+                plan.ptr_bits,
+            );
             let type_materialization_key = writeback_type_materialization_key(&apply_type);
             let type_materialization_required = type_materialization_required_for_type(
                 &apply_type,
@@ -944,6 +987,7 @@ pub struct TypeWritebackAnalysis {
     source: Arc<SsaArtifact>,
     function_facts: FunctionFacts,
     plan: TypeWritebackPlan,
+    callee_signatures: BTreeMap<u64, crate::SourceOwnedCalleeSignature>,
 }
 
 #[derive(Debug, Clone)]
@@ -970,22 +1014,81 @@ impl TypeWritebackAnalysis {
         &self.function_facts
     }
 
+    /// Export the signature this exact retained body proves for its callers.
+    ///
+    /// The opaque result keeps the SSA and physical interface that authorize
+    /// the logical C types, so it cannot be reattached to an unrelated call.
+    pub fn source_owned_callee_signature(&self) -> Option<crate::SourceOwnedCalleeSignature> {
+        let signature = self
+            .function_facts
+            .type_facts()
+            .render_authorized_signature()?;
+        let return_type = signature.ret_type.clone()?;
+        let render = self.function_facts.render()?;
+        let ptr_bits = self
+            .source
+            .machine_context()
+            .memory_model()
+            .default_address_bits();
+        let params = signature
+            .params
+            .iter()
+            .enumerate()
+            .map(|(slot, parameter)| {
+                let id = r2ssa::SemanticId::parameter(slot)?;
+                let crate::CertifiedEntity::Parameter { carrier_width, .. } =
+                    render.certified_entities.get(&id)?
+                else {
+                    return None;
+                };
+                let width_bits = carrier_width.checked_mul(8)?;
+                Some(crate::admit_declaration_type(
+                    parameter.ty.clone()?,
+                    width_bits,
+                    ptr_bits,
+                ))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        crate::SourceOwnedCalleeSignature::new(
+            &self.source,
+            crate::FunctionType {
+                return_type,
+                params,
+                // Function interfaces own fixed carriers. Variadicity belongs
+                // to the exact callsite prototype and is attached there.
+                variadic: false,
+            },
+        )
+    }
+
     fn enrich_from_source_for_decompile(&mut self) -> bool {
-        if crate::prepare::prepared_arch_name(self.source.as_ref()).is_none() {
+        if crate::prepare::prepared_arch_display_name(self.source.as_ref()).is_none() {
             return false;
         }
-        let prior_facts = self.function_facts.clone();
         let prior_plan = self.plan.clone();
-        let applied_constraints = SourceOwnedFunctionFacts::enrich_report_from_source_for_decompile(
-            self.source.as_ref(),
-            &mut self.function_facts,
-        );
-        if applied_constraints > 0
-            && !self.refresh_plan_after_source_constraints(&prior_facts, applied_constraints)
+        let (changed_parameters, return_type_changed) =
+            SourceOwnedFunctionFacts::enrich_report_from_source_with_callee_signatures(
+                self.source.as_ref(),
+                &mut self.function_facts,
+                &self.callee_signatures,
+            );
+        if (!changed_parameters.is_empty() || return_type_changed)
+            && !self.refresh_plan_after_source_constraints(&changed_parameters)
         {
-            self.function_facts = prior_facts;
+            // The plan is the writeback's projection of the facts, and it is
+            // refreshed atomically: a plan that binds one argument twice, or
+            // to a register that is no slot, would write conflicting types
+            // back, so such a plan is left as it was. That is a fact about the
+            // writeback, not about the decompilation. The enriched facts are
+            // what the rendering reads, and they stand; only the plan keeps
+            // its prior signature, which the writeback authority sees.
+            // Failing the whole function here had cost every function whose
+            // plan carried one such binding its decompilation.
+            r2il::refusal_evidence!(
+                "signature-refresh",
+                "plan not refreshed: changed slots {changed_parameters:?} return_changed={return_type_changed}; facts enriched, plan kept"
+            );
             self.plan = prior_plan;
-            return false;
         }
         true
     }
@@ -1028,25 +1131,41 @@ impl TypeWritebackAnalysis {
         ) {
             return Err(TypeWritebackAnalysisError::IncompatibleDecompileRoute);
         }
-        SourceOwnedFunctionFacts::seal(self.source, self.function_facts)
-            .ok_or(TypeWritebackAnalysisError::FunctionFactsSourceMismatch)
+        SourceOwnedFunctionFacts::seal_with_callee_signatures(
+            self.source,
+            self.function_facts,
+            self.callee_signatures,
+        )
+        .ok_or(TypeWritebackAnalysisError::FunctionFactsSourceMismatch)
     }
 
-    fn refresh_plan_after_source_constraints(
-        &mut self,
-        prior_facts: &FunctionFacts,
-        expected_constraints: usize,
-    ) -> bool {
+    /// Project the enriched signature into the writeback plan.
+    ///
+    /// `changed_slots` is the enrichment's own account of which parameter
+    /// declarations changed; nothing is recounted here, and the return type
+    /// arrives with the signature itself. The refresh is
+    /// atomic over the plan's argument bindings: a binding with no register,
+    /// with a register that is no argument slot, or a second binding for one
+    /// slot leaves the plan untouched and returns false, because a plan half
+    /// refreshed would write conflicting types back.
+    fn refresh_plan_after_source_constraints(&mut self, changed_slots: &BTreeSet<usize>) -> bool {
         let Some(signature) = self
             .function_facts
             .type_facts()
             .render_authorized_signature()
             .cloned()
         else {
-            return false;
+            // Nothing is authorized for the plan to carry, so there is
+            // nothing to refresh; the facts changed all the same, and the
+            // rendering reads the facts.
+            r2il::refusal_evidence!(
+                "signature-refresh",
+                "no render-authorized signature; plan not refreshed for changed slots {changed_slots:?}"
+            );
+            return true;
         };
         let source = self.source.as_ref();
-        let Some(arch_name) = crate::prepare::prepared_arch_name(source) else {
+        let Some(arch_name) = crate::prepare::prepared_arch_display_name(source) else {
             return false;
         };
         let ptr_bits = source
@@ -1077,22 +1196,6 @@ impl TypeWritebackAnalysis {
             .signature
             .callconv_confidence
             .max(prior_callconv_confidence);
-        let prior_signature = prior_facts.type_facts().merged_signature.as_ref();
-        let changed_slots = signature
-            .params
-            .iter()
-            .enumerate()
-            .filter_map(|(slot, parameter)| {
-                (prior_signature
-                    .and_then(|signature| signature.params.get(slot))
-                    .and_then(|parameter| parameter.ty.as_ref())
-                    != parameter.ty.as_ref())
-                .then_some(slot)
-            })
-            .collect::<BTreeSet<_>>();
-        if changed_slots.len() != expected_constraints {
-            return false;
-        }
         let mut refreshed_slots = BTreeSet::new();
         for candidate in plan
             .var_type_candidates
@@ -1120,9 +1223,9 @@ impl TypeWritebackAnalysis {
             else {
                 return false;
             };
-            let var_type = render_signature_type(ty, ptr_bits);
-            let size = estimate_c_type_size_bytes(&var_type, ptr_bits) as u32;
-            candidate.var_type = var_type;
+            let size =
+                estimate_c_type_size_bytes(&render_signature_type(ty, ptr_bits), ptr_bits) as u32;
+            candidate.var_type = ty.clone();
             candidate.size = size;
             candidate.source = WritebackSource::CalleeSignature;
             if !candidate
@@ -1134,8 +1237,22 @@ impl TypeWritebackAnalysis {
                     .push(WritebackEvidence::CertifiedCallArgument);
             }
         }
-        if refreshed_slots != changed_slots {
-            return false;
+        // A changed slot with no argument candidate is not an inconsistency:
+        // the plan carries no variable for that parameter, so there is nothing
+        // to refresh for it. Demanding one made every function whose declared
+        // parameter types the source interface supplies -- but whose plan names
+        // no register variable for one of them -- fail its whole writeback, and
+        // with it the decompilation, once the interface began supplying every
+        // parameter's type rather than only the return's.
+        let unrefreshed = changed_slots
+            .difference(&refreshed_slots)
+            .copied()
+            .collect::<Vec<_>>();
+        if !unrefreshed.is_empty() {
+            r2il::refusal_evidence!(
+                "signature-refresh",
+                "slots {unrefreshed:?} changed type with no argument candidate to carry it"
+            );
         }
         self.plan = plan;
         true
@@ -1189,7 +1306,10 @@ pub enum TypeWritebackAnalysisError {
     AssumptionSetMismatch,
     FunctionFactsSourceMismatch,
     IncompatibleDecompileRoute,
+    DerivedSignatureMismatch,
+    DerivedTypeFactsMismatch,
     SourceEnrichmentFailed,
+    DuplicateCalleeAddress,
 }
 
 #[derive(Debug, Clone)]
@@ -1198,6 +1318,7 @@ pub struct TypeWritebackAnalysisRequest {
     parsed_context: ParsedExternalContext,
     semantic_artifact: Option<r2sym::SemanticArtifact>,
     interproc_summary: Option<r2ssa::PreparedInterprocSummarySet>,
+    callee_signatures: BTreeMap<u64, crate::SourceOwnedCalleeSignature>,
 }
 
 impl TypeWritebackAnalysisRequest {
@@ -1213,6 +1334,7 @@ impl TypeWritebackAnalysisRequest {
             parsed_context,
             semantic_artifact: None,
             interproc_summary: None,
+            callee_signatures: BTreeMap::new(),
         })
     }
 
@@ -1235,6 +1357,22 @@ impl TypeWritebackAnalysisRequest {
             return Err(TypeWritebackAnalysisError::ForeignInterprocSummary);
         }
         self.interproc_summary = Some(interproc_summary);
+        Ok(self)
+    }
+
+    pub fn with_source_owned_callee_signatures(
+        mut self,
+        signatures: impl IntoIterator<Item = crate::SourceOwnedCalleeSignature>,
+    ) -> Result<Self, TypeWritebackAnalysisError> {
+        for signature in signatures {
+            if self
+                .callee_signatures
+                .insert(signature.address(), signature)
+                .is_some()
+            {
+                return Err(TypeWritebackAnalysisError::DuplicateCalleeAddress);
+            }
+        }
         Ok(self)
     }
 
@@ -1269,6 +1407,17 @@ struct DerivedTypeWritebackAnalysisInput<'a> {
 struct DerivedTypeWritebackSemanticInputs<'a> {
     artifact: &'a r2sym::SemanticArtifactReport,
     local_field_accesses: &'a [LocalFieldAccessFact],
+}
+
+struct PreparedMachineVarProfile {
+    architecture: r2ssa::MachineArchitectureFamily,
+    pointer_arg_slots: HashMap<String, usize>,
+}
+
+struct ScalarArrayMachineProfile<'a> {
+    architecture: r2ssa::MachineArchitectureFamily,
+    pointer_arg_slots: Option<&'a HashMap<String, usize>>,
+    ptr_bits: u32,
 }
 
 #[cfg(test)]
@@ -1649,7 +1798,7 @@ fn merge_param_type_hint(
         hints.insert(index, hint);
         return;
     };
-    if render_signature_type(existing, ptr_bits) == render_signature_type(&hint, ptr_bits) {
+    if crate::signature_infer::signature_types_are_equivalent(existing, &hint, ptr_bits) {
         return;
     }
     let should_replace = matches!(
@@ -2083,7 +2232,7 @@ fn collect_worker_summary_type_hints(
         r2sym::NativeWorkerSummaryKind::OutputStream => signed_byte_pointer_type(),
         r2sym::NativeWorkerSummaryKind::FormatRender
         | r2sym::NativeWorkerSummaryKind::MetadataProbe => void_pointer_type(),
-        r2sym::NativeWorkerSummaryKind::SortMerge => typedef_pointer_type("sortfile"),
+        r2sym::NativeWorkerSummaryKind::SortMerge => void_pointer_type(),
         r2sym::NativeWorkerSummaryKind::NumericTransform if summary.memory.is_some() => {
             byte_pointer_type()
         }
@@ -2181,7 +2330,7 @@ fn region_summary_pointer_hint(summary: &r2sym::NativeRegionSummary) -> CTypeLik
         r2sym::NativeWorkerSummaryKind::RecordStream => typedef_pointer_type("FILE"),
         r2sym::NativeWorkerSummaryKind::FieldSelection
         | r2sym::NativeWorkerSummaryKind::OutputStream => signed_byte_pointer_type(),
-        r2sym::NativeWorkerSummaryKind::SortMerge => typedef_pointer_type("sortfile"),
+        r2sym::NativeWorkerSummaryKind::SortMerge => void_pointer_type(),
         r2sym::NativeWorkerSummaryKind::NumericTransform => void_pointer_type(),
         r2sym::NativeWorkerSummaryKind::HashFold
         | r2sym::NativeWorkerSummaryKind::TableWalk
@@ -2392,6 +2541,7 @@ fn apply_signature_projection_to_inferred(
     inferred_signature: &mut InferredSignature,
     projection: FunctionSignatureProjection,
     ptr_bits: u32,
+    type_db: &ExternalTypeDb,
 ) -> SignatureProjectionResult {
     let mut merged_signature = inferred_signature_to_spec(inferred_signature, ptr_bits);
     let confidence = projection.signature_confidence();
@@ -2412,7 +2562,7 @@ fn apply_signature_projection_to_inferred(
         return result;
     }
     if let Some(signature) = merged_signature.as_ref() {
-        apply_signature_context_overrides(inferred_signature, Some(signature), ptr_bits);
+        apply_signature_context_overrides(inferred_signature, Some(signature), ptr_bits, type_db);
         if exact_strong_projection && inferred_signature.params.len() > signature.params.len() {
             inferred_signature.params.truncate(signature.params.len());
         }
@@ -2451,10 +2601,6 @@ fn semantic_role_param_name_is_weak(name: &str) -> bool {
     crate::signature_param_name_is_weak(name)
 }
 
-fn semantic_role_typedef_is_authoritative(name: &str) -> bool {
-    crate::role_registry::semantic_typedef_is_authoritative(name)
-}
-
 fn heap_allocation_return_type() -> CTypeLike {
     CTypeLike::Typedef("allocation_ptr".to_string())
 }
@@ -2467,7 +2613,6 @@ fn merge_role_type_projection(
     let crate::role_registry::RoleTypeProjection {
         ret_type,
         pointer_param_indices,
-        out_param_indices: _,
         param_type_hints,
         param_name_hints,
     } = role_projection;
@@ -3091,7 +3236,7 @@ fn infer_interproc_return_type(
                 inferred_signature
                     .params
                     .get(idx)
-                    .and_then(|param| parse_type_like_spec(&param.param_type, ptr_bits))
+                    .and_then(|param| parse_c_type_like(&param.param_type, ptr_bits))
                     .filter(|ty| !is_generic_signature_type(Some(ty)))
             }),
         _ => None,
@@ -3122,6 +3267,7 @@ fn maybe_upgrade_param_to_pointer(
     merged_signature: &mut Option<FunctionSignatureSpec>,
     inferred_signature: &mut InferredSignature,
     ptr_bits: u32,
+    type_db: &ExternalTypeDb,
 ) {
     let pointer_ty = CTypeLike::Pointer(Box::new(CTypeLike::Void));
 
@@ -3141,13 +3287,11 @@ fn maybe_upgrade_param_to_pointer(
         let merged_param = signature.params.get_mut(idx);
         let inferred_param = inferred_signature.params.get_mut(idx);
 
-        if merged_param
-            .as_ref()
-            .is_some_and(|param| param_has_authoritative_named_scalar_role(param, ptr_bits))
-            || inferred_param.as_ref().is_some_and(|param| {
-                inferred_param_has_authoritative_named_scalar_role(param, ptr_bits)
-            })
-        {
+        if merged_param.as_ref().is_some_and(|param| {
+            param_has_authoritative_named_scalar_role(param, ptr_bits, type_db)
+        }) || inferred_param.as_ref().is_some_and(|param| {
+            inferred_param_has_authoritative_named_scalar_role(param, ptr_bits, type_db)
+        }) {
             continue;
         }
 
@@ -3169,7 +3313,7 @@ fn maybe_upgrade_param_to_pointer(
         let inferred_is_generic = inferred_param.as_ref().is_some_and(|param| {
             is_generic_type_string(&param.param_type)
                 || matches!(
-                    parse_type_like_spec(&param.param_type, ptr_bits),
+                    parse_c_type_like(&param.param_type, ptr_bits),
                     Some(CTypeLike::Int {
                         bits,
                         signedness: Signedness::Signed
@@ -3193,6 +3337,7 @@ fn upgrade_param_indices_to_pointer(
     merged_signature: &mut Option<FunctionSignatureSpec>,
     inferred_signature: &mut InferredSignature,
     ptr_bits: u32,
+    type_db: &ExternalTypeDb,
 ) {
     let pointer_ty = CTypeLike::Pointer(Box::new(CTypeLike::Void));
 
@@ -3208,13 +3353,11 @@ fn upgrade_param_indices_to_pointer(
         let merged_param = signature.params.get_mut(idx);
         let inferred_param = inferred_signature.params.get_mut(idx);
 
-        if merged_param
-            .as_ref()
-            .is_some_and(|param| param_has_authoritative_named_scalar_role(param, ptr_bits))
-            || inferred_param.as_ref().is_some_and(|param| {
-                inferred_param_has_authoritative_named_scalar_role(param, ptr_bits)
-            })
-        {
+        if merged_param.as_ref().is_some_and(|param| {
+            param_has_authoritative_named_scalar_role(param, ptr_bits, type_db)
+        }) || inferred_param.as_ref().is_some_and(|param| {
+            inferred_param_has_authoritative_named_scalar_role(param, ptr_bits, type_db)
+        }) {
             continue;
         }
 
@@ -3236,7 +3379,7 @@ fn upgrade_param_indices_to_pointer(
         let inferred_is_generic = inferred_param.as_ref().is_some_and(|param| {
             is_generic_type_string(&param.param_type)
                 || matches!(
-                    parse_type_like_spec(&param.param_type, ptr_bits),
+                    parse_c_type_like(&param.param_type, ptr_bits),
                     Some(CTypeLike::Int {
                         bits,
                         signedness: Signedness::Signed
@@ -3255,45 +3398,50 @@ fn upgrade_param_indices_to_pointer(
     }
 }
 
-fn type_is_authoritative_named_scalar_role(ty: &CTypeLike) -> bool {
+fn type_is_authoritative_named_scalar_role(
+    ty: &CTypeLike,
+    type_db: &ExternalTypeDb,
+    ptr_bits: u32,
+) -> bool {
     match ty {
         CTypeLike::Bool | CTypeLike::Enum(_) => true,
-        CTypeLike::Typedef(name) => {
-            matches!(
-                name.trim().to_ascii_lowercase().as_str(),
-                "int" | "unsigned int"
-            ) || semantic_role_typedef_is_authoritative(name)
-        }
+        CTypeLike::Typedef(name) => type_db_resolves_type_name(type_db, name, ptr_bits),
         _ => false,
     }
 }
 
-fn param_has_authoritative_named_scalar_role(param: &FunctionParamSpec, _ptr_bits: u32) -> bool {
+fn param_has_authoritative_named_scalar_role(
+    param: &FunctionParamSpec,
+    ptr_bits: u32,
+    type_db: &ExternalTypeDb,
+) -> bool {
     !semantic_role_param_name_is_weak(&param.name)
         && param
             .ty
             .as_ref()
-            .is_some_and(type_is_authoritative_named_scalar_role)
+            .is_some_and(|ty| type_is_authoritative_named_scalar_role(ty, type_db, ptr_bits))
 }
 
 fn inferred_param_has_authoritative_named_scalar_role(
     param: &InferredSignatureParam,
     ptr_bits: u32,
+    type_db: &ExternalTypeDb,
 ) -> bool {
     if semantic_role_param_name_is_weak(&param.name) {
         return false;
     }
     parse_signature_type_preserving_c_typedefs(&param.param_type, ptr_bits)
         .as_ref()
-        .is_some_and(type_is_authoritative_named_scalar_role)
+        .is_some_and(|ty| type_is_authoritative_named_scalar_role(ty, type_db, ptr_bits))
 }
 
 fn summary_hint_can_replace_weak_existing(
     existing: &CTypeLike,
     hint: &CTypeLike,
     ptr_bits: u32,
+    type_db: &ExternalTypeDb,
 ) -> bool {
-    crate::summary_hint_can_replace_weak_existing(existing, hint, ptr_bits)
+    crate::summary_hint_can_replace_weak_existing(existing, hint, ptr_bits, type_db)
 }
 
 fn upgrade_param_type_hints(
@@ -3301,6 +3449,7 @@ fn upgrade_param_type_hints(
     merged_signature: &mut Option<FunctionSignatureSpec>,
     inferred_signature: &mut InferredSignature,
     ptr_bits: u32,
+    type_db: &ExternalTypeDb,
 ) {
     if hints.is_empty() {
         return;
@@ -3313,7 +3462,7 @@ fn upgrade_param_type_hints(
         for (idx, hint) in hints {
             if let Some(param) = signature.params.get_mut(*idx) {
                 let should_replace = param.ty.as_ref().is_none_or(|existing| {
-                    summary_hint_can_replace_weak_existing(existing, hint, ptr_bits)
+                    summary_hint_can_replace_weak_existing(existing, hint, ptr_bits, type_db)
                 });
                 if should_replace {
                     param.ty = Some(hint.clone());
@@ -3324,10 +3473,10 @@ fn upgrade_param_type_hints(
 
     for (idx, hint) in hints {
         if let Some(param) = inferred_signature.params.get_mut(*idx) {
-            let existing_ty = parse_type_like_spec(&param.param_type, ptr_bits);
+            let existing_ty = parse_c_type_like(&param.param_type, ptr_bits);
             let should_replace = is_generic_type_string(&param.param_type)
                 || existing_ty.as_ref().is_some_and(|existing| {
-                    summary_hint_can_replace_weak_existing(existing, hint, ptr_bits)
+                    summary_hint_can_replace_weak_existing(existing, hint, ptr_bits, type_db)
                 });
             if should_replace {
                 param.param_type = render_signature_type(hint, ptr_bits);
@@ -3341,6 +3490,7 @@ fn upgrade_return_type_hint(
     merged_signature: &mut Option<FunctionSignatureSpec>,
     inferred_signature: &mut InferredSignature,
     ptr_bits: u32,
+    type_db: &ExternalTypeDb,
 ) -> bool {
     let Some(hint) = hint else {
         return false;
@@ -3352,12 +3502,13 @@ fn upgrade_return_type_hint(
     let mut changed = false;
     if let Some(signature) = merged_signature.as_mut() {
         let should_replace = signature.ret_type.as_ref().is_none_or(|existing| {
-            summary_hint_can_replace_weak_existing(existing, hint, ptr_bits)
+            summary_hint_can_replace_weak_existing(existing, hint, ptr_bits, type_db)
                 || matches!(hint, CTypeLike::Void)
                     && crate::signature_return_hint_can_replace_existing(
                         existing,
                         Some(hint),
                         ptr_bits,
+                        type_db,
                     )
         });
         if should_replace && signature.ret_type.as_ref() != Some(hint) {
@@ -3366,15 +3517,16 @@ fn upgrade_return_type_hint(
         }
     }
 
-    let existing_ty = parse_type_like_spec(&inferred_signature.ret_type, ptr_bits);
+    let existing_ty = parse_c_type_like(&inferred_signature.ret_type, ptr_bits);
     let should_replace = is_generic_type_string(&inferred_signature.ret_type)
         || existing_ty.as_ref().is_some_and(|existing| {
-            summary_hint_can_replace_weak_existing(existing, hint, ptr_bits)
+            summary_hint_can_replace_weak_existing(existing, hint, ptr_bits, type_db)
                 || matches!(hint, CTypeLike::Void)
                     && crate::signature_return_hint_can_replace_existing(
                         existing,
                         Some(hint),
                         ptr_bits,
+                        type_db,
                     )
         });
     if should_replace {
@@ -3449,6 +3601,7 @@ fn apply_interproc_summary_to_signature(
     summary_view: &InterprocSummaryView,
     semantic_projection: Option<&SemanticTypeProjection>,
     ptr_bits: u32,
+    type_db: &ExternalTypeDb,
 ) {
     let Some(summary) = summary_view.root_summary() else {
         if let Some(projection) = semantic_projection {
@@ -3457,6 +3610,7 @@ fn apply_interproc_summary_to_signature(
                 merged_signature,
                 inferred_signature,
                 ptr_bits,
+                type_db,
             );
             upgrade_param_name_hints(
                 &projection.param_name_hints,
@@ -3469,23 +3623,32 @@ fn apply_interproc_summary_to_signature(
                 merged_signature,
                 inferred_signature,
                 ptr_bits,
+                type_db,
             );
             upgrade_param_type_hints(
                 &projection.param_type_hints,
                 merged_signature,
                 inferred_signature,
                 ptr_bits,
+                type_db,
             );
         }
         return;
     };
-    maybe_upgrade_param_to_pointer(summary, merged_signature, inferred_signature, ptr_bits);
+    maybe_upgrade_param_to_pointer(
+        summary,
+        merged_signature,
+        inferred_signature,
+        ptr_bits,
+        type_db,
+    );
     if let Some(projection) = semantic_projection {
         upgrade_return_type_hint(
             projection.return_type_hint.as_ref(),
             merged_signature,
             inferred_signature,
             ptr_bits,
+            type_db,
         );
         upgrade_param_name_hints(
             &projection.param_name_hints,
@@ -3498,12 +3661,14 @@ fn apply_interproc_summary_to_signature(
             merged_signature,
             inferred_signature,
             ptr_bits,
+            type_db,
         );
         upgrade_param_type_hints(
             &projection.param_type_hints,
             merged_signature,
             inferred_signature,
             ptr_bits,
+            type_db,
         );
     }
     let Some(ret_ty) = infer_interproc_return_type(
@@ -3520,15 +3685,18 @@ fn apply_interproc_summary_to_signature(
         .and_then(|signature| signature.ret_type.as_ref())
         .is_none_or(|ty| {
             is_generic_signature_type(Some(ty))
-                || summary_hint_can_replace_weak_existing(ty, &ret_ty, ptr_bits)
+                || summary_hint_can_replace_weak_existing(ty, &ret_ty, ptr_bits, type_db)
                 || matches!(summary.return_relation, SummaryReturnRelation::HeapAlloc)
-                    && crate::signature_hint_can_replace_existing(ty, Some(&ret_ty), ptr_bits)
+                    && crate::signature_hint_can_replace_existing(ty, Some(&ret_ty), ptr_bits,
+                type_db,
+            )
                 || matches!(ret_ty, CTypeLike::Void)
                     && crate::signature_return_hint_can_replace_existing(
                         ty,
                         Some(&ret_ty),
                         ptr_bits,
-                    )
+                type_db,
+            )
                 || matches!(
                     (&ret_ty, ty),
                     (
@@ -3544,6 +3712,19 @@ fn apply_interproc_summary_to_signature(
         return;
     }
 
+    // A declared `void` is a fact about the interface, not an absent one. A
+    // summary watches what the machine leaves in the return register, which a
+    // function returning nothing still writes, so letting that stand against the
+    // declaration turned `void list_free(Node *head)` into `void *` and left the
+    // body returning the program counter.
+    let declared_void_return = merged_signature
+        .as_ref()
+        .and_then(|signature| signature.ret_type.as_ref())
+        .is_some_and(|ty| matches!(ty, CTypeLike::Void));
+    if declared_void_return && !matches!(ret_ty, CTypeLike::Void) {
+        return;
+    }
+
     if merged_signature.is_none() {
         *merged_signature = inferred_signature_to_spec(inferred_signature, ptr_bits);
     }
@@ -3552,18 +3733,24 @@ fn apply_interproc_summary_to_signature(
     }
 
     if is_generic_type_string(&inferred_signature.ret_type)
-        || parse_type_like_spec(&inferred_signature.ret_type, ptr_bits)
-            .is_some_and(|ty| summary_hint_can_replace_weak_existing(&ty, &ret_ty, ptr_bits))
+        || parse_c_type_like(&inferred_signature.ret_type, ptr_bits).is_some_and(|ty| {
+            summary_hint_can_replace_weak_existing(&ty, &ret_ty, ptr_bits, type_db)
+        })
         || matches!(summary.return_relation, SummaryReturnRelation::HeapAlloc)
-            && parse_type_like_spec(&inferred_signature.ret_type, ptr_bits).is_some_and(|ty| {
-                crate::signature_hint_can_replace_existing(&ty, Some(&ret_ty), ptr_bits)
+            && parse_c_type_like(&inferred_signature.ret_type, ptr_bits).is_some_and(|ty| {
+                crate::signature_hint_can_replace_existing(&ty, Some(&ret_ty), ptr_bits, type_db)
             })
         || matches!(ret_ty, CTypeLike::Void)
-            && parse_type_like_spec(&inferred_signature.ret_type, ptr_bits).is_some_and(|ty| {
-                crate::signature_return_hint_can_replace_existing(&ty, Some(&ret_ty), ptr_bits)
+            && parse_c_type_like(&inferred_signature.ret_type, ptr_bits).is_some_and(|ty| {
+                crate::signature_return_hint_can_replace_existing(
+                    &ty,
+                    Some(&ret_ty),
+                    ptr_bits,
+                    type_db,
+                )
             })
         || matches!(
-            parse_type_like_spec(&inferred_signature.ret_type, ptr_bits),
+            parse_c_type_like(&inferred_signature.ret_type, ptr_bits),
             Some(CTypeLike::Int {
                 bits,
                 signedness: Signedness::Signed | Signedness::Unsigned | Signedness::Unknown,
@@ -3585,7 +3772,7 @@ fn assumption_type_hint(
 }
 
 fn type_hint_conflicts(existing: &CTypeLike, hint: &CTypeLike, ptr_bits: u32) -> bool {
-    render_signature_type(existing, ptr_bits) != render_signature_type(hint, ptr_bits)
+    !crate::signature_infer::signature_types_are_equivalent(existing, hint, ptr_bits)
 }
 
 fn type_hint_requires_semantic_corroboration(assumption: &r2ssa::AnalysisAssumption) -> bool {
@@ -3671,7 +3858,7 @@ fn apply_type_hint_to_signature_param(
     }
 
     if let Some(param) = inferred_signature.params.get_mut(index) {
-        let existing_ty = parse_type_like_spec(&param.param_type, ptr_bits);
+        let existing_ty = parse_c_type_like(&param.param_type, ptr_bits);
         let can_replace = is_generic_type_string(&param.param_type)
             || existing_ty.as_ref().is_some_and(|existing| {
                 type_hint_can_replace_weak_existing(
@@ -3690,20 +3877,12 @@ fn apply_type_hint_to_signature_param(
     Ok(applied)
 }
 
-fn assumption_stack_base(base: &str) -> Option<ExternalStackBase> {
-    match base.trim().to_ascii_lowercase().as_str() {
-        "bp" | "rbp" | "ebp" | "frame" | "fp" => Some(ExternalStackBase::FramePointer),
-        "sp" | "rsp" | "esp" | "stack" => Some(ExternalStackBase::StackPointer),
-        "" => None,
-        other => Some(ExternalStackBase::Named(other.to_string())),
-    }
-}
-
 fn apply_type_hint_assumptions_to_context(
     parsed_context: &mut ParsedExternalContext,
     inferred_signature: &mut InferredSignature,
     ptr_bits: u32,
     semantic_projection: Option<&SemanticTypeProjection>,
+    registers: &crate::RegisterIdentity,
 ) -> r2ssa::AssumptionUsageReport {
     let mut usage = r2ssa::AssumptionUsageReport::default();
     let inferred_register_params =
@@ -3746,7 +3925,7 @@ fn apply_type_hint_assumptions_to_context(
                     .iter_mut()
                     .enumerate()
                     .find(|(_, param)| {
-                        register_family_matches(&param.reg, name)
+                        registers.same_parameter_storage(&param.reg, name)
                             || param.name.eq_ignore_ascii_case(name)
                     })
                 else {
@@ -3804,12 +3983,8 @@ fn apply_type_hint_assumptions_to_context(
                 }
             }
             r2ssa::AssumptionSubject::StackSlot { base, offset } => {
-                let Some(base) = assumption_stack_base(base) else {
-                    usage.mark_ignored(assumption);
-                    continue;
-                };
                 let key = StackSlotKey {
-                    base,
+                    base: *base,
                     offset: *offset,
                 };
                 let corroborated = semantic_projection.is_some_and(|projection| {
@@ -3851,10 +4026,9 @@ fn apply_type_hint_assumptions_to_context(
                             assumption,
                             format!(
                                 "stack slot {}@{} already has incompatible type {}",
-                                match &key.base {
+                                match key.base {
                                     ExternalStackBase::FramePointer => "bp",
                                     ExternalStackBase::StackPointer => "sp",
-                                    ExternalStackBase::Named(name) => name.as_str(),
                                 },
                                 key.offset,
                                 render_signature_type(existing, ptr_bits)
@@ -3895,6 +4069,7 @@ fn apply_type_hint_assumptions_to_context(
 fn applied_type_assumption_parameter_slots(
     usage: &r2ssa::AssumptionUsageReport,
     parsed_context: &ParsedExternalContext,
+    registers: &crate::RegisterIdentity,
 ) -> HashSet<usize> {
     usage
         .applied
@@ -3903,16 +4078,15 @@ fn applied_type_assumption_parameter_slots(
             r2ssa::AssumptionSubject::Parameter { index } => Some(*index),
             r2ssa::AssumptionSubject::Register { name } => {
                 parsed_context.register_params.iter().position(|param| {
-                    register_family_matches(&param.reg, name)
+                    registers.same_parameter_storage(&param.reg, name)
                         || param.name.eq_ignore_ascii_case(name)
                 })
             }
-            r2ssa::AssumptionSubject::StackSlot { base, offset } => assumption_stack_base(base)
-                .and_then(|base| {
-                    parsed_context.stack_slots.get(&StackSlotKey {
-                        base,
-                        offset: *offset,
-                    })
+            r2ssa::AssumptionSubject::StackSlot { base, offset } => parsed_context
+                .stack_slots
+                .get(&StackSlotKey {
+                    base: *base,
+                    offset: *offset,
                 })
                 .and_then(|slot| slot.param_index),
             r2ssa::AssumptionSubject::Predicate { .. }
@@ -3926,13 +4100,9 @@ fn build_type_writeback_analysis_inner(
     mut input: DerivedTypeWritebackAnalysisInput<'_>,
     semantic_inputs: Option<DerivedTypeWritebackSemanticInputs<'_>>,
     prep_facts: Option<&r2ssa::DecompilePrepFacts>,
+    machine_profile: Option<&PreparedMachineVarProfile>,
+    registers: &crate::RegisterIdentity,
 ) -> DerivedTypeWritebackAnalysis {
-    if input.parsed_context.stack_slots.is_empty()
-        && !input.parsed_context.external_stack_vars.is_empty()
-    {
-        input.parsed_context.stack_slots =
-            stack_slots_from_legacy_external_stack_vars(&input.parsed_context.external_stack_vars);
-    }
     // This inner projection builder is also used by detached report-only
     // tests. Invalid advisory reports lose all interprocedural evidence here;
     // the source-owned entrypoint validates and propagates the exact schema
@@ -3958,9 +4128,17 @@ fn build_type_writeback_analysis_inner(
         &mut input.inferred_signature,
         input.ptr_bits,
         Some(&semantic_projection),
+        registers,
     );
-    let type_assumption_parameter_slots =
-        applied_type_assumption_parameter_slots(&type_assumption_usage, &input.parsed_context);
+
+    // Borrowed after the last mutation of the context, and not copied: the
+    // database is per binary while this runs per function.
+    let type_db = &input.parsed_context.external_type_db;
+    let type_assumption_parameter_slots = applied_type_assumption_parameter_slots(
+        &type_assumption_usage,
+        &input.parsed_context,
+        registers,
+    );
     let mut signature_certificate_sources = Vec::new();
     if authoritative_external_arity {
         push_signature_certificate_source(
@@ -3994,19 +4172,13 @@ fn build_type_writeback_analysis_inner(
         canonicalize_register_params
             .extend_from_slice(&inferred_register_params[canonicalize_register_params.len()..]);
     }
-    canonicalize_external_stack_slots_with_prep_facts(
-        &mut input.parsed_context.stack_slots,
-        input.ssa_blocks,
-        prep_facts,
-        input.ptr_bits,
-    );
     canonicalize_param_home_stack_slots(
         merged_signature.as_ref(),
         &canonicalize_register_params,
         &mut input.parsed_context.stack_slots,
         input.ssa_blocks,
         prep_facts,
-        input.ptr_bits,
+        registers,
     );
     hide_unproven_stack_pointer_frame_slots(&mut input.parsed_context.stack_slots);
     apply_main_signature_override(input.function_name, &mut merged_signature);
@@ -4041,6 +4213,7 @@ fn build_type_writeback_analysis_inner(
             &mut input.inferred_signature,
             projection,
             input.ptr_bits,
+            type_db,
         );
     }
     let before_interproc_signature = merged_signature.clone();
@@ -4050,6 +4223,7 @@ fn build_type_writeback_analysis_inner(
         &summary_view,
         Some(&semantic_projection),
         input.ptr_bits,
+        type_db,
     );
     if merged_signature != before_interproc_signature {
         push_signature_certificate_source(
@@ -4134,7 +4308,7 @@ fn build_type_writeback_analysis_inner(
     );
 
     let mut type_db = input.parsed_context.external_type_db.clone();
-    merge_local_structs_into_type_db(&mut type_db, &struct_decls);
+    merge_local_structs_into_type_db(&mut type_db, &struct_decls, input.ptr_bits);
     let before_slot_signature = merged_signature.clone();
     let merged_signature = merge_slot_type_overrides_into_signature(
         merged_signature,
@@ -4172,12 +4346,13 @@ fn build_type_writeback_analysis_inner(
         &type_db,
         merged_signature.as_ref(),
         &local_structs.slot_element_strides,
-        if input.inferred_signature.arch.is_empty() {
-            input.parsed_context.callconv.as_deref()
-        } else {
-            Some(input.inferred_signature.arch.as_str())
+        ScalarArrayMachineProfile {
+            architecture: machine_profile
+                .map(|profile| profile.architecture)
+                .unwrap_or(r2ssa::MachineArchitectureFamily::Unknown),
+            pointer_arg_slots: machine_profile.map(|profile| &profile.pointer_arg_slots),
+            ptr_bits: input.ptr_bits,
         },
-        input.ptr_bits,
     );
     array_index_certificates.extend(scalar_array_access_certificates.array_index);
     let mut scalar_array_render_candidates = exact_indexed_access_certificates.render_candidates;
@@ -4216,11 +4391,13 @@ fn build_type_writeback_analysis_inner(
         merged_signature.as_ref(),
         input.ptr_bits,
     );
-    let current_context_maps = signature_context_maps(merged_signature.as_ref(), input.ptr_bits);
+    let current_context_maps =
+        signature_context_maps(merged_signature.as_ref(), input.ptr_bits, &type_db);
     apply_signature_context_overrides(
         &mut input.inferred_signature,
         merged_signature.as_ref(),
         input.ptr_bits,
+        &type_db,
     );
     let existing_types =
         parse_existing_var_types_from_specs(&input.parsed_context.stack_slots, input.ptr_bits);
@@ -4252,7 +4429,6 @@ fn build_type_writeback_analysis_inner(
         &mut input.parsed_context.stack_slots,
         input.recovered_vars,
         &var_type_candidates,
-        input.ptr_bits,
     );
     let var_rename_candidates = build_var_rename_candidates(
         input.recovered_vars,
@@ -4280,12 +4456,8 @@ fn build_type_writeback_analysis_inner(
             &input.parsed_context.callee_facts,
             input.interproc_summary_set.as_ref(),
         ),
-        external_stack_vars: if input.parsed_context.stack_slots.is_empty() {
-            input.parsed_context.external_stack_vars.clone()
-        } else {
-            HashMap::new()
-        },
         external_type_db: type_db,
+        program_data_objects: input.parsed_context.program_data_objects.clone(),
         slot_type_overrides: local_structs.slot_type_overrides.clone(),
         slot_field_profiles: local_structs.slot_field_profiles.clone(),
         local_field_accesses: semantic_inputs
@@ -4328,6 +4500,7 @@ fn build_type_writeback_analysis_inner(
     );
 
     let plan = TypeWritebackPlan {
+        ptr_bits: input.ptr_bits,
         signature: input.inferred_signature.clone(),
         var_type_candidates,
         var_rename_candidates,
@@ -4349,10 +4522,84 @@ fn build_type_writeback_analysis_inner(
 }
 
 #[cfg(test)]
+fn register_identity_from(registers: &[(&str, u64, u32)]) -> crate::RegisterIdentity {
+    let storages = registers
+        .iter()
+        .map(|(name, offset, size)| {
+            (
+                (*name).to_string(),
+                r2ssa::CanonicalStorageId {
+                    space: r2ssa::CanonicalStorageSpace::Register,
+                    offset: *offset,
+                    size: *size,
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    crate::RegisterIdentity::from_register_storages(&storages)
+}
+
+#[cfg(test)]
+fn x86_64_register_identity() -> crate::RegisterIdentity {
+    register_identity_from(&[
+        ("rax", 0x00, 8),
+        ("eax", 0x00, 4),
+        ("ax", 0x00, 2),
+        ("al", 0x00, 1),
+        ("ah", 0x01, 1),
+        ("rdx", 0x10, 8),
+        ("edx", 0x10, 4),
+        ("dx", 0x10, 2),
+        ("dl", 0x10, 1),
+        ("dh", 0x11, 1),
+        ("rdi", 0x38, 8),
+        ("edi", 0x38, 4),
+        ("dil", 0x38, 1),
+        ("rsi", 0x30, 8),
+        ("esi", 0x30, 4),
+        ("sil", 0x30, 1),
+        ("rcx", 0x08, 8),
+        ("ecx", 0x08, 4),
+    ])
+}
+
+#[cfg(test)]
+fn aarch64_register_identity() -> crate::RegisterIdentity {
+    let mut registers = Vec::new();
+    for index in 0..31u64 {
+        let offset = 0x1000 + index * 8;
+        registers.push((format!("x{index}"), offset, 8u32));
+        registers.push((format!("w{index}"), offset, 4u32));
+    }
+    registers.push(("sp".to_string(), 0x1100, 8));
+    let storages = registers
+        .iter()
+        .map(|(name, offset, size)| {
+            (
+                name.clone(),
+                r2ssa::CanonicalStorageId {
+                    space: r2ssa::CanonicalStorageSpace::Register,
+                    offset: *offset,
+                    size: *size,
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    crate::RegisterIdentity::from_register_storages(&storages)
+}
+
+#[cfg(test)]
 fn build_type_writeback_analysis(
     input: DerivedTypeWritebackAnalysisInput<'_>,
 ) -> DerivedTypeWritebackAnalysis {
-    build_type_writeback_analysis_inner(input, None, None)
+    let machine = detached_x86_64_test_machine_profile();
+    build_type_writeback_analysis_inner(
+        input,
+        None,
+        None,
+        Some(&machine),
+        &x86_64_register_identity(),
+    )
 }
 
 #[cfg(test)]
@@ -4360,7 +4607,14 @@ fn build_type_writeback_analysis_with_prep_facts(
     input: DerivedTypeWritebackAnalysisInput<'_>,
     prep_facts: &r2ssa::DecompilePrepFacts,
 ) -> DerivedTypeWritebackAnalysis {
-    build_type_writeback_analysis_inner(input, None, Some(prep_facts))
+    let machine = detached_x86_64_test_machine_profile();
+    build_type_writeback_analysis_inner(
+        input,
+        None,
+        Some(prep_facts),
+        Some(&machine),
+        &x86_64_register_identity(),
+    )
 }
 
 #[cfg(test)]
@@ -4368,7 +4622,23 @@ fn build_type_writeback_analysis_with_semantics(
     input: DerivedTypeWritebackAnalysisInput<'_>,
     semantic_inputs: DerivedTypeWritebackSemanticInputs<'_>,
 ) -> DerivedTypeWritebackAnalysis {
-    build_type_writeback_analysis_inner(input, Some(semantic_inputs), None)
+    let machine = detached_x86_64_test_machine_profile();
+    build_type_writeback_analysis_inner(
+        input,
+        Some(semantic_inputs),
+        None,
+        Some(&machine),
+        &x86_64_register_identity(),
+    )
+}
+
+#[cfg(test)]
+fn detached_x86_64_test_machine_profile() -> PreparedMachineVarProfile {
+    let architecture = r2ssa::MachineArchitectureFamily::X86_64;
+    PreparedMachineVarProfile {
+        architecture,
+        pointer_arg_slots: collect_pointer_arg_slot_map(architecture, 64),
+    }
 }
 
 pub fn build_source_owned_type_writeback_analysis(
@@ -4379,6 +4649,7 @@ pub fn build_source_owned_type_writeback_analysis(
         parsed_context,
         semantic_artifact,
         interproc_summary,
+        callee_signatures,
     } = request;
     if source.facts().assumptions != parsed_context.assumptions {
         return Err(TypeWritebackAnalysisError::AssumptionSetMismatch);
@@ -4400,14 +4671,21 @@ pub fn build_source_owned_type_writeback_analysis(
     let inferred_signature = crate::infer_signature_from_prepared_ssa(source.as_ref());
     let recovered_vars = crate::prepare::recover_vars_from_prepared_ssa(source.as_ref(), ptr_bits);
     let mut diagnostics = TypeWritebackDiagnostics::default();
-    let arch_name = crate::prepare::prepared_arch_name(source.as_ref());
+    let arch_name = crate::prepare::prepared_arch_display_name(source.as_ref());
+    let machine_profile = PreparedMachineVarProfile {
+        architecture: source.machine_context().architecture_family(),
+        pointer_arg_slots: collect_prepared_pointer_arg_slot_map(source.as_ref()),
+    };
     let local_structs = infer_local_struct_artifacts_from_prepared_ssa(
         source.as_ref(),
         arch_name,
         ptr_bits,
         &mut diagnostics,
     );
-    let local_field_accesses = local_field_accesses_from_struct_artifacts(&local_structs);
+    let local_field_accesses = local_field_accesses_named(
+        &local_structs,
+        &crate::prepare::source_field_names(source.as_ref()),
+    );
     let interproc_report = interproc_summary
         .as_ref()
         .map(|summary| summary.report().clone());
@@ -4434,6 +4712,8 @@ pub fn build_source_owned_type_writeback_analysis(
         derived_input,
         semantic_inputs,
         source.decompile_prep_facts(),
+        Some(&machine_profile),
+        &crate::RegisterIdentity::from_prepared(source.as_ref()),
     );
     let mut function_facts = derived.function_facts;
     if let Some(semantic_artifact) = semantic_artifact {
@@ -4442,12 +4722,29 @@ pub fn build_source_owned_type_writeback_analysis(
     if let Some(interproc_summary) = interproc_summary {
         function_facts = function_facts.with_prepared_interproc_summary(interproc_summary);
     }
-    debug_assert_eq!(derived.signature, derived.plan.signature);
-    debug_assert_eq!(derived.type_facts, *function_facts.type_facts());
+    if derived.signature != derived.plan.signature {
+        return Err(TypeWritebackAnalysisError::DerivedSignatureMismatch);
+    }
+    if derived.type_facts != *function_facts.type_facts() {
+        return Err(TypeWritebackAnalysisError::DerivedTypeFactsMismatch);
+    }
+    let exact_source_fields = field_access_certificates_from_source_aggregate_accesses(&source);
+    if !exact_source_fields.is_empty() {
+        let mut type_facts = function_facts.type_facts().clone();
+        for certificate in exact_source_fields {
+            type_facts.field_access_certificates.retain(|existing| {
+                existing.slot != certificate.slot
+                    || existing.field_offset != certificate.field_offset
+            });
+            type_facts.field_access_certificates.push(certificate);
+        }
+        function_facts.replace_type_facts(type_facts);
+    }
     let mut analysis = TypeWritebackAnalysis {
         source,
         function_facts,
         plan: derived.plan,
+        callee_signatures,
     };
     if !analysis.enrich_from_source_for_decompile() {
         return Err(TypeWritebackAnalysisError::SourceEnrichmentFailed);
@@ -4998,15 +5295,14 @@ impl InferredLocalFieldType {
     }
 }
 
-fn collect_pointer_arg_slot_map(arch_name: Option<&str>, ptr_bits: u32) -> HashMap<String, usize> {
-    let (arg_regs, _, _) = recover_vars_arch_profile(arch_name);
-    let arch_name = arch_name.unwrap_or_default().to_ascii_lowercase();
-    let is_arm64 = arch_name.contains("aarch64") || arch_name.contains("arm64");
-    let is_x86_64 = arch_name.contains("x86-64")
-        || arch_name.contains("x86_64")
-        || arch_name.contains("amd64")
-        || arch_name.contains("x64");
-    let is_riscv64 = arch_name.contains("riscv64") || arch_name.contains("rv64");
+fn collect_pointer_arg_slot_map(
+    architecture: r2ssa::MachineArchitectureFamily,
+    ptr_bits: u32,
+) -> HashMap<String, usize> {
+    let (arg_regs, _, _) = recover_vars_arch_profile(architecture);
+    let is_arm64 = matches!(architecture, r2ssa::MachineArchitectureFamily::AArch64);
+    let is_x86_64 = matches!(architecture, r2ssa::MachineArchitectureFamily::X86_64);
+    let is_riscv64 = matches!(architecture, r2ssa::MachineArchitectureFamily::RiscV64);
 
     let mut out = HashMap::new();
     for (idx, (canonical, aliases)) in arg_regs.iter().enumerate() {
@@ -5039,26 +5335,29 @@ fn collect_pointer_arg_slot_map(arch_name: Option<&str>, ptr_bits: u32) -> HashM
     out
 }
 
-fn parse_ssa_const_offset(name: &str, ptr_bits: u32) -> Option<i64> {
-    let val_str = name
-        .strip_prefix("const:")
-        .or_else(|| name.strip_prefix("CONST:"))?;
-    let val_str = val_str.split('_').next().unwrap_or(val_str);
+fn collect_prepared_pointer_arg_slot_map(prepared: &SsaArtifact) -> HashMap<String, usize> {
+    let context = prepared.machine_context();
+    let abi = context.abi_model();
+    if !abi.is_available() || !abi.is_coherent() {
+        return HashMap::new();
+    }
 
-    let raw = if let Some(hex) = val_str
-        .strip_prefix("0x")
-        .or_else(|| val_str.strip_prefix("0X"))
-    {
-        u64::from_str_radix(hex, 16).ok()?
-    } else if let Some(dec) = val_str
-        .strip_prefix("0d")
-        .or_else(|| val_str.strip_prefix("0D"))
-    {
-        dec.parse::<u64>().ok()?
-    } else {
-        u64::from_str_radix(val_str, 16).ok()?
-    };
-    Some(signed_offset_from_const(raw, ptr_bits))
+    let mut out = HashMap::new();
+    for slot in abi.argument_registers() {
+        let Ok(index) = usize::try_from(slot.index()) else {
+            continue;
+        };
+        for (name, storage) in context.register_storages_by_name() {
+            if *storage == slot.storage() {
+                out.insert(name.to_ascii_lowercase(), index);
+            }
+        }
+    }
+    out
+}
+
+fn exact_ssa_const_offset(var: &SSAVar, ptr_bits: u32) -> Option<i64> {
+    Some(signed_offset_from_const(var.constant_bits()?, ptr_bits))
 }
 
 fn local_struct_type_slots(
@@ -5307,7 +5606,7 @@ fn local_affine_value(
     if let Some(value) = memo.get(var) {
         return value.clone();
     }
-    if let Some(constant) = parse_ssa_const_offset(&var.name, ptr_bits) {
+    if let Some(constant) = exact_ssa_const_offset(var, ptr_bits) {
         return Some(LocalAffineValue {
             root: None,
             scale: 0,
@@ -5363,7 +5662,7 @@ fn local_affine_value(
             }
         }
         Some(SSAOp::IntLeft { a, b, .. }) => {
-            let shift = parse_ssa_const_offset(&b.name, ptr_bits)?;
+            let shift = exact_ssa_const_offset(b, ptr_bits)?;
             let shift = u32::try_from(shift).ok()?;
             let multiplier = 1i128.checked_shl(shift)?;
             let value = local_affine_value(a, definitions, ptr_bits, memo, visiting)?;
@@ -5499,15 +5798,25 @@ fn local_struct_inference_from_function_blocks(
 
 pub fn infer_local_struct_artifacts_from_ssa(
     ssa_blocks: &[SSABlock],
-    arch_name: Option<&str>,
+    architecture: r2ssa::MachineArchitectureFamily,
     ptr_bits: u32,
     diagnostics: &mut TypeWritebackDiagnostics,
 ) -> LocalStructArtifacts {
     let blocks = local_struct_inference_from_local_blocks(ssa_blocks);
-    infer_local_struct_artifacts_from_blocks(&blocks, None, arch_name, ptr_bits, diagnostics)
+    let arch_name = crate::prepare::architecture_family_name(architecture);
+    let pointer_arg_slots = collect_pointer_arg_slot_map(architecture, ptr_bits);
+    infer_local_struct_artifacts_from_blocks(
+        &blocks,
+        None,
+        arch_name,
+        architecture,
+        &pointer_arg_slots,
+        ptr_bits,
+        diagnostics,
+    )
 }
 
-pub fn infer_local_struct_artifacts_from_prepared_ssa(
+fn infer_local_struct_artifacts_from_prepared_ssa(
     prepared: &SsaArtifact,
     arch_name: Option<&str>,
     ptr_bits: u32,
@@ -5515,10 +5824,14 @@ pub fn infer_local_struct_artifacts_from_prepared_ssa(
 ) -> LocalStructArtifacts {
     let blocks = local_struct_inference_from_function_blocks(prepared.function().blocks().cloned());
     let memory_versions = LocalMemoryVersionFacts::from_prepared(prepared);
+    let architecture = prepared.machine_context().architecture_family();
+    let pointer_arg_slots = collect_prepared_pointer_arg_slot_map(prepared);
     let mut artifacts = infer_local_struct_artifacts_from_blocks(
         &blocks,
         Some(&memory_versions),
         arch_name,
+        architecture,
+        &pointer_arg_slots,
         ptr_bits,
         diagnostics,
     );
@@ -5575,11 +5888,12 @@ fn infer_local_struct_artifacts_from_blocks(
     ssa_blocks: &[LocalStructInferenceBlock],
     memory_versions: Option<&LocalMemoryVersionFacts>,
     arch_name: Option<&str>,
+    architecture: r2ssa::MachineArchitectureFamily,
+    pointer_arg_slot_map: &HashMap<String, usize>,
     ptr_bits: u32,
     diagnostics: &mut TypeWritebackDiagnostics,
 ) -> LocalStructArtifacts {
-    let pointer_arg_slot_map = collect_pointer_arg_slot_map(arch_name, ptr_bits);
-    let type_slots = local_struct_type_slots(ssa_blocks, &pointer_arg_slot_map, ptr_bits);
+    let type_slots = local_struct_type_slots(ssa_blocks, pointer_arg_slot_map, ptr_bits);
     let scalar_signedness = infer_scalar_signedness(
         ssa_blocks.iter().flat_map(|block| block.ops.iter()),
         ssa_blocks.iter().flat_map(|block| {
@@ -5592,7 +5906,7 @@ fn infer_local_struct_artifacts_from_blocks(
     );
     let pointer_pointee_types =
         local_pointer_pointee_types(ssa_blocks, ptr_bits, &scalar_signedness);
-    let (_, stack_bases, frame_bases) = recover_vars_arch_profile(arch_name);
+    let (_, stack_bases, frame_bases) = recover_vars_arch_profile(architecture);
     let mut addr_exprs: HashMap<SSAVar, LocalAddrExpr> = HashMap::new();
     let mut stack_addr_offsets: HashMap<SSAVar, i64> = HashMap::new();
     let mut stack_slot_values: HashMap<(u64, i64), LocalAddrExpr> = HashMap::new();
@@ -5739,20 +6053,20 @@ fn infer_local_struct_artifacts_from_blocks(
                         }
                     }
                     SSAOp::IntAdd { dst, a, b } => {
-                        if let Some(off) = parse_ssa_const_offset(&b.name, ptr_bits) {
+                        if let Some(off) = exact_ssa_const_offset(b, ptr_bits) {
                             let a_lower = a.name.to_ascii_lowercase();
                             if is_stack_base(a_lower.as_str()) {
                                 changed |= set_stack_slot(dst, off, &mut stack_addr_offsets);
                             }
                         }
-                        if let Some(off) = parse_ssa_const_offset(&a.name, ptr_bits) {
+                        if let Some(off) = exact_ssa_const_offset(a, ptr_bits) {
                             let b_lower = b.name.to_ascii_lowercase();
                             if is_stack_base(b_lower.as_str()) {
                                 changed |= set_stack_slot(dst, off, &mut stack_addr_offsets);
                             }
                         }
                         if let Some(base) = addr_of(a, &addr_exprs)
-                            && let Some(delta) = parse_ssa_const_offset(&b.name, ptr_bits)
+                            && let Some(delta) = exact_ssa_const_offset(b, ptr_bits)
                         {
                             let off = base.offset.saturating_add(delta);
                             if (-offset_bound..=offset_bound).contains(&off) {
@@ -5798,7 +6112,7 @@ fn infer_local_struct_artifacts_from_blocks(
                                 );
                             }
                         } else if let Some(base) = addr_of(b, &addr_exprs)
-                            && let Some(delta) = parse_ssa_const_offset(&a.name, ptr_bits)
+                            && let Some(delta) = exact_ssa_const_offset(a, ptr_bits)
                         {
                             let off = base.offset.saturating_add(delta);
                             if (-offset_bound..=offset_bound).contains(&off) {
@@ -5846,7 +6160,7 @@ fn infer_local_struct_artifacts_from_blocks(
                         }
                     }
                     SSAOp::IntSub { dst, a, b } => {
-                        if let Some(delta) = parse_ssa_const_offset(&b.name, ptr_bits) {
+                        if let Some(delta) = exact_ssa_const_offset(b, ptr_bits) {
                             let a_lower = a.name.to_ascii_lowercase();
                             if is_stack_base(a_lower.as_str()) {
                                 changed |= set_stack_slot(
@@ -5857,7 +6171,7 @@ fn infer_local_struct_artifacts_from_blocks(
                             }
                         }
                         if let Some(base) = addr_of(a, &addr_exprs)
-                            && let Some(delta) = parse_ssa_const_offset(&b.name, ptr_bits)
+                            && let Some(delta) = exact_ssa_const_offset(b, ptr_bits)
                         {
                             let off = base.offset.saturating_sub(delta);
                             if (-offset_bound..=offset_bound).contains(&off) {
@@ -6213,18 +6527,33 @@ fn infer_local_struct_artifacts_from_blocks(
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         shape.hash(&mut hasher);
         let struct_name = format!("sla_struct_{:016x}", hasher.finish());
-        let fields = selected_fields
+        let Some(fields) = selected_fields
             .into_iter()
-            .map(|(offset, field_type, confidence)| StructFieldCandidate {
-                name: format!("f_{offset:x}"),
-                offset,
-                field_type: field_type.render(&struct_name),
-                confidence,
+            .map(|(offset, field_type, confidence)| {
+                Some(StructFieldCandidate {
+                    name: format!("f_{offset:x}"),
+                    offset,
+                    field_type: parse_c_type_like(&field_type.render(&struct_name), ptr_bits)?,
+                    confidence,
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
         let normalized_fields = fields
             .iter()
-            .map(|field| (field.offset, field.field_type.clone()))
+            // The profile is still keyed by spelling; render at that boundary
+            // rather than keeping the candidate's type as text.
+            .map(|field| {
+                (
+                    field.offset,
+                    crate::signature_infer::render_writeback_apply_type(
+                        &field.field_type,
+                        ptr_bits,
+                    ),
+                )
+            })
             .collect::<BTreeMap<_, _>>();
         let Some(decl) =
             build_struct_decl_with_size(&struct_name, &fields, ptr_bits, element_stride)
@@ -6258,8 +6587,21 @@ fn infer_local_struct_artifacts_from_blocks(
 }
 
 /// Project advisory local field observations without granting certificates.
-pub fn local_field_accesses_from_struct_artifacts(
+fn local_field_accesses_from_struct_artifacts(
     local_structs: &LocalStructArtifacts,
+) -> Vec<LocalFieldAccessFact> {
+    local_field_accesses_named(local_structs, &HashMap::new())
+}
+
+/// The same observations, naming each field what the source called it when the
+/// source said.
+///
+/// Naming a field after its offset is what you do when nothing told you its
+/// name. When debug info did tell you, using the offset anyway throws the
+/// answer away.
+pub fn local_field_accesses_named(
+    local_structs: &LocalStructArtifacts,
+    source_field_names: &HashMap<u64, String>,
 ) -> Vec<LocalFieldAccessFact> {
     let mut accesses = Vec::new();
     for (slot, fields) in &local_structs.slot_field_profiles {
@@ -6267,7 +6609,10 @@ pub fn local_field_accesses_from_struct_artifacts(
             accesses.push(LocalFieldAccessFact {
                 slot: *slot,
                 field_offset: *field_offset,
-                field_name: format!("f_{field_offset:x}"),
+                field_name: source_field_names
+                    .get(field_offset)
+                    .cloned()
+                    .unwrap_or_else(|| format!("f_{field_offset:x}")),
                 field_type: Some(field_type.clone()),
             });
         }
@@ -6288,6 +6633,123 @@ fn field_access_certificates_from_struct_artifacts(
             field_type: access.field_type,
         })
         .collect()
+}
+
+pub(crate) fn source_type_like(
+    graph: &r2ssa::SourceTypeGraph,
+    type_id: u32,
+    visiting: &mut BTreeSet<u32>,
+) -> Option<CTypeLike> {
+    if !visiting.insert(type_id) {
+        return None;
+    }
+    let source_type = graph
+        .types()
+        .get(usize::try_from(type_id).ok()?)
+        .filter(|source_type| source_type.id() == type_id)?;
+    let bits = u32::try_from(source_type.size_bits()).ok()?;
+    let ty = match source_type.kind() {
+        r2ssa::SourceTypeKind::SignedInteger => CTypeLike::Int {
+            bits,
+            signedness: Signedness::Signed,
+        },
+        r2ssa::SourceTypeKind::UnsignedInteger => CTypeLike::Int {
+            bits,
+            signedness: Signedness::Unsigned,
+        },
+        r2ssa::SourceTypeKind::Pointer { target_type_id } => {
+            CTypeLike::Pointer(Box::new(source_type_like(graph, target_type_id, visiting)?))
+        }
+        r2ssa::SourceTypeKind::Struct { aggregate_id } => {
+            let aggregate = graph
+                .aggregates()
+                .get(usize::try_from(aggregate_id).ok()?)
+                .filter(|aggregate| {
+                    aggregate.id() == aggregate_id && aggregate.type_id() == type_id
+                })?;
+            CTypeLike::Struct(aggregate.name().to_string())
+        }
+        r2ssa::SourceTypeKind::Union { aggregate_id } => {
+            let aggregate = graph
+                .aggregates()
+                .get(usize::try_from(aggregate_id).ok()?)
+                .filter(|aggregate| {
+                    aggregate.id() == aggregate_id && aggregate.type_id() == type_id
+                })?;
+            CTypeLike::Union(aggregate.name().to_string())
+        }
+        r2ssa::SourceTypeKind::Void => CTypeLike::Void,
+        // A function whose signature the graph does not carry; spelled with
+        // an empty parameter list, which in C is an unspecified one.
+        r2ssa::SourceTypeKind::Code => CTypeLike::Function {
+            ret: Box::new(CTypeLike::Void),
+            params: Vec::new(),
+        },
+    };
+    visiting.remove(&type_id);
+    Some(ty)
+}
+
+/// Project exact, revision-bound source aggregate accesses into the canonical
+/// type certificate keyed by ABI parameter slot and byte offset.
+///
+/// The r2ssa projection has already joined the immutable source type graph,
+/// parameter provenance, memory occurrence, and access width. r2types only
+/// publishes projections whose logical member type retains that exact width;
+/// it does not recover a field from address syntax or a rendered name.
+fn field_access_certificates_from_source_aggregate_accesses(
+    source: &r2ssa::SsaArtifact,
+) -> Vec<crate::FieldAccessCertificate> {
+    let Some(interface) = source.machine_context().function_interface() else {
+        return Vec::new();
+    };
+    let Some(graph) = interface.type_graph() else {
+        return Vec::new();
+    };
+    let Some(projections) = source
+        .aggregate_accesses()
+        .projections_for_revision(interface.revision_identity())
+    else {
+        return Vec::new();
+    };
+    let ptr_bits = source
+        .machine_context()
+        .memory_model()
+        .default_address_bits();
+    let mut by_location = BTreeMap::<(usize, u64), Option<crate::FieldAccessCertificate>>::new();
+    for projection in projections.values() {
+        let Ok(slot) = usize::try_from(projection.source_parameter_index) else {
+            continue;
+        };
+        let Some(field_type) =
+            source_type_like(graph, projection.member_type_id, &mut BTreeSet::new())
+        else {
+            continue;
+        };
+        if crate::function_facts::type_like_size_bytes(&field_type, ptr_bits)
+            != Some(u64::from(projection.byte_width))
+        {
+            continue;
+        }
+        let certificate = crate::FieldAccessCertificate {
+            slot,
+            field_offset: projection.byte_offset,
+            field_name: projection.member_name.to_string(),
+            field_type: Some(render_c_type_like(&field_type)),
+        };
+        let key = (slot, projection.byte_offset);
+        match by_location.entry(key) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(Some(certificate));
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                if entry.get().as_ref() != Some(&certificate) {
+                    entry.insert(None);
+                }
+            }
+        }
+    }
+    by_location.into_values().flatten().collect::<Vec<_>>()
 }
 
 fn array_index_certificates_from_struct_artifacts(
@@ -6420,12 +6882,20 @@ fn scalar_array_access_certificates_from_ssa(
     type_db: &ExternalTypeDb,
     merged_signature: Option<&FunctionSignatureSpec>,
     local_element_strides: &HashMap<usize, u64>,
-    arch_name: Option<&str>,
-    ptr_bits: u32,
+    machine: ScalarArrayMachineProfile<'_>,
 ) -> ScalarArrayAccessCertificates {
-    let arch_name = arch_name.filter(|name| !name.is_empty());
-    let pointer_arg_slot_map = collect_pointer_arg_slot_map(arch_name, ptr_bits);
-    let (_, stack_bases, frame_bases) = recover_vars_arch_profile(arch_name);
+    let architecture = machine.architecture;
+    let detached_pointer_arg_slots;
+    let pointer_arg_slot_map = match machine.pointer_arg_slots {
+        Some(slots) => slots,
+        None => {
+            detached_pointer_arg_slots =
+                collect_pointer_arg_slot_map(architecture, machine.ptr_bits);
+            &detached_pointer_arg_slots
+        }
+    };
+    let (_, stack_bases, frame_bases) = recover_vars_arch_profile(architecture);
+    let ptr_bits = machine.ptr_bits;
     let mut stack_addr_offsets: HashMap<String, i64> = HashMap::new();
     let mut stack_addr_offset_names: HashMap<String, Option<i64>> = HashMap::new();
     let mut pointer_values: HashMap<String, ScalarPointerValue> = HashMap::new();
@@ -6477,7 +6947,7 @@ fn scalar_array_access_certificates_from_ssa(
                             type_db,
                             merged_signature,
                             ptr_bits,
-                            pointer_arg_slot_map: &pointer_arg_slot_map,
+                            pointer_arg_slot_map,
                             local_element_strides,
                             pointer_values: &pointer_values,
                             pointer_value_names: &pointer_value_names,
@@ -6536,7 +7006,7 @@ fn scalar_array_access_certificates_from_ssa(
                             type_db,
                             merged_signature,
                             ptr_bits,
-                            pointer_arg_slot_map: &pointer_arg_slot_map,
+                            pointer_arg_slot_map,
                             local_element_strides,
                             pointer_values: &pointer_values,
                             pointer_value_names: &pointer_value_names,
@@ -6576,7 +7046,7 @@ fn scalar_array_access_certificates_from_ssa(
                         }
                     }
                     SSAOp::IntAdd { dst, a, b } => {
-                        if let Some(off) = parse_ssa_const_offset(&b.name, ptr_bits)
+                        if let Some(off) = exact_ssa_const_offset(b, ptr_bits)
                             && is_stack_base(a.name.to_ascii_lowercase().as_str())
                         {
                             changed |= set_stack_addr_offset(
@@ -6587,7 +7057,7 @@ fn scalar_array_access_certificates_from_ssa(
                                 &mut stack_addr_offset_names,
                             );
                         }
-                        if let Some(off) = parse_ssa_const_offset(&a.name, ptr_bits)
+                        if let Some(off) = exact_ssa_const_offset(a, ptr_bits)
                             && is_stack_base(b.name.to_ascii_lowercase().as_str())
                         {
                             changed |= set_stack_addr_offset(
@@ -6604,7 +7074,7 @@ fn scalar_array_access_certificates_from_ssa(
                                 type_db,
                                 merged_signature,
                                 ptr_bits,
-                                pointer_arg_slot_map: &pointer_arg_slot_map,
+                                pointer_arg_slot_map,
                                 local_element_strides,
                                 pointer_values: &pointer_values,
                                 pointer_value_names: &pointer_value_names,
@@ -6632,7 +7102,7 @@ fn scalar_array_access_certificates_from_ssa(
                                 type_db,
                                 merged_signature,
                                 ptr_bits,
-                                pointer_arg_slot_map: &pointer_arg_slot_map,
+                                pointer_arg_slot_map,
                                 local_element_strides,
                                 pointer_values: &pointer_values,
                                 pointer_value_names: &pointer_value_names,
@@ -6657,7 +7127,7 @@ fn scalar_array_access_certificates_from_ssa(
                         }
                     }
                     SSAOp::IntSub { dst, a, b } => {
-                        if let Some(delta) = parse_ssa_const_offset(&b.name, ptr_bits)
+                        if let Some(delta) = exact_ssa_const_offset(b, ptr_bits)
                             && is_stack_base(a.name.to_ascii_lowercase().as_str())
                         {
                             changed |= set_stack_addr_offset(
@@ -6674,7 +7144,7 @@ fn scalar_array_access_certificates_from_ssa(
                                 type_db,
                                 merged_signature,
                                 ptr_bits,
-                                pointer_arg_slot_map: &pointer_arg_slot_map,
+                                pointer_arg_slot_map,
                                 local_element_strides,
                                 pointer_values: &pointer_values,
                                 pointer_value_names: &pointer_value_names,
@@ -6715,7 +7185,7 @@ fn scalar_array_access_certificates_from_ssa(
                                 type_db,
                                 merged_signature,
                                 ptr_bits,
-                                pointer_arg_slot_map: &pointer_arg_slot_map,
+                                pointer_arg_slot_map,
                                 local_element_strides,
                                 pointer_values: &pointer_values,
                                 pointer_value_names: &pointer_value_names,
@@ -6789,7 +7259,7 @@ fn scalar_array_access_certificates_from_ssa(
                         type_db,
                         merged_signature,
                         ptr_bits,
-                        pointer_arg_slot_map: &pointer_arg_slot_map,
+                        pointer_arg_slot_map,
                         local_element_strides,
                         pointer_values: &pointer_values,
                         pointer_value_names: &pointer_value_names,
@@ -6843,7 +7313,7 @@ fn scalar_array_access_certificates_from_ssa(
                         type_db,
                         merged_signature,
                         ptr_bits,
-                        pointer_arg_slot_map: &pointer_arg_slot_map,
+                        pointer_arg_slot_map,
                         local_element_strides,
                         pointer_values: &pointer_values,
                         pointer_value_names: &pointer_value_names,
@@ -7062,7 +7532,7 @@ fn external_field_access_for_offset(
     let rel = offset - field.offset;
     let field_ty = field.ty.as_deref();
     if let Some(CTypeLike::Array(inner, len)) =
-        field_ty.and_then(|ty| parse_type_like_spec(ty, ptr_bits))
+        field_ty.and_then(|ty| parse_c_type_like(ty, ptr_bits))
     {
         let elem_size = estimate_type_like_size_bytes(&inner, ptr_bits)?;
         if elem_size == 0 || !rel.is_multiple_of(elem_size) || access_width > elem_size {
@@ -7156,7 +7626,7 @@ fn scalar_pointer_value_for_stack_slot(
                 .and_then(|ty| pointer_element_stride(ty, type_db, ptr_bits))?;
             Some(ScalarPointerValue {
                 slot: legacy_array_slot_for_stack_slot(key),
-                base: ArrayIndexBase::StackSlot { slot: key.clone() },
+                base: ArrayIndexBase::StackSlot { slot: *key },
                 element_stride,
                 confidence: 94,
             })
@@ -7190,7 +7660,7 @@ fn scalar_element_stride(ty: &CTypeLike, ptr_bits: u32) -> Option<u64> {
         }
         CTypeLike::Typedef(name) => {
             let normalized = normalize_external_type_name(name);
-            parse_type_like_spec(&normalized, ptr_bits).and_then(|parsed| match parsed {
+            parse_c_type_like(&normalized, ptr_bits).and_then(|parsed| match parsed {
                 CTypeLike::Bool | CTypeLike::Int { .. } | CTypeLike::Float(_) => {
                     estimate_type_like_size_bytes(&parsed, ptr_bits).filter(|size| *size > 0)
                 }
@@ -7203,7 +7673,8 @@ fn scalar_element_stride(ty: &CTypeLike, ptr_bits: u32) -> Option<u64> {
         | CTypeLike::Struct(_)
         | CTypeLike::Union(_)
         | CTypeLike::Enum(_)
-        | CTypeLike::Function => None,
+        | CTypeLike::BitVector(_)
+        | CTypeLike::Function { .. } => None,
         CTypeLike::Pointer(_) => Some((ptr_bits / 8).max(1) as u64),
     }
 }
@@ -7420,7 +7891,7 @@ fn phi_pointer_step_matches(
     if pointer_term != phi_dst {
         return false;
     }
-    let Some(offset) = parse_ssa_const_offset(&offset_term.name, ctx.ptr_bits) else {
+    let Some(offset) = exact_ssa_const_offset(offset_term, ctx.ptr_bits) else {
         return false;
     };
     offset
@@ -7497,7 +7968,7 @@ fn scalar_pointer_plus_const(
     const_var: &SSAVar,
     ctx: &ScalarArrayInferenceCtx<'_>,
 ) -> Option<ScalarPointerValue> {
-    let offset = parse_ssa_const_offset(&const_var.name, ctx.ptr_bits)?;
+    let offset = exact_ssa_const_offset(const_var, ctx.ptr_bits)?;
     scalar_pointer_offset_by_const(block_addr, pointer_var, offset, ctx)
 }
 
@@ -7507,7 +7978,7 @@ fn scalar_pointer_minus_const(
     const_var: &SSAVar,
     ctx: &ScalarArrayInferenceCtx<'_>,
 ) -> Option<ScalarPointerValue> {
-    let offset = parse_ssa_const_offset(&const_var.name, ctx.ptr_bits)?;
+    let offset = exact_ssa_const_offset(const_var, ctx.ptr_bits)?;
     scalar_pointer_offset_by_const(block_addr, pointer_var, offset.saturating_neg(), ctx)
 }
 
@@ -7532,7 +8003,7 @@ fn scalar_array_plus_const(
     const_var: &SSAVar,
     ctx: &ScalarArrayInferenceCtx<'_>,
 ) -> Option<ScalarArrayAddrExpr> {
-    let offset = parse_ssa_const_offset(&const_var.name, ctx.ptr_bits)?;
+    let offset = exact_ssa_const_offset(const_var, ctx.ptr_bits)?;
     let mut expr = scalar_array_addr_expr_for_var(
         block_addr,
         array_var,
@@ -7596,7 +8067,7 @@ fn scalar_index_matches_stride(
     {
         return false;
     }
-    if let Some(offset) = parse_ssa_const_offset(&var.name, 64) {
+    if let Some(offset) = exact_ssa_const_offset(var, 64) {
         return offset >= 0 && (offset as u64).is_multiple_of(stride.max(1));
     }
     if let Some(factor) = scalar_index_affine_factor(block_addr, var, ctx, depth)
@@ -7630,7 +8101,7 @@ fn scalar_index_matches_stride(
             scaled_index_term_matches_stride(block_addr, a, b, stride, ctx, depth + 1)
         }
         SSAOp::IntLeft { a, b, .. } => {
-            parse_ssa_const_offset(&b.name, 64)
+            exact_ssa_const_offset(b, 64)
                 .and_then(|shift| (shift >= 0).then_some(1u64.checked_shl(shift as u32)?))
                 == Some(stride)
                 && scalar_index_matches_stride(block_addr, a, 1, ctx, depth + 1)
@@ -7675,7 +8146,7 @@ fn scalar_index_affine_factor(
     {
         return None;
     }
-    if parse_ssa_const_offset(&var.name, 64).is_some() {
+    if exact_ssa_const_offset(var, 64).is_some() {
         return Some(AffineIndexFactor {
             root: None,
             scale: 0,
@@ -7705,7 +8176,7 @@ fn scalar_index_affine_factor(
         SSAOp::IntMult { a, b, .. } => affine_scaled_term(block_addr, a, b, ctx, depth + 1)
             .or_else(|| affine_scaled_term(block_addr, b, a, ctx, depth + 1)),
         SSAOp::IntLeft { a, b, .. } => {
-            let shift = parse_ssa_const_offset(&b.name, 64)?;
+            let shift = exact_ssa_const_offset(b, 64)?;
             if shift < 0 {
                 return None;
             }
@@ -7753,7 +8224,7 @@ fn affine_scaled_term(
     ctx: &ScalarArrayInferenceCtx<'_>,
     depth: u32,
 ) -> Option<AffineIndexFactor> {
-    let multiplier = parse_ssa_const_offset(&multiplier.name, 64)?;
+    let multiplier = exact_ssa_const_offset(multiplier, 64)?;
     let factor = scalar_index_affine_factor(block_addr, term, ctx, depth)?;
     Some(AffineIndexFactor {
         root: factor.root,
@@ -7789,12 +8260,10 @@ fn scaled_index_term_matches_stride(
     ctx: &ScalarArrayInferenceCtx<'_>,
     depth: u32,
 ) -> bool {
-    if parse_ssa_const_offset(&a.name, 64).is_some_and(|value| value >= 0 && value as u64 == stride)
-    {
+    if exact_ssa_const_offset(a, 64).is_some_and(|value| value >= 0 && value as u64 == stride) {
         return scalar_index_matches_stride(block_addr, b, 1, ctx, depth + 1);
     }
-    if parse_ssa_const_offset(&b.name, 64).is_some_and(|value| value >= 0 && value as u64 == stride)
-    {
+    if exact_ssa_const_offset(b, 64).is_some_and(|value| value >= 0 && value as u64 == stride) {
         return scalar_index_matches_stride(block_addr, a, 1, ctx, depth + 1);
     }
     false
@@ -7885,7 +8354,7 @@ fn aggregate_stride_for_slot(
 }
 
 fn aggregate_pointee_type_names_from_str(raw_ty: &str, ptr_bits: u32) -> Vec<String> {
-    parse_type_like_spec(raw_ty, ptr_bits)
+    parse_c_type_like(raw_ty, ptr_bits)
         .map(|ty| aggregate_pointee_type_names_from_type(&ty))
         .unwrap_or_default()
 }
@@ -7916,7 +8385,8 @@ fn collect_aggregate_type_names(ty: &CTypeLike, out: &mut Vec<String>) {
         | CTypeLike::Bool
         | CTypeLike::Int { .. }
         | CTypeLike::Float(_)
-        | CTypeLike::Function => {}
+        | CTypeLike::BitVector(_)
+        | CTypeLike::Function { .. } => {}
     }
 }
 
@@ -8014,15 +8484,20 @@ fn augment_local_struct_artifacts_with_projection(
             continue;
         }
         let struct_name = format!("sla_struct_symbolic_arg{}", slot + 1);
-        let fields = profile
+        let Some(fields) = profile
             .iter()
-            .map(|(offset, field_type)| StructFieldCandidate {
-                name: format!("f_{offset:x}"),
-                offset: *offset,
-                field_type: field_type.clone(),
-                confidence: 84,
+            .map(|(offset, field_type)| {
+                Some(StructFieldCandidate {
+                    name: format!("f_{offset:x}"),
+                    offset: *offset,
+                    field_type: parse_c_type_like(field_type, ptr_bits)?,
+                    confidence: 84,
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
         let Some(decl) = build_struct_decl(&struct_name, &fields, ptr_bits) else {
             continue;
         };
@@ -8077,18 +8552,21 @@ fn augment_local_struct_artifacts_with_local_field_accesses(
             continue;
         }
         let mut shape = String::new();
-        let fields = profile
+        let Some(fields) = profile
             .iter()
             .map(|(offset, field_type)| {
                 shape.push_str(&format!("{offset:x}:{field_type};"));
-                StructFieldCandidate {
+                Some(StructFieldCandidate {
                     name: format!("f_{offset:x}"),
                     offset: *offset,
-                    field_type: field_type.clone(),
+                    field_type: parse_c_type_like(field_type, ptr_bits)?,
                     confidence: 90,
-                }
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         shape.hash(&mut hasher);
         let struct_name = format!("sla_struct_{:016x}", hasher.finish());
@@ -8146,31 +8624,34 @@ fn inferred_signature_abi_register_params(
     let callconv = signature.callconv.trim().to_ascii_lowercase();
     let is_sysv64 = matches!(arch.as_str(), "x86-64" | "x86_64" | "x64" | "amd64")
         && matches!(callconv.as_str(), "amd64" | "sysv" | "sysv64" | "x86-64");
-    if !is_sysv64 {
-        return Vec::new();
-    }
+    // AArch64 has one standard convention for these registers, and radare2
+    // leaves the calling-convention field empty rather than naming it, so an
+    // unnamed convention on that architecture is AAPCS64 rather than unknown.
+    let is_aapcs64 = matches!(arch.as_str(), "aarch64" | "arm64")
+        && matches!(
+            callconv.as_str(),
+            "" | "aapcs" | "aapcs64" | "arm64" | "aarch64"
+        );
     const SYSV64_ARG_REGS: [&str; 6] = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
+    const AAPCS64_ARG_REGS: [&str; 8] = ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"];
+    let arg_regs: &[&str] = if is_sysv64 {
+        &SYSV64_ARG_REGS
+    } else if is_aapcs64 {
+        &AAPCS64_ARG_REGS
+    } else {
+        return Vec::new();
+    };
     signature
         .params
         .iter()
-        .take(SYSV64_ARG_REGS.len())
+        .take(arg_regs.len())
         .enumerate()
         .map(|(idx, param)| ExternalRegisterParamSpec {
             name: param.name.clone(),
-            ty: parse_type_like_spec(&param.param_type, ptr_bits),
-            reg: SYSV64_ARG_REGS[idx].to_string(),
+            ty: parse_c_type_like(&param.param_type, ptr_bits),
+            reg: arg_regs[idx].to_string(),
         })
         .collect()
-}
-
-fn stack_slot_key_from_prepared_root(root: r2ssa::StackAddressRoot) -> StackSlotKey {
-    StackSlotKey {
-        base: match root.base {
-            r2ssa::StackAddressBase::FramePointer => ExternalStackBase::FramePointer,
-            r2ssa::StackAddressBase::StackPointer => ExternalStackBase::StackPointer,
-        },
-        offset: root.offset,
-    }
 }
 
 fn canonical_stack_access_widths(
@@ -8201,10 +8682,7 @@ fn canonical_stack_access_widths(
         let Some(root) = prep_facts.stack_address_root_of(addr).copied() else {
             continue;
         };
-        widths
-            .entry(stack_slot_key_from_prepared_root(root))
-            .or_default()
-            .insert(size);
+        widths.entry(root).or_default().insert(size);
     }
     widths
 }
@@ -8244,112 +8722,11 @@ fn canonical_stack_access_signedness(
             continue;
         };
         signedness
-            .entry(stack_slot_key_from_prepared_root(root))
+            .entry(root)
             .or_default()
             .extend(observed.iter().copied());
     }
     signedness
-}
-
-fn merge_rebased_stack_slot(
-    target: &mut ExternalStackVarSpec,
-    source: ExternalStackVarSpec,
-    canonical_base: ExternalStackBase,
-) {
-    target.base = canonical_base;
-    if target.ty.is_none() {
-        target.ty = source.ty;
-    }
-    if matches!(target.role, ExternalStackSlotRole::Unknown) {
-        target.role = source.role;
-    }
-    if (target.name.is_empty() || is_low_quality_stack_name(&target.name))
-        && !source.name.is_empty()
-    {
-        target.name = source.name;
-    }
-    if target.param_index.is_none() {
-        target.param_index = source.param_index;
-    }
-    if target.param_name.is_none() {
-        target.param_name = source.param_name;
-    }
-    if target.source_reg.is_none() {
-        target.source_reg = source.source_reg;
-    }
-}
-
-fn canonicalize_external_stack_slots_with_prep_facts(
-    stack_slots: &mut BTreeMap<StackSlotKey, ExternalStackVarSpec>,
-    ssa_blocks: &[SSABlock],
-    prep_facts: Option<&r2ssa::DecompilePrepFacts>,
-    ptr_bits: u32,
-) {
-    let Some(prep_facts) = prep_facts else {
-        return;
-    };
-    let data_addresses = ssa_blocks
-        .iter()
-        .flat_map(|block| &block.ops)
-        .filter_map(|op| match op {
-            SSAOp::Load {
-                space: r2il::SpaceId::Ram,
-                addr,
-                ..
-            }
-            | SSAOp::Store {
-                space: r2il::SpaceId::Ram,
-                addr,
-                ..
-            } => Some(addr.clone()),
-            _ => None,
-        })
-        .collect::<HashSet<_>>();
-    let mut canonical_candidates = BTreeMap::<StackSlotKey, BTreeSet<StackSlotKey>>::new();
-    for op in ssa_blocks.iter().flat_map(|block| &block.ops) {
-        let (dst, raw_slot) = match op {
-            SSAOp::IntAdd { dst, a, b } if data_addresses.contains(dst) => {
-                (dst, stack_slot_key_from_add_sub(a, b, false, ptr_bits))
-            }
-            SSAOp::IntSub { dst, a, b } if data_addresses.contains(dst) => {
-                (dst, stack_slot_key_from_add_sub(a, b, true, ptr_bits))
-            }
-            _ => continue,
-        };
-        let Some(raw_slot) = raw_slot else {
-            continue;
-        };
-        let Some(root) = prep_facts.stack_address_root_of(dst).copied() else {
-            continue;
-        };
-        let canonical_slot = stack_slot_key_from_prepared_root(root);
-        if canonical_slot != raw_slot {
-            canonical_candidates
-                .entry(raw_slot)
-                .or_default()
-                .insert(canonical_slot);
-        }
-    }
-
-    let rebases = canonical_candidates
-        .into_iter()
-        .filter_map(|(raw, candidates)| {
-            let mut candidates = candidates.into_iter();
-            let canonical = candidates.next()?;
-            candidates.next().is_none().then_some((raw, canonical))
-        })
-        .collect::<Vec<_>>();
-    for (raw, canonical) in rebases {
-        let Some(mut source) = stack_slots.remove(&raw) else {
-            continue;
-        };
-        source.base = canonical.base.clone();
-        if let Some(target) = stack_slots.get_mut(&canonical) {
-            merge_rebased_stack_slot(target, source, canonical.base);
-        } else {
-            stack_slots.insert(canonical, source);
-        }
-    }
 }
 
 fn canonicalize_param_home_stack_slots(
@@ -8358,7 +8735,7 @@ fn canonicalize_param_home_stack_slots(
     stack_slots: &mut BTreeMap<StackSlotKey, ExternalStackVarSpec>,
     ssa_blocks: &[SSABlock],
     prep_facts: Option<&r2ssa::DecompilePrepFacts>,
-    ptr_bits: u32,
+    registers: &crate::RegisterIdentity,
 ) {
     if register_params.is_empty() || ssa_blocks.is_empty() {
         return;
@@ -8369,22 +8746,18 @@ fn canonicalize_param_home_stack_slots(
     for block in ssa_blocks {
         for op in &block.ops {
             match op {
-                SSAOp::IntAdd { dst, a, b } => {
+                SSAOp::IntAdd { dst, .. } => {
                     let slot_key = prep_facts
                         .and_then(|facts| facts.stack_address_root_of(dst))
-                        .copied()
-                        .map(stack_slot_key_from_prepared_root)
-                        .or_else(|| stack_slot_key_from_add_sub(a, b, false, ptr_bits));
+                        .copied();
                     if let Some(slot_key) = slot_key {
                         slot_addr_by_var.insert(dst.display_name(), slot_key);
                     }
                 }
-                SSAOp::IntSub { dst, a, b } => {
+                SSAOp::IntSub { dst, .. } => {
                     let slot_key = prep_facts
                         .and_then(|facts| facts.stack_address_root_of(dst))
-                        .copied()
-                        .map(stack_slot_key_from_prepared_root)
-                        .or_else(|| stack_slot_key_from_add_sub(a, b, true, ptr_bits));
+                        .copied();
                     if let Some(slot_key) = slot_key {
                         slot_addr_by_var.insert(dst.display_name(), slot_key);
                     }
@@ -8401,7 +8774,6 @@ fn canonicalize_param_home_stack_slots(
                             prep_facts
                                 .and_then(|facts| facts.stack_address_root_of(addr))
                                 .copied()
-                                .map(stack_slot_key_from_prepared_root)
                         })
                     else {
                         continue;
@@ -8409,7 +8781,8 @@ fn canonicalize_param_home_stack_slots(
                     let rooted_val = resolve_trivial_value_root(&trivial_value_sources, val);
                     let Some((param_index, param_reg)) =
                         register_params.iter().enumerate().find_map(|(idx, param)| {
-                            register_family_matches(&param.reg, &rooted_val.name)
+                            registers
+                                .same_parameter_storage(&param.reg, &rooted_val.name)
                                 .then_some((idx, param.reg.clone()))
                         })
                     else {
@@ -8423,13 +8796,12 @@ fn canonicalize_param_home_stack_slots(
                         .map(|param| param.name.clone())
                         .filter(|name| !name.is_empty())
                         .unwrap_or_else(|| format!("arg{}", param_index + 1));
-                    let slot_key = canonical_frame_stack_slot_key(&source_slot_key);
+                    let slot_key = source_slot_key;
                     if slot_key != source_slot_key
                         && let Some(source_slot) = stack_slots.remove(&source_slot_key)
                     {
-                        stack_slots.entry(slot_key.clone()).or_insert(source_slot);
+                        stack_slots.entry(slot_key).or_insert(source_slot);
                     }
-                    let slot_base = slot_key.base.clone();
                     let slot =
                         stack_slots
                             .entry(slot_key)
@@ -8438,7 +8810,6 @@ fn canonicalize_param_home_stack_slots(
                                 ty: merged_signature
                                     .and_then(|sig| sig.params.get(param_index))
                                     .and_then(|param| param.ty.clone()),
-                                base: slot_base,
                                 role: ExternalStackSlotRole::Unknown,
                                 param_index: None,
                                 param_name: None,
@@ -8464,10 +8835,6 @@ fn canonicalize_param_home_stack_slots(
             }
         }
     }
-}
-
-fn canonical_frame_stack_slot_key(slot: &StackSlotKey) -> StackSlotKey {
-    slot.clone()
 }
 
 fn hide_unproven_stack_pointer_frame_slots(
@@ -8531,94 +8898,6 @@ fn resolve_trivial_value_root(
     current
 }
 
-fn stack_slot_key_from_add_sub(
-    a: &SSAVar,
-    b: &SSAVar,
-    is_sub: bool,
-    ptr_bits: u32,
-) -> Option<StackSlotKey> {
-    let base = stack_base_from_var(a)?;
-    let raw = parse_const_value(&b.name)?;
-    let offset = signed_offset_from_const(raw, ptr_bits);
-    Some(StackSlotKey {
-        base,
-        offset: if is_sub { -offset } else { offset },
-    })
-}
-
-fn stack_base_from_var(var: &SSAVar) -> Option<ExternalStackBase> {
-    let lower = var.name.to_ascii_lowercase();
-    match lower.as_str() {
-        "rbp" | "ebp" | "bp" | "fp" => Some(ExternalStackBase::FramePointer),
-        "rsp" | "esp" | "sp" => Some(ExternalStackBase::StackPointer),
-        _ => None,
-    }
-}
-
-fn register_family_matches(expected: &str, actual: &str) -> bool {
-    let expected = expected.to_ascii_lowercase();
-    let actual = actual.to_ascii_lowercase();
-    if expected == actual {
-        return true;
-    }
-
-    fn x86_family(name: &str) -> Option<&str> {
-        match name {
-            "rax" | "eax" | "ax" | "al" | "ah" => Some("ax"),
-            "rbx" | "ebx" | "bx" | "bl" | "bh" => Some("bx"),
-            "rcx" | "ecx" | "cx" | "cl" | "ch" => Some("cx"),
-            "rdx" | "edx" | "dx" | "dl" | "dh" => Some("dx"),
-            "rsi" | "esi" | "si" | "sil" => Some("si"),
-            "rdi" | "edi" | "di" | "dil" => Some("di"),
-            "rbp" | "ebp" | "bp" | "bpl" => Some("bp"),
-            "rsp" | "esp" | "sp" | "spl" => Some("sp"),
-            "r8" | "r8d" | "r8w" | "r8b" => Some("8"),
-            "r9" | "r9d" | "r9w" | "r9b" => Some("9"),
-            "r10" | "r10d" | "r10w" | "r10b" => Some("10"),
-            "r11" | "r11d" | "r11w" | "r11b" => Some("11"),
-            "r12" | "r12d" | "r12w" | "r12b" => Some("12"),
-            "r13" | "r13d" | "r13w" | "r13b" => Some("13"),
-            "r14" | "r14d" | "r14w" | "r14b" => Some("14"),
-            "r15" | "r15d" | "r15w" | "r15b" => Some("15"),
-            _ => None,
-        }
-    }
-
-    if let (Some(expected), Some(actual)) = (x86_family(&expected), x86_family(&actual)) {
-        return expected == actual;
-    }
-
-    fn numbered_register(name: &str, prefixes: &[char], max_index: u8) -> Option<u8> {
-        let mut chars = name.chars();
-        let prefix = chars.next()?;
-        if !prefixes.contains(&prefix) {
-            return None;
-        }
-        let index = chars.as_str();
-        if index.is_empty() || !index.bytes().all(|byte| byte.is_ascii_digit()) {
-            return None;
-        }
-        index.parse::<u8>().ok().filter(|index| *index <= max_index)
-    }
-
-    let expected_gpr = numbered_register(&expected, &['x', 'w'], 30);
-    let actual_gpr = numbered_register(&actual, &['x', 'w'], 30);
-    if let (Some(expected), Some(actual)) = (expected_gpr, actual_gpr) {
-        return expected == actual;
-    }
-
-    let expected_vector = numbered_register(&expected, &['v', 'q', 'd', 's', 'h', 'b'], 31);
-    let actual_vector = numbered_register(&actual, &['v', 'q', 'd', 's', 'h', 'b'], 31);
-    if let (Some(expected), Some(actual)) = (expected_vector, actual_vector) {
-        return expected == actual;
-    }
-
-    matches!(
-        (expected.as_str(), actual.as_str()),
-        ("sp", "wsp") | ("wsp", "sp") | ("xzr", "wzr") | ("wzr", "xzr")
-    )
-}
-
 fn parse_signature_type_preserving_c_typedefs(ty: &str, ptr_bits: u32) -> Option<CTypeLike> {
     match normalize_external_type_name(ty)
         .trim()
@@ -8636,7 +8915,7 @@ fn parse_signature_type_preserving_c_typedefs(ty: &str, ptr_bits: u32) -> Option
         "ptrdiff_t" => Some(typedef_type("ptrdiff_t")),
         "uintptr_t" => Some(typedef_type("uintptr_t")),
         "intptr_t" => Some(typedef_type("intptr_t")),
-        _ => parse_type_like_spec(ty, ptr_bits),
+        _ => parse_c_type_like(ty, ptr_bits),
     }
 }
 
@@ -8680,7 +8959,18 @@ fn merge_local_signature_into_merged_signature(
         (Some(mut external), Some(local)) => {
             let external_param_count_is_authoritative =
                 signature_param_count_is_authoritative(&external);
-            if local_signature_should_override_external(
+            // A declared `void` return says the function returns nothing. That
+            // is an answer, not a missing one, and it is the only return type a
+            // local reading of the machine cannot contradict: a function that
+            // returns nothing still leaves something in the return register.
+            // Treating it as unknown let inference replace it with `int64_t`,
+            // which is weak enough that recovered evidence then replaced it with
+            // `void *`, so `void list_free(Node *head)` rendered as returning a
+            // pointer and its body ended `return rip;`.
+            let external_returns_void = matches!(external.ret_type.as_ref(), Some(CTypeLike::Void));
+            if external_returns_void {
+                // Keep it.
+            } else if local_signature_should_override_external(
                 local.ret_type.as_ref(),
                 external.ret_type.as_ref(),
             ) || (!external_param_count_is_authoritative
@@ -8818,11 +9108,10 @@ fn stack_base_for_recovered_var_kind(kind: &str) -> Option<ExternalStackBase> {
 }
 
 fn stack_slot_key_for_recovered_var(var: &RecoveredVariable) -> Option<StackSlotKey> {
-    let key = StackSlotKey {
+    Some(StackSlotKey {
         base: stack_base_for_recovered_var_kind(&var.kind)?,
         offset: var.delta,
-    };
-    Some(canonical_frame_stack_slot_key(&key))
+    })
 }
 
 fn slot_spec_for_recovered_var<'a>(
@@ -8889,7 +9178,7 @@ fn visible_binding_type_specificity(ty: &CTypeLike) -> u8 {
     match ty {
         CTypeLike::Unknown => 0,
         CTypeLike::Void => 1,
-        CTypeLike::Function => 2,
+        CTypeLike::Function { .. } | CTypeLike::BitVector(_) => 2,
         CTypeLike::Bool | CTypeLike::Int { .. } | CTypeLike::Float(_) => 4,
         CTypeLike::Typedef(_) | CTypeLike::Enum(_) => 5,
         CTypeLike::Struct(_) | CTypeLike::Union(_) => 6,
@@ -9005,9 +9294,9 @@ fn build_visible_bindings(
         .collect::<HashMap<_, _>>();
     let mut type_map = BTreeMap::<RecoveredVarKey, CTypeLike>::new();
     for candidate in var_type_candidates {
-        let Some(ty) = parse_type_like_spec(&candidate.var_type, ptr_bits) else {
-            continue;
-        };
+        // The candidate carries a type now, so there is nothing left to parse
+        // and nothing to skip for being unparseable.
+        let ty = candidate.var_type.clone();
         let key = RecoveredVarKey::for_type_candidate(candidate);
         type_map
             .entry(key)
@@ -9020,12 +9309,11 @@ fn build_visible_bindings(
     }
 
     for (slot_key, slot_spec) in stack_slots {
-        let canonical_slot_key = canonical_frame_stack_slot_key(slot_key);
         let key = slot_spec
             .param_index
             .filter(|_| matches!(slot_spec.role, ExternalStackSlotRole::StackArg))
             .map(VisibleBindingKey::Param)
-            .unwrap_or_else(|| VisibleBindingKey::Stack(canonical_slot_key.clone()));
+            .unwrap_or_else(|| VisibleBindingKey::Stack(*slot_key));
         let candidate = VisibleBinding {
             name: slot_spec
                 .param_name
@@ -9039,7 +9327,7 @@ fn build_visible_bindings(
                 }),
             ty: slot_spec.ty.clone(),
             kind: visible_binding_kind_for_slot_role(slot_spec.role),
-            stack_slot: Some(canonical_slot_key),
+            stack_slot: Some(*slot_key),
             param_index: slot_spec.param_index,
             source_reg: slot_spec.source_reg.clone(),
         };
@@ -9073,7 +9361,7 @@ fn build_visible_bindings(
             ty: type_map
                 .get(&RecoveredVarKey::for_recovered_var(var))
                 .cloned()
-                .or_else(|| parse_type_like_spec(&var.var_type, ptr_bits)),
+                .or_else(|| parse_c_type_like(&var.var_type, ptr_bits)),
             kind: if var.isarg {
                 VisibleBindingKind::Param
             } else if matches!(key, VisibleBindingKey::Stack(_)) {
@@ -9082,7 +9370,7 @@ fn build_visible_bindings(
                 VisibleBindingKind::Unknown
             },
             stack_slot: match &key {
-                VisibleBindingKey::Stack(slot_key) => Some(slot_key.clone()),
+                VisibleBindingKey::Stack(slot_key) => Some(*slot_key),
                 VisibleBindingKey::Param(_) => None,
             },
             param_index: match key {
@@ -9101,7 +9389,7 @@ fn build_visible_bindings(
 }
 
 fn integer_type_bits(ty: &str, ptr_bits: u32) -> Option<u32> {
-    match parse_type_like_spec(ty, ptr_bits)? {
+    match parse_c_type_like(ty, ptr_bits)? {
         CTypeLike::Int { bits, .. } => Some(bits),
         _ => None,
     }
@@ -9135,7 +9423,6 @@ fn apply_canonical_stack_width_types(
     stack_slots: &mut BTreeMap<StackSlotKey, ExternalStackVarSpec>,
     vars: &[RecoveredVariable],
     candidates: &[VarTypeCandidate],
-    ptr_bits: u32,
 ) {
     let candidates = candidates
         .iter()
@@ -9156,9 +9443,7 @@ fn apply_canonical_stack_width_types(
         let Some(candidate) = candidates.get(&RecoveredVarKey::for_recovered_var(var)) else {
             continue;
         };
-        let Some(candidate_ty) = parse_type_like_spec(&candidate.var_type, ptr_bits) else {
-            continue;
-        };
+        let candidate_ty = candidate.var_type.clone();
         let CTypeLike::Int {
             bits: candidate_bits,
             ..
@@ -9197,7 +9482,10 @@ fn build_var_type_candidates(
         }
 
         let mut source = WritebackSource::LocalInferred;
-        let mut confidence = if var.var_type.contains('*') {
+        let mut confidence = if var
+            .recovered_type(ctx.ptr_bits)
+            .is_some_and(|ty| ty.is_pointer())
+        {
             92
         } else if var.isarg {
             88
@@ -9314,15 +9602,23 @@ fn build_var_type_candidates(
             }
         }
 
-        let chosen_type = normalize_external_type_name(&chosen_type);
+        let Some(var_type) = parse_c_type_like(&chosen_type, ctx.ptr_bits) else {
+            diagnostics.warnings.push(format!(
+                "var `{}` type `{chosen_type}` was not a placeable C type",
+                var.name
+            ));
+            continue;
+        };
+        let size =
+            estimate_type_like_size_bytes(&var_type, ctx.ptr_bits).unwrap_or_default() as u32;
         out.push(VarTypeCandidate {
             name: var.name.clone(),
             kind: var.kind.clone(),
             delta: var.delta,
-            var_type: chosen_type.clone(),
+            var_type,
             isarg: var.isarg,
             reg: var.reg.clone(),
-            size: estimate_c_type_size_bytes(&chosen_type, ctx.ptr_bits) as u32,
+            size,
             confidence,
             source,
             evidence,
@@ -9409,6 +9705,7 @@ fn build_var_rename_candidates(
 fn signature_context_maps(
     signature: Option<&FunctionSignatureSpec>,
     ptr_bits: u32,
+    type_db: &ExternalTypeDb,
 ) -> SignatureContextMaps {
     let mut maps = SignatureContextMaps::default();
     let Some(signature) = signature else {
@@ -9418,7 +9715,7 @@ fn signature_context_maps(
         if let Some(ty) = param.ty.as_ref() {
             let ty_str = render_signature_type(ty, ptr_bits);
             if !is_generic_type_string(&ty_str)
-                || param_has_authoritative_named_scalar_role(param, ptr_bits)
+                || param_has_authoritative_named_scalar_role(param, ptr_bits, type_db)
             {
                 maps.param_types.insert(idx, ty_str);
             }
@@ -9434,6 +9731,7 @@ fn apply_signature_context_overrides(
     signature_out: &mut InferredSignature,
     signature: Option<&FunctionSignatureSpec>,
     ptr_bits: u32,
+    type_db: &ExternalTypeDb,
 ) {
     let Some(signature) = signature else {
         return;
@@ -9470,7 +9768,7 @@ fn apply_signature_context_overrides(
         if let Some(ty) = param.ty.as_ref() {
             let ty_str = render_signature_type(ty, ptr_bits);
             if (!is_generic_type_string(&ty_str)
-                || param_has_authoritative_named_scalar_role(param, ptr_bits))
+                || param_has_authoritative_named_scalar_role(param, ptr_bits, type_db))
                 && let Some(inferred_param) = signature_out.params.get_mut(idx)
             {
                 inferred_param.param_type = ty_str;
@@ -9587,7 +9885,7 @@ fn merge_slot_type_overrides_into_signature(
         if *slot >= sig.params.len() {
             continue;
         }
-        let Some(parsed) = parse_type_like_spec(raw_ty, ptr_bits) else {
+        let Some(parsed) = parse_c_type_like(raw_ty, ptr_bits) else {
             continue;
         };
         let param = &mut sig.params[*slot];
@@ -9616,7 +9914,7 @@ fn generated_local_struct_name_from_override(raw_ty: &str, ptr_bits: u32) -> Opt
     {
         return Some(name);
     }
-    let Some(CTypeLike::Pointer(inner)) = parse_type_like_spec(raw_ty, ptr_bits) else {
+    let Some(CTypeLike::Pointer(inner)) = parse_c_type_like(raw_ty, ptr_bits) else {
         return None;
     };
     match inner.as_ref() {
@@ -9627,6 +9925,38 @@ fn generated_local_struct_name_from_override(raw_ty: &str, ptr_bits: u32) -> Opt
         }
         _ => None,
     }
+}
+
+/// Whether a type name denotes something we can actually resolve.
+///
+/// This replaces `role_registry::semantic_typedef_is_authoritative`, a
+/// hardcoded list of about two hundred spellings -- most of them private to GNU
+/// coreutils and gnulib -- which decided whether a typedef was concrete enough
+/// to keep rather than replace. A name on the list was authoritative for every
+/// binary and a name off it for none, whatever the binary actually said.
+///
+/// The question is answerable from evidence. A name resolves if the C language
+/// resolves it, which `parse_c_type_like` already answers for the builtin and
+/// stdint spellings; or if the external type database holds a real layout for
+/// it; or if the database holds a typedef entry that eventually names one.
+/// Unlike the list, that says the same thing about a coreutils typedef and
+/// about anybody else's, and it says it from what the binary carries.
+pub fn type_db_resolves_type_name(type_db: &ExternalTypeDb, name: &str, ptr_bits: u32) -> bool {
+    // Typedefs this decompiler mints itself. These are resolvable because we
+    // define them in the emitted prelude, not because some binary declared
+    // them, so no evidence from the binary is required or possible.
+    if matches!(name.trim(), "allocation_ptr" | "memory_ptr") {
+        return true;
+    }
+    if parse_c_type_like(name, ptr_bits).is_some_and(|ty| !matches!(ty, CTypeLike::Typedef(_))) {
+        return true;
+    }
+    if external_named_aggregate_has_real_layout(type_db, name) {
+        return true;
+    }
+    aggregate_lookup_keys_for_writeback(name)
+        .iter()
+        .any(|key| type_db.typedefs.contains_key(key))
 }
 
 fn external_named_aggregate_has_real_layout(type_db: &ExternalTypeDb, name: &str) -> bool {
@@ -9672,13 +10002,14 @@ fn external_named_aggregate_has_real_layout(type_db: &ExternalTypeDb, name: &str
 fn unresolved_named_struct_target_for_param(
     param: &FunctionParamSpec,
     type_db: &ExternalTypeDb,
+    ptr_bits: u32,
 ) -> Option<String> {
     let Some(CTypeLike::Pointer(inner)) = param.ty.as_ref() else {
         return None;
     };
     match inner.as_ref() {
         CTypeLike::Struct(name) => unresolved_named_struct_target(name, type_db),
-        CTypeLike::Typedef(name) if !semantic_role_typedef_is_authoritative(name) => {
+        CTypeLike::Typedef(name) if !type_db_resolves_type_name(type_db, name, ptr_bits) => {
             unresolved_named_struct_target(name, type_db)
         }
         _ => None,
@@ -9759,7 +10090,8 @@ fn materialize_unresolved_signature_struct_layouts(
         let Some(param) = signature.params.get(slot) else {
             continue;
         };
-        let Some(target_name) = unresolved_named_struct_target_for_param(param, type_db) else {
+        let Some(target_name) = unresolved_named_struct_target_for_param(param, type_db, ptr_bits)
+        else {
             continue;
         };
         let Some(local_decl) = struct_decls
@@ -9813,7 +10145,7 @@ fn signature_param_blocks_generated_local_struct_override(
             CTypeLike::Unknown | CTypeLike::Void => false,
             CTypeLike::Struct(name) => external_named_aggregate_has_real_layout(type_db, name),
             CTypeLike::Typedef(name) => {
-                semantic_role_typedef_is_authoritative(name)
+                type_db_resolves_type_name(type_db, name, ptr_bits)
                     || external_named_aggregate_has_real_layout(type_db, name)
             }
             CTypeLike::Union(_) | CTypeLike::Enum(_) => true,
@@ -9894,7 +10226,7 @@ fn collect_external_struct_candidates_from_db(
     keys.sort();
 
     let mut out = Vec::new();
-    for key in keys {
+    'structs: for key in keys {
         let Some(st) = db.structs.get(&key) else {
             continue;
         };
@@ -9907,10 +10239,13 @@ fn collect_external_struct_candidates_from_db(
         let mut fields = Vec::new();
         for (offset, field) in &st.fields {
             let raw_ty = field.ty.clone().unwrap_or_else(|| "uint8_t".to_string());
+            let Some(field_type) = parse_c_type_like(&raw_ty, ptr_bits) else {
+                continue 'structs;
+            };
             fields.push(StructFieldCandidate {
                 name: field.name.clone(),
                 offset: *offset,
-                field_type: normalize_external_type_name(&raw_ty),
+                field_type,
                 confidence: 95,
             });
         }
@@ -9928,7 +10263,11 @@ fn collect_external_struct_candidates_from_db(
     out
 }
 
-fn merge_local_structs_into_type_db(db: &mut ExternalTypeDb, struct_decls: &[StructDeclCandidate]) {
+fn merge_local_structs_into_type_db(
+    db: &mut ExternalTypeDb,
+    struct_decls: &[StructDeclCandidate],
+    ptr_bits: u32,
+) {
     for decl in struct_decls {
         let key = decl.name.to_ascii_lowercase();
         let mut fields = BTreeMap::new();
@@ -9938,7 +10277,7 @@ fn merge_local_structs_into_type_db(db: &mut ExternalTypeDb, struct_decls: &[Str
                 ExternalField {
                     name: field.name.clone(),
                     offset: field.offset,
-                    ty: Some(field.field_type.clone()),
+                    ty: Some(render_signature_type(&field.field_type, ptr_bits)),
                 },
             );
         }
@@ -9994,7 +10333,7 @@ fn should_replace_struct_decl(
 
 fn canonical_field_type_key(ty: &str, ptr_bits: u32) -> String {
     let normalized = normalize_external_type_name(ty);
-    parse_type_like_spec(&normalized, ptr_bits)
+    parse_c_type_like(&normalized, ptr_bits)
         .map(|parsed| render_signature_type(&parsed, ptr_bits).to_ascii_lowercase())
         .unwrap_or_else(|| normalized.to_ascii_lowercase())
 }
@@ -10002,7 +10341,12 @@ fn canonical_field_type_key(ty: &str, ptr_bits: u32) -> String {
 fn struct_fields_signature(fields: &[StructFieldCandidate], ptr_bits: u32) -> Vec<(u64, String)> {
     let mut out: Vec<(u64, String)> = fields
         .iter()
-        .map(|f| (f.offset, canonical_field_type_key(&f.field_type, ptr_bits)))
+        .map(|f| {
+            (
+                f.offset,
+                canonical_field_type_key(&render_signature_type(&f.field_type, ptr_bits), ptr_bits),
+            )
+        })
         .collect();
     out.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     out
@@ -10030,7 +10374,10 @@ fn local_struct_profile_score(
         .map(|field| {
             (
                 field.offset,
-                canonical_field_type_key(&field.field_type, ptr_bits),
+                canonical_field_type_key(
+                    &render_signature_type(&field.field_type, ptr_bits),
+                    ptr_bits,
+                ),
             )
         })
         .collect::<BTreeMap<_, _>>();
@@ -10188,13 +10535,16 @@ fn score_global_type_links(
         return Vec::new();
     }
 
-    let mut per_type_weight: BTreeMap<String, i32> = BTreeMap::new();
-    let mut decl_profiles: BTreeMap<String, BTreeMap<u64, String>> = BTreeMap::new();
+    let mut per_type_weight: BTreeMap<CTypeLike, i32> = BTreeMap::new();
+    let mut decl_profiles: BTreeMap<CTypeLike, BTreeMap<u64, String>> = BTreeMap::new();
     for decl in struct_decls {
-        let key = format!("struct {} *", decl.name);
-        if is_generic_type_string(&key) {
+        // Genericity here is a property of the struct's own name, which is what
+        // the placeholder test actually inspects once it has stripped the
+        // `struct` keyword and the star back off a rendered spelling.
+        if writeback_type_name_is_opaque_placeholder(&decl.name) {
             continue;
         }
+        let key = CTypeLike::Pointer(Box::new(CTypeLike::Struct(decl.name.clone())));
         let source_boost = if decl.source == StructDeclSource::ExternalTypeDb {
             12
         } else {
@@ -10211,32 +10561,30 @@ fn score_global_type_links(
                 .map(|field| {
                     (
                         field.offset,
-                        normalize_external_type_name(&field.field_type).to_ascii_lowercase(),
+                        render_signature_type(&field.field_type, ptr_bits).to_ascii_lowercase(),
                     )
                 })
                 .collect(),
         );
     }
     for var in var_type_candidates {
-        if var.var_type.starts_with("struct ")
-            && var.var_type.ends_with(" *")
-            && !is_generic_type_string(&var.var_type)
+        let parsed = var.var_type.clone();
+        if matches!(&parsed, CTypeLike::Pointer(inner) if matches!(inner.as_ref(), CTypeLike::Struct(name) if !writeback_type_name_is_opaque_placeholder(name)))
         {
-            *per_type_weight.entry(var.var_type.clone()).or_insert(30) +=
-                4 + (var.confidence as i32 / 12);
+            *per_type_weight.entry(parsed).or_insert(30) += 4 + (var.confidence as i32 / 12);
         }
     }
     if per_type_weight.is_empty() {
         return Vec::new();
     }
 
-    let mut per_addr_best: BTreeMap<u64, (String, i32)> = BTreeMap::new();
+    let mut per_addr_best: BTreeMap<u64, (CTypeLike, i32)> = BTreeMap::new();
     for (addr, profile) in per_addr_profiles {
         if profile.is_empty() {
             continue;
         }
         let observed_fields = profile.len();
-        let mut best: Option<(String, i32)> = None;
+        let mut best: Option<(CTypeLike, i32)> = None;
         for (ty, base_score) in &per_type_weight {
             let Some(decl_profile) = decl_profiles.get(ty) else {
                 continue;
@@ -10296,7 +10644,7 @@ fn infer_global_field_profiles(
     ssa_blocks: &[SSABlock],
     ptr_bits: u32,
 ) -> BTreeMap<u64, BTreeMap<u64, InferredGlobalFieldEvidence>> {
-    let mut addr_exprs: HashMap<String, GlobalAddrExpr> = HashMap::new();
+    let mut addr_exprs: HashMap<(u64, SSAVar), GlobalAddrExpr> = HashMap::new();
     let mut field_evidence: BTreeMap<u64, BTreeMap<u64, InferredGlobalFieldEvidence>> =
         BTreeMap::new();
     let offset_bound = 0x4000i64;
@@ -10305,21 +10653,21 @@ fn infer_global_field_profiles(
         let mut changed = false;
         for block in ssa_blocks {
             for op in &block.ops {
-                let addr_of = |var: &SSAVar, map: &HashMap<String, GlobalAddrExpr>| {
-                    parse_const_value(&var.name)
+                let addr_of = |var: &SSAVar, map: &HashMap<(u64, SSAVar), GlobalAddrExpr>| {
+                    var.constant_bits()
                         .filter(|base| *base >= 0x10000)
                         .map(|base| GlobalAddrExpr {
                             base,
                             offset: 0,
                             confidence: 92,
                         })
-                        .or_else(|| map.get(&ssa_var_block_key(block.addr, var)).copied())
+                        .or_else(|| map.get(&(block.addr, var.clone())).copied())
                 };
                 let set_expr =
                     |dst: &SSAVar,
                      expr: GlobalAddrExpr,
-                     map: &mut HashMap<String, GlobalAddrExpr>| {
-                        let key = ssa_var_block_key(block.addr, dst);
+                     map: &mut HashMap<(u64, SSAVar), GlobalAddrExpr>| {
+                        let key = (block.addr, dst.clone());
                         match map.get(&key).copied() {
                             Some(prev) if prev.confidence >= expr.confidence => false,
                             _ => {
@@ -10370,7 +10718,7 @@ fn infer_global_field_profiles(
                     }
                     SSAOp::IntAdd { dst, a, b } => {
                         if let Some(base) = addr_of(a, &addr_exprs)
-                            && let Some(raw) = parse_const_value(&b.name)
+                            && let Some(raw) = b.constant_bits()
                         {
                             let off = base
                                 .offset
@@ -10387,7 +10735,7 @@ fn infer_global_field_profiles(
                                 );
                             }
                         } else if let Some(base) = addr_of(b, &addr_exprs)
-                            && let Some(raw) = parse_const_value(&a.name)
+                            && let Some(raw) = a.constant_bits()
                         {
                             let off = base
                                 .offset
@@ -10407,7 +10755,7 @@ fn infer_global_field_profiles(
                     }
                     SSAOp::IntSub { dst, a, b } => {
                         if let Some(base) = addr_of(a, &addr_exprs)
-                            && let Some(raw) = parse_const_value(&b.name)
+                            && let Some(raw) = b.constant_bits()
                         {
                             let off = base
                                 .offset
@@ -10432,7 +10780,7 @@ fn infer_global_field_profiles(
                         element_size,
                     } => {
                         if let Some(base_expr) = addr_of(base, &addr_exprs)
-                            && let Some(raw) = parse_const_value(&index.name)
+                            && let Some(raw) = index.constant_bits()
                         {
                             let scaled = signed_offset_from_const(raw, ptr_bits)
                                 .saturating_mul((*element_size).into());
@@ -10457,7 +10805,7 @@ fn infer_global_field_profiles(
                         element_size,
                     } => {
                         if let Some(base_expr) = addr_of(base, &addr_exprs)
-                            && let Some(raw) = parse_const_value(&index.name)
+                            && let Some(raw) = index.constant_bits()
                         {
                             let scaled = signed_offset_from_const(raw, ptr_bits)
                                 .saturating_mul((*element_size).into());
@@ -10487,18 +10835,14 @@ fn infer_global_field_profiles(
     for block in ssa_blocks {
         for op in &block.ops {
             let resolve_addr = |addr: &SSAVar| -> Option<GlobalAddrExpr> {
-                parse_const_value(&addr.name)
+                addr.constant_bits()
                     .filter(|base| *base >= 0x10000)
                     .map(|base| GlobalAddrExpr {
                         base,
                         offset: 0,
                         confidence: 92,
                     })
-                    .or_else(|| {
-                        addr_exprs
-                            .get(&ssa_var_block_key(block.addr, addr))
-                            .copied()
-                    })
+                    .or_else(|| addr_exprs.get(&(block.addr, addr.clone())).copied())
             };
             match op {
                 SSAOp::Load {
@@ -10568,7 +10912,7 @@ fn parse_existing_var_types_from_specs(
 }
 
 fn estimate_c_type_size_bytes(ty: &str, ptr_bits: u32) -> u64 {
-    if let Some(parsed) = parse_type_like_spec(ty, ptr_bits)
+    if let Some(parsed) = parse_c_type_like(ty, ptr_bits)
         && let Some(size) = estimate_type_like_size_bytes(&parsed, ptr_bits)
         && size > 0
     {
@@ -10587,7 +10931,10 @@ fn estimate_c_type_size_bytes(ty: &str, ptr_bits: u32) -> u64 {
 
 fn estimate_type_like_size_bytes(ty: &CTypeLike, ptr_bits: u32) -> Option<u64> {
     match ty {
-        CTypeLike::Void | CTypeLike::Unknown | CTypeLike::Function => None,
+        CTypeLike::Void
+        | CTypeLike::Unknown
+        | CTypeLike::BitVector(_)
+        | CTypeLike::Function { .. } => None,
         CTypeLike::Bool => Some(1),
         CTypeLike::Int { bits, .. } | CTypeLike::Float(bits) => {
             Some((u64::from(*bits).saturating_add(7) / 8).max(1))
@@ -10643,7 +10990,7 @@ fn build_struct_decl_with_size(
             cursor = field.offset;
         }
 
-        let field_type = normalize_external_type_name(&field.field_type);
+        let field_type = render_signature_type(&field.field_type, ptr_bits);
         lines.push(format!("    {} {};", field_type, field.name));
         cursor = cursor.saturating_add(estimate_c_type_size_bytes(&field_type, ptr_bits));
     }
@@ -10718,7 +11065,20 @@ pub fn writeback_apply_type_name_is_opaque_placeholder(type_name: &str) -> bool 
     normalize_writeback_apply_compare_string(type_name).contains("type_0x")
 }
 
-pub fn writeback_apply_type_name_is_generic(type_name: &str) -> bool {
+/// Whether a spelling is a plain scalar or an opaque placeholder.
+///
+/// This is *not* the same question as `writeback_type_name_is_generic`, and the
+/// two disagree on every fixed-width integer. That is deliberate, and the names
+/// hid it: this one is asked at apply time, where the guard is "do not let a
+/// plain scalar displace a type that already has structure". A `uint32_t` is
+/// informative -- it is a width -- and so it is not *generic*; but it is still
+/// weaker than `struct real_type *`, and writing it over one would lose the
+/// aggregate. `writeback_type_name_is_generic` asks the narrower question of
+/// whether a spelling says anything at all, and gates whether a hint may
+/// replace a recovered signature type.
+///
+/// A test pins the difference so that neither drifts into the other again.
+pub fn writeback_apply_type_name_is_plain_scalar_or_opaque(type_name: &str) -> bool {
     if type_name.is_empty() {
         return true;
     }
@@ -10895,8 +11255,8 @@ pub fn type_writeback_var_type_apply_decision(
         return TypeWritebackApplyDecision::SkipMissingMaterialization;
     }
     if let Some(existing_type) = existing_type.filter(|ty| !ty.trim().is_empty())
-        && !writeback_apply_type_name_is_generic(existing_type)
-        && writeback_apply_type_name_is_generic(candidate_type)
+        && !writeback_apply_type_name_is_plain_scalar_or_opaque(existing_type)
+        && writeback_apply_type_name_is_plain_scalar_or_opaque(candidate_type)
     {
         return TypeWritebackApplyDecision::SkipConcreteExisting;
     }
@@ -10917,7 +11277,7 @@ pub fn type_writeback_global_type_link_apply_decision(
     }
     if let Some(existing_type) = existing_type.filter(|ty| !ty.trim().is_empty())
         && !writeback_apply_types_equivalent(existing_type, candidate_type)
-        && !writeback_apply_type_name_is_generic(existing_type)
+        && !writeback_apply_type_name_is_plain_scalar_or_opaque(existing_type)
     {
         return TypeWritebackApplyDecision::SkipConcreteExisting;
     }
@@ -10972,7 +11332,7 @@ pub fn canonicalize_writeback_apply_type_name(type_name: &str) -> Option<String>
 }
 
 pub fn writeback_type_materialization_key(type_name: &str) -> Option<String> {
-    if writeback_apply_type_name_is_generic(type_name) {
+    if writeback_apply_type_name_is_plain_scalar_or_opaque(type_name) {
         return None;
     }
     let canonical = canonicalize_writeback_apply_type_name(type_name)?;
@@ -11133,7 +11493,7 @@ fn is_generic_type_string(ty: &str) -> bool {
 }
 
 fn is_low_signal_storage_scalar_type(ty: &str, ptr_bits: u32) -> bool {
-    parse_type_like_spec(ty, ptr_bits).is_some_and(|parsed| matches!(parsed, CTypeLike::Int { .. }))
+    parse_c_type_like(ty, ptr_bits).is_some_and(|parsed| matches!(parsed, CTypeLike::Int { .. }))
 }
 
 fn sanitize_c_identifier(raw: &str) -> Option<String> {
@@ -11166,30 +11526,6 @@ fn is_low_quality_stack_name(name: &str) -> bool {
         || lower.starts_with("stack_")
         || lower == "saved_fp"
         || is_generic_arg_name(&lower)
-}
-
-fn parse_const_value(name: &str) -> Option<u64> {
-    let val_str = name
-        .strip_prefix("const:")
-        .or_else(|| name.strip_prefix("CONST:"))?;
-    let val_str = val_str.split('_').next().unwrap_or(val_str);
-
-    if let Some(hex) = val_str
-        .strip_prefix("0x")
-        .or_else(|| val_str.strip_prefix("0X"))
-    {
-        return u64::from_str_radix(hex, 16).ok();
-    }
-    if let Some(dec) = val_str
-        .strip_prefix("0d")
-        .or_else(|| val_str.strip_prefix("0D"))
-    {
-        return dec.parse::<u64>().ok();
-    }
-    if val_str.chars().all(|c| c.is_ascii_hexdigit()) {
-        return u64::from_str_radix(val_str, 16).ok();
-    }
-    val_str.parse::<u64>().ok()
 }
 
 fn size_to_type(size: u32) -> String {
@@ -11227,18 +11563,215 @@ fn signed_offset_from_const(raw: u64, ptr_bits: u32) -> i64 {
     }
 }
 
-fn ssa_var_block_key(block_addr: u64, var: &SSAVar) -> String {
-    format!(
-        "{}_{}@{block_addr:x}",
-        var.name.to_ascii_lowercase(),
-        var.version
-    )
-}
-
 #[cfg(test)]
 mod tests {
+    /// A type database that declares one named aggregate.
+    ///
+    /// Tests that depend on a typedef being *known* now have to say where that
+    /// knowledge comes from. It used to come from a hardcoded list of coreutils
+    /// spellings, so a test could rely on `FTS` being authoritative without
+    /// providing anything that declared it.
+    fn type_db_declaring(name: &str) -> ParsedExternalContext {
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            0u64,
+            crate::external::ExternalField {
+                name: "field_0".to_string(),
+                offset: 0,
+                ty: Some("int32_t".to_string()),
+            },
+        );
+        let mut context = ParsedExternalContext::default();
+        context.external_type_db.structs.insert(
+            name.to_ascii_lowercase(),
+            crate::external::ExternalStruct {
+                name: name.to_string(),
+                fields,
+            },
+        );
+        context
+    }
+
+    /// The two type-strength questions, and where they deliberately differ.
+    ///
+    /// They were named `..._is_generic` and `..._apply_type_name_is_generic`,
+    /// which reads as one question asked twice; they are two questions, and
+    /// merging them lets a `uint32_t` overwrite a `struct real_type *`. This
+    /// pins the boundary so neither drifts into the other.
+    #[test]
+    fn the_two_type_strength_questions_differ_only_on_bare_widths() {
+        // Says nothing at all, on both counts.
+        for name in ["void *", "void*", "char *", "int", ""] {
+            assert!(
+                super::writeback_type_name_is_generic(name),
+                "generic: {name}"
+            );
+            assert!(
+                super::writeback_apply_type_name_is_plain_scalar_or_opaque(name),
+                "plain: {name}"
+            );
+        }
+        // A width is information, so it is not generic -- but it is still a
+        // plain scalar, and must not displace an aggregate at apply time. The
+        // literal spelling `unknown` sits here too, which is worth noticing:
+        // the narrower predicate does not treat it as generic, because its
+        // placeholder test looks for `anon_` and `type_0x` rather than for a
+        // type that says in words that it is not known.
+        for name in [
+            "int64_t",
+            "uint32_t",
+            "int8_t",
+            "int32_t",
+            "uintptr_t",
+            "unknown",
+        ] {
+            assert!(
+                !super::writeback_type_name_is_generic(name),
+                "generic: {name}"
+            );
+            assert!(
+                super::writeback_apply_type_name_is_plain_scalar_or_opaque(name),
+                "plain: {name}"
+            );
+        }
+        // Structure is informative on both counts.
+        for name in ["struct real_type *", "struct Foo *"] {
+            assert!(
+                !super::writeback_type_name_is_generic(name),
+                "generic: {name}"
+            );
+            assert!(
+                !super::writeback_apply_type_name_is_plain_scalar_or_opaque(name),
+                "plain: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn abi_register_params_cover_aarch64_as_well_as_sysv64() {
+        // radare2 reports `arch="aarch64"` with the calling-convention field
+        // left empty. Requiring a named convention meant arm64 functions got no
+        // register parameters at all, which switched off the whole parameter
+        // home machinery: no ParamHome slots, so no hidden-home bindings, so an
+        // empty stack alias map, so frame accesses rendered as raw pointer
+        // arithmetic instead of named locals.
+        let signature = |arch: &str, callconv: &str| super::InferredSignature {
+            function_name: "f".to_string(),
+            signature: "int f(long a, long b, long c)".to_string(),
+            ret_type: "int".to_string(),
+            params: vec![
+                super::InferredSignatureParam {
+                    name: "a".to_string(),
+                    param_type: "int64_t".to_string(),
+                },
+                super::InferredSignatureParam {
+                    name: "b".to_string(),
+                    param_type: "int64_t".to_string(),
+                },
+                super::InferredSignatureParam {
+                    name: "c".to_string(),
+                    param_type: "int64_t".to_string(),
+                },
+            ],
+            callconv: callconv.to_string(),
+            arch: arch.to_string(),
+            confidence: 90,
+            callconv_confidence: 90,
+        };
+        let regs = |arch: &str, callconv: &str| {
+            super::inferred_signature_abi_register_params(&signature(arch, callconv), 64)
+                .into_iter()
+                .map(|param| param.reg)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(regs("aarch64", ""), vec!["x0", "x1", "x2"]);
+        assert_eq!(regs("arm64", "aapcs"), vec!["x0", "x1", "x2"]);
+        assert_eq!(regs("x86-64", "amd64"), vec!["rdi", "rsi", "rdx"]);
+        assert!(
+            regs("mips", "").is_empty(),
+            "an architecture with no table here still yields nothing"
+        );
+    }
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
+
+    fn parse_test_type(spelling: &str, ptr_bits: u32) -> CTypeLike {
+        parse_c_type_like(spelling, ptr_bits).expect("test type spelling should parse")
+    }
+
+    #[test]
+    fn unplaceable_recovered_type_produces_no_writeback_candidate() {
+        let vars = [RecoveredVariable {
+            name: "var_8h".to_string(),
+            kind: "b".to_string(),
+            delta: -8,
+            var_type: "not a type".to_string(),
+            isarg: false,
+            reg: None,
+        }];
+        let context_maps = SignatureContextMaps::default();
+        let slot_type_overrides = HashMap::new();
+        let stack_slots = BTreeMap::new();
+        let existing_types = HashMap::new();
+        let stack_access_widths = BTreeMap::new();
+        let stack_access_signedness = BTreeMap::new();
+        let context = VarTypeCandidateContext {
+            current_context_maps: &context_maps,
+            merged_signature: None,
+            slot_type_overrides: &slot_type_overrides,
+            stack_slots: &stack_slots,
+            existing_types: &existing_types,
+            stack_access_widths: &stack_access_widths,
+            stack_access_signedness: &stack_access_signedness,
+            ptr_bits: 64,
+            is_main_signature: false,
+        };
+        let mut diagnostics = TypeWritebackDiagnostics::default();
+
+        let candidates = build_var_type_candidates(&vars, &context, &mut diagnostics);
+
+        assert!(candidates.is_empty());
+        assert_eq!(
+            diagnostics.warnings,
+            ["var `var_8h` type `not a type` was not a placeable C type"]
+        );
+    }
+
+    #[test]
+    fn constant_offsets_require_exact_ssa_evidence() {
+        let spoofed = SSAVar::new("const:20", 0, 8);
+        let exact = SSAVar::constant(0x20, 8);
+
+        assert_eq!(exact_ssa_const_offset(&spoofed, 64), None);
+        assert_eq!(exact_ssa_const_offset(&exact, 64), Some(0x20));
+    }
+
+    #[test]
+    fn global_field_profiles_refuse_spoofed_constant_names() {
+        let load_from = |addr| SSABlock {
+            addr: 0x401000,
+            size: 4,
+            ops: vec![SSAOp::Load {
+                dst: SSAVar::new("value", 1, 4),
+                space: r2il::SpaceId::Ram,
+                addr,
+            }],
+        };
+
+        let spoofed =
+            infer_global_field_profiles(&[load_from(SSAVar::new("const:10000", 0, 8))], 64);
+        let exact = infer_global_field_profiles(&[load_from(SSAVar::constant(0x10000, 8))], 64);
+
+        assert!(spoofed.is_empty());
+        assert_eq!(
+            exact
+                .get(&0x10000)
+                .and_then(|fields| fields.get(&0))
+                .map(|field| field.reads),
+            Some(1)
+        );
+    }
 
     fn source_owned_worker_fixture(entry: u64) -> (Arc<SsaArtifact>, r2il::ArchSpec) {
         let mut arch = r2il::ArchSpec::new("x86-64");
@@ -11311,9 +11844,8 @@ mod tests {
     fn source_owned_writeback_retains_exact_prepared_owners() {
         let (source, _) = source_owned_worker_fixture(0x401000);
         let summary = prepared_summary_for(&source);
-        let semantic =
-            r2sym::compile_native_worker_summary_artifact(&source, None, Some(&summary), true)
-                .expect("source-owned semantic artifact");
+        let semantic = r2sym::compile_native_worker_summary_artifact(&source, Some(&summary), true)
+            .expect("source-owned semantic artifact");
         let request = TypeWritebackAnalysisRequest::new(
             Arc::clone(&source),
             ParsedExternalContext::default(),
@@ -11386,7 +11918,6 @@ mod tests {
             .expect("source-owned route");
         assert_eq!(route.kind, crate::DecompileRouteKind::Standard);
         assert_eq!(route.reason.as_deref(), Some("test route"));
-        assert!(route.skip_runtime_type_inference);
         assert!(route.use_prepared_semantic_view);
         assert!(route.fallback_comment.is_none());
         drop(shared);
@@ -11407,6 +11938,7 @@ mod tests {
                 None,
             ),
             plan: TypeWritebackPlan {
+                ptr_bits: 64,
                 signature: inferred_test_signature("fcn.refresh", "presentation_only"),
                 var_type_candidates: candidates,
                 var_rename_candidates: Vec::new(),
@@ -11414,6 +11946,7 @@ mod tests {
                 global_type_links: Vec::new(),
                 diagnostics: TypeWritebackDiagnostics::default(),
             },
+            callee_signatures: BTreeMap::new(),
         }
     }
 
@@ -11422,7 +11955,7 @@ mod tests {
             name: name.to_string(),
             kind: "r".to_string(),
             delta: 0,
-            var_type: "int64_t".to_string(),
+            var_type: parse_test_type("int64_t", 64),
             isarg: true,
             reg: register.map(str::to_string),
             size: 8,
@@ -11435,7 +11968,6 @@ mod tests {
     #[test]
     fn constrained_plan_refresh_uses_exact_storage_alias_and_updates_size() {
         let (source, _) = source_owned_worker_fixture(0x401200);
-        let prior_facts = FunctionFacts::new(certified_signature_facts("old_name", 64), None);
         let mut analysis = constrained_refresh_test_analysis(
             source,
             8,
@@ -11445,9 +11977,9 @@ mod tests {
             )],
         );
 
-        assert!(analysis.refresh_plan_after_source_constraints(&prior_facts, 1));
+        assert!(analysis.refresh_plan_after_source_constraints(&BTreeSet::from([0])));
         let candidate = &analysis.plan().var_type_candidates[0];
-        assert_eq!(candidate.var_type, "int8_t");
+        assert_eq!(candidate.var_type, parse_test_type("int8_t", 64));
         assert_eq!(candidate.size, 1);
         assert_eq!(candidate.source, WritebackSource::CalleeSignature);
         assert!(
@@ -11460,7 +11992,6 @@ mod tests {
     #[test]
     fn constrained_plan_refresh_refuses_name_only_foreign_and_duplicate_bindings_atomically() {
         let (source, _) = source_owned_worker_fixture(0x401300);
-        let prior_facts = FunctionFacts::new(certified_signature_facts("old_name", 64), None);
         let mutations = [
             vec![constrained_refresh_candidate(None, "renamed_parameter")],
             vec![constrained_refresh_candidate(
@@ -11477,7 +12008,7 @@ mod tests {
             let mut analysis =
                 constrained_refresh_test_analysis(Arc::clone(&source), 8, candidates);
             let prior_plan = analysis.plan().clone();
-            assert!(!analysis.refresh_plan_after_source_constraints(&prior_facts, 1));
+            assert!(!analysis.refresh_plan_after_source_constraints(&BTreeSet::from([0])));
             assert_eq!(analysis.plan(), &prior_plan);
         }
     }
@@ -11491,6 +12022,7 @@ mod tests {
             source: Arc::clone(&source),
             function_facts: function_facts.clone(),
             plan: plan.clone(),
+            callee_signatures: BTreeMap::new(),
         };
         let budget = TypeWritebackMutationBudget::new(64, usize::MAX, usize::MAX);
         let policy = TypeWritebackApplyPolicy::balanced();
@@ -11583,13 +12115,9 @@ mod tests {
         let (source, _) = source_owned_worker_fixture(0x402000);
         let (foreign, _) = source_owned_worker_fixture(0x402000);
         let foreign_summary = prepared_summary_for(&foreign);
-        let foreign_semantic = r2sym::compile_native_worker_summary_artifact(
-            &foreign,
-            None,
-            Some(&foreign_summary),
-            true,
-        )
-        .expect("foreign semantic artifact");
+        let foreign_semantic =
+            r2sym::compile_native_worker_summary_artifact(&foreign, Some(&foreign_summary), true)
+                .expect("foreign semantic artifact");
 
         assert_eq!(
             TypeWritebackAnalysisRequest::new(
@@ -11613,13 +12141,9 @@ mod tests {
         );
 
         let source_summary = prepared_summary_for(&source);
-        let source_semantic = r2sym::compile_native_worker_summary_artifact(
-            &source,
-            None,
-            Some(&source_summary),
-            true,
-        )
-        .expect("base semantic artifact");
+        let source_semantic =
+            r2sym::compile_native_worker_summary_artifact(&source, Some(&source_summary), true)
+                .expect("base semantic artifact");
         let assumptions = r2ssa::AssumptionSet::new(vec![r2ssa::AnalysisAssumption {
             id: None,
             subject: r2ssa::AssumptionSubject::Parameter { index: 0 },
@@ -11656,7 +12180,6 @@ mod tests {
         let conditioned_summary = prepared_summary_for(&conditioned);
         let conditioned_semantic = r2sym::compile_native_worker_summary_artifact(
             &conditioned,
-            None,
             Some(&conditioned_summary),
             true,
         )
@@ -11699,17 +12222,6 @@ mod tests {
                 .expect_err("incoherent memory model must refuse"),
             TypeWritebackAnalysisError::IncoherentMachineMemoryModel
         );
-    }
-
-    #[test]
-    fn canonical_frame_stack_slots_preserve_signed_displacement() {
-        let raw = StackSlotKey {
-            base: ExternalStackBase::FramePointer,
-            offset: -16,
-        };
-        let canonical = canonical_frame_stack_slot_key(&raw);
-        assert_eq!(canonical.offset, -16);
-        assert_eq!(canonical_frame_stack_slot_key(&canonical), canonical);
     }
 
     #[test]
@@ -11797,12 +12309,52 @@ mod tests {
     }
 
     #[test]
-    fn register_families_require_an_explicit_architecture_identity() {
-        assert!(register_family_matches("rdi", "edi"));
-        assert!(register_family_matches("x0", "w0"));
-        assert!(register_family_matches("v7", "s7"));
-        assert!(!register_family_matches("x0", "w8"));
-        assert!(!register_family_matches("foo", "bar"));
+    fn same_parameter_storage_follows_the_machine_not_the_spelling() {
+        let x86 = x86_64_register_identity();
+
+        // A low alias is the same parameter, at every width.
+        assert!(x86.same_parameter_storage("rdi", "edi"));
+        assert!(x86.same_parameter_storage("rdi", "dil"));
+        assert!(x86.same_parameter_storage("rdi", "RDI"));
+
+        // `dh` is a byte of `rdx` and is not the byte `rdx` is passed in. The
+        // name table this replaced gave both the key "dx" and said yes, so an
+        // externally supplied type assumption for `dh` was applied to the
+        // `rdx` parameter and a stack slot was named after it.
+        assert!(!x86.same_parameter_storage("rdx", "dh"));
+        assert!(x86.same_parameter_storage("rdx", "dl"));
+        assert!(!x86.same_parameter_storage("rax", "ah"));
+        assert!(x86.same_parameter_storage("rax", "al"));
+
+        // Different registers stay different however they are spelled.
+        assert!(!x86.same_parameter_storage("rdi", "rdx"));
+        assert!(!x86.same_parameter_storage("al", "dl"));
+    }
+
+    #[test]
+    fn same_parameter_storage_needs_no_per_architecture_table() {
+        // The same predicate, with no arm64 case written anywhere: `w0` is the
+        // low half of `x0`, and `s7` the low quarter of `v7`, because that is
+        // where the machine puts them.
+        let arm64 = register_identity_from(&[
+            ("x0", 0x00, 8),
+            ("w0", 0x00, 4),
+            ("x8", 0x40, 8),
+            ("w8", 0x40, 4),
+            ("x29", 0xe8, 8),
+            ("v7", 0x100, 16),
+            ("d7", 0x100, 8),
+            ("s7", 0x100, 4),
+        ]);
+        assert!(arm64.same_parameter_storage("x0", "w0"));
+        assert!(arm64.same_parameter_storage("v7", "s7"));
+        assert!(arm64.same_parameter_storage("v7", "d7"));
+        assert!(!arm64.same_parameter_storage("x0", "w8"));
+
+        // A name the machine does not declare is only ever itself.
+        assert!(!arm64.same_parameter_storage("foo", "bar"));
+        assert!(arm64.same_parameter_storage("foo", "FOO"));
+        assert!(!arm64.same_parameter_storage("x0", "foo"));
     }
 
     #[test]
@@ -11856,7 +12408,7 @@ mod tests {
             .collect(),
             ..r2ssa::DecompilePrepFacts::default()
         };
-        let mut stack_slots = [(8, "var_8h"), (12, "var_ch")]
+        let mut stack_slots = [(-8, "var_8h"), (-4, "var_ch")]
             .into_iter()
             .map(|(offset, name)| {
                 (
@@ -11870,7 +12422,6 @@ mod tests {
                             bits: 32,
                             signedness: Signedness::Signed,
                         }),
-                        base: ExternalStackBase::StackPointer,
                         role: ExternalStackSlotRole::Local,
                         param_index: None,
                         param_name: None,
@@ -11886,19 +12437,13 @@ mod tests {
             reg: "x0".to_string(),
         }];
 
-        canonicalize_external_stack_slots_with_prep_facts(
-            &mut stack_slots,
-            &ssa_blocks,
-            Some(&prep_facts),
-            64,
-        );
         canonicalize_param_home_stack_slots(
             Some(&signature),
             &register_params,
             &mut stack_slots,
             &ssa_blocks,
             Some(&prep_facts),
-            64,
+            &aarch64_register_identity(),
         );
 
         let home = stack_slots
@@ -11956,7 +12501,6 @@ mod tests {
                     bits: 64,
                     signedness: Signedness::Signed,
                 }),
-                base: ExternalStackBase::StackPointer,
                 role: ExternalStackSlotRole::Local,
                 param_index: None,
                 param_name: None,
@@ -11997,7 +12541,7 @@ mod tests {
         );
 
         let candidate = &analysis.plan.var_type_candidates[0];
-        assert_eq!(candidate.var_type, "int32_t");
+        assert_eq!(candidate.var_type, parse_test_type("int32_t", 64));
         assert_eq!(candidate.source, WritebackSource::DataflowRanked);
         assert!(
             candidate
@@ -12067,14 +12611,13 @@ mod tests {
         };
         let mut parsed_context = ParsedExternalContext::default();
         parsed_context.stack_slots.insert(
-            slot_key.clone(),
+            slot_key,
             ExternalStackVarSpec {
                 name: "var_fh".to_string(),
                 ty: Some(CTypeLike::Int {
                     bits: 8,
                     signedness: Signedness::Signed,
                 }),
-                base: ExternalStackBase::StackPointer,
                 role: ExternalStackSlotRole::Local,
                 param_index: None,
                 param_name: None,
@@ -12115,7 +12658,7 @@ mod tests {
         );
 
         let candidate = &analysis.plan.var_type_candidates[0];
-        assert_eq!(candidate.var_type, "uint8_t");
+        assert_eq!(candidate.var_type, parse_test_type("uint8_t", 64));
         assert!(
             candidate
                 .evidence
@@ -12205,7 +12748,7 @@ mod tests {
             &mut stack_slots,
             &blocks,
             Some(&prep_facts),
-            64,
+            &aarch64_register_identity(),
         );
 
         let home = stack_slots
@@ -12240,6 +12783,24 @@ mod tests {
         }
     }
 
+    fn three_prepared_frame_slot_roots() -> r2ssa::DecompilePrepFacts {
+        r2ssa::DecompilePrepFacts {
+            stack_address_roots: [(1, -8), (2, -12), (3, -16)]
+                .into_iter()
+                .map(|(version, offset)| {
+                    (
+                        SSAVar::new("tmp:slot", version, 8),
+                        r2ssa::StackAddressRoot {
+                            base: r2ssa::StackAddressBase::FramePointer,
+                            offset,
+                        },
+                    )
+                })
+                .collect(),
+            ..r2ssa::DecompilePrepFacts::default()
+        }
+    }
+
     fn inferred_test_signature(function_name: &str, param_name: &str) -> InferredSignature {
         InferredSignature {
             function_name: function_name.to_string(),
@@ -12258,6 +12819,7 @@ mod tests {
 
     fn empty_writeback_plan(function_name: &str) -> TypeWritebackPlan {
         TypeWritebackPlan {
+            ptr_bits: 64,
             signature: inferred_test_signature(function_name, "value"),
             var_type_candidates: Vec::new(),
             var_rename_candidates: Vec::new(),
@@ -12468,7 +13030,7 @@ mod tests {
             "struct type_0x1234 *",
         ] {
             assert!(
-                writeback_apply_type_name_is_generic(generic),
+                writeback_apply_type_name_is_plain_scalar_or_opaque(generic),
                 "{generic:?} should remain a weak apply-time type"
             );
         }
@@ -12479,7 +13041,9 @@ mod tests {
         assert!(!writeback_apply_type_name_is_opaque_placeholder(
             "struct real_type *"
         ));
-        assert!(!writeback_apply_type_name_is_generic("struct real_type *"));
+        assert!(!writeback_apply_type_name_is_plain_scalar_or_opaque(
+            "struct real_type *"
+        ));
     }
 
     #[test]
@@ -12860,12 +13424,13 @@ mod tests {
         rename_confidence: u8,
     ) -> TypeWritebackPlan {
         TypeWritebackPlan {
+            ptr_bits: 64,
             signature: inferred_test_signature(function_name, "value"),
             var_type_candidates: vec![VarTypeCandidate {
                 name: "var_8h".to_string(),
                 kind: "b".to_string(),
                 delta: -8,
-                var_type: "int32_t".to_string(),
+                var_type: parse_test_type("int32_t", 64),
                 isarg: false,
                 reg: None,
                 size: 4,
@@ -12889,7 +13454,9 @@ mod tests {
             }],
             global_type_links: vec![GlobalTypeLinkCandidate {
                 addr: 0x404000,
-                target_type: "struct policy_item *".to_string(),
+                target_type: CTypeLike::Pointer(Box::new(CTypeLike::Struct(
+                    "policy_item".to_string(),
+                ))),
                 confidence,
                 source: WritebackSource::ExternalTypeDb,
             }],
@@ -13027,7 +13594,7 @@ mod tests {
             name: "var_8h".to_string(),
             kind: "b".to_string(),
             delta: -8,
-            var_type: "int32_t".to_string(),
+            var_type: parse_test_type("int32_t", 64),
             isarg: false,
             reg: None,
             size: 4,
@@ -13086,7 +13653,7 @@ mod tests {
             name: "var_8h".to_string(),
             kind: "b".to_string(),
             delta: -8,
-            var_type: "struct type.Foo*".to_string(),
+            var_type: parse_test_type("struct type.Foo*", 64),
             isarg: false,
             reg: None,
             size: 8,
@@ -13096,7 +13663,7 @@ mod tests {
         });
         plan.global_type_links.push(GlobalTypeLinkCandidate {
             addr: 0x404000,
-            target_type: "struct.Foo*".to_string(),
+            target_type: CTypeLike::Pointer(Box::new(CTypeLike::Struct("Foo".to_string()))),
             confidence: 95,
             source: WritebackSource::ExternalTypeDb,
         });
@@ -13104,7 +13671,7 @@ mod tests {
             name: "var_ch".to_string(),
             kind: "b".to_string(),
             delta: -12,
-            var_type: "int32_t".to_string(),
+            var_type: parse_test_type("int32_t", 64),
             isarg: false,
             reg: None,
             size: 4,
@@ -13116,7 +13683,7 @@ mod tests {
             name: "var_10h".to_string(),
             kind: "b".to_string(),
             delta: -16,
-            var_type: "struct type_0x123 *".to_string(),
+            var_type: parse_test_type("struct type_0x123 *", 64),
             isarg: false,
             reg: None,
             size: 8,
@@ -13486,13 +14053,13 @@ mod tests {
         plan.global_type_links = vec![
             GlobalTypeLinkCandidate {
                 addr: 0x404000,
-                target_type: "struct a *".to_string(),
+                target_type: CTypeLike::Pointer(Box::new(CTypeLike::Struct("a".to_string()))),
                 confidence: 90,
                 source: WritebackSource::ExternalTypeDb,
             },
             GlobalTypeLinkCandidate {
                 addr: 0x404008,
-                target_type: "struct b *".to_string(),
+                target_type: CTypeLike::Pointer(Box::new(CTypeLike::Struct("b".to_string()))),
                 confidence: 90,
                 source: WritebackSource::ExternalTypeDb,
             },
@@ -13529,13 +14096,13 @@ mod tests {
         plan.global_type_links = vec![
             GlobalTypeLinkCandidate {
                 addr: 0x404000,
-                target_type: "struct a *".to_string(),
+                target_type: CTypeLike::Pointer(Box::new(CTypeLike::Struct("a".to_string()))),
                 confidence: 90,
                 source: WritebackSource::ExternalTypeDb,
             },
             GlobalTypeLinkCandidate {
                 addr: 0x404008,
-                target_type: "struct b *".to_string(),
+                target_type: CTypeLike::Pointer(Box::new(CTypeLike::Struct("b".to_string()))),
                 confidence: 90,
                 source: WritebackSource::ExternalTypeDb,
             },
@@ -13646,7 +14213,7 @@ mod tests {
             name: "var_8h".to_string(),
             kind: "b".to_string(),
             delta: -8,
-            var_type: "int32_t".to_string(),
+            var_type: parse_test_type("int32_t", 64),
             isarg: false,
             reg: None,
             size: 4,
@@ -13732,7 +14299,7 @@ mod tests {
             name: "var_8h".to_string(),
             kind: "b".to_string(),
             delta: -8,
-            var_type: "int32_t".to_string(),
+            var_type: parse_test_type("int32_t", 64),
             isarg: false,
             reg: None,
             size: 4,
@@ -13797,13 +14364,13 @@ mod tests {
                 StructFieldCandidate {
                     name: "f_8".to_string(),
                     offset: 8,
-                    field_type: "int32_t".to_string(),
+                    field_type: parse_test_type("int32_t", 64),
                     confidence: 95,
                 },
                 StructFieldCandidate {
                     name: "f_34".to_string(),
                     offset: 0x34,
-                    field_type: "int32_t".to_string(),
+                    field_type: parse_test_type("int32_t", 64),
                     confidence: 95,
                 },
             ],
@@ -13823,8 +14390,6 @@ mod tests {
             role_identity: None,
             closure_functions: 1,
             helper_functions: 0,
-            derived_summaries: 0,
-            derived_diagnostics: Default::default(),
             region_summaries: Vec::new(),
             worker_summaries: Vec::new(),
         }
@@ -14677,6 +15242,7 @@ mod tests {
             &mut inferred_signature,
             64,
             Some(&SemanticTypeProjection::default()),
+            &x86_64_register_identity(),
         );
 
         assert_eq!(usage.applied.len(), 1);
@@ -14732,6 +15298,7 @@ mod tests {
             &mut inferred_signature,
             64,
             Some(&SemanticTypeProjection::default()),
+            &x86_64_register_identity(),
         );
 
         assert!(usage.applied.is_empty());
@@ -14784,6 +15351,7 @@ mod tests {
             &mut inferred_signature,
             64,
             Some(&SemanticTypeProjection::default()),
+            &x86_64_register_identity(),
         );
 
         assert_eq!(usage.applied.len(), 1);
@@ -14849,6 +15417,7 @@ mod tests {
             &mut inferred_signature,
             64,
             Some(&SemanticTypeProjection::default()),
+            &x86_64_register_identity(),
         );
 
         assert_eq!(usage.applied.len(), 1);
@@ -14940,6 +15509,7 @@ mod tests {
             &mut inferred_signature,
             64,
             Some(&projection),
+            &x86_64_register_identity(),
         );
 
         assert_eq!(usage.applied.len(), 1);
@@ -15183,7 +15753,10 @@ mod tests {
         });
 
         assert_eq!(analysis.signature.params[0].param_type, "int32_t");
-        assert_eq!(analysis.plan.var_type_candidates[0].var_type, "int32_t");
+        assert_eq!(
+            analysis.plan.var_type_candidates[0].var_type,
+            parse_test_type("int32_t", 64)
+        );
         let merged = analysis
             .type_facts
             .merged_signature
@@ -15598,15 +16171,11 @@ mod tests {
                 bits: 32,
                 signedness: Signedness::Signed,
             }),
-            base: ExternalStackBase::FramePointer,
             role: ExternalStackSlotRole::Local,
             param_index: None,
             param_name: None,
             source_reg: None,
         };
-        parsed_context
-            .external_stack_vars
-            .insert(-0x10, spec.clone());
         parsed_context.stack_slots.insert(
             StackSlotKey {
                 base: ExternalStackBase::FramePointer,
@@ -15642,7 +16211,10 @@ mod tests {
             interproc_summary_set: None,
             diagnostics: TypeWritebackDiagnostics::default(),
         });
-        assert_eq!(analysis.plan.var_type_candidates[0].var_type, "int32_t");
+        assert_eq!(
+            analysis.plan.var_type_candidates[0].var_type,
+            parse_test_type("int32_t", 64)
+        );
         assert_eq!(analysis.plan.var_rename_candidates[0].target_name, "count");
         assert!(
             analysis
@@ -15681,7 +16253,6 @@ mod tests {
         let spec = ExternalStackVarSpec {
             name: "buf".to_string(),
             ty: Some(CTypeLike::Pointer(Box::new(CTypeLike::Void))),
-            base: ExternalStackBase::FramePointer,
             role: ExternalStackSlotRole::Local,
             param_index: None,
             param_name: None,
@@ -15756,15 +16327,11 @@ mod tests {
         let spec = ExternalStackVarSpec {
             name: "arr_home".to_string(),
             ty: Some(CTypeLike::Pointer(Box::new(CTypeLike::Void))),
-            base: ExternalStackBase::FramePointer,
             role: ExternalStackSlotRole::ParamHome,
             param_index: Some(0),
             param_name: Some("arr".to_string()),
             source_reg: Some("rdi".to_string()),
         };
-        parsed_context
-            .external_stack_vars
-            .insert(0x10, spec.clone());
         parsed_context.stack_slots.insert(
             StackSlotKey {
                 base: ExternalStackBase::FramePointer,
@@ -15837,7 +16404,6 @@ mod tests {
             ExternalStackVarSpec {
                 name: "var_8h".to_string(),
                 ty: Some(CTypeLike::Pointer(Box::new(CTypeLike::Void))),
-                base: ExternalStackBase::StackPointer,
                 role: ExternalStackSlotRole::Unknown,
                 param_index: None,
                 param_name: None,
@@ -15852,7 +16418,6 @@ mod tests {
             ExternalStackVarSpec {
                 name: "arr".to_string(),
                 ty: Some(CTypeLike::Pointer(Box::new(CTypeLike::Void))),
-                base: ExternalStackBase::FramePointer,
                 role: ExternalStackSlotRole::ParamHome,
                 param_index: Some(0),
                 param_name: Some("arr".to_string()),
@@ -15948,7 +16513,7 @@ mod tests {
     }
 
     #[test]
-    fn generic_unknown_param_home_slots_are_canonicalized_from_entry_stores() {
+    fn prepared_entry_store_roots_classify_unknown_param_homes() {
         let mut parsed_context = ParsedExternalContext {
             merged_signature: Some(FunctionSignatureSpec {
                 ret_type: Some(CTypeLike::Int {
@@ -16010,7 +16575,6 @@ mod tests {
                 ExternalStackVarSpec {
                     name: name.to_string(),
                     ty: None,
-                    base: ExternalStackBase::FramePointer,
                     role: ExternalStackSlotRole::Unknown,
                     param_index: None,
                     param_name: None,
@@ -16026,7 +16590,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("tmp:slot", 1, 8),
                     a: SSAVar::new("RBP", 1, 8),
-                    b: SSAVar::new("const:fffffffffffffff8", 0, 8),
+                    b: SSAVar::constant(0xffff_ffff_ffff_fff8, 8),
                 },
                 SSAOp::Store {
                     space: r2il::SpaceId::Ram,
@@ -16036,7 +16600,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("tmp:slot", 2, 8),
                     a: SSAVar::new("RBP", 1, 8),
-                    b: SSAVar::new("const:fffffffffffffff4", 0, 8),
+                    b: SSAVar::constant(0xffff_ffff_ffff_fff4, 8),
                 },
                 SSAOp::Store {
                     space: r2il::SpaceId::Ram,
@@ -16046,7 +16610,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("tmp:slot", 3, 8),
                     a: SSAVar::new("RBP", 1, 8),
-                    b: SSAVar::new("const:fffffffffffffff0", 0, 8),
+                    b: SSAVar::constant(0xffff_ffff_ffff_fff0, 8),
                 },
                 SSAOp::Store {
                     space: r2il::SpaceId::Ram,
@@ -16056,41 +16620,45 @@ mod tests {
             ],
         }];
 
-        let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
-            function_name: "sym.test_struct_array_index",
-            ptr_bits: 64,
-            inferred_signature: InferredSignature {
-                function_name: "sym.test_struct_array_index".to_string(),
-                signature:
-                    "int32_t sym.test_struct_array_index(void * arr, int32_t idx, int32_t v)"
-                        .to_string(),
-                ret_type: "int32_t".to_string(),
-                params: vec![
-                    InferredSignatureParam {
-                        name: "arr".to_string(),
-                        param_type: "void *".to_string(),
-                    },
-                    InferredSignatureParam {
-                        name: "idx".to_string(),
-                        param_type: "int32_t".to_string(),
-                    },
-                    InferredSignatureParam {
-                        name: "v".to_string(),
-                        param_type: "int32_t".to_string(),
-                    },
-                ],
-                callconv: "amd64".to_string(),
-                arch: "x86-64".to_string(),
-                confidence: 90,
-                callconv_confidence: 90,
+        let prep_facts = three_prepared_frame_slot_roots();
+        let analysis = build_type_writeback_analysis_with_prep_facts(
+            TypeWritebackAnalysisInput {
+                function_name: "sym.test_struct_array_index",
+                ptr_bits: 64,
+                inferred_signature: InferredSignature {
+                    function_name: "sym.test_struct_array_index".to_string(),
+                    signature:
+                        "int32_t sym.test_struct_array_index(void * arr, int32_t idx, int32_t v)"
+                            .to_string(),
+                    ret_type: "int32_t".to_string(),
+                    params: vec![
+                        InferredSignatureParam {
+                            name: "arr".to_string(),
+                            param_type: "void *".to_string(),
+                        },
+                        InferredSignatureParam {
+                            name: "idx".to_string(),
+                            param_type: "int32_t".to_string(),
+                        },
+                        InferredSignatureParam {
+                            name: "v".to_string(),
+                            param_type: "int32_t".to_string(),
+                        },
+                    ],
+                    callconv: "amd64".to_string(),
+                    arch: "x86-64".to_string(),
+                    confidence: 90,
+                    callconv_confidence: 90,
+                },
+                recovered_vars: &[],
+                ssa_blocks: &ssa_blocks,
+                parsed_context,
+                local_structs: LocalStructArtifacts::default(),
+                interproc_summary_set: None,
+                diagnostics: TypeWritebackDiagnostics::default(),
             },
-            recovered_vars: &[],
-            ssa_blocks: &ssa_blocks,
-            parsed_context,
-            local_structs: LocalStructArtifacts::default(),
-            interproc_summary_set: None,
-            diagnostics: TypeWritebackDiagnostics::default(),
-        });
+            &prep_facts,
+        );
 
         for (offset, expected_name, expected_idx) in
             [(-8, "arr", 0usize), (-12, "idx", 1), (-16, "v", 2)]
@@ -16110,7 +16678,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_register_param_homes_are_completed_from_abi_signature() {
+    fn prepared_roots_complete_partial_register_param_homes() {
         let mut parsed_context = ParsedExternalContext {
             register_params: vec![ExternalRegisterParamSpec {
                 name: "arg0".to_string(),
@@ -16151,7 +16719,6 @@ mod tests {
                 ExternalStackVarSpec {
                     name: name.to_string(),
                     ty: Some(ty),
-                    base: ExternalStackBase::FramePointer,
                     role: ExternalStackSlotRole::Local,
                     param_index: None,
                     param_name: None,
@@ -16167,7 +16734,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("tmp:slot", 1, 8),
                     a: SSAVar::new("RBP", 1, 8),
-                    b: SSAVar::new("const:fffffffffffffff8", 0, 8),
+                    b: SSAVar::constant(0xffff_ffff_ffff_fff8, 8),
                 },
                 SSAOp::Store {
                     space: r2il::SpaceId::Ram,
@@ -16177,7 +16744,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("tmp:slot", 2, 8),
                     a: SSAVar::new("RBP", 1, 8),
-                    b: SSAVar::new("const:fffffffffffffff4", 0, 8),
+                    b: SSAVar::constant(0xffff_ffff_ffff_fff4, 8),
                 },
                 SSAOp::Store {
                     space: r2il::SpaceId::Ram,
@@ -16187,7 +16754,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("tmp:slot", 3, 8),
                     a: SSAVar::new("RBP", 1, 8),
-                    b: SSAVar::new("const:fffffffffffffff0", 0, 8),
+                    b: SSAVar::constant(0xffff_ffff_ffff_fff0, 8),
                 },
                 SSAOp::Store {
                     space: r2il::SpaceId::Ram,
@@ -16223,7 +16790,8 @@ mod tests {
             },
         ];
 
-        let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
+        let prep_facts = three_prepared_frame_slot_roots();
+        let analysis = build_type_writeback_analysis_with_prep_facts(TypeWritebackAnalysisInput {
             function_name: "sym.test_struct_array_index",
             ptr_bits: 64,
             inferred_signature: InferredSignature {
@@ -16257,7 +16825,7 @@ mod tests {
             local_structs: LocalStructArtifacts::default(),
             interproc_summary_set: None,
             diagnostics: TypeWritebackDiagnostics::default(),
-        });
+        }, &prep_facts);
 
         for (offset, expected_name, expected_idx) in
             [(-8, "arr", 0usize), (-12, "idx", 1), (-16, "v", 2)]
@@ -16287,7 +16855,7 @@ mod tests {
     }
 
     #[test]
-    fn generic_unknown_param_home_slots_are_canonicalized_from_entry_store_copies() {
+    fn prepared_entry_store_copy_roots_classify_unknown_param_homes() {
         let mut parsed_context = ParsedExternalContext {
             merged_signature: Some(FunctionSignatureSpec {
                 ret_type: Some(CTypeLike::Int {
@@ -16349,7 +16917,6 @@ mod tests {
                 ExternalStackVarSpec {
                     name: name.to_string(),
                     ty: None,
-                    base: ExternalStackBase::FramePointer,
                     role: ExternalStackSlotRole::Unknown,
                     param_index: None,
                     param_name: None,
@@ -16365,7 +16932,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("tmp:slot", 1, 8),
                     a: SSAVar::new("RBP", 1, 8),
-                    b: SSAVar::new("const:fffffffffffffff8", 0, 8),
+                    b: SSAVar::constant(0xffff_ffff_ffff_fff8, 8),
                 },
                 SSAOp::Copy {
                     dst: SSAVar::new("tmp:spill_arr", 1, 8),
@@ -16379,7 +16946,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("tmp:slot", 2, 8),
                     a: SSAVar::new("RBP", 1, 8),
-                    b: SSAVar::new("const:fffffffffffffff4", 0, 8),
+                    b: SSAVar::constant(0xffff_ffff_ffff_fff4, 8),
                 },
                 SSAOp::Copy {
                     dst: SSAVar::new("tmp:spill_idx", 1, 4),
@@ -16393,7 +16960,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("tmp:slot", 3, 8),
                     a: SSAVar::new("RBP", 1, 8),
-                    b: SSAVar::new("const:fffffffffffffff0", 0, 8),
+                    b: SSAVar::constant(0xffff_ffff_ffff_fff0, 8),
                 },
                 SSAOp::Copy {
                     dst: SSAVar::new("tmp:spill_v", 1, 4),
@@ -16407,41 +16974,45 @@ mod tests {
             ],
         }];
 
-        let analysis = build_type_writeback_analysis(TypeWritebackAnalysisInput {
-            function_name: "sym.test_struct_array_index",
-            ptr_bits: 64,
-            inferred_signature: InferredSignature {
-                function_name: "sym.test_struct_array_index".to_string(),
-                signature:
-                    "int32_t sym.test_struct_array_index(void * arr, int32_t idx, int32_t v)"
-                        .to_string(),
-                ret_type: "int32_t".to_string(),
-                params: vec![
-                    InferredSignatureParam {
-                        name: "arr".to_string(),
-                        param_type: "void *".to_string(),
-                    },
-                    InferredSignatureParam {
-                        name: "idx".to_string(),
-                        param_type: "int32_t".to_string(),
-                    },
-                    InferredSignatureParam {
-                        name: "v".to_string(),
-                        param_type: "int32_t".to_string(),
-                    },
-                ],
-                callconv: "amd64".to_string(),
-                arch: "x86-64".to_string(),
-                confidence: 90,
-                callconv_confidence: 90,
+        let prep_facts = three_prepared_frame_slot_roots();
+        let analysis = build_type_writeback_analysis_with_prep_facts(
+            TypeWritebackAnalysisInput {
+                function_name: "sym.test_struct_array_index",
+                ptr_bits: 64,
+                inferred_signature: InferredSignature {
+                    function_name: "sym.test_struct_array_index".to_string(),
+                    signature:
+                        "int32_t sym.test_struct_array_index(void * arr, int32_t idx, int32_t v)"
+                            .to_string(),
+                    ret_type: "int32_t".to_string(),
+                    params: vec![
+                        InferredSignatureParam {
+                            name: "arr".to_string(),
+                            param_type: "void *".to_string(),
+                        },
+                        InferredSignatureParam {
+                            name: "idx".to_string(),
+                            param_type: "int32_t".to_string(),
+                        },
+                        InferredSignatureParam {
+                            name: "v".to_string(),
+                            param_type: "int32_t".to_string(),
+                        },
+                    ],
+                    callconv: "amd64".to_string(),
+                    arch: "x86-64".to_string(),
+                    confidence: 90,
+                    callconv_confidence: 90,
+                },
+                recovered_vars: &[],
+                ssa_blocks: &ssa_blocks,
+                parsed_context,
+                local_structs: LocalStructArtifacts::default(),
+                interproc_summary_set: None,
+                diagnostics: TypeWritebackDiagnostics::default(),
             },
-            recovered_vars: &[],
-            ssa_blocks: &ssa_blocks,
-            parsed_context,
-            local_structs: LocalStructArtifacts::default(),
-            interproc_summary_set: None,
-            diagnostics: TypeWritebackDiagnostics::default(),
-        });
+            &prep_facts,
+        );
 
         for (offset, expected_name, expected_idx) in
             [(-8, "arr", 0usize), (-12, "idx", 1), (-16, "v", 2)]
@@ -16469,13 +17040,11 @@ mod tests {
                 bits: 64,
                 signedness: Signedness::Unsigned,
             }),
-            base: ExternalStackBase::FramePointer,
             role: ExternalStackSlotRole::Local,
             param_index: None,
             param_name: None,
             source_reg: None,
         };
-        parsed_context.external_stack_vars.insert(-8, spec.clone());
         parsed_context.stack_slots.insert(
             StackSlotKey {
                 base: ExternalStackBase::FramePointer,
@@ -16514,7 +17083,10 @@ mod tests {
         });
 
         assert_eq!(analysis.plan.var_type_candidates.len(), 1);
-        assert_eq!(analysis.plan.var_type_candidates[0].var_type, "void *");
+        assert_eq!(
+            analysis.plan.var_type_candidates[0].var_type,
+            parse_test_type("void *", 64)
+        );
         assert_eq!(
             analysis.plan.var_type_candidates[0].source,
             WritebackSource::LocalInferred
@@ -16527,7 +17099,7 @@ mod tests {
     }
 
     #[test]
-    fn writeback_does_not_use_offset_only_legacy_slots_when_canonical_slots_exist() {
+    fn writeback_does_not_apply_structural_slots_to_unrooted_variables() {
         let mut parsed_context = ParsedExternalContext::default();
         let spec = ExternalStackVarSpec {
             name: "len".to_string(),
@@ -16535,13 +17107,11 @@ mod tests {
                 bits: 64,
                 signedness: Signedness::Unsigned,
             }),
-            base: ExternalStackBase::FramePointer,
             role: ExternalStackSlotRole::Local,
             param_index: None,
             param_name: None,
             source_reg: None,
         };
-        parsed_context.external_stack_vars.insert(-8, spec.clone());
         parsed_context.stack_slots.insert(
             StackSlotKey {
                 base: ExternalStackBase::FramePointer,
@@ -16580,35 +17150,23 @@ mod tests {
         });
 
         assert_eq!(analysis.plan.var_type_candidates.len(), 1);
-        assert_eq!(analysis.plan.var_type_candidates[0].var_type, "void *");
+        assert_eq!(
+            analysis.plan.var_type_candidates[0].var_type,
+            parse_test_type("void *", 64)
+        );
         assert_eq!(
             analysis.plan.var_type_candidates[0].source,
             WritebackSource::LocalInferred
         );
         assert!(
             analysis.plan.var_rename_candidates.is_empty(),
-            "unknown-base recovered vars must not inherit names from offset-only legacy slots when canonical slots exist: {:?}",
+            "unrooted recovered vars must not inherit names from structural slots: {:?}",
             analysis.plan.var_rename_candidates
         );
     }
 
     #[test]
-    fn writeback_canonicalizes_legacy_only_stack_var_input() {
-        let mut parsed_context = ParsedExternalContext::default();
-        let spec = ExternalStackVarSpec {
-            name: "count".to_string(),
-            ty: Some(CTypeLike::Int {
-                bits: 32,
-                signedness: Signedness::Signed,
-            }),
-            base: ExternalStackBase::FramePointer,
-            role: ExternalStackSlotRole::Local,
-            param_index: None,
-            param_name: None,
-            source_reg: None,
-        };
-        parsed_context.external_stack_vars.insert(-0x10, spec);
-
+    fn writeback_refuses_external_stack_identity_without_a_structural_root() {
         let vars = [RecoveredVariable {
             name: "var_10h".to_string(),
             kind: "b".to_string(),
@@ -16632,21 +17190,17 @@ mod tests {
             },
             recovered_vars: &vars,
             ssa_blocks: &[],
-            parsed_context,
+            parsed_context: ParsedExternalContext::default(),
             local_structs: LocalStructArtifacts::default(),
             interproc_summary_set: None,
             diagnostics: TypeWritebackDiagnostics::default(),
         });
 
-        assert_eq!(analysis.plan.var_type_candidates[0].var_type, "int32_t");
-        assert_eq!(analysis.plan.var_rename_candidates[0].target_name, "count");
-        assert!(
-            analysis.type_facts.stack_slots.contains_key(&StackSlotKey {
-                base: ExternalStackBase::FramePointer,
-                offset: -0x10,
-            }),
-            "legacy-only input should be canonicalized into stack_slots: {:?}",
-            analysis.type_facts.stack_slots
+        assert!(analysis.type_facts.stack_slots.is_empty());
+        assert!(analysis.plan.var_rename_candidates.is_empty());
+        assert_eq!(
+            analysis.plan.var_type_candidates[0].source,
+            WritebackSource::LocalInferred
         );
     }
 
@@ -16687,13 +17241,13 @@ mod tests {
                     StructFieldCandidate {
                         name: "f_0".to_string(),
                         offset: 0,
-                        field_type: "int32_t".to_string(),
+                        field_type: parse_test_type("int32_t", 64),
                         confidence: 90,
                     },
                     StructFieldCandidate {
                         name: "f_8".to_string(),
                         offset: 8,
-                        field_type: "struct node *".to_string(),
+                        field_type: parse_test_type("struct node *", 64),
                         confidence: 90,
                     },
                 ],
@@ -16807,13 +17361,13 @@ mod tests {
                     StructFieldCandidate {
                         name: "f_8".to_string(),
                         offset: 8,
-                        field_type: "int32_t".to_string(),
+                        field_type: parse_test_type("int32_t", 64),
                         confidence: 95,
                     },
                     StructFieldCandidate {
                         name: "f_34".to_string(),
                         offset: 0x34,
-                        field_type: "int32_t".to_string(),
+                        field_type: parse_test_type("int32_t", 64),
                         confidence: 95,
                     },
                 ],
@@ -16839,7 +17393,7 @@ mod tests {
                 SSAOp::IntMult {
                     dst: SSAVar::new("scaled", 1, 8),
                     a: SSAVar::new("RSI", 0, 8),
-                    b: SSAVar::new("const:38", 0, 8),
+                    b: SSAVar::constant(0x38, 8),
                 },
                 SSAOp::IntAdd {
                     dst: SSAVar::new("elem", 1, 8),
@@ -16849,7 +17403,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("field", 1, 8),
                     a: SSAVar::new("elem", 1, 8),
-                    b: SSAVar::new("const:8", 0, 8),
+                    b: SSAVar::constant(8, 8),
                 },
                 SSAOp::Load {
                     dst: SSAVar::new("value", 1, 4),
@@ -16963,13 +17517,13 @@ mod tests {
                     StructFieldCandidate {
                         name: "f_8".to_string(),
                         offset: 8,
-                        field_type: "int32_t".to_string(),
+                        field_type: parse_test_type("int32_t", 64),
                         confidence: 95,
                     },
                     StructFieldCandidate {
                         name: "f_34".to_string(),
                         offset: 0x34,
-                        field_type: "int32_t".to_string(),
+                        field_type: parse_test_type("int32_t", 64),
                         confidence: 95,
                     },
                 ],
@@ -17107,13 +17661,13 @@ mod tests {
                     StructFieldCandidate {
                         name: "f_0".to_string(),
                         offset: 0,
-                        field_type: "int32_t".to_string(),
+                        field_type: parse_test_type("int32_t", 64),
                         confidence: 95,
                     },
                     StructFieldCandidate {
                         name: "f_c".to_string(),
                         offset: 12,
-                        field_type: "int32_t".to_string(),
+                        field_type: parse_test_type("int32_t", 64),
                         confidence: 95,
                     },
                 ],
@@ -17276,13 +17830,13 @@ mod tests {
                     StructFieldCandidate {
                         name: "f_8".to_string(),
                         offset: 8,
-                        field_type: "int32_t".to_string(),
+                        field_type: parse_test_type("int32_t", 64),
                         confidence: 95,
                     },
                     StructFieldCandidate {
                         name: "f_34".to_string(),
                         offset: 52,
-                        field_type: "int32_t".to_string(),
+                        field_type: parse_test_type("int32_t", 64),
                         confidence: 95,
                     },
                 ],
@@ -17466,14 +18020,15 @@ mod tests {
             &mut signature,
             64,
             Some(&SemanticTypeProjection::default()),
+            &x86_64_register_identity(),
         );
 
         assert_eq!(usage.applied.len(), 1);
         assert_eq!(signature.params[0].param_type, "int32_t");
-        assert!(register_family_matches(
-            &context.register_params[0].reg,
-            "rdi"
-        ));
+        assert!(
+            x86_64_register_identity()
+                .same_parameter_storage(&context.register_params[0].reg, "rdi")
+        );
     }
 
     #[test]
@@ -17481,7 +18036,7 @@ mod tests {
         let stack_assumption = r2ssa::AnalysisAssumption {
             id: None,
             subject: r2ssa::AssumptionSubject::StackSlot {
-                base: "sp".to_string(),
+                base: r2ssa::StackAddressBase::StackPointer,
                 offset: -8,
             },
             value: r2ssa::AssumptionValue::TypeHint {
@@ -17496,7 +18051,10 @@ mod tests {
         };
         let context = ParsedExternalContext::default();
 
-        assert!(applied_type_assumption_parameter_slots(&usage, &context).is_empty());
+        assert!(
+            applied_type_assumption_parameter_slots(&usage, &context, &x86_64_register_identity())
+                .is_empty()
+        );
 
         usage.applied.push(r2ssa::AnalysisAssumption {
             id: None,
@@ -17508,7 +18066,7 @@ mod tests {
             provenance: r2ssa::AssumptionProvenance::ImportedContext,
         });
         assert_eq!(
-            applied_type_assumption_parameter_slots(&usage, &context),
+            applied_type_assumption_parameter_slots(&usage, &context, &x86_64_register_identity()),
             HashSet::from([1])
         );
     }
@@ -18260,7 +18818,13 @@ mod tests {
             signature_projection_for_semantic_artifact(&artifact, signature.params.len())
                 .expect("certified structural role projection");
         assert!(
-            apply_signature_projection_to_inferred(&mut signature, projection, 64).was_applied()
+            apply_signature_projection_to_inferred(
+                &mut signature,
+                projection,
+                64,
+                &ExternalTypeDb::default()
+            )
+            .was_applied()
         );
         assert_eq!(signature.params[0].name, "string");
         assert_eq!(signature.params[1].name, "len");
@@ -18821,147 +19385,6 @@ mod tests {
             })
         );
     }
-
-    #[test]
-    fn accepted_type_quality_roles_replace_generic_signatures_with_role_identity() {
-        fn assert_projection(
-            name: &str,
-            weak_param_count: usize,
-            expected_ret: &str,
-            expected_params: &[(&str, &str)],
-        ) {
-            let params = (0..weak_param_count)
-                .map(|idx| InferredSignatureParam {
-                    name: format!("arg{}", idx + 1),
-                    param_type: "int64_t".to_string(),
-                })
-                .collect::<Vec<_>>();
-            let artifact = test_artifact_with_role_identity(
-                name,
-                r2sym::NativeWorkerSummaryKind::ProgramOrchestrator,
-            );
-            let analysis = build_type_writeback_analysis_with_semantics(
-                TypeWritebackAnalysisInput {
-                    function_name: name,
-                    ptr_bits: 64,
-                    inferred_signature: InferredSignature {
-                        function_name: name.to_string(),
-                        signature: format!("int64_t {name}(...)"),
-                        ret_type: "int64_t".to_string(),
-                        params,
-                        callconv: "amd64".to_string(),
-                        arch: "x86-64".to_string(),
-                        confidence: 80,
-                        callconv_confidence: 80,
-                    },
-                    recovered_vars: &[],
-                    ssa_blocks: &[],
-                    parsed_context: ParsedExternalContext::default(),
-                    local_structs: LocalStructArtifacts::default(),
-                    interproc_summary_set: None,
-                    diagnostics: TypeWritebackDiagnostics::default(),
-                },
-                TypeWritebackSemanticInputs {
-                    artifact: &artifact,
-                    local_field_accesses: &[],
-                },
-            );
-
-            assert_eq!(analysis.signature.ret_type, expected_ret, "{name} return");
-            assert_eq!(
-                analysis.signature.params.len(),
-                expected_params.len(),
-                "{name} arity"
-            );
-            for (idx, (expected_name, expected_ty)) in expected_params.iter().enumerate() {
-                assert_eq!(
-                    analysis.signature.params[idx].name, *expected_name,
-                    "{name} param {idx} name"
-                );
-                assert_eq!(
-                    analysis.signature.params[idx].param_type, *expected_ty,
-                    "{name} param {idx} type"
-                );
-            }
-        }
-
-        assert_projection(
-            "dbg.xnumtoumax",
-            8,
-            "uintmax_t",
-            &[
-                ("n_str", "int8_t*"),
-                ("base", "int"),
-                ("min", "uintmax_t"),
-                ("max", "uintmax_t"),
-                ("suffixes", "int8_t*"),
-                ("err", "int8_t*"),
-                ("err_exit", "int"),
-                ("flags", "int"),
-            ],
-        );
-        assert_projection(
-            "sym.setlocale_null_r_unlocked",
-            4,
-            "int",
-            &[
-                ("category", "int"),
-                ("buf", "int8_t*"),
-                ("bufsize", "size_t"),
-            ],
-        );
-        assert_projection(
-            "dbg.areadlink_with_size",
-            3,
-            "int8_t*",
-            &[("filename", "int8_t*"), ("size_hint", "size_t")],
-        );
-        assert_projection("sym.hard_locale", 2, "bool", &[("category", "int")]);
-        assert_projection("sym.set_program_name", 2, "void", &[("argv0", "int8_t*")]);
-        assert_projection(
-            "sym.nstrftime",
-            7,
-            "ptrdiff_t",
-            &[
-                ("s", "int8_t*"),
-                ("maxsize", "size_t"),
-                ("format", "int8_t*"),
-                ("tp", "tm*"),
-                ("tz", "timezone_t"),
-                ("ns", "int"),
-            ],
-        );
-        assert_projection("dbg.hash_free", 2, "void", &[("table", "hash_table*")]);
-        assert_projection(
-            "dbg.num_processors",
-            2,
-            "unsigned long",
-            &[("query", "enum nproc_query")],
-        );
-        assert_projection(
-            "dbg.open_input_files",
-            4,
-            "size_t",
-            &[
-                ("files", "sortfile*"),
-                ("nfiles", "size_t"),
-                ("pfps", "FILE***"),
-            ],
-        );
-        assert_projection(
-            "dbg.physmem_claimable",
-            2,
-            "double",
-            &[("aggressivity", "double")],
-        );
-        assert_projection(
-            "dbg.randread_new",
-            3,
-            "randread_source*",
-            &[("name", "int8_t*"), ("bytes_bound", "size_t")],
-        );
-    }
-
     #[test]
     fn weak_summary_kind_projection_does_not_widen_authoritative_anonymous_signature() {
         let mut facts = FunctionTypeFacts {
@@ -19013,204 +19436,6 @@ mod tests {
             Some(2)
         );
     }
-
-    #[test]
-    fn exact_role_signature_replaces_weak_role_identity_signature_slots() {
-        let analysis = build_type_writeback_analysis_with_role_identity(
-            TypeWritebackAnalysisInput {
-                function_name: "sym.quotearg_buffer_restyled",
-                ptr_bits: 64,
-                inferred_signature: InferredSignature {
-                    function_name: "sym.quotearg_buffer_restyled".to_string(),
-                    signature: "void* sym.quotearg_buffer_restyled (int8_t* arg1, int64_t arg2, int8_t* arg3, uint64_t arg4)"
-                        .to_string(),
-                    ret_type: "void*".to_string(),
-                    params: vec![
-                        InferredSignatureParam {
-                            name: "arg1".to_string(),
-                            param_type: "int8_t*".to_string(),
-                        },
-                        InferredSignatureParam {
-                            name: "arg2".to_string(),
-                            param_type: "int64_t".to_string(),
-                        },
-                        InferredSignatureParam {
-                            name: "arg3".to_string(),
-                            param_type: "int8_t*".to_string(),
-                        },
-                        InferredSignatureParam {
-                            name: "arg4".to_string(),
-                            param_type: "uint64_t".to_string(),
-                        },
-                    ],
-                    callconv: "amd64".to_string(),
-                    arch: "x86-64".to_string(),
-                    confidence: 80,
-                    callconv_confidence: 80,
-                },
-                recovered_vars: &[],
-                ssa_blocks: &[],
-                parsed_context: ParsedExternalContext::default(),
-                local_structs: LocalStructArtifacts::default(),
-                interproc_summary_set: None,
-                diagnostics: TypeWritebackDiagnostics::default(),
-            },
-            "sym.quotearg_buffer_restyled",
-            r2sym::NativeWorkerSummaryKind::FormatRender,
-        );
-
-        assert_eq!(analysis.signature.ret_type, "size_t");
-        assert_eq!(analysis.signature.params.len(), 9);
-        assert_eq!(analysis.signature.params[0].name, "buffer");
-        assert_eq!(analysis.signature.params[1].param_type, "size_t");
-        assert_eq!(
-            analysis.signature.params[4].param_type,
-            "enum quoting_style"
-        );
-        assert_eq!(analysis.signature.params[6].param_type, "unsigned int*");
-    }
-
-    #[test]
-    fn exact_role_signature_replaces_single_letter_weak_slots() {
-        let analysis = build_type_writeback_analysis_with_role_identity(
-            TypeWritebackAnalysisInput {
-                function_name: "sym.streamsavedir",
-                ptr_bits: 64,
-                inferred_signature: InferredSignature {
-                    function_name: "sym.streamsavedir".to_string(),
-                    signature: "int32_t sym.streamsavedir (int32_t a, int32_t b)".to_string(),
-                    ret_type: "int32_t".to_string(),
-                    params: vec![
-                        InferredSignatureParam {
-                            name: "a".to_string(),
-                            param_type: "int32_t".to_string(),
-                        },
-                        InferredSignatureParam {
-                            name: "b".to_string(),
-                            param_type: "int32_t".to_string(),
-                        },
-                    ],
-                    callconv: "amd64".to_string(),
-                    arch: "x86-64".to_string(),
-                    confidence: 80,
-                    callconv_confidence: 80,
-                },
-                recovered_vars: &[],
-                ssa_blocks: &[],
-                parsed_context: ParsedExternalContext::default(),
-                local_structs: LocalStructArtifacts::default(),
-                interproc_summary_set: None,
-                diagnostics: TypeWritebackDiagnostics::default(),
-            },
-            "sym.streamsavedir",
-            r2sym::NativeWorkerSummaryKind::DirectoryTraversal,
-        );
-
-        assert_eq!(analysis.signature.ret_type, "int8_t*");
-        assert_eq!(analysis.signature.params[0].name, "dirp");
-        assert_eq!(analysis.signature.params[0].param_type, "DIR*");
-        assert_eq!(analysis.signature.params[1].name, "option");
-        assert_eq!(
-            analysis.signature.params[1].param_type,
-            "enum savedir_option"
-        );
-    }
-
-    #[test]
-    fn exact_role_signature_truncates_weak_surplus_slots() {
-        let analysis = build_type_writeback_analysis_with_role_identity(
-            TypeWritebackAnalysisInput {
-                function_name: "sym.rpl_fts_read",
-                ptr_bits: 64,
-                inferred_signature: InferredSignature {
-                    function_name: "sym.rpl_fts_read".to_string(),
-                    signature: "FTSENT* sym.rpl_fts_read (void* sp, int64_t arg2)".to_string(),
-                    ret_type: "FTSENT*".to_string(),
-                    params: vec![
-                        InferredSignatureParam {
-                            name: "sp".to_string(),
-                            param_type: "void*".to_string(),
-                        },
-                        InferredSignatureParam {
-                            name: "arg2".to_string(),
-                            param_type: "int64_t".to_string(),
-                        },
-                    ],
-                    callconv: "amd64".to_string(),
-                    arch: "x86-64".to_string(),
-                    confidence: 80,
-                    callconv_confidence: 80,
-                },
-                recovered_vars: &[],
-                ssa_blocks: &[],
-                parsed_context: ParsedExternalContext::default(),
-                local_structs: LocalStructArtifacts::default(),
-                interproc_summary_set: None,
-                diagnostics: TypeWritebackDiagnostics::default(),
-            },
-            "sym.rpl_fts_read",
-            r2sym::NativeWorkerSummaryKind::DirectoryTraversal,
-        );
-
-        assert_eq!(analysis.signature.params.len(), 1);
-        assert_eq!(analysis.signature.params[0].name, "sp");
-        assert_eq!(analysis.signature.params[0].param_type, "FTS*");
-    }
-
-    #[test]
-    fn mbrtoc32_role_signature_refines_parser_projection_slots() {
-        let analysis = build_type_writeback_analysis_with_role_identity(
-            TypeWritebackAnalysisInput {
-                function_name: "sym.rpl_mbrtoc32",
-                ptr_bits: 64,
-                inferred_signature: InferredSignature {
-                    function_name: "sym.rpl_mbrtoc32".to_string(),
-                    signature: "void* sym.rpl_mbrtoc32 (uint8_t* output, uint8_t* stream, uint64_t arg3, int64_t arg4)"
-                        .to_string(),
-                    ret_type: "void*".to_string(),
-                    params: vec![
-                        InferredSignatureParam {
-                            name: "output".to_string(),
-                            param_type: "uint8_t*".to_string(),
-                        },
-                        InferredSignatureParam {
-                            name: "stream".to_string(),
-                            param_type: "uint8_t*".to_string(),
-                        },
-                        InferredSignatureParam {
-                            name: "arg3".to_string(),
-                            param_type: "uint64_t".to_string(),
-                        },
-                        InferredSignatureParam {
-                            name: "arg4".to_string(),
-                            param_type: "int64_t".to_string(),
-                        },
-                    ],
-                    callconv: "amd64".to_string(),
-                    arch: "x86-64".to_string(),
-                    confidence: 80,
-                    callconv_confidence: 80,
-                },
-                recovered_vars: &[],
-                ssa_blocks: &[],
-                parsed_context: ParsedExternalContext::default(),
-                local_structs: LocalStructArtifacts::default(),
-                interproc_summary_set: None,
-                diagnostics: TypeWritebackDiagnostics::default(),
-            },
-            "sym.rpl_mbrtoc32",
-            r2sym::NativeWorkerSummaryKind::Parser,
-        );
-
-        assert_eq!(analysis.signature.ret_type, "size_t");
-        assert_eq!(analysis.signature.params[0].name, "pwc");
-        assert_eq!(analysis.signature.params[0].param_type, "char32_t*");
-        assert_eq!(analysis.signature.params[1].name, "s");
-        assert_eq!(analysis.signature.params[1].param_type, "int8_t*");
-        assert_eq!(analysis.signature.params[2].param_type, "size_t");
-        assert_eq!(analysis.signature.params[3].param_type, "mbstate_t*");
-    }
-
     #[test]
     fn explicit_role_type_hint_blocks_generic_pointer_upgrade() {
         let mut projection = SemanticTypeProjection::default();
@@ -19238,6 +19463,7 @@ mod tests {
             &mut merged,
             &mut signature,
             64,
+            &ExternalTypeDb::default(),
         );
 
         assert_eq!(signature.params[0].param_type, "int");
@@ -19260,7 +19486,13 @@ mod tests {
                 ..Default::default()
             },
         );
-        maybe_upgrade_param_to_pointer(&summary, &mut merged, &mut signature, 64);
+        maybe_upgrade_param_to_pointer(
+            &summary,
+            &mut merged,
+            &mut signature,
+            64,
+            &ExternalTypeDb::default(),
+        );
 
         assert_eq!(signature.params[0].param_type, "int");
     }
@@ -19269,13 +19501,12 @@ mod tests {
     fn printf_fetchargs_role_signature_hint_replaces_generic_dense_switch_signature() {
         let analysis = build_type_writeback_analysis_with_role_identity(
             TypeWritebackAnalysisInput {
-                function_name: "sym.printf_fetchargs",
+                function_name: "sym.read_records",
                 ptr_bits: 64,
                 inferred_signature: InferredSignature {
-                    function_name: "sym.printf_fetchargs".to_string(),
-                    signature:
-                        "void sym.printf_fetchargs (int64_t arg1, int64_t arg2, int64_t arg3)"
-                            .to_string(),
+                    function_name: "sym.read_records".to_string(),
+                    signature: "void sym.read_records (int64_t arg1, int64_t arg2, int64_t arg3)"
+                        .to_string(),
                     ret_type: "void".to_string(),
                     params: vec![
                         InferredSignatureParam {
@@ -19307,12 +19538,12 @@ mod tests {
             r2sym::NativeWorkerSummaryKind::FormatArgumentFetch,
         );
 
-        assert_eq!(analysis.signature.ret_type, "printf_status_t");
+        assert_eq!(analysis.signature.ret_type, "int");
         assert_eq!(analysis.signature.params.len(), 2);
         assert_eq!(analysis.signature.params[0].name, "args");
         assert_eq!(analysis.signature.params[0].param_type, "__va_list_tag*");
         assert_eq!(analysis.signature.params[1].name, "arguments_out");
-        assert_eq!(analysis.signature.params[1].param_type, "arguments*");
+        assert_eq!(analysis.signature.params[1].param_type, "void*");
     }
 
     #[test]
@@ -19327,23 +19558,23 @@ mod tests {
                     StructFieldCandidate {
                         name: "f_0".to_string(),
                         offset: 0,
-                        field_type: "int32_t".to_string(),
+                        field_type: parse_test_type("int32_t", 64),
                         confidence: 95,
                     },
                     StructFieldCandidate {
                         name: "f_8".to_string(),
                         offset: 8,
-                        field_type: "int32_t".to_string(),
+                        field_type: parse_test_type("int32_t", 64),
                         confidence: 95,
                     },
                 ],
             }],
             slot_type_overrides: HashMap::from([(
-                1usize,
+                0usize,
                 "struct sla_struct_deadbeef *".to_string(),
             )]),
             slot_field_profiles: HashMap::from([(
-                1usize,
+                0usize,
                 BTreeMap::from([(0u64, "int32_t".to_string()), (8u64, "int32_t".to_string())]),
             )]),
             slot_element_strides: HashMap::new(),
@@ -19352,13 +19583,12 @@ mod tests {
 
         let analysis = build_type_writeback_analysis_with_role_identity(
             TypeWritebackAnalysisInput {
-                function_name: "sym.printf_fetchargs",
+                function_name: "sym.read_records",
                 ptr_bits: 64,
                 inferred_signature: InferredSignature {
-                    function_name: "sym.printf_fetchargs".to_string(),
-                    signature:
-                        "void sym.printf_fetchargs (int64_t arg1, int64_t arg2, int64_t arg3)"
-                            .to_string(),
+                    function_name: "sym.read_records".to_string(),
+                    signature: "void sym.read_records (int64_t arg1, int64_t arg2, int64_t arg3)"
+                        .to_string(),
                     ret_type: "void".to_string(),
                     params: vec![
                         InferredSignatureParam {
@@ -19381,17 +19611,17 @@ mod tests {
                 },
                 recovered_vars: &[],
                 ssa_blocks: &[],
-                parsed_context: ParsedExternalContext::default(),
+                parsed_context: type_db_declaring("FILE"),
                 local_structs,
                 interproc_summary_set: None,
                 diagnostics: TypeWritebackDiagnostics::default(),
             },
-            "sym.printf_fetchargs",
-            r2sym::NativeWorkerSummaryKind::FormatArgumentFetch,
+            "sym.read_records",
+            r2sym::NativeWorkerSummaryKind::RecordStream,
         );
 
-        assert_eq!(analysis.signature.params[1].param_type, "arguments*");
-        assert!(!analysis.type_facts.slot_type_overrides.contains_key(&1));
+        assert_eq!(analysis.signature.params[0].param_type, "FILE*");
+        assert!(!analysis.type_facts.slot_type_overrides.contains_key(&0));
         assert!(
             !analysis
                 .plan
@@ -19413,13 +19643,13 @@ mod tests {
                     StructFieldCandidate {
                         name: "f_8".to_string(),
                         offset: 8,
-                        field_type: "int32_t".to_string(),
+                        field_type: parse_test_type("int32_t", 64),
                         confidence: 95,
                     },
                     StructFieldCandidate {
                         name: "f_34".to_string(),
                         offset: 52,
-                        field_type: "int32_t".to_string(),
+                        field_type: parse_test_type("int32_t", 64),
                         confidence: 95,
                     },
                 ],
@@ -19462,7 +19692,7 @@ mod tests {
                 },
                 recovered_vars: &[],
                 ssa_blocks: &[],
-                parsed_context: ParsedExternalContext::default(),
+                parsed_context: type_db_declaring("FTS"),
                 local_structs: fts_local_structs,
                 interproc_summary_set: None,
                 diagnostics: TypeWritebackDiagnostics::default(),
@@ -19471,10 +19701,22 @@ mod tests {
             r2sym::NativeWorkerSummaryKind::DirectoryTraversal,
         );
 
-        assert_eq!(analysis.signature.params[0].param_type, "FTS*");
-        assert!(!analysis.type_facts.slot_type_overrides.contains_key(&0));
+        // `struct sla_struct_fts*`, not `FTS*`. The role signature offers `FTS`,
+        // but nothing in this input declares what `FTS` is, and a typedef is
+        // only authoritative now when something can resolve it. It used to be
+        // authoritative because the spelling appeared in a list of coreutils
+        // type names, which said the same thing for every binary whether or not
+        // the binary carried the type.
+        assert_eq!(
+            analysis.signature.params[0].param_type,
+            "struct sla_struct_fts*"
+        );
+        // The generated aggregate is kept for the same reason: with nothing
+        // declaring `FTS`, the locally inferred layout is the only description
+        // of this parameter that anything can point at.
+        assert!(analysis.type_facts.slot_type_overrides.contains_key(&0));
         assert!(
-            !analysis
+            analysis
                 .plan
                 .struct_decls
                 .iter()
@@ -19490,7 +19732,7 @@ mod tests {
                 fields: vec![StructFieldCandidate {
                     name: "f_0".to_string(),
                     offset: 0,
-                    field_type: "int32_t".to_string(),
+                    field_type: parse_test_type("int32_t", 64),
                     confidence: 95,
                 }],
             }],
@@ -20201,6 +20443,8 @@ mod tests {
             &blocks,
             None,
             Some("aarch64"),
+            r2ssa::MachineArchitectureFamily::AArch64,
+            &collect_pointer_arg_slot_map(r2ssa::MachineArchitectureFamily::AArch64, 64),
             64,
             &mut diagnostics,
         );
@@ -20218,9 +20462,9 @@ mod tests {
         assert_eq!(profile.get(&0x20), Some(struct_pointer));
         assert!(
             artifacts.struct_decls.iter().any(|decl| {
-                decl.fields
-                    .iter()
-                    .any(|field| field.offset == 0x20 && field.field_type == *struct_pointer)
+                decl.fields.iter().any(|field| {
+                    field.offset == 0x20 && field.field_type == parse_test_type(struct_pointer, 64)
+                })
             }),
             "diagnostics={diagnostics:?}; artifacts={artifacts:?}"
         );
@@ -20268,6 +20512,8 @@ mod tests {
             &blocks,
             None,
             Some("aarch64"),
+            r2ssa::MachineArchitectureFamily::AArch64,
+            &collect_pointer_arg_slot_map(r2ssa::MachineArchitectureFamily::AArch64, 64),
             64,
             &mut diagnostics,
         );
@@ -20285,7 +20531,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("tmp:slot_arr", 1, 8),
                     a: SSAVar::new("RBP", 1, 8),
-                    b: SSAVar::new("const:fffffffffffffff8", 0, 8),
+                    b: SSAVar::constant(0xffff_ffff_ffff_fff8, 8),
                 },
                 SSAOp::Copy {
                     dst: SSAVar::new("tmp:spill_arr", 1, 8),
@@ -20299,7 +20545,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("tmp:slot_idx", 1, 8),
                     a: SSAVar::new("RBP", 1, 8),
-                    b: SSAVar::new("const:fffffffffffffff4", 0, 8),
+                    b: SSAVar::constant(0xffff_ffff_ffff_fff4, 8),
                 },
                 SSAOp::Copy {
                     dst: SSAVar::new("tmp:spill_idx", 1, 4),
@@ -20313,7 +20559,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("tmp:slot_idx", 2, 8),
                     a: SSAVar::new("RBP", 1, 8),
-                    b: SSAVar::new("const:fffffffffffffff4", 0, 8),
+                    b: SSAVar::constant(0xffff_ffff_ffff_fff4, 8),
                 },
                 SSAOp::Load {
                     dst: SSAVar::new("idx32", 1, 4),
@@ -20327,7 +20573,7 @@ mod tests {
                 SSAOp::IntLeft {
                     dst: SSAVar::new("idx8", 1, 8),
                     a: SSAVar::new("idx64", 1, 8),
-                    b: SSAVar::new("const:3", 0, 4),
+                    b: SSAVar::constant(3, 4),
                 },
                 SSAOp::IntSub {
                     dst: SSAVar::new("idx7", 1, 8),
@@ -20337,12 +20583,12 @@ mod tests {
                 SSAOp::IntLeft {
                     dst: SSAVar::new("idx56", 1, 8),
                     a: SSAVar::new("idx7", 1, 8),
-                    b: SSAVar::new("const:3", 0, 4),
+                    b: SSAVar::constant(3, 4),
                 },
                 SSAOp::IntAdd {
                     dst: SSAVar::new("tmp:slot_arr", 2, 8),
                     a: SSAVar::new("RBP", 1, 8),
-                    b: SSAVar::new("const:fffffffffffffff8", 0, 8),
+                    b: SSAVar::constant(0xffff_ffff_ffff_fff8, 8),
                 },
                 SSAOp::Load {
                     dst: SSAVar::new("arr", 1, 8),
@@ -20357,7 +20603,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("field8", 1, 8),
                     a: SSAVar::new("elem", 1, 8),
-                    b: SSAVar::new("const:8", 0, 8),
+                    b: SSAVar::constant(8, 8),
                 },
                 SSAOp::Store {
                     space: r2il::SpaceId::Ram,
@@ -20367,7 +20613,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("field34", 1, 8),
                     a: SSAVar::new("elem", 1, 8),
-                    b: SSAVar::new("const:34", 0, 8),
+                    b: SSAVar::constant(0x34, 8),
                 },
                 SSAOp::Load {
                     dst: SSAVar::new("field34_val", 1, 4),
@@ -20380,7 +20626,7 @@ mod tests {
 
         let local_structs = infer_local_struct_artifacts_from_ssa(
             &ssa_blocks,
-            Some("x86-64"),
+            r2ssa::MachineArchitectureFamily::X86_64,
             64,
             &mut diagnostics,
         );
@@ -20495,7 +20741,7 @@ mod tests {
 
         let local_structs = infer_local_struct_artifacts_from_ssa(
             &ssa_blocks,
-            Some("aarch64"),
+            r2ssa::MachineArchitectureFamily::AArch64,
             64,
             &mut diagnostics,
         );
@@ -20718,6 +20964,8 @@ mod tests {
             &blocks,
             Some(&memory_versions),
             Some("aarch64"),
+            r2ssa::MachineArchitectureFamily::AArch64,
+            &collect_pointer_arg_slot_map(r2ssa::MachineArchitectureFamily::AArch64, 64),
             64,
             &mut diagnostics,
         );
@@ -20914,8 +21162,25 @@ mod tests {
             space: r2il::SpaceId::Custom(7),
             addr: r2il::Varnode::unique(2, 8),
         });
-        let prepared = r2ssa::SsaArtifact::for_decompile(&[block], Some(&arch))
-            .expect("prepared indexed load");
+        let register_storage = |offset| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let interface = r2ssa::SourceFunctionInterface::new_exact(
+            b"prepared-indexed-access-fixture".to_vec(),
+            "sysv64",
+            [
+                r2ssa::SourceAbiParameterSpec::new(0, register_storage(0x10)),
+                r2ssa::SourceAbiParameterSpec::new(1, register_storage(0x18)),
+            ],
+            r2ssa::SourceFunctionReturn::Void,
+            [],
+        )
+        .expect("exact indexed-access interface");
+        let prepared =
+            r2ssa::SsaArtifact::for_decompile_with_interface(&[block], Some(&arch), interface)
+                .expect("prepared indexed load");
         let address = prepared
             .memory_certificate_for_op_site(0x401000, 2, false)
             .expect("memory certificate");
@@ -20956,14 +21221,13 @@ mod tests {
             offset: -8,
         };
         parsed_context.stack_slots.insert(
-            buf_slot.clone(),
+            buf_slot,
             crate::ExternalStackSlotSpec {
                 name: "buf".to_string(),
                 ty: Some(CTypeLike::Pointer(Box::new(CTypeLike::Int {
                     bits: 8,
                     signedness: Signedness::Signed,
                 }))),
-                base: ExternalStackBase::FramePointer,
                 role: ExternalStackSlotRole::Local,
                 param_index: None,
                 param_name: None,
@@ -20981,7 +21245,6 @@ mod tests {
                     bits: 64,
                     signedness: Signedness::Unsigned,
                 }),
-                base: ExternalStackBase::FramePointer,
                 role: ExternalStackSlotRole::ParamHome,
                 param_index: Some(1),
                 param_name: Some("len".to_string()),
@@ -20995,7 +21258,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("buf_slot_addr", 1, 8),
                     a: SSAVar::new("RBP", 1, 8),
-                    b: SSAVar::new("const:fffffffffffffff8", 0, 8),
+                    b: SSAVar::constant(0xffff_ffff_ffff_fff8, 8),
                 },
                 SSAOp::Load {
                     dst: SSAVar::new("buf", 1, 8),
@@ -21005,7 +21268,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("len_slot_addr", 1, 8),
                     a: SSAVar::new("RBP", 1, 8),
-                    b: SSAVar::new("const:ffffffffffffffe0", 0, 8),
+                    b: SSAVar::constant(0xffff_ffff_ffff_ffe0, 8),
                 },
                 SSAOp::Load {
                     dst: SSAVar::new("len", 1, 8),
@@ -21020,7 +21283,7 @@ mod tests {
                 SSAOp::Store {
                     space: r2il::SpaceId::Ram,
                     addr: SSAVar::new("nul_addr", 1, 8),
-                    val: SSAVar::new("const:0", 0, 1),
+                    val: SSAVar::constant(0, 1),
                 },
             ],
         }];
@@ -21137,7 +21400,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("RDI", 1, 8),
                     a: SSAVar::new("RDI", 2, 8),
-                    b: SSAVar::new("const:1", 0, 8),
+                    b: SSAVar::constant(1, 8),
                 },
                 SSAOp::Load {
                     dst: SSAVar::new("byte", 1, 1),
@@ -21317,12 +21580,12 @@ mod tests {
                 SSAOp::IntSub {
                     dst: SSAVar::new("sp", 1, 8),
                     a: SSAVar::new("sp", 0, 8),
-                    b: SSAVar::new("const:200", 0, 8),
+                    b: SSAVar::constant(0x200, 8),
                 },
                 SSAOp::IntAdd {
                     dst: SSAVar::new("slot", 1, 8),
                     a: SSAVar::new("sp", 1, 8),
-                    b: SSAVar::new("const:178", 0, 8),
+                    b: SSAVar::constant(0x178, 8),
                 },
                 SSAOp::Store {
                     space: r2il::SpaceId::Ram,
@@ -21332,7 +21595,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("slot", 2, 8),
                     a: SSAVar::new("sp", 1, 8),
-                    b: SSAVar::new("const:178", 0, 8),
+                    b: SSAVar::constant(0x178, 8),
                 },
                 SSAOp::Load {
                     dst: SSAVar::new("x8", 1, 8),
@@ -21342,7 +21605,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("arg_addr", 1, 8),
                     a: SSAVar::new("x8", 1, 8),
-                    b: SSAVar::new("const:8", 0, 8),
+                    b: SSAVar::constant(8, 8),
                 },
                 SSAOp::Load {
                     dst: SSAVar::new("x0", 1, 8),
@@ -21447,7 +21710,7 @@ mod tests {
                     SSAOp::IntAdd {
                         dst: SSAVar::new("slot", 1, 8),
                         a: SSAVar::new("RBP", 0, 8),
-                        b: SSAVar::new("const:ffffffffffffffe8", 0, 8),
+                        b: SSAVar::constant(0xffff_ffff_ffff_ffe8, 8),
                     },
                     SSAOp::Store {
                         space: r2il::SpaceId::Ram,
@@ -21463,7 +21726,7 @@ mod tests {
                     SSAOp::IntAdd {
                         dst: SSAVar::new("slot", 2, 8),
                         a: SSAVar::new("RBP", 0, 8),
-                        b: SSAVar::new("const:ffffffffffffffe8", 0, 8),
+                        b: SSAVar::constant(0xffff_ffff_ffff_ffe8, 8),
                     },
                     SSAOp::Load {
                         dst: SSAVar::new("ptr", 1, 8),
@@ -21473,7 +21736,7 @@ mod tests {
                     SSAOp::IntLeft {
                         dst: SSAVar::new("idx_scaled", 1, 8),
                         a: SSAVar::new("RSI", 0, 8),
-                        b: SSAVar::new("const:2", 0, 8),
+                        b: SSAVar::constant(2, 8),
                     },
                     SSAOp::IntAdd {
                         dst: SSAVar::new("elem", 1, 8),
@@ -21610,7 +21873,7 @@ mod tests {
                 SSAOp::IntMult {
                     dst: SSAVar::new("tmp:4900", 1, 8),
                     a: SSAVar::new("RSI", 1, 8),
-                    b: SSAVar::new("const:4", 0, 8),
+                    b: SSAVar::constant(4, 8),
                 },
                 SSAOp::IntAdd {
                     dst: SSAVar::new("tmp:4a00", 1, 8),
@@ -21620,7 +21883,7 @@ mod tests {
                 SSAOp::IntMult {
                     dst: SSAVar::new("tmp:4900", 2, 8),
                     a: SSAVar::new("tmp:4a00", 1, 8),
-                    b: SSAVar::new("const:8", 0, 8),
+                    b: SSAVar::constant(8, 8),
                 },
                 SSAOp::IntAdd {
                     dst: SSAVar::new("elem", 1, 8),
@@ -21630,7 +21893,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("scores2", 1, 8),
                     a: SSAVar::new("elem", 1, 8),
-                    b: SSAVar::new("const:10", 0, 8),
+                    b: SSAVar::constant(0x10, 8),
                 },
                 SSAOp::Load {
                     dst: SSAVar::new("score", 1, 4),
@@ -21640,7 +21903,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("flags", 1, 8),
                     a: SSAVar::new("elem", 1, 8),
-                    b: SSAVar::new("const:4", 0, 8),
+                    b: SSAVar::constant(4, 8),
                 },
                 SSAOp::Load {
                     dst: SSAVar::new("flagv", 1, 2),
@@ -21781,7 +22044,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("idx_addr", 1, 8),
                     a: SSAVar::new("RBP", 1, 8),
-                    b: SSAVar::new("const:fffffffffffffff4", 0, 8),
+                    b: SSAVar::constant(0xffff_ffff_ffff_fff4, 8),
                 },
                 SSAOp::Load {
                     dst: SSAVar::new("idx", 1, 4),
@@ -21795,7 +22058,7 @@ mod tests {
                 SSAOp::IntLeft {
                     dst: SSAVar::new("idx_x8", 1, 8),
                     a: SSAVar::new("idx64", 1, 8),
-                    b: SSAVar::new("const:3", 0, 8),
+                    b: SSAVar::constant(3, 8),
                 },
                 SSAOp::IntSub {
                     dst: SSAVar::new("idx_x7", 1, 8),
@@ -21805,7 +22068,7 @@ mod tests {
                 SSAOp::IntLeft {
                     dst: SSAVar::new("idx_x56", 1, 8),
                     a: SSAVar::new("idx_x7", 1, 8),
-                    b: SSAVar::new("const:3", 0, 8),
+                    b: SSAVar::constant(3, 8),
                 },
                 SSAOp::IntAdd {
                     dst: SSAVar::new("elem", 1, 8),
@@ -21815,7 +22078,7 @@ mod tests {
                 SSAOp::IntAdd {
                     dst: SSAVar::new("field", 1, 8),
                     a: SSAVar::new("elem", 1, 8),
-                    b: SSAVar::new("const:34", 0, 8),
+                    b: SSAVar::constant(0x34, 8),
                 },
                 SSAOp::Load {
                     dst: SSAVar::new("value", 1, 4),

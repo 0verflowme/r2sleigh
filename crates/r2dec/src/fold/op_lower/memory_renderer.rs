@@ -1,8 +1,56 @@
-use std::collections::{BTreeSet, HashSet};
-
 use r2ssa::SSAVar;
 
 use super::*;
+use r2rewrite::CValue;
+
+/// Opaque proof that one rendered lvalue came from the exact source-owned
+/// structured memory-access fact for the current operation.
+///
+/// The fields stay private to this module so an arbitrary contextual AST
+/// cannot be presented as a certified address occurrence downstream.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct CertifiedMemoryAccessExpr {
+    access: r2ssa::StructuredAccessId,
+    address: r2ssa::ValueId,
+    is_write: bool,
+    expr: CExpr,
+}
+
+impl CertifiedMemoryAccessExpr {
+    pub(super) const fn access(&self) -> r2ssa::StructuredAccessId {
+        self.access
+    }
+
+    pub(super) const fn address(&self) -> r2ssa::ValueId {
+        self.address
+    }
+
+    pub(super) const fn is_write(&self) -> bool {
+        self.is_write
+    }
+
+    pub(super) const fn expr(&self) -> &CExpr {
+        &self.expr
+    }
+
+    pub(super) fn into_expr(self) -> CExpr {
+        self.expr
+    }
+}
+
+/// Syntax selected for a certified memory access before its render-cell
+/// contract is finalized.
+///
+/// Every route returns this enum rather than a `CExpr`. Adding a route without
+/// deciding whether it preserves the plan's ordinary value rendering or
+/// replaces a canonical access therefore fails at the return type; adding a
+/// new contract kind also makes the finalizer's match non-exhaustive.
+#[derive(Debug, Clone, PartialEq)]
+#[must_use = "certified memory syntax must pass through its cell finalizer"]
+enum PendingMemoryAccessExpr {
+    Planned(CExpr),
+    Replacement(PendingReplacementExpr),
+}
 
 #[derive(Debug, Clone, PartialEq)]
 struct CertifiedLinearAddress {
@@ -18,7 +66,83 @@ struct CertifiedLinearIndex {
 }
 
 impl<'a> FoldingContext<'a> {
-    fn certified_pointer_base_expr(&self, expr: &CExpr) -> bool {
+    fn certified_memory_access_expr(
+        &self,
+        address: r2ssa::ValueId,
+        value: r2ssa::ValueId,
+        width: u32,
+        is_write: bool,
+        elem_ty: CType,
+    ) -> OpLoweringResult<CertifiedMemoryAccessExpr> {
+        let (block_addr, op_idx) = self
+            .current_source_op_site()
+            .ok_or_else(|| OpLoweringRefusal::missing_machine_projection())?;
+        let fact = self
+            .certified_memory_access_for_current_op(is_write)
+            .filter(|fact| {
+                fact.block_addr == block_addr
+                    && fact.op_index == op_idx
+                    && fact.space == r2il::SpaceId::Ram
+                    && fact.address == address
+                    && fact.value == Some(value)
+                    && fact.is_write == is_write
+                    && fact.width == width
+            })
+            .ok_or_else(|| OpLoweringRefusal::missing_machine_projection())?;
+        let expr = self
+            .finalize_certified_memory_expr_for_fact(fact, elem_ty.clone())
+            .ok_or_else(|| OpLoweringRefusal::missing_machine_projection())?;
+        if is_write && !Self::expr_is_store_target_candidate(&expr) {
+            return Err(OpLoweringRefusal::missing_machine_projection());
+        }
+        Ok(CertifiedMemoryAccessExpr {
+            access: fact.access,
+            address: fact.address,
+            is_write: fact.is_write,
+            expr,
+        })
+    }
+
+    pub(super) fn render_certified_load_access_expr(
+        &self,
+        dst: &SSAVar,
+        addr: &SSAVar,
+        elem_ty: CType,
+    ) -> OpLoweringResult<CertifiedMemoryAccessExpr> {
+        let address = self
+            .prepared_value_id_for_var(addr)
+            .ok_or_else(|| OpLoweringRefusal::missing_machine_projection())?;
+        let value = self
+            .prepared_value_id_for_var(dst)
+            .ok_or_else(|| OpLoweringRefusal::missing_machine_projection())?;
+        self.certified_memory_access_expr(address, value, dst.size, false, elem_ty)
+    }
+
+    pub(super) fn render_certified_store_access_expr(
+        &self,
+        addr: &SSAVar,
+        val: &SSAVar,
+        elem_ty: CType,
+    ) -> OpLoweringResult<CertifiedMemoryAccessExpr> {
+        let address = self
+            .prepared_value_id_for_var(addr)
+            .ok_or_else(|| OpLoweringRefusal::missing_machine_projection())?;
+        let value = self
+            .prepared_value_id_for_var(val)
+            .ok_or_else(|| OpLoweringRefusal::missing_machine_projection())?;
+        self.certified_memory_access_expr(address, value, val.size, true, elem_ty)
+    }
+
+    /// Whether a rendered operand names an object declared a pointer.
+    ///
+    /// An object declared a pointer is a pointer wherever it is read, and
+    /// the declaration is the one place that says so: it already agrees with
+    /// the certificate that typed the parameter or the carrier, because it
+    /// was made from it. This is only consulted where a declared aggregate
+    /// fact says the address is a member or element and the C address has to
+    /// be split around the base; an element the rewriter proves is spelled
+    /// from its term and never comes here.
+    fn declared_pointer_expr(&self, expr: &CExpr) -> bool {
         let expr = match expr {
             CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => inner.as_ref(),
             _ => expr,
@@ -26,45 +150,16 @@ impl<'a> FoldingContext<'a> {
         let CExpr::Var(name) = expr else {
             return false;
         };
-        if self
-            .inputs
-            .function_facts
-            .type_facts()
-            .render_authorized_signature()
-            .is_some_and(|signature| {
-                signature.params.iter().any(|param| {
-                    param.name.eq_ignore_ascii_case(name)
-                        && param.ty.as_ref().is_some_and(|ty| {
-                            matches!(
-                                crate::type_like_to_ctype(ty),
-                                CType::Pointer(_) | CType::Array(_, _)
-                            )
-                        })
-                })
-            })
-        {
-            return true;
-        }
-        self.inputs.render_facts().is_some_and(|render| {
-            render.loop_carriers().any(|entity| {
-                let r2types::CertifiedEntity::LoopCarrier { phi, ty, .. } = entity else {
-                    return false;
-                };
-                crate::certified_loop_carrier_name(*phi).eq_ignore_ascii_case(name)
-                    && ty.as_ref().is_some_and(|ty| {
-                        matches!(
-                            crate::type_like_to_ctype(ty),
-                            CType::Pointer(_) | CType::Array(_, _)
-                        )
-                    })
-            })
-        })
+        matches!(
+            self.symbols.borrow().get(*name).ty,
+            CType::Pointer(_) | CType::Array(_, _)
+        )
     }
 
-    fn certified_expr_contains_pointer_parameter(&self, expr: &CExpr) -> bool {
+    fn certified_expr_contains_declared_pointer(&self, expr: &CExpr) -> bool {
         let mut contains = false;
         expr.visit(&mut |node| {
-            if !contains && self.certified_pointer_base_expr(node) {
+            if !contains && self.declared_pointer_expr(node) {
                 contains = true;
             }
         });
@@ -175,7 +270,7 @@ impl<'a> FoldingContext<'a> {
                 Some((left_atom, coefficient))
             }
             _ if self.literal_to_i64(expr).is_some()
-                || self.certified_expr_contains_pointer_parameter(expr) =>
+                || self.certified_expr_contains_declared_pointer(expr) =>
             {
                 None
             }
@@ -191,7 +286,7 @@ impl<'a> FoldingContext<'a> {
         let mut base = None;
         let mut index = None::<(CExpr, i64)>;
         for (sign, term) in terms {
-            if self.certified_pointer_base_expr(&term) {
+            if self.declared_pointer_expr(&term) {
                 if sign != 1 || base.replace(term).is_some() {
                     return None;
                 }
@@ -214,7 +309,7 @@ impl<'a> FoldingContext<'a> {
         })
     }
 
-    fn certified_member_fact_for_memory(
+    pub(super) fn certified_member_fact_for_memory(
         &self,
         memory: &r2types::MemoryAccessRenderFact,
     ) -> Option<&r2types::MemberAccessRenderFact> {
@@ -251,6 +346,26 @@ impl<'a> FoldingContext<'a> {
         matching.next().is_none().then_some(first)
     }
 
+    /// Whether a rendered name may carry a C subscript.
+    ///
+    /// `base[index]` is only C where the base is a pointer or an array. An
+    /// array certificate proves an access is element `index` of a run at that
+    /// base; it does not, on its own, make the base's *declaration* one of
+    /// those. Emitting the subscript anyway produced `RDI_0[i]` for a
+    /// parameter declared `uint64_t`, which no compiler accepts, so the
+    /// certificate has to be rendered some other way when the declaration
+    /// cannot carry it. A base whose declaration is unknown is not refused
+    /// here: nothing has said it is not a pointer.
+    fn name_may_be_subscripted(&self, base: &CExpr) -> bool {
+        match self.declared_type_of_name(base) {
+            Some(declared) => match declared.as_type() {
+                Some(CType::Pointer(_) | CType::Array(_, _)) | None => true,
+                Some(_) => false,
+            },
+            None => true,
+        }
+    }
+
     fn render_certified_structured_memory_expr(
         &self,
         memory: &r2types::MemoryAccessRenderFact,
@@ -274,7 +389,10 @@ impl<'a> FoldingContext<'a> {
                 expr: index,
                 stride,
             } = index?;
-            if offset != expected_offset || stride != expected_stride {
+            if offset != expected_offset
+                || stride != expected_stride
+                || !self.name_may_be_subscripted(&base)
+            {
                 return None;
             }
             let indexed = CExpr::Subscript {
@@ -300,10 +418,150 @@ impl<'a> FoldingContext<'a> {
         Some(self.member_access_expr(base, member.field_name.clone()))
     }
 
+    /// Spell an exact linear machine address without claiming an array or
+    /// member projection. Casting the certified base to a byte pointer before
+    /// applying the proved stride keeps C from scaling the addition by an
+    /// inferred pointee type. The result remains a raw dereference; source-like
+    /// subscript/member syntax is reserved for the upstream facts above.
+    /// What a rendered name is declared as.
+    ///
+    /// Address arithmetic is decomposed from the rendered address, so its
+    /// base reaches here as a name rather than as a value, and the
+    /// declaration the symbol table emits for that name is the one fact it
+    /// carries about its type.
+    pub(super) fn declared_type_of_name(&self, expr: &CExpr) -> Option<CValue> {
+        match expr.unobserved() {
+            CExpr::Var(symbol) => {
+                Some(CValue::Typed(self.symbols.borrow().get(*symbol).ty.clone()))
+            }
+            _ => None,
+        }
+    }
+
+    fn render_certified_linear_byte_address(&self, address: &CExpr) -> Option<CExpr> {
+        let CertifiedLinearAddress {
+            base,
+            index,
+            offset,
+        } = self.certified_linear_address_components(address)?;
+        let byte_pointer = CType::ptr(CType::u8());
+        let base_type = self.declared_type_of_name(&base);
+        let mut result = self.convert_from(base, base_type.as_ref(), &byte_pointer);
+        if let Some(CertifiedLinearIndex { expr, stride }) = index
+            && stride != 0
+        {
+            let magnitude = stride.checked_abs()?;
+            let delta = if magnitude == 1 {
+                expr
+            } else {
+                CExpr::binary(BinaryOp::Mul, expr, CExpr::IntLit(magnitude))
+            };
+            result = CExpr::binary(
+                if stride > 0 {
+                    BinaryOp::Add
+                } else {
+                    BinaryOp::Sub
+                },
+                result,
+                delta,
+            );
+        }
+        if offset != 0 {
+            let magnitude = offset.checked_abs()?;
+            result = CExpr::binary(
+                if offset > 0 {
+                    BinaryOp::Add
+                } else {
+                    BinaryOp::Sub
+                },
+                result,
+                CExpr::IntLit(magnitude),
+            );
+        }
+        Some(result)
+    }
+
+    /// Spell an address computation over the integers of its names.
+    ///
+    /// Each name is converted from what it is declared as to the address
+    /// integer: a pointer takes its address-width step, and a name already
+    /// declared as that integer is left alone.
+    fn integerize_certified_address_expr(&self, expr: &CExpr, pointer_bits: u32) -> Option<CExpr> {
+        let integer = CType::Int {
+            bits: pointer_bits,
+            signedness: r2types::Signedness::Unsigned,
+        };
+        Some(match expr {
+            CExpr::Observed { id, expr } => CExpr::Observed {
+                id: *id,
+                expr: Box::new(self.integerize_certified_address_expr(expr, pointer_bits)?),
+            },
+            CExpr::IntLit(value) => CExpr::IntLit(*value),
+            CExpr::UIntLit(value) => CExpr::UIntLit(*value),
+            CExpr::Var(symbol) => {
+                let declared = CValue::Typed(self.symbols.borrow().get(*symbol).ty.clone());
+                self.convert(CExpr::Var(*symbol), &declared, &integer)
+            }
+            CExpr::Unary { op, operand } if matches!(op, UnaryOp::Neg | UnaryOp::BitNot) => {
+                CExpr::Unary {
+                    op: *op,
+                    operand: Box::new(
+                        self.integerize_certified_address_expr(operand, pointer_bits)?,
+                    ),
+                }
+            }
+            CExpr::Binary { op, left, right }
+                if matches!(
+                    op,
+                    BinaryOp::Add
+                        | BinaryOp::Sub
+                        | BinaryOp::Mul
+                        | BinaryOp::Shl
+                        | BinaryOp::Shr
+                        | BinaryOp::BitAnd
+                        | BinaryOp::BitOr
+                        | BinaryOp::BitXor
+                ) =>
+            {
+                CExpr::binary(
+                    *op,
+                    self.integerize_certified_address_expr(left, pointer_bits)?,
+                    self.integerize_certified_address_expr(right, pointer_bits)?,
+                )
+            }
+            CExpr::Paren(inner) => CExpr::Paren(Box::new(
+                self.integerize_certified_address_expr(inner, pointer_bits)?,
+            )),
+            CExpr::FloatLit(_)
+            | CExpr::StringLit(_)
+            | CExpr::CharLit(_)
+            | CExpr::Unary { .. }
+            | CExpr::Binary { .. }
+            | CExpr::External { .. }
+            | CExpr::DataObject { .. }
+            | CExpr::Ternary { .. }
+            | CExpr::Cast { .. }
+            | CExpr::Call { .. }
+            | CExpr::Subscript { .. }
+            | CExpr::Member { .. }
+            | CExpr::PtrMember { .. }
+            | CExpr::Sizeof(_)
+            | CExpr::SizeofType(_)
+            | CExpr::AddrOf(_)
+            | CExpr::Deref(_)
+            | CExpr::Comma(_) => return None,
+        })
+    }
+
+    /// The typed scalar-array spelling of one access, as a replacement.
+    ///
+    /// It eliminates the multiply/add chain that computed the address, so it
+    /// owes exactly the cells any other replacement owes and goes through the
+    /// one contract that derives them rather than marking them by hand.
     fn render_certified_semantic_array_expr(
         &self,
         memory: &r2types::MemoryAccessRenderFact,
-    ) -> Option<CExpr> {
+    ) -> Option<PendingReplacementExpr> {
         let array = self.certified_array_fact_for_memory(memory)?;
         let (Some(base), Some(index)) = (array.base, array.index) else {
             return None;
@@ -316,29 +574,38 @@ impl<'a> FoldingContext<'a> {
         };
         let render = self.inputs.render_facts()?;
         let slot = usize::try_from(slot).ok()?;
-        if render.parameter_values(slot).next().is_none()
-            || !render
-                .certified_expr_for_value(index)
-                .is_some_and(|expr| expr.fact.renderable)
+        let base_value = render.parameter_values(slot).next()?;
+        if !render
+            .certified_expr_for_value(index)
+            .is_some_and(|expr| expr.fact.renderable)
         {
             return None;
         }
-        let base = self
-            .inputs
-            .function_facts
-            .type_facts()
-            .render_authorized_signature()?
-            .params
-            .get(slot)
-            .map(|param| param.name.trim())
-            .filter(|name| !name.is_empty())?;
-        let index_var = self.prepared_ssa()?.value_var(index)?;
-        let index = self.render_certified_value_expr_for_var(index_var)?;
+        let base = match self.planned_value_expr(base_value) {
+            Ok(expr) => expr,
+            Err(error) => {
+                self.retain_first_observation_error(error);
+                return None;
+            }
+        };
+        let base = self.observe_certified_address_read_expr(base_value, array.access, base);
+        let index_value = index;
+        let index = match self.planned_value_expr(index_value) {
+            Ok(expr) => expr,
+            Err(error) => {
+                self.retain_first_observation_error(error);
+                return None;
+            }
+        };
+        let index = self.observe_certified_address_read_expr(index_value, array.access, index);
+        if !self.name_may_be_subscripted(&base) {
+            return None;
+        }
         let indexed = CExpr::Subscript {
-            base: Box::new(CExpr::Var(base.to_string())),
+            base: Box::new(base),
             index: Box::new(index),
         };
-        match self.certified_member_fact_for_memory(memory) {
+        let rendered = match self.certified_member_fact_for_memory(memory) {
             Some(member)
                 if member.field_offset == array.field_offset && member.access == array.access =>
             {
@@ -346,11 +613,20 @@ impl<'a> FoldingContext<'a> {
             }
             None if array.field_offset == 0 => Some(indexed),
             _ => None,
-        }
+        }?;
+        Some(PendingReplacementExpr::canonical_access(memory, rendered))
     }
 
+    /// Whether this expression can stand on the left of an assignment.
+    ///
+    /// The question is about syntax, so it is asked of the syntax: an
+    /// observation marker records who accounts for a node and changes nothing
+    /// about what the node *is*, exactly as a parenthesis does not. Asking it
+    /// of the marked node instead rejected every store whose target the
+    /// rewriter had proved to be an array element, because the subscript path
+    /// marks the address it renders and the dereference path does not.
     fn expr_is_store_target_candidate(expr: &CExpr) -> bool {
-        match expr {
+        match expr.unobserved() {
             CExpr::Var(_)
             | CExpr::Deref(_)
             | CExpr::Subscript { .. }
@@ -361,417 +637,116 @@ impl<'a> FoldingContext<'a> {
         }
     }
 
-    fn byte_indexed_pointer_add_expr(&self, expr: &CExpr) -> Option<CExpr> {
-        self.indexed_pointer_add_expr(expr, &CType::u8())
-    }
-
-    pub(super) fn indexed_pointer_add_expr(&self, expr: &CExpr, elem_ty: &CType) -> Option<CExpr> {
-        if self.requires_certified_rendering() {
-            return None;
-        }
-        let CExpr::Binary {
-            op: BinaryOp::Add,
-            left,
-            right,
-        } = expr
-        else {
-            return None;
-        };
-
-        for (base, index) in [
-            (left.as_ref(), right.as_ref()),
-            (right.as_ref(), left.as_ref()),
-        ] {
-            let normalized_base = self.normalize_pointer_base_expr(base, 0);
-            if !(self.looks_like_pointer(&normalized_base)
-                || self.is_non_index_pointer_expr(&normalized_base))
-            {
-                continue;
-            }
-            if self.looks_like_pointer(index) || self.is_non_index_pointer_expr(index) {
-                continue;
-            }
-            let elem_ty = match self.expr_type_hint(&normalized_base) {
-                Some(CType::Pointer(inner)) | Some(CType::Array(inner, _)) => *inner,
-                _ => elem_ty.clone(),
-            };
-            let elem_size = elem_ty
-                .bits()
-                .map(|bits| bits.div_ceil(8).max(1))
-                .unwrap_or(1);
-            let Some(index) = self.scaled_index_expr(index, elem_size) else {
-                continue;
-            };
-            let index = self.normalize_index_expr(&index, 0).unwrap_or(index);
-            let base_source_ty = self.expr_type_hint(&normalized_base);
-            let normalized_base = self.cast_expr_if_needed(
-                normalized_base,
-                CType::ptr(elem_ty),
-                base_source_ty.as_ref(),
-            );
-            return Some(CExpr::Subscript {
-                base: Box::new(normalized_base),
-                index: Box::new(index),
-            });
-        }
-
-        None
-    }
-
-    fn scaled_index_expr(&self, expr: &CExpr, elem_size: u32) -> Option<CExpr> {
-        if elem_size <= 1 {
-            return Some(expr.clone());
-        }
-
-        match expr {
-            CExpr::Binary {
-                op: BinaryOp::Mul,
-                left,
-                right,
-            } => {
-                if self.literal_to_i64(right) == Some(i64::from(elem_size)) {
-                    return Some((**left).clone());
-                }
-                if self.literal_to_i64(left) == Some(i64::from(elem_size)) {
-                    return Some((**right).clone());
-                }
-                None
-            }
-            CExpr::Binary {
-                op: BinaryOp::Shl,
-                left,
-                right,
-            } => {
-                let shift = self.literal_to_i64(right)?;
-                if !(0..=30).contains(&shift) {
-                    return None;
-                }
-                (1u32.checked_shl(shift as u32)? == elem_size).then(|| (**left).clone())
-            }
-            _ => None,
-        }
-    }
-
-    fn has_authoritative_memory_semantics(&self, name: &str) -> bool {
-        matches!(
-            self.lookup_semantic_value(name),
-            Some(analysis::SemanticValue::Address(_)) | Some(analysis::SemanticValue::Load { .. })
-        )
-    }
-
-    pub(crate) fn render_certified_value_expr_for_var(&self, var: &SSAVar) -> Option<CExpr> {
-        if var.is_const() {
-            let value = parse_const_value(&var.name)?;
-            return Some(if value > 0x7fff_ffff {
-                CExpr::UIntLit(value)
-            } else {
-                CExpr::IntLit(value as i64)
-            });
-        }
-
-        let value = self.prepared_value_id_for_var(var)?;
-        if let Some(name) = self.certified_loop_carrier_name_for_value(value) {
-            return Some(CExpr::Var(name));
-        }
-        if let Some(name) = self.certified_memory_result_name_for_value(value) {
-            return Some(CExpr::Var(name));
-        }
-        if self.prepared_ssa().is_some_and(|prepared| {
-            prepared
-                .call_result_certificate_for_value(value)
-                .is_some_and(|result| result.relation.is_identity())
-        }) {
-            return self.certified_call_result_expr_for_value(value);
-        }
-        if !self
-            .certified_render_context()
-            .is_some_and(|proof| proof.expression_is_renderable(value))
-        {
-            return None;
-        }
-        if let Some(expr) = self.certified_parameter_expr_for_value(value) {
-            return Some(expr);
-        }
-        if let Some(expr) =
-            self.render_certified_stack_param_value_expr(value, 0, &mut HashSet::new())
-        {
-            return Some(expr);
-        }
-        if let Some(expr) = self.certified_structural_expr_for_value(value, 0, &mut BTreeSet::new())
-        {
-            return Some(expr);
-        }
-        if var.version == 0 && var.is_register() && self.stable_semantic_ids_are_required() {
-            return None;
-        }
-        let rendered = self.var_name(var);
-        Some(
-            self.arg_alias_for_rendered_name(&rendered)
-                .map(CExpr::Var)
-                .unwrap_or_else(|| CExpr::Var(rendered)),
-        )
-    }
-
-    fn render_certified_stack_param_value_expr(
-        &self,
-        value: r2ssa::ValueId,
-        depth: u32,
-        visited: &mut HashSet<r2ssa::ValueId>,
-    ) -> Option<CExpr> {
-        if depth > Self::MAX_SEMANTIC_RENDER_DEPTH || !visited.insert(value) {
-            return None;
-        }
-
-        let result = (|| {
-            let prepared = self.prepared_ssa()?;
-            if let Some(expr) = self.certified_parameter_expr_for_value(value) {
-                return Some(expr);
-            }
-            let inst_id = prepared.graph().def_inst(value)?;
-            let inst = prepared.graph().inst(inst_id)?;
-            let r2ssa::InstPayload::Op(op) = &inst.payload else {
-                return None;
-            };
-            match op {
-                SSAOp::Copy { src, .. }
-                | SSAOp::New { src, .. }
-                | SSAOp::Cast { src, .. }
-                | SSAOp::Subpiece { src, .. }
-                | SSAOp::IntZExt { src, .. }
-                | SSAOp::IntSExt { src, .. } => {
-                    let src_value = self.prepared_value_id_for_var(src)?;
-                    self.render_certified_stack_param_value_expr(src_value, depth + 1, visited)
-                }
-                SSAOp::Load { .. } => {
-                    let (block_addr, op_idx) = prepared.inst_op_site(inst_id)?;
-                    let proof = self.certified_render_context()?;
-                    let fact = proof.memory_access_for_op(block_addr, op_idx, false)?;
-                    if fact.value != Some(value) {
-                        return None;
-                    }
-                    self.certified_stack_owner_expr_for_memory_fact(fact)
-                }
-                _ => None,
-            }
-        })();
-
-        visited.remove(&value);
-        result
-    }
-
     pub(super) fn certified_memory_address_expr(
         &self,
         fact: &r2types::MemoryAccessRenderFact,
     ) -> Option<(SSAVar, CExpr)> {
         let prepared = self.prepared_ssa()?;
         let addr = prepared.value_var(fact.address)?.clone();
-        let expr = self
-            .render_certified_address_expr_for_var(&addr, 0, &mut HashSet::new())
-            .or_else(|| self.render_certified_value_expr_for_var(&addr))?;
-        if self.expr_contains_raw_stack_base_arithmetic(&expr) {
+        if self.prepared_value_id_for_var(&addr) != Some(fact.address) {
             return None;
         }
-        if self.certified_return_expr_contains_raw_storage_name(&expr)
-            && self
-                .control_facts()
-                .is_none_or(|facts| facts.loops.is_empty() && facts.switches.is_empty())
-        {
-            return None;
-        }
+        let expr = match self.planned_value_expr(fact.address) {
+            Ok(expr) => expr,
+            Err(error) => {
+                // The refusal the reader sees names the site that noticed the
+                // address had no expression, one call above this one; the
+                // error here says why the plan had none, which is the fact
+                // that decides what to fix.
+                r2il::refusal_evidence!(
+                    "memory-address-unplanned",
+                    "value={:?} object={:?} kind={:?} indexed={} slot_offset={:?} error={error:?}",
+                    fact.address,
+                    fact.object,
+                    self.prepared_ssa()
+                        .and_then(|prepared| prepared.objects().object(fact.object))
+                        .map(|object| object.kind.clone()),
+                    self.prepared_ssa().is_some_and(|prepared| prepared
+                        .objects()
+                        .address_is_indexed(fact.address)),
+                    self.inputs
+                        .render_facts()
+                        .and_then(|facts| facts.stack_slot_offset(fact.object))
+                );
+                self.retain_first_observation_error(error);
+                self.retain_first_lowering_refusal(OpLoweringRefusal::missing_program_variable());
+                return None;
+            }
+        };
         Some((addr, expr))
     }
 
-    fn render_certified_address_expr_for_var(
-        &self,
-        var: &SSAVar,
-        depth: u32,
-        visited: &mut HashSet<r2ssa::ValueId>,
-    ) -> Option<CExpr> {
-        if depth > Self::MAX_SEMANTIC_RENDER_DEPTH {
-            return None;
-        }
-        if var.is_const() {
-            return self.render_certified_value_expr_for_var(var);
-        }
-        let prepared = self.prepared_ssa()?;
-        let value = self.prepared_value_id_for_var(var)?;
-        if let Some(name) = self.certified_loop_carrier_name_for_value(value) {
-            return Some(CExpr::Var(name));
-        }
-        if var.version == 0 && var.is_register() {
-            if let Some(expr) = self.certified_parameter_expr_for_value(value) {
-                return Some(expr);
-            }
-            if self.stable_semantic_ids_are_required() {
-                return None;
-            }
-            let rendered = self.var_name(var);
-            return Some(
-                self.arg_alias_for_rendered_name(&rendered)
-                    .or_else(|| self.certified_signature_arg_alias_for_register(&rendered))
-                    .map(CExpr::Var)
-                    .unwrap_or_else(|| CExpr::Var(rendered)),
-            );
-        }
-
-        if !visited.insert(value) {
-            return None;
-        }
-
-        let result = (|| {
-            let inst_id = prepared.graph().def_inst(value)?;
-            let inst = prepared.graph().inst(inst_id)?;
-            let r2ssa::InstPayload::Op(op) = &inst.payload else {
-                return None;
-            };
-            match op {
-                SSAOp::Copy { src, .. }
-                | SSAOp::New { src, .. }
-                | SSAOp::Cast { src, .. }
-                | SSAOp::Subpiece { src, .. }
-                | SSAOp::IntZExt { src, .. }
-                | SSAOp::IntSExt { src, .. } => {
-                    self.render_certified_address_expr_for_var(src, depth + 1, visited)
-                }
-                SSAOp::Load { .. } => {
-                    let (block_addr, op_idx) = prepared.inst_op_site(inst_id)?;
-                    let proof = self.certified_render_context()?;
-                    let fact = proof.memory_access_for_op(block_addr, op_idx, false)?;
-                    if fact.value != Some(value) {
-                        return None;
-                    }
-                    self.certified_stack_owner_expr_for_memory_fact(fact)
-                }
-                SSAOp::IntAdd { a, b, .. } => Some(CExpr::binary(
-                    BinaryOp::Add,
-                    self.render_certified_address_expr_for_var(a, depth + 1, visited)?,
-                    self.render_certified_address_expr_for_var(b, depth + 1, visited)?,
-                )),
-                SSAOp::IntSub { a, b, .. } => Some(CExpr::binary(
-                    BinaryOp::Sub,
-                    self.render_certified_address_expr_for_var(a, depth + 1, visited)?,
-                    self.render_certified_address_expr_for_var(b, depth + 1, visited)?,
-                )),
-                SSAOp::IntMult { a, b, .. } => Some(CExpr::binary(
-                    BinaryOp::Mul,
-                    self.render_certified_address_expr_for_var(a, depth + 1, visited)?,
-                    self.render_certified_address_expr_for_var(b, depth + 1, visited)?,
-                )),
-                SSAOp::IntLeft { a, b, .. } => {
-                    let shift = self.certified_const_value_for_address_var(b, 0)?;
-                    if shift > 63 {
-                        return None;
-                    }
-                    Some(CExpr::binary(
-                        BinaryOp::Shl,
-                        self.render_certified_address_expr_for_var(a, depth + 1, visited)?,
-                        CExpr::IntLit(shift as i64),
-                    ))
-                }
-                SSAOp::PtrAdd {
-                    base,
-                    index,
-                    element_size,
-                    ..
-                } => {
-                    let index =
-                        self.render_certified_address_expr_for_var(index, depth + 1, visited)?;
-                    let scaled = if *element_size == 1 {
-                        index
-                    } else {
-                        CExpr::binary(
-                            BinaryOp::Mul,
-                            index,
-                            CExpr::IntLit(i64::from(*element_size)),
-                        )
-                    };
-                    Some(CExpr::binary(
-                        BinaryOp::Add,
-                        self.render_certified_address_expr_for_var(base, depth + 1, visited)?,
-                        scaled,
-                    ))
-                }
-                SSAOp::PtrSub {
-                    base,
-                    index,
-                    element_size,
-                    ..
-                } => {
-                    let index =
-                        self.render_certified_address_expr_for_var(index, depth + 1, visited)?;
-                    let scaled = if *element_size == 1 {
-                        index
-                    } else {
-                        CExpr::binary(
-                            BinaryOp::Mul,
-                            index,
-                            CExpr::IntLit(i64::from(*element_size)),
-                        )
-                    };
-                    Some(CExpr::binary(
-                        BinaryOp::Sub,
-                        self.render_certified_address_expr_for_var(base, depth + 1, visited)?,
-                        scaled,
-                    ))
-                }
-                _ => None,
-            }
-        })();
-
-        visited.remove(&value);
-        result
-    }
-
-    pub(super) fn certified_signature_arg_alias_for_register(
-        &self,
-        reg_name: &str,
-    ) -> Option<String> {
-        if !self.requires_certified_rendering() {
-            return None;
-        }
-        let reg_name = reg_name.to_ascii_lowercase();
-        let index = self.inputs.arch.arg_regs.iter().position(|arg_reg| {
-            crate::register_alias_names(arg_reg)
-                .into_iter()
-                .any(|alias| alias.eq_ignore_ascii_case(&reg_name))
-        })?;
-        self.inputs
-            .function_facts
-            .type_facts()
-            .render_authorized_signature()
-            .and_then(|signature| signature.params.get(index))
-            .map(|param| param.name.clone())
-            .filter(|name| !name.trim().is_empty())
-    }
-
-    pub(super) fn render_certified_memory_expr_for_fact(
+    /// The access as C, by whichever authority answers for it first: a
+    /// declared aggregate's element, the rewriter's proven subscript, a stack
+    /// slot's name, a declared member split out of the address, and last the
+    /// address itself dereferenced. Each is one lookup; none takes an
+    /// expression apart to decide.
+    fn render_certified_memory_expr_for_fact(
         &self,
         fact: &r2types::MemoryAccessRenderFact,
         elem_ty: CType,
-    ) -> Option<CExpr> {
+    ) -> Option<PendingMemoryAccessExpr> {
         if fact.space != r2il::SpaceId::Ram {
             return None;
-        }
-        if let Some(expr) = self.certified_stack_owner_expr_for_memory_fact(fact) {
-            return Some(expr);
         }
         if let Some(array) = self.certified_array_fact_for_memory(fact)
             && (array.base.is_some() || array.index.is_some())
         {
-            return self.render_certified_semantic_array_expr(fact);
+            return self
+                .render_certified_semantic_array_expr(fact)
+                .map(PendingMemoryAccessExpr::Replacement);
         }
-        let (addr, addr_expr) = self.certified_memory_address_expr(fact)?;
+        if let Some(expr) = self.certified_subscript_expr_for_fact(fact, &elem_ty) {
+            return Some(PendingMemoryAccessExpr::Replacement(expr));
+        }
+        if let Some(expr) = self.certified_stack_owner_expr_for_memory_fact(fact) {
+            return Some(PendingMemoryAccessExpr::Planned(expr));
+        }
+        let (_, addr_expr) = self.certified_memory_address_expr(fact)?;
         if let Some(rendered) = self.render_certified_structured_memory_expr(fact, &addr_expr) {
-            return Some(rendered);
+            return Some(PendingMemoryAccessExpr::Planned(rendered));
         }
         if matches!(addr_expr, CExpr::Binary { .. }) {
-            return None;
+            let pointer_bits = self.pointer_bits();
+            let byte_address = self
+                .render_certified_linear_byte_address(&addr_expr)
+                .or_else(|| self.integerize_certified_address_expr(&addr_expr, pointer_bits))?;
+            return Some(PendingMemoryAccessExpr::Planned(CExpr::Deref(Box::new(
+                CExpr::cast(CType::ptr(elem_ty), byte_address),
+            ))));
         }
+        // The address is a value, and what it is declared as is what the
+        // conversion to the pointee's pointer is made from.
         let ptr_ty = CType::ptr(elem_ty);
-        let casted = self.cast_addr_expr_to_ptr_if_needed(&addr, addr_expr, &ptr_ty);
-        Some(CExpr::Deref(Box::new(casted)))
+        let address_type = self.value_type(fact.address);
+        let casted = self.convert_from(addr_expr, address_type.as_ref(), &ptr_ty);
+        Some(PendingMemoryAccessExpr::Planned(CExpr::Deref(Box::new(
+            casted,
+        ))))
     }
 
+    /// The only extractor for a certified memory route's pending syntax.
+    /// Canonical replacements cannot reach a caller without their structural
+    /// replacement contract being converted to cells here.
+    pub(super) fn finalize_certified_memory_expr_for_fact(
+        &self,
+        fact: &r2types::MemoryAccessRenderFact,
+        elem_ty: CType,
+    ) -> Option<CExpr> {
+        match self.render_certified_memory_expr_for_fact(fact, elem_ty)? {
+            PendingMemoryAccessExpr::Planned(expr) => Some(expr),
+            PendingMemoryAccessExpr::Replacement(replacement) => {
+                Some(self.finish_replacement_expr(replacement))
+            }
+        }
+    }
+
+    /// The slot's name, for an access that sits at the slot's own offset.
+    ///
+    /// An access at an offset the machine computes is inside the slot and
+    /// not at it, so the name alone would read the first element for every
+    /// element; that access is the subscript path's or, failing it, the
+    /// address's.
     fn certified_stack_owner_expr_for_memory_fact(
         &self,
         fact: &r2types::MemoryAccessRenderFact,
@@ -779,343 +754,13 @@ impl<'a> FoldingContext<'a> {
         if fact.width == 0 {
             return None;
         }
-        if let Some(plan) = self
-            .certified_render_context()
-            .and_then(|proof| self.certified_render_plan(proof))
-            && let Some(expr) = plan.stack_param_expr_for_memory_fact(fact)
+        if self
+            .prepared_ssa()
+            .is_some_and(|prepared| prepared.objects().address_is_indexed(fact.address))
         {
-            return Some(expr);
-        }
-        let offset = self.inputs.render_facts()?.stack_slot_offset(fact.object)?;
-        let name = self
-            .certified_stack_var_name_for_object_offset(fact.object, offset)
-            .unwrap_or_else(|| {
-                format!(
-                    "var_{}h",
-                    if offset >= 0 {
-                        format!("{:x}", offset)
-                    } else {
-                        format!("{:x}", -offset)
-                    }
-                )
-            });
-        Some(CExpr::Var(name))
-    }
-
-    pub(super) fn certified_memory_render_refusal_for_current_op(&self, is_write: bool) -> String {
-        let Some(block_addr) = self.current_block_addr.get() else {
-            return "missing current block".to_string();
-        };
-        let Some(op_idx) = self.current_op_idx.get() else {
-            return "missing current op".to_string();
-        };
-        let Some(fact) = self.certified_memory_access_for_current_op(is_write) else {
-            return format!("missing FunctionRenderFacts memory fact at 0x{block_addr:x}:{op_idx}");
-        };
-        if fact.space != r2il::SpaceId::Ram {
-            return format!("unsupported exact memory space {}", fact.space);
-        }
-        let (array_fact_count, member_fact_count) = self
-            .inputs
-            .render_facts()
-            .map(|render| {
-                (
-                    render
-                        .array_accesses_by_op
-                        .get(&(block_addr, op_idx, is_write))
-                        .map_or(0, Vec::len),
-                    render
-                        .member_accesses_by_op
-                        .get(&(block_addr, op_idx, is_write))
-                        .map_or(0, Vec::len),
-                )
-            })
-            .unwrap_or((0, 0));
-        format!(
-            "memory access lacks exact typed stack owner or array/member render proof; array_facts {} member_facts {}",
-            array_fact_count, member_fact_count
-        )
-    }
-
-    fn certified_const_value_for_address_var(&self, var: &SSAVar, depth: u32) -> Option<u64> {
-        if depth > 4 {
             return None;
         }
-        if let Some(value) = parse_const_value(&var.name) {
-            return Some(value);
-        }
-        let prepared = self.prepared_ssa()?;
-        let value = self.prepared_value_id_for_var(var)?;
-        let inst_id = prepared.graph().def_inst(value)?;
-        let inst = prepared.graph().inst(inst_id)?;
-        let r2ssa::InstPayload::Op(op) = &inst.payload else {
-            return None;
-        };
-        match op {
-            SSAOp::Copy { src, .. }
-            | SSAOp::New { src, .. }
-            | SSAOp::Cast { src, .. }
-            | SSAOp::Subpiece { src, .. }
-            | SSAOp::IntZExt { src, .. }
-            | SSAOp::IntSExt { src, .. } => {
-                self.certified_const_value_for_address_var(src, depth + 1)
-            }
-            SSAOp::IntAnd { a, b, .. } => Some(
-                self.certified_const_value_for_address_var(a, depth + 1)?
-                    & self.certified_const_value_for_address_var(b, depth + 1)?,
-            ),
-            _ => None,
-        }
-    }
-
-    pub(super) fn render_authoritative_memory_access_by_name(
-        &self,
-        name: &str,
-        elem_size: u32,
-        depth: u32,
-        visited: &mut HashSet<String>,
-    ) -> Option<CExpr> {
-        if !self.enter_resolution_guard(ResolutionPhase::Memory, name) {
-            return None;
-        }
-
-        let semantic = self.render_memory_access_by_name(name, elem_size, depth, visited);
-        let result = if semantic.is_some() || self.has_authoritative_memory_semantics(name) {
-            semantic
-        } else {
-            self.lookup_definition(name).and_then(|expr| {
-                self.render_memory_access_from_visible_expr(&expr, elem_size, depth, visited)
-            })
-        };
-
-        self.leave_resolution_guard(ResolutionPhase::Memory, name);
-        result
-    }
-
-    pub(super) fn render_canonical_load_expr(
-        &self,
-        dst: &SSAVar,
-        addr: &SSAVar,
-        elem_ty: CType,
-    ) -> CExpr {
-        let memo_key = self
-            .prepared_value_id_for_var(dst)
-            .map(|value| (value, elem_ty.to_string()));
-        if let Some(cached) = memo_key
-            .as_ref()
-            .and_then(|key| self.load_expr_memo.borrow().get(key).cloned())
-        {
-            return cached;
-        }
-        let rendered = self.render_canonical_load_expr_uncached(dst, addr, elem_ty);
-        if let Some(key) = memo_key {
-            self.load_expr_memo
-                .borrow_mut()
-                .insert(key, rendered.clone());
-        }
-        rendered
-    }
-
-    fn render_canonical_load_expr_uncached(
-        &self,
-        dst: &SSAVar,
-        addr: &SSAVar,
-        elem_ty: CType,
-    ) -> CExpr {
-        if let Some(named) = self.prepared_named_memory_expr_for_value(dst) {
-            return named;
-        }
-        let pointee_load = dst.size < addr.size;
-        let fallback_addr_expr = self
-            .lookup_definition(&addr.display_name())
-            .or_else(|| self.definition_for_name(&addr.display_name()).cloned())
-            .unwrap_or_else(|| self.get_expr(addr));
-        let mut semantic_visited = HashSet::new();
-        let mut best = self.render_authoritative_memory_access_by_name(
-            &dst.display_name(),
-            dst.size,
-            0,
-            &mut semantic_visited,
-        );
-        best = self.choose_preferred_visible_expr(
-            best,
-            self.render_authoritative_memory_access_by_name(
-                &addr.display_name(),
-                dst.size,
-                0,
-                &mut semantic_visited,
-            ),
-        );
-        let fallback_rendered = self.render_memory_access_from_visible_expr(
-            &fallback_addr_expr,
-            dst.size,
-            0,
-            &mut semantic_visited,
-        );
-        if let Some(fallback_structured) = fallback_rendered
-            .as_ref()
-            .filter(|expr| Self::expr_is_structured_memory_candidate(expr))
-            .cloned()
-            && !best
-                .as_ref()
-                .is_some_and(Self::expr_is_structured_memory_candidate)
-        {
-            best = Some(fallback_structured);
-        }
-        best = self.choose_preferred_visible_expr(best, fallback_rendered);
-        if let Some(expr) = best {
-            if let CExpr::Deref(inner) = &expr
-                && let Some(indexed) = self.indexed_pointer_add_expr(inner, &elem_ty)
-            {
-                return indexed;
-            }
-            if !Self::expr_is_scalar_memory_candidate(&expr)
-                && !matches!(elem_ty, CType::Pointer(_) | CType::Array(_, _))
-                && self.normalized_addr_from_visible_expr(&expr, 0).is_some()
-            {
-                return self.typed_deref_expr(addr, expr, elem_ty);
-            }
-            return expr;
-        }
-
-        if pointee_load {
-            let ptr_ty = CType::ptr(elem_ty.clone());
-            let casted = self.cast_addr_expr_to_ptr_if_needed(addr, self.get_expr(addr), &ptr_ty);
-            return CExpr::Deref(Box::new(casted));
-        }
-
-        if dst.size >= addr.size
-            && let Some(stack_var) = self.stack_var_for_addr_var(addr)
-        {
-            return CExpr::Var(stack_var);
-        }
-
-        if addr.is_const() {
-            let direct = self.get_expr(addr);
-            if matches!(direct, CExpr::Var(_) | CExpr::StringLit(_)) {
-                return direct;
-            }
-        }
-
-        if let Some(exact) = self.resolve_literalish_call_arg_expr(&fallback_addr_expr) {
-            return exact;
-        }
-
-        self.typed_deref_expr(addr, fallback_addr_expr, elem_ty)
-    }
-
-    pub(super) fn render_canonical_store_target_expr(
-        &self,
-        addr: &SSAVar,
-        value_size: u32,
-        elem_ty: CType,
-    ) -> CExpr {
-        let fallback_addr_expr = self
-            .lookup_definition(&addr.display_name())
-            .or_else(|| self.definition_for_name(&addr.display_name()).cloned())
-            .unwrap_or_else(|| self.get_expr(addr));
-        let mut semantic_visited = HashSet::new();
-        let mut best = self.render_authoritative_memory_access_by_name(
-            &addr.display_name(),
-            value_size,
-            0,
-            &mut semantic_visited,
-        );
-        let fallback_rendered = self.render_memory_access_from_visible_expr(
-            &fallback_addr_expr,
-            value_size,
-            0,
-            &mut semantic_visited,
-        );
-        if let Some(fallback_structured) = fallback_rendered
-            .as_ref()
-            .filter(|expr| Self::expr_is_structured_memory_candidate(expr))
-            .cloned()
-            && !best
-                .as_ref()
-                .is_some_and(Self::expr_is_structured_memory_candidate)
-        {
-            best = Some(fallback_structured);
-        }
-        best = self.choose_preferred_visible_expr(best, fallback_rendered);
-        best = self.choose_preferred_visible_expr(
-            best,
-            self.prepared_named_memory_def_expr_for_current_op(),
-        );
-        if let Some(expr) = best.filter(Self::expr_is_store_target_candidate) {
-            return expr;
-        }
-
-        if let Some(stack_var) = self.stack_var_for_addr_var(addr) {
-            return CExpr::Var(stack_var);
-        }
-
-        if addr.is_const() {
-            let direct = self.get_expr(addr);
-            if matches!(direct, CExpr::Var(_) | CExpr::StringLit(_)) {
-                return direct;
-            }
-        }
-
-        if let Some(exact) = self.resolve_literalish_call_arg_expr(&fallback_addr_expr) {
-            return exact;
-        }
-
-        if value_size == 1
-            && let Some(indexed) = self.byte_indexed_pointer_add_expr(&fallback_addr_expr)
-        {
-            return indexed;
-        }
-
-        self.typed_deref_expr(addr, fallback_addr_expr, elem_ty)
-    }
-
-    pub(super) fn render_memory_access_from_visible_expr(
-        &self,
-        expr: &CExpr,
-        elem_size: u32,
-        depth: u32,
-        visited: &mut HashSet<String>,
-    ) -> Option<CExpr> {
-        self.render_memory_access_from_visible_expr_with_direction(
-            expr, elem_size, false, depth, visited,
-        )
-    }
-
-    fn render_memory_access_from_visible_expr_with_direction(
-        &self,
-        expr: &CExpr,
-        elem_size: u32,
-        is_write: bool,
-        depth: u32,
-        visited: &mut HashSet<String>,
-    ) -> Option<CExpr> {
-        let mut try_render = |candidate: &CExpr, ctx: &FoldingContext<'_>| {
-            let canonical = ctx.canonicalize_visible_address_expr(candidate, depth + 1);
-            let addr = ctx.normalized_addr_from_visible_expr(&canonical, depth + 1)?;
-            ctx.render_access_expr_from_addr(&addr, elem_size, is_write, depth + 1, visited)
-        };
-
-        let mut semantic_visited = HashSet::new();
-        let semanticized = self.semanticize_visible_expr(expr, depth + 1, &mut semantic_visited);
-        let preferred = if self.prefers_visible_expr(expr, &semanticized) {
-            semanticized
-        } else {
-            expr.clone()
-        };
-        if let Some(rendered) = try_render(&preferred, self).or_else(|| try_render(expr, self)) {
-            return Some(rendered);
-        }
-        let elem_ty = type_from_size(elem_size);
-        if let Some(indexed) = self.indexed_pointer_add_expr(&preferred, &elem_ty) {
-            return Some(indexed);
-        }
-        if preferred != *expr
-            && let Some(indexed) = self.indexed_pointer_add_expr(expr, &elem_ty)
-        {
-            return Some(indexed);
-        }
-
-        None
+        self.inputs.render_facts()?.stack_slot_offset(fact.object)?;
+        self.certified_stack_var_expr_for_object(fact.object)
     }
 }

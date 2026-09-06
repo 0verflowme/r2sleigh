@@ -1,0 +1,152 @@
+NAME=regression_watch_stress_fp_interpolate_decompile_current
+FILE=../extras/../../bins/stress_test
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+double dbg.fp_interpolate(double a, double b, double t)
+{
+    local_8 = xmm0_qa;
+    local_10 = xmm1_qa;
+    local_18 = xmm2_qa;
+    return saved_fp;
+}
+
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s dbg.fp_interpolate
+a:sla.dec
+EOF_CMDS
+RUN
+
+NAME=regression_watch_test_piece_decompile_current
+FILE=../extras/../../bins/vuln_test
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+uint64_t dbg.test_piece(uint32_t hi, uint32_t lo)
+{
+    local_4 = hi;
+    local_8 = lo;
+    return saved_fp;
+}
+
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s dbg.test_piece
+a:sla.dec
+EOF_CMDS
+RUN
+
+NAME=regression_watch_test_array_index_decompile_current
+FILE=../extras/../../bins/vuln_test
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+int32_t dbg.test_array_index(int32_t* arr, int32_t idx)
+{
+    local_8 = (int32_t*)arr;
+    local_c = idx;
+    return saved_fp;
+}
+
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s dbg.test_array_index
+a:sla.dec
+EOF_CMDS
+RUN
+
+NAME=regression_watch_test_array_index_neg_decompile_current
+FILE=../extras/../../bins/vuln_test
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+int32_t dbg.test_array_index_neg(int32_t* arr, int32_t idx)
+{
+    local_8 = (int32_t*)arr;
+    local_c = idx;
+    return saved_fp;
+}
+
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s dbg.test_array_index_neg
+a:sla.dec
+EOF_CMDS
+RUN
+
+NAME=regression_watch_test_cast_u8_decompile_current
+FILE=../extras/../../bins/vuln_test
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+uint8_t dbg.test_cast_u8(int32_t x)
+{
+    local_4 = x;
+    return saved_fp;
+}
+
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s dbg.test_cast_u8
+a:sla.dec
+EOF_CMDS
+RUN
+
+NAME=regression_watch_vuln_memcpy_decompile_current
+FILE=../extras/../../bins/vuln_test
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+void dbg.vuln_memcpy(int8_t* user_input, int32_t user_len)
+{
+    local_48 = rdi;
+    local_4c = user_len;
+    sym.imp.memcpy(&local, arg1, arg2);
+    sym.imp.printf("Copied: %s\\n", &local);
+    return 0;
+}
+
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s dbg.vuln_memcpy
+a:sla.dec
+EOF_CMDS
+RUN
+
+NAME=regression_watch_check_secret_signature_writeback_current
+FILE=../extras/../../bins/vuln_test
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+[{"name":"dbg.check_secret","return":"void","args":[{"name":"arg0","type":"void"}],"count":1}]
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s dbg.check_secret
+a:sla.info >/dev/null
+e anal.sla.mode=full
+afs void dbg.check_secret(void)
+afc ms
+aaaa
+afcfj
+EOF_CMDS
+RUN
+
+NAME=regression_watch_ls_signature_writeback_current
+FILE=/bin/ls
+ARGS=-e scr.color=false -e log.level=0 -e bin.relocs.apply=true
+EXPECT=<<EOF_EXPECT
+[{"name":"custom_sigkeep","return":"void","args":[{"name":"arg1","type":"void *"},{"name":"arg2","type":"void *"},{"name":"arg3","type":"void *"}],"count":3}]
+EOF_EXPECT
+CMDS=<<EOF_CMDS
+aaa
+s fcn.00007ed0
+afn custom_sigkeep
+s custom_sigkeep
+afs void custom_sigkeep(void)
+aaaa
+s custom_sigkeep
+afij~name,signature >/dev/null
+afcfj
+EOF_CMDS
+RUN

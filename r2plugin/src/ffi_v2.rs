@@ -38,7 +38,7 @@ pub const R2SLEIGH_CAPABILITIES_V2: u64 = R2SLEIGH_CAP_DECOMPILE_V2
 /// with the snapshot and accessor schema versions, none of which move when an
 /// unrelated radare2 ABI bump happens.
 pub const R2SLEIGH_RADARE_SNAPSHOT_CONTRACT_V2: u32 = 1;
-pub const R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2: u32 = 13;
+pub const R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2: u32 = 16;
 pub const R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2: u32 = 5;
 
 pub const R2SLEIGH_STATUS_OK_V2: u32 = 0;
@@ -51,6 +51,7 @@ pub const R2SLEIGH_STATUS_PANIC_V2: u32 = 6;
 
 pub const R2SLEIGH_REQUEST_DECOMPILE_V2: u32 = 1;
 pub const R2SLEIGH_REQUEST_TYPE_FUNCTION_V2: u32 = 2;
+pub const R2SLEIGH_REQUEST_PROVEN_FACTS_V2: u32 = 3;
 pub const R2SLEIGH_RESPONSE_INFO_SCHEMA_V2: u32 = 2;
 pub const R2SLEIGH_OUTCOME_COMPLETED_V2: u32 = 0;
 pub const R2SLEIGH_OUTCOME_REFUSED_V2: u32 = 1;
@@ -166,6 +167,24 @@ pub struct R2SleighRequestV2 {
 }
 
 /// Length-tagged UTF-8 source string.
+/// Everything a caller needs to know about one lifted block.
+///
+/// Six accessors used to answer this, and each one locked the lift registry and
+/// looked the handle up again to read a single field. Six lock acquisitions to
+/// describe one block is the cost; the maintenance is that both sides carry a
+/// declaration per field. One view answers under one lock.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct R2SleighBlockViewV2 {
+    pub struct_size: u32,
+    pub block_type: u32,
+    pub size: u32,
+    pub addr: u64,
+    pub jump: u64,
+    pub fail: u64,
+    pub op_count: usize,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct R2SleighStringViewV2 {
@@ -173,31 +192,8 @@ pub struct R2SleighStringViewV2 {
     pub len: usize,
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-macro_rules! assert_wire_layout {
-    ($wire:ty, $source:ty) => {
-        const _: [(); size_of::<$wire>()] = [(); size_of::<$source>()];
-        const _: [(); align_of::<$wire>()] = [(); align_of::<$source>()];
-    };
-}
-
-const _: [(); R2SLEIGH_RADARE_SNAPSHOT_CONTRACT_V2 as usize] = [(); r2source::RADARE_SNAPSHOT_CONTRACT_VERSION as usize];
+const _: [(); R2SLEIGH_RADARE_SNAPSHOT_CONTRACT_V2 as usize] =
+    [(); r2source::RADARE_SNAPSHOT_CONTRACT_VERSION as usize];
 const _: [(); R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2 as usize] =
     [(); r2source::RADARE_FUNCTION_SNAPSHOT_SCHEMA_VERSION as usize];
 const _: [(); R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2 as usize] =
@@ -540,17 +536,13 @@ pub struct R2SleighApiV2 {
         *mut u32,
         *mut R2SleighDirectCallIdentityV2,
     ) -> u32,
-    pub lift_block_size: extern "C" fn(*const R2ILBlock, *mut u32) -> u32,
-    pub lift_block_addr: extern "C" fn(*const R2ILBlock, *mut u64) -> u32,
+    pub lift_block_view: extern "C" fn(*const R2ILBlock, *mut R2SleighBlockViewV2) -> u32,
     pub lift_block_mnemonic: extern "C" fn(
         *const R2ILContext,
         R2SleighByteViewV2,
         u64,
         *mut *mut R2SleighOwnedBytesV2,
     ) -> u32,
-    pub lift_block_type: extern "C" fn(*const R2ILBlock, *mut u32) -> u32,
-    pub lift_block_jump: extern "C" fn(*const R2ILBlock, *mut u64) -> u32,
-    pub lift_block_fail: extern "C" fn(*const R2ILBlock, *mut u64) -> u32,
     pub owned_bytes_view:
         extern "C" fn(*const R2SleighOwnedBytesV2, *mut R2SleighByteViewV2) -> u32,
     pub owned_bytes_free: extern "C" fn(*mut R2SleighOwnedBytesV2) -> u32,
@@ -1177,16 +1169,149 @@ fn elapsed_us(started: Instant) -> u64 {
 unsafe fn capture_trusted_ssa_from_buffer(
     payload: &R2SleighEngineRequestPayloadV2,
     execution: &r2engine::EngineExecutionControl,
-) -> Result<Arc<r2ssa::TrustedSsaArtifact>, BoundaryError> {
+) -> Result<TrustedIngress, BoundaryError> {
     let ssa_control = execution.ssa_execution_control();
     r2ssa::SsaWorkControl::poll(&ssa_control)
         .map_err(|error| BoundaryError::engine(format!("trusted ingress stopped: {error}")))?;
     // SAFETY: the caller guarantees the buffer extent.
     let bytes =
         unsafe { std::slice::from_raw_parts(payload.snapshot_buffer, payload.snapshot_buffer_len) };
-    let source = r2source::snapshot_wire::decode_snapshot(bytes)
+    let decode_started = Instant::now();
+    let (source, callees) = r2source::snapshot_wire::decode_snapshot_set(bytes)
         .map_err(|error| BoundaryError::invalid(format!("snapshot buffer rejected: {error}")))?;
-    trusted_from_source(source, execution)
+    let decode_elapsed = decode_started.elapsed();
+    // Callees first, so the root can describe a call whose prototype the
+    // source never recovered from what the callee's own body does.
+    //
+    // A callee that will not lift costs the caller nothing: the solver falls
+    // back to knowing nothing about that call, which is where it started.
+    let mut callee_facts = Vec::new();
+    let mut callee_interfaces = std::collections::BTreeMap::new();
+    let callee_started = Instant::now();
+    let callee_count = callees.len();
+    let mut callee_hits = 0usize;
+    // Every callee in one capture is the same machine as the root, which is
+    // what the interprocedural solve checks before it uses any of them.
+    let ptr_bits = source.machine().bits();
+    for callee in callees {
+        let entry = callee.function().address();
+        // A callee body is prepared from its own snapshot and nothing else --
+        // the set is one level deep, so it has no callee interfaces of its own
+        // to be prepared against. Re-serializing it therefore reproduces the
+        // whole of what its lift reads, which is what the cache compares. The
+        // encoder is deterministic, so the same body yields the same bytes;
+        // re-encoding costs microseconds against a lift's hundreds of
+        // milliseconds, and a body that will not serialize is simply not
+        // cached rather than being cached under a partial key.
+        //
+        // `encode_snapshot_cache_key` rather than `encode_snapshot`, because a
+        // callee inherits its caller's capture tag and a plain encoding would
+        // therefore differ for every caller of the same body. That function
+        // states exactly what it substitutes and why.
+        let key = r2source::snapshot_wire::encode_snapshot_cache_key(&callee).ok();
+        let cached = key
+            .as_deref()
+            .and_then(|key| r2engine::cached_callee_facts(entry, key));
+        let facts = match cached {
+            Some(facts) => {
+                // A hit answers the whole of what this callee contributes, so
+                // its body is never built. That is the point of deriving the
+                // contribution rather than keeping the body to re-derive it.
+                callee_hits += 1;
+                facts
+            }
+            None => {
+                let Ok(artifact) = trusted_from_source(callee, execution) else {
+                    continue;
+                };
+                let Some(facts) = r2engine::CalleeFacts::derive(&artifact, ptr_bits) else {
+                    continue;
+                };
+                if let Some(key) = key.as_deref() {
+                    r2engine::cache_callee_facts(entry, key, &facts);
+                }
+                facts
+            }
+        };
+        callee_interfaces.insert(entry, facts.interface().clone());
+        callee_facts.push(facts);
+    }
+    let callee_elapsed = callee_started.elapsed();
+    let root_started = Instant::now();
+    // The root is prepared against the interfaces of the callees above, so its
+    // input is the whole request buffer rather than its own record within it.
+    // That is exactly the buffer in hand, and it is the buffer radare2 built
+    // from the function and everything it calls: two requests that agree on it
+    // agree on every input the root's preparation reads.
+    let root_address = source.function().address();
+    let (root, root_hit) = match r2engine::cached_root_artifact(root_address, bytes) {
+        Some(root) => (root, true),
+        None => {
+            let root = trusted_from_source_with_callees(source, execution, &callee_interfaces)?;
+            r2engine::cache_root_artifact(root_address, bytes, &root);
+            (root, false)
+        }
+    };
+    Ok(TrustedIngress {
+        root,
+        callees: callee_facts,
+        capture: CaptureTiming {
+            decode: decode_elapsed,
+            callee_lift: callee_elapsed,
+            callee_count,
+            callee_hits,
+            root_lift: root_started.elapsed(),
+            root_hit,
+        },
+    })
+}
+
+/// What one snapshot capture cost, split where the cost actually divides.
+///
+/// The engine's phase inventory begins after the artifact exists, so every
+/// decompile through the borrowed-snapshot provider reported `ssa=0us` and the
+/// wire decode, the callee lifts and the root lift were attributed to nothing.
+/// On `/bin/ls` that unmeasured span is most of the wall clock.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct CaptureTiming {
+    pub(crate) decode: Duration,
+    pub(crate) callee_lift: Duration,
+    pub(crate) callee_count: usize,
+    /// How many of those callees came back from the program cache instead of
+    /// being lifted. Reported beside the count, because `callee_lift` falling
+    /// says nothing on its own about whether the cache or the program changed.
+    pub(crate) callee_hits: usize,
+    pub(crate) root_lift: Duration,
+    pub(crate) root_hit: bool,
+}
+
+impl CaptureTiming {
+    /// One comment naming the capture's cost, when `R2SLEIGH_TIMING` asks.
+    pub(crate) fn comment(&self) -> Option<String> {
+        std::env::var_os("R2SLEIGH_TIMING")?;
+        let cache = r2engine::program_cache_stats();
+        Some(format!(
+            "/* r2dec timing: capture={}us decode={}us callee_lift={}us callees={} cached_callees={} root_lift={}us cached_root={} cache_entries={} cache_hits={} cache_misses={} cache_replacements={} */",
+            (self.decode + self.callee_lift + self.root_lift).as_micros(),
+            self.decode.as_micros(),
+            self.callee_lift.as_micros(),
+            self.callee_count,
+            self.callee_hits,
+            self.root_lift.as_micros(),
+            u8::from(self.root_hit),
+            cache.entries,
+            cache.hits,
+            cache.misses,
+            cache.replacements,
+        ))
+    }
+}
+
+/// One trusted root and the bodies of what it calls, from one capture.
+pub(crate) struct TrustedIngress {
+    pub(crate) root: Arc<r2ssa::TrustedSsaArtifact>,
+    pub(crate) callees: Vec<r2engine::CalleeFacts>,
+    pub(crate) capture: CaptureTiming,
 }
 
 /// Lift and prepare one owned snapshot, whichever transport produced it. Both
@@ -1195,6 +1320,16 @@ unsafe fn capture_trusted_ssa_from_buffer(
 fn trusted_from_source(
     source: r2source::OwnedFunctionSnapshot,
     execution: &r2engine::EngineExecutionControl,
+) -> Result<Arc<r2ssa::TrustedSsaArtifact>, BoundaryError> {
+    trusted_from_source_with_callees(source, execution, &std::collections::BTreeMap::new())
+}
+
+/// Lift and prepare one owned snapshot, describing each call whose callee body
+/// arrived in the same capture.
+fn trusted_from_source_with_callees(
+    source: r2source::OwnedFunctionSnapshot,
+    execution: &r2engine::EngineExecutionControl,
+    callee_interfaces: &std::collections::BTreeMap<u64, r2source::SourceFunctionInterface>,
 ) -> Result<Arc<r2ssa::TrustedSsaArtifact>, BoundaryError> {
     let ssa_control = execution.ssa_execution_control();
     r2ssa::SsaWorkControl::poll(&ssa_control).map_err(|error| {
@@ -1207,10 +1342,12 @@ fn trusted_from_source(
     r2ssa::SsaWorkControl::poll(&ssa_control).map_err(|error| {
         BoundaryError::engine(format!("trusted ingress stopped after lift: {error}"))
     })?;
-    let trusted =
-        r2ssa::TrustedSsaArtifact::prepare_with_control(lifted, &ssa_control).map_err(|error| {
-            BoundaryError::engine(format!("trusted SSA preparation failed: {error}"))
-        })?;
+    let trusted = r2ssa::TrustedSsaArtifact::prepare_with_callee_interfaces(
+        lifted,
+        &ssa_control,
+        callee_interfaces,
+    )
+    .map_err(|error| BoundaryError::engine(format!("trusted SSA preparation failed: {error}")))?;
     Ok(Arc::new(trusted))
 }
 
@@ -1259,7 +1396,9 @@ unsafe fn execute_request(
     }
     if !matches!(
         request.kind,
-        R2SLEIGH_REQUEST_DECOMPILE_V2 | R2SLEIGH_REQUEST_TYPE_FUNCTION_V2
+        R2SLEIGH_REQUEST_DECOMPILE_V2
+            | R2SLEIGH_REQUEST_TYPE_FUNCTION_V2
+            | R2SLEIGH_REQUEST_PROVEN_FACTS_V2
     ) {
         return Err(BoundaryError::unsupported("unsupported request kind"));
     }
@@ -1270,8 +1409,9 @@ unsafe fn execute_request(
     });
     let execution = r2engine::EngineExecutionControl::new(cancellation, deadline);
     let trusted = unsafe { capture_trusted_ssa_from_buffer(payload, &execution) }?;
+    let capture_comment = trusted.capture.comment();
     let ffi_conversion_elapsed_us = elapsed_us(ffi_started);
-    let output = match request.kind {
+    let mut output = match request.kind {
         R2SLEIGH_REQUEST_DECOMPILE_V2 => {
             super::r2sleigh_engine_decompile_trusted_output(payload, trusted, execution)
                 .ok_or_else(|| BoundaryError::engine("decompile engine refused the request"))?
@@ -1280,8 +1420,19 @@ unsafe fn execute_request(
             super::r2sleigh_engine_type_function_trusted_output(payload, trusted, execution)
                 .ok_or_else(|| BoundaryError::engine("type engine refused the request"))?
         }
+        R2SLEIGH_REQUEST_PROVEN_FACTS_V2 => {
+            super::r2sleigh_engine_proven_facts_trusted_output(payload, trusted, execution)
+                .ok_or_else(|| BoundaryError::engine("proof engine refused the request"))?
+        }
         _ => unreachable!("request kind validated above"),
     };
+    if let Some(comment) = capture_comment {
+        if !output.output.ends_with('\n') {
+            output.output.push('\n');
+        }
+        output.output.push_str(&comment);
+        output.output.push('\n');
+    }
     Ok(ExecutedRequest {
         output,
         request_kind: request.kind,
@@ -1422,84 +1573,812 @@ fn engine_plan_name(plan: r2engine::EnginePlan) -> &'static str {
     }
 }
 
-fn engine_semantic_kernel_region_name(
-    region: r2engine::EngineSemanticKernelRegion,
-) -> &'static str {
-    match region {
-        r2engine::EngineSemanticKernelRegion::TerminalReturnBlock => "terminal_return_block",
-        r2engine::EngineSemanticKernelRegion::AggregateMemberTerminalReturnFunction => {
-            "aggregate_member_terminal_return_function"
+fn binding_shadow_domain_json(domain: r2engine::BindingShadowDomainAudit) -> serde_json::Value {
+    serde_json::json!({
+        "total": domain.total,
+        "observed": domain.observed,
+        "agree_correct": domain.agree_correct,
+        "old_wrong": domain.old_wrong,
+        "shadow_wrong": domain.shadow_wrong,
+        "both_wrong_equal": domain.both_wrong_equal,
+        "both_wrong_different": domain.both_wrong_different,
+        "unclassified": domain.unclassified,
+        "refused": domain.refused,
+    })
+}
+
+fn binding_shadow_ledger_json(ledger: r2engine::BindingShadowAuditLedger) -> serde_json::Value {
+    serde_json::json!({
+        "values": binding_shadow_domain_json(ledger.values),
+        "uses": binding_shadow_domain_json(ledger.uses),
+        "writes": binding_shadow_domain_json(ledger.writes),
+    })
+}
+
+fn binding_observation_domain_json(
+    domain: r2engine::BindingObservationDomainAudit,
+) -> serde_json::Value {
+    serde_json::json!({
+        "total": domain.total,
+        "rendered": domain.rendered,
+        "justified_elision": domain.justified_elision,
+        "refused": domain.refused,
+        "unaccounted": domain.unaccounted,
+    })
+}
+
+fn binding_observations_json(observations: r2engine::BindingObservationAudit) -> serde_json::Value {
+    serde_json::json!({
+        "values": binding_observation_domain_json(observations.values),
+        "uses": binding_observation_domain_json(observations.uses),
+        "writes": binding_observation_domain_json(observations.writes),
+    })
+}
+
+fn binding_observation_journal_failure_json(
+    failure: r2engine::BindingObservationJournalFailure,
+) -> serde_json::Value {
+    use r2engine::{
+        BindingMachineProjectionFailure as MachineFailure,
+        BindingObservationJournalFailure as Failure,
+    };
+
+    let mut cause = serde_json::Map::new();
+    cause.insert("kind".to_string(), serde_json::json!(failure.kind()));
+    match failure {
+        Failure::SourceAuthority
+        | Failure::BindingPlanAuthority
+        | Failure::NormalizationSourceAuthority
+        | Failure::NormalizationBlockTopology
+        | Failure::NormalizationOriginalCoverage
+        | Failure::NormalizationRemovedPhi
+        | Failure::NormalizationRemovedPhiEdge
+        | Failure::NormalizationInvalidCarrierCertificates
+        | Failure::TooManyObservations
+        | Failure::MissingNormalizedSiteContext
+        | Failure::SymbolTableMismatch => {}
+        Failure::BindingPlanMachineProjection(failure) => match failure {
+            MachineFailure::UntrustedArtifactProvenance
+            | MachineFailure::IncompleteObligationInventory
+            | MachineFailure::TopologyMismatch
+            | MachineFailure::MachineContextMismatch => {}
+            MachineFailure::MissingGraphValue { value }
+            | MachineFailure::DuplicateEntity { value } => {
+                cause.insert("value_id".to_string(), serde_json::json!(value.0));
+            }
+            MachineFailure::MissingGraphBlock { block } => {
+                cause.insert("block_id".to_string(), serde_json::json!(block.0));
+            }
+            MachineFailure::DuplicateBlockAddress { address } => {
+                cause.insert("address".to_string(), serde_json::json!(address));
+            }
+            MachineFailure::MissingInstruction { inst }
+            | MachineFailure::MissingInstructionDisposition { inst }
+            | MachineFailure::MissingWriteDisposition { inst }
+            | MachineFailure::MissingOutput { inst }
+            | MachineFailure::EntityMismatch { inst }
+            | MachineFailure::ObligationMismatch { inst }
+            | MachineFailure::WriteDispositionMismatch { inst }
+            | MachineFailure::UnsupportedOperation { inst } => {
+                cause.insert("instruction_id".to_string(), serde_json::json!(inst.0));
+            }
+            MachineFailure::MissingUseDisposition { site }
+            | MachineFailure::UseDispositionMismatch { site } => {
+                cause.insert("instruction_id".to_string(), serde_json::json!(site.inst.0));
+                cause.insert("input_index".to_string(), serde_json::json!(site.input_idx));
+            }
+            MachineFailure::InvalidValueWidth { value, size_bytes } => {
+                cause.insert("value_id".to_string(), serde_json::json!(value.0));
+                cause.insert("size_bytes".to_string(), serde_json::json!(size_bytes));
+            }
+            MachineFailure::ConstantTooWide { value, width_bits } => {
+                cause.insert("value_id".to_string(), serde_json::json!(value.0));
+                cause.insert("width_bits".to_string(), serde_json::json!(width_bits));
+            }
+            MachineFailure::WrongOperandCount {
+                inst,
+                expected,
+                actual,
+            } => {
+                cause.insert("instruction_id".to_string(), serde_json::json!(inst.0));
+                cause.insert("expected_count".to_string(), serde_json::json!(expected));
+                cause.insert("actual_count".to_string(), serde_json::json!(actual));
+            }
+            MachineFailure::WidthMismatch {
+                inst,
+                expected_bits,
+                actual_bits,
+            } => {
+                cause.insert("instruction_id".to_string(), serde_json::json!(inst.0));
+                cause.insert(
+                    "expected_bits".to_string(),
+                    serde_json::json!(expected_bits),
+                );
+                cause.insert("actual_bits".to_string(), serde_json::json!(actual_bits));
+            }
+            MachineFailure::InvalidCastWidth {
+                inst,
+                from_bits,
+                to_bits,
+                ..
+            } => {
+                cause.insert("instruction_id".to_string(), serde_json::json!(inst.0));
+                cause.insert("from_bits".to_string(), serde_json::json!(from_bits));
+                cause.insert("to_bits".to_string(), serde_json::json!(to_bits));
+            }
+            MachineFailure::InvalidSubpiece {
+                inst,
+                source_bits,
+                result_bits,
+                lsb_bits,
+            } => {
+                cause.insert("instruction_id".to_string(), serde_json::json!(inst.0));
+                cause.insert("source_bits".to_string(), serde_json::json!(source_bits));
+                cause.insert("result_bits".to_string(), serde_json::json!(result_bits));
+                cause.insert("lsb_bits".to_string(), serde_json::json!(lsb_bits));
+            }
+            MachineFailure::InvalidChild {
+                expr_index,
+                child_index,
+            } => {
+                cause.insert(
+                    "expression_index".to_string(),
+                    serde_json::json!(expr_index),
+                );
+                cause.insert("child_index".to_string(), serde_json::json!(child_index));
+            }
+            MachineFailure::InvalidExpressionType { expr_index } => {
+                cause.insert(
+                    "expression_index".to_string(),
+                    serde_json::json!(expr_index),
+                );
+            }
+            MachineFailure::ObligationSourceMismatch { instruction } => {
+                cause.insert(
+                    "block_address".to_string(),
+                    serde_json::json!(instruction.block_addr),
+                );
+                match instruction.site {
+                    r2ssa::CanonicalInstructionSite::Phi(storage) => {
+                        if let r2ssa::CanonicalStorageSpace::Custom(id) = storage.space {
+                            cause.insert("storage_custom_id".to_string(), serde_json::json!(id));
+                        }
+                        cause.insert(
+                            "storage_offset".to_string(),
+                            serde_json::json!(storage.offset),
+                        );
+                        cause.insert("storage_size".to_string(), serde_json::json!(storage.size));
+                    }
+                    r2ssa::CanonicalInstructionSite::Op(ordinal) => {
+                        cause.insert("op_ordinal".to_string(), serde_json::json!(ordinal));
+                    }
+                    r2ssa::CanonicalInstructionSite::NativeSpan {
+                        instruction_addr,
+                        size,
+                    } => {
+                        cause.insert(
+                            "instruction_address".to_string(),
+                            serde_json::json!(instruction_addr),
+                        );
+                        cause.insert("instruction_size".to_string(), serde_json::json!(size));
+                    }
+                }
+            }
+        },
+        Failure::BindingPlanValueTopology { index, value } => {
+            cause.insert("index".to_string(), serde_json::json!(index));
+            cause.insert("value_id".to_string(), serde_json::json!(value.0));
         }
-        r2engine::EngineSemanticKernelRegion::PlainRamMemoryTerminalReturnFunction => {
-            "plain_ram_memory_terminal_return_function"
+        Failure::BindingPlanDispositionCount { expected, actual }
+        | Failure::BindingPlanBindingCount { expected, actual }
+        | Failure::BindingPlanStackObjectCount { expected, actual }
+        | Failure::BindingPlanParameterCount { expected, actual } => {
+            cause.insert("expected_count".to_string(), serde_json::json!(expected));
+            cause.insert("actual_count".to_string(), serde_json::json!(actual));
         }
-        r2engine::EngineSemanticKernelRegion::DirectCallTerminalReturnFunction => {
-            "direct_call_terminal_return_function"
+        Failure::BindingPlanInvalidBindingReference {
+            value,
+            binding_index,
+        } => {
+            cause.insert("value_id".to_string(), serde_json::json!(value.0));
+            cause.insert(
+                "binding_index".to_string(),
+                serde_json::json!(binding_index),
+            );
         }
-        r2engine::EngineSemanticKernelRegion::PrivateFrameConditionalJoinFunction => {
-            "private_frame_conditional_join_function"
+        Failure::BindingPlanInvalidLiteralInline { value }
+        | Failure::BindingPlanInvalidElisionProof { value }
+        | Failure::BindingPlanUnexpectedValueDisposition { value } => {
+            cause.insert("value_id".to_string(), serde_json::json!(value.0));
         }
-        r2engine::EngineSemanticKernelRegion::ConditionalTerminalReturnFunction => {
-            "conditional_terminal_return_function"
+        Failure::BindingPlanCertificateMembership { binding_index }
+        | Failure::BindingPlanDeclarationWidth { binding_index } => {
+            cause.insert(
+                "binding_index".to_string(),
+                serde_json::json!(binding_index),
+            );
         }
-        r2engine::EngineSemanticKernelRegion::GuardedTerminalReturnFunction => {
-            "guarded_terminal_return_function"
+        Failure::BindingPlanUnexpectedStackObjectDisposition { object } => {
+            cause.insert("object_id".to_string(), serde_json::json!(object.0));
         }
-        r2engine::EngineSemanticKernelRegion::SwitchTerminalReturnFunction => {
-            "switch_terminal_return_function"
+        Failure::BindingPlanStackObjectCertificate {
+            object,
+            binding_index,
         }
-        r2engine::EngineSemanticKernelRegion::CarrierFreeLoopTerminalReturnFunction => {
-            "carrier_free_loop_terminal_return_function"
+        | Failure::BindingPlanStackObjectDeclarationWidth {
+            object,
+            binding_index,
+        } => {
+            cause.insert("object_id".to_string(), serde_json::json!(object.0));
+            cause.insert(
+                "binding_index".to_string(),
+                serde_json::json!(binding_index),
+            );
+        }
+        Failure::BindingPlanUnexpectedParameterDisposition { slot } => {
+            cause.insert("parameter_slot".to_string(), serde_json::json!(slot));
+        }
+        Failure::BindingPlanParameterCertificate {
+            slot,
+            binding_index,
+        }
+        | Failure::BindingPlanParameterDeclarationWidth {
+            slot,
+            binding_index,
+        } => {
+            cause.insert("parameter_slot".to_string(), serde_json::json!(slot));
+            cause.insert(
+                "binding_index".to_string(),
+                serde_json::json!(binding_index),
+            );
+        }
+        Failure::NormalizationRowCount { block_address } => {
+            cause.insert(
+                "block_address".to_string(),
+                serde_json::json!(block_address),
+            );
+        }
+        Failure::NormalizationOriginalInstruction {
+            block_address,
+            op_idx,
+        }
+        | Failure::NormalizationPhiEdge {
+            block_address,
+            op_idx,
+        }
+        | Failure::NormalizationRelocatedInitializer {
+            block_address,
+            op_idx,
+        } => {
+            cause.insert(
+                "block_address".to_string(),
+                serde_json::json!(block_address),
+            );
+            cause.insert("op_index".to_string(), serde_json::json!(op_idx));
+        }
+        Failure::InvalidValue { value }
+        | Failure::RenderedValueRequired { value }
+        | Failure::PlannedElidedValueRendered { value }
+        | Failure::PlannedRefusedValueRendered { value }
+        | Failure::MissingPlannedValue { value }
+        | Failure::ConflictingValue { value } => {
+            cause.insert("value_id".to_string(), serde_json::json!(value.0));
+        }
+        Failure::InvalidCertifiedValueRead { value, at } => {
+            cause.insert("value_id".to_string(), serde_json::json!(value.0));
+            cause.insert("instruction_id".to_string(), serde_json::json!(at.0));
+        }
+        Failure::InvalidPlannedInline { value, term_index } => {
+            cause.insert("value_id".to_string(), serde_json::json!(value.0));
+            cause.insert("term_index".to_string(), serde_json::json!(term_index));
+        }
+        Failure::InvalidUse { site }
+        | Failure::RefusedRenderedUse { site }
+        | Failure::ExactUseRequiresRenderedOccurrence { site }
+        | Failure::ConflictingUse { site } => {
+            cause.insert("instruction_id".to_string(), serde_json::json!(site.inst.0));
+            cause.insert("input_index".to_string(), serde_json::json!(site.input_idx));
+        }
+        Failure::InvalidWrite { inst }
+        | Failure::OutputlessWrite { inst }
+        | Failure::RefusedRenderedWrite { inst }
+        | Failure::ExactWriteRequiresRenderedOccurrence { inst }
+        | Failure::ConflictingWrite { inst } => {
+            cause.insert("instruction_id".to_string(), serde_json::json!(inst.0));
+        }
+        Failure::InvalidEffectObligation { obligation } => {
+            cause.insert("obligation".to_string(), serde_json::json!(obligation));
+        }
+        Failure::InvalidNormalizedSite { block, op_idx }
+        | Failure::MissingNormalizedOutput { block, op_idx } => {
+            cause.insert("block_id".to_string(), serde_json::json!(block.0));
+            cause.insert("op_index".to_string(), serde_json::json!(op_idx));
+        }
+        Failure::MissingNormalizedBlock { address } => {
+            cause.insert("address".to_string(), serde_json::json!(address));
+        }
+        Failure::InvalidNormalizedInput {
+            block,
+            op_idx,
+            input_idx,
+        } => {
+            cause.insert("block_id".to_string(), serde_json::json!(block.0));
+            cause.insert("op_index".to_string(), serde_json::json!(op_idx));
+            cause.insert("input_index".to_string(), serde_json::json!(input_idx));
+        }
+        Failure::UnownedBindingSymbol {
+            value,
+            symbol_index,
+        } => {
+            cause.insert("value_id".to_string(), serde_json::json!(value.0));
+            cause.insert("symbol_index".to_string(), serde_json::json!(symbol_index));
+        }
+        Failure::ObservationDomainTooLarge { expected_count }
+        | Failure::ObservationCapacityUnavailable { expected_count } => {
+            cause.insert(
+                "expected_count".to_string(),
+                serde_json::json!(expected_count),
+            );
+        }
+        Failure::ObservationOutOfRange {
+            observation_id,
+            expected_count,
+        } => {
+            cause.insert(
+                "observation_id".to_string(),
+                serde_json::json!(observation_id),
+            );
+            cause.insert(
+                "expected_count".to_string(),
+                serde_json::json!(expected_count),
+            );
+        }
+        Failure::DuplicateObservation { observation_id } => {
+            cause.insert(
+                "observation_id".to_string(),
+                serde_json::json!(observation_id),
+            );
+        }
+    }
+    serde_json::Value::Object(cause)
+}
+
+fn binding_audit_json(audit: Option<r2engine::BindingShadowAuditOutcome>) -> serde_json::Value {
+    use r2engine::{BindingShadowAuditFailure, BindingShadowAuditOutcome};
+
+    fn counted_binding_audit_json(
+        status: &'static str,
+        ledger: r2engine::BindingShadowAuditLedger,
+        observations: r2engine::BindingObservationAudit,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 2,
+            "status": status,
+            "observations": binding_observations_json(observations),
+            "shadow": binding_shadow_ledger_json(ledger),
+        })
+    }
+
+    match audit {
+        None => serde_json::Value::Null,
+        Some(BindingShadowAuditOutcome::NotRun) => serde_json::json!({
+            "schema_version": 2,
+            "status": "not_run",
+        }),
+        Some(BindingShadowAuditOutcome::Complete {
+            ledger,
+            observations,
+        }) => counted_binding_audit_json("complete", ledger, observations),
+        Some(BindingShadowAuditOutcome::Failed(
+            BindingShadowAuditFailure::IncompleteObservations {
+                ledger,
+                observations,
+            },
+        )) => counted_binding_audit_json("incomplete_observations", ledger, observations),
+        Some(BindingShadowAuditOutcome::Failed(BindingShadowAuditFailure::NonQuality {
+            ledger,
+            observations,
+        })) => counted_binding_audit_json("non_quality", ledger, observations),
+        Some(BindingShadowAuditOutcome::Failed(
+            BindingShadowAuditFailure::NonQualityObservations { observations },
+        )) => serde_json::json!({
+            "schema_version": 2,
+            "status": "non_quality_observations",
+            "observations": binding_observations_json(observations),
+        }),
+        Some(BindingShadowAuditOutcome::Failed(BindingShadowAuditFailure::Placement(refusal))) => {
+            serde_json::json!({
+                "schema_version": 2,
+                "status": "failed",
+                "reason": "placement_refusal",
+                "cause": placement_refusal_json(refusal),
+            })
+        }
+        Some(BindingShadowAuditOutcome::Failed(BindingShadowAuditFailure::JournalSeal(cause))) => {
+            serde_json::json!({
+                "schema_version": 2,
+                "status": "failed",
+                "reason": "journal_seal_failure",
+                "cause": binding_observation_journal_failure_json(cause),
+            })
+        }
+        Some(BindingShadowAuditOutcome::Failed(
+            BindingShadowAuditFailure::JournalConstruction(cause),
+        )) => serde_json::json!({
+            "schema_version": 2,
+            "status": "failed",
+            "reason": "journal_construction_failure",
+            "cause": binding_observation_journal_failure_json(cause),
+        }),
+        Some(BindingShadowAuditOutcome::Failed(BindingShadowAuditFailure::JournalRecording(
+            cause,
+        ))) => serde_json::json!({
+            "schema_version": 2,
+            "status": "failed",
+            "reason": "journal_recording_failure",
+            "cause": binding_observation_journal_failure_json(cause),
+        }),
+        Some(BindingShadowAuditOutcome::Failed(failure)) => {
+            let reason = match failure {
+                BindingShadowAuditFailure::PlanBuild => "plan_build_failure",
+                BindingShadowAuditFailure::SourcePairing => "source_pairing_failure",
+                BindingShadowAuditFailure::Report => "report_failure",
+                BindingShadowAuditFailure::JournalConstruction(_)
+                | BindingShadowAuditFailure::JournalRecording(_)
+                | BindingShadowAuditFailure::JournalSeal(_) => {
+                    unreachable!("typed journal failures are matched above")
+                }
+                BindingShadowAuditFailure::Placement(_)
+                | BindingShadowAuditFailure::NonQualityObservations { .. } => {
+                    unreachable!("typed admission failures are matched above")
+                }
+                BindingShadowAuditFailure::IncompleteObservations { .. }
+                | BindingShadowAuditFailure::NonQuality { .. } => {
+                    unreachable!("counted audit failures are matched above")
+                }
+            };
+            serde_json::json!({
+                "schema_version": 2,
+                "status": "failed",
+                "reason": reason,
+            })
         }
     }
 }
 
-fn engine_semantic_kernel_region_schema(region: r2engine::EngineSemanticKernelRegion) -> u32 {
-    region.current_schema_version()
+fn placement_refusal_json(refusal: r2engine::PlacementAuditRefusal) -> serde_json::Value {
+    use r2engine::PlacementAuditRefusal as Refusal;
+
+    let mut cause = serde_json::Map::new();
+    cause.insert("kind".to_string(), serde_json::json!(refusal.kind()));
+    match refusal {
+        Refusal::MissingStructuredRegionArtifact
+        | Refusal::ObservationJournalUnavailable
+        | Refusal::SourceAuthorityMismatch
+        | Refusal::RegionMarkerUnsealed => {}
+        Refusal::BindingOutsidePlan { binding_index }
+        | Refusal::ExternalBindingOutsidePlan { binding_index }
+        | Refusal::UnobservedBindingRead { binding_index }
+        | Refusal::UnobservedBindingWrite { binding_index }
+        | Refusal::NoDominatingRegion { binding_index }
+        | Refusal::MissingDefinition { binding_index }
+        | Refusal::UnprovableExecutionOrder { binding_index }
+        | Refusal::MissingBinding { binding_index }
+        | Refusal::MissingBindingSymbol { binding_index }
+        | Refusal::ExternalBindingMissingParameter { binding_index }
+        | Refusal::MissingBindingRole { binding_index } => {
+            cause.insert(
+                "binding_index".to_string(),
+                serde_json::json!(binding_index),
+            );
+        }
+        Refusal::RegionOutsideArtifact { region_index }
+        | Refusal::RegionMarkerDuplicate { region_index }
+        | Refusal::RegionMarkerMissing { region_index }
+        | Refusal::RegionMarkerParentMismatch { region_index }
+        | Refusal::MissingRegion { region_index }
+        | Refusal::DuplicateRegion { region_index } => {
+            cause.insert("region_index".to_string(), serde_json::json!(region_index));
+        }
+        Refusal::BlockOutsideFunction { block_address } => {
+            cause.insert(
+                "block_address".to_string(),
+                serde_json::json!(block_address),
+            );
+        }
+        Refusal::RegionDoesNotDominateOccurrence {
+            region_index,
+            block_address,
+        } => {
+            cause.insert("region_index".to_string(), serde_json::json!(region_index));
+            cause.insert(
+                "block_address".to_string(),
+                serde_json::json!(block_address),
+            );
+        }
+        Refusal::RegionMarkerForeign { anchor_index } => {
+            cause.insert("anchor_index".to_string(), serde_json::json!(anchor_index));
+        }
+        Refusal::RegionMarkerOutOfOrder {
+            region_index,
+            expected_region_index,
+        } => {
+            cause.insert("region_index".to_string(), serde_json::json!(region_index));
+            cause.insert(
+                "expected_region_index".to_string(),
+                serde_json::json!(expected_region_index),
+            );
+        }
+        Refusal::ObservationDomainTooLarge { expected_count }
+        | Refusal::ObservationCapacityUnavailable { expected_count } => {
+            cause.insert(
+                "expected_count".to_string(),
+                serde_json::json!(expected_count),
+            );
+        }
+        Refusal::ObservationOutOfRange {
+            observation_id,
+            expected_count,
+        } => {
+            cause.insert(
+                "observation_id".to_string(),
+                serde_json::json!(observation_id),
+            );
+            cause.insert(
+                "expected_count".to_string(),
+                serde_json::json!(expected_count),
+            );
+        }
+        Refusal::DuplicateObservation { observation_id }
+        | Refusal::MissingObservationTarget { observation_id }
+        | Refusal::UnscopedObservation { observation_id }
+        | Refusal::AmbiguousObservationExecutionOrder { observation_id } => {
+            cause.insert(
+                "observation_id".to_string(),
+                serde_json::json!(observation_id),
+            );
+        }
+        Refusal::InvalidUse {
+            instruction_id,
+            input_index,
+        } => {
+            cause.insert(
+                "instruction_id".to_string(),
+                serde_json::json!(instruction_id),
+            );
+            cause.insert("input_index".to_string(), serde_json::json!(input_index));
+        }
+        Refusal::InvalidWrite { instruction_id }
+        | Refusal::MissingInlineWrite { instruction_id }
+        | Refusal::DuplicateInlineWrite { instruction_id } => {
+            cause.insert(
+                "instruction_id".to_string(),
+                serde_json::json!(instruction_id),
+            );
+        }
+        Refusal::InvalidCertifiedValueRead {
+            value_id,
+            instruction_id,
+        } => {
+            cause.insert("value_id".to_string(), serde_json::json!(value_id));
+            cause.insert(
+                "instruction_id".to_string(),
+                serde_json::json!(instruction_id),
+            );
+        }
+        Refusal::MissingPlannedValue { value_id } | Refusal::RefusedPlannedValue { value_id } => {
+            cause.insert("value_id".to_string(), serde_json::json!(value_id));
+        }
+        Refusal::UnauthorizedProgramVariable { symbol_index } => {
+            cause.insert("symbol_index".to_string(), serde_json::json!(symbol_index));
+        }
+        Refusal::ReadBeforeAssignment {
+            binding_index,
+            instruction_id,
+            input_index,
+        } => {
+            cause.insert(
+                "binding_index".to_string(),
+                serde_json::json!(binding_index),
+            );
+            cause.insert(
+                "instruction_id".to_string(),
+                serde_json::json!(instruction_id),
+            );
+            cause.insert("input_index".to_string(), serde_json::json!(input_index));
+        }
+        Refusal::CertifiedValueReadBeforeAssignment {
+            binding_index,
+            value_id,
+            instruction_id,
+        } => {
+            cause.insert(
+                "binding_index".to_string(),
+                serde_json::json!(binding_index),
+            );
+            cause.insert("value_id".to_string(), serde_json::json!(value_id));
+            cause.insert(
+                "instruction_id".to_string(),
+                serde_json::json!(instruction_id),
+            );
+        }
+        Refusal::StackAccessReadBeforeAssignment {
+            binding_index,
+            instruction_id,
+            access_ordinal,
+        } => {
+            cause.insert(
+                "binding_index".to_string(),
+                serde_json::json!(binding_index),
+            );
+            cause.insert(
+                "instruction_id".to_string(),
+                serde_json::json!(instruction_id),
+            );
+            cause.insert(
+                "access_ordinal".to_string(),
+                serde_json::json!(access_ordinal),
+            );
+        }
+        Refusal::PreservedCarrierReadBeforeAssignment {
+            binding_index,
+            instruction_id,
+        } => {
+            cause.insert(
+                "binding_index".to_string(),
+                serde_json::json!(binding_index),
+            );
+            cause.insert(
+                "instruction_id".to_string(),
+                serde_json::json!(instruction_id),
+            );
+        }
+        Refusal::UndeclaredNames { count } => {
+            cause.insert("count".to_string(), serde_json::json!(count));
+        }
+    }
+    serde_json::Value::Object(cause)
 }
 
-fn response_semantic_kernel_render_json(
-    render: &r2engine::EngineSemanticKernelRender,
-) -> Result<serde_json::Value, BoundaryError> {
-    let region_name = engine_semantic_kernel_region_name(render.region);
-    let expected_schema = engine_semantic_kernel_region_schema(render.region);
-    if render.region_schema_version != expected_schema {
-        return Err(BoundaryError::unsupported(format!(
-            "unsupported semantic-kernel region schema version {} for {region_name}; expected {expected_schema}",
-            render.region_schema_version,
-        )));
+fn placement_audit_json(audit: Option<r2engine::PlacementAudit>) -> serde_json::Value {
+    match audit {
+        None => serde_json::Value::Null,
+        Some(r2engine::PlacementAudit::Applied) => serde_json::json!({
+            "schema_version": 1,
+            "status": "applied",
+        }),
+        Some(r2engine::PlacementAudit::NotRun) => serde_json::json!({
+            "schema_version": 1,
+            "status": "not_run",
+        }),
+        Some(r2engine::PlacementAudit::Refused(refusal)) => serde_json::json!({
+            "schema_version": 1,
+            "status": "refused",
+            "cause": placement_refusal_json(refusal),
+        }),
     }
-    Ok(serde_json::json!({
-        "region_id": format!("{region_name}_v{}", render.region_schema_version),
-        "region_schema_version": render.region_schema_version,
-        "exact_obligation_closure": render.exact_obligation_closure,
-    }))
+}
+
+fn render_refusal_json(refusal: Option<r2engine::DecompileRenderRefusal>) -> serde_json::Value {
+    match refusal {
+        None => serde_json::json!({
+            "schema_version": 1,
+            "status": "none",
+        }),
+        Some(r2engine::DecompileRenderRefusal::DeclarationPlacement(refusal)) => {
+            serde_json::json!({
+                "schema_version": 1,
+                "status": "refused",
+                "kind": refusal.kind(),
+                "cause": placement_refusal_json(refusal),
+            })
+        }
+        Some(r2engine::DecompileRenderRefusal::ObservationJournal(failure)) => {
+            serde_json::json!({
+                "schema_version": 1,
+                "status": "refused",
+                "kind": failure.kind(),
+                "cause": binding_observation_journal_failure_json(failure),
+            })
+        }
+        Some(r2engine::DecompileRenderRefusal::RefusedBindingDisposition { observations }) => {
+            serde_json::json!({
+                "schema_version": 1,
+                "status": "refused",
+                "kind": "refused_binding_disposition",
+                "observations": binding_observations_json(observations),
+            })
+        }
+        Some(refusal) => serde_json::json!({
+            "schema_version": 1,
+            "status": "refused",
+            "kind": refusal.kind(),
+        }),
+    }
 }
 
 fn response_diagnostics_json(
     diagnostics: &r2engine::EngineDiagnostics,
+    binding_audit: Option<r2engine::BindingShadowAuditOutcome>,
+    effect_obligations: Option<r2engine::EffectObligationAudit>,
+    placement_audit: Option<r2engine::PlacementAudit>,
+    render_refusal: Option<r2engine::DecompileRenderRefusal>,
 ) -> Result<String, BoundaryError> {
-    let semantic_kernel_render = diagnostics
-        .semantic_kernel_render
-        .as_ref()
-        .map(response_semantic_kernel_render_json)
-        .transpose()?;
+    let outcome = match response_outcome(
+        diagnostics,
+        binding_audit,
+        effect_obligations,
+        placement_audit,
+        render_refusal,
+    ) {
+        R2SLEIGH_OUTCOME_COMPLETED_V2 => "completed",
+        R2SLEIGH_OUTCOME_REFUSED_V2 => "refused",
+        _ => unreachable!("response outcome is a closed V2 enum"),
+    };
     Ok(serde_json::json!({
+        "outcome": outcome,
         "plan": diagnostics.plan.map(engine_plan_name),
         "route_reason": diagnostics.route_reason.as_deref(),
         "warnings": &diagnostics.warnings,
         "refusal": diagnostics.refusal.as_deref(),
-        "semantic_kernel_render": semantic_kernel_render,
+        "binding_audit": binding_audit_json(binding_audit),
+        "effect_obligations": effect_obligations_json(effect_obligations),
+        "placement_audit": placement_audit_json(placement_audit),
+        "render_refusal": render_refusal_json(render_refusal),
     })
     .to_string())
 }
 
-fn response_outcome(diagnostics: &r2engine::EngineDiagnostics) -> u32 {
+fn effect_obligations_json(audit: Option<r2engine::EffectObligationAudit>) -> serde_json::Value {
+    let Some(audit) = audit else {
+        return serde_json::Value::Null;
+    };
+    let status = match audit.disposition {
+        r2engine::EffectObligationDisposition::Admitted => "admitted",
+        r2engine::EffectObligationDisposition::Refused => "refused",
+        r2engine::EffectObligationDisposition::NotRun => "not_run",
+    };
+    serde_json::json!({
+        "schema_version": 1,
+        "status": status,
+        "total": audit.total,
+        "rendered": audit.rendered,
+        "justified_elision": audit.justified_elision,
+        "refused": audit.refused,
+        "unaccounted": audit.unaccounted,
+        "conflicts": audit.conflicts,
+    })
+}
+
+fn response_outcome(
+    diagnostics: &r2engine::EngineDiagnostics,
+    binding_audit: Option<r2engine::BindingShadowAuditOutcome>,
+    effect_obligations: Option<r2engine::EffectObligationAudit>,
+    placement_audit: Option<r2engine::PlacementAudit>,
+    render_refusal: Option<r2engine::DecompileRenderRefusal>,
+) -> u32 {
     if diagnostics.refusal.is_some()
         || matches!(
             diagnostics.plan,
             Some(r2engine::EnginePlan::RefuseWithEvidence)
         )
+        || matches!(
+            binding_audit,
+            Some(r2engine::BindingShadowAuditOutcome::Failed(
+                r2engine::BindingShadowAuditFailure::Placement(_)
+                    | r2engine::BindingShadowAuditFailure::NonQualityObservations { .. }
+            ))
+        )
+        || effect_obligations.is_some_and(|audit| {
+            matches!(
+                audit.disposition,
+                r2engine::EffectObligationDisposition::Refused
+            ) || audit.refused != 0
+                || audit.unaccounted != 0
+                || audit.conflicts != 0
+        })
+        || matches!(placement_audit, Some(r2engine::PlacementAudit::Refused(_)))
+        || render_refusal.is_some()
     {
         R2SLEIGH_OUTCOME_REFUSED_V2
     } else {
@@ -1537,13 +2416,25 @@ unsafe extern "C" fn execute(
             }
             let bytes = CString::new(response.output.output)
                 .map_err(|_| BoundaryError::engine("engine response contains an interior NUL"))?;
-            let diagnostics_json = response_diagnostics_json(&response.output.diagnostics)?;
+            let diagnostics_json = response_diagnostics_json(
+                &response.output.diagnostics,
+                response.output.binding_audit,
+                response.output.effect_obligations,
+                response.output.placement_audit,
+                response.output.render_refusal,
+            )?;
             if diagnostics_json.len() > MAX_RESPONSE_BYTES {
                 return Err(BoundaryError::limit("response diagnostics exceed byte cap"));
             }
             let diagnostics = CString::new(diagnostics_json)
                 .map_err(|_| BoundaryError::engine("diagnostics contain an interior NUL"))?;
-            let outcome = response_outcome(&response.output.diagnostics);
+            let outcome = response_outcome(
+                &response.output.diagnostics,
+                response.output.binding_audit,
+                response.output.effect_obligations,
+                response.output.placement_audit,
+                response.output.render_refusal,
+            );
             let phase_timings = response_phase_timings(&response.output.metrics);
             let mut owned_response = Box::new(R2SleighResponseV2 {
                 bytes,
@@ -2060,26 +2951,24 @@ extern "C" fn lift_block_direct_call_identity(
     })
 }
 
-extern "C" fn lift_block_size(block: *const R2ILBlock, output: *mut u32) -> u32 {
+extern "C" fn lift_block_view(block: *const R2ILBlock, output: *mut R2SleighBlockViewV2) -> u32 {
     lift_boundary_for(block, || {
-        valid_output_ptr(output, "block size output")?;
-        unsafe { *output = 0 };
+        valid_output_ptr(output, "block view output")?;
+        unsafe { *output = R2SleighBlockViewV2::default() };
         let key = lift_handle_key(block, "lifted block")?;
         let registry = lock_lift_registry();
         let payload = registry.payload::<R2ILBlock>(key, LiftHandleKind::Block, "lifted block")?;
-        unsafe { *output = super::r2il_block_size(payload) };
-        Ok(())
-    })
-}
-
-extern "C" fn lift_block_addr(block: *const R2ILBlock, output: *mut u64) -> u32 {
-    lift_boundary_for(block, || {
-        valid_output_ptr(output, "block address output")?;
-        unsafe { *output = 0 };
-        let key = lift_handle_key(block, "lifted block")?;
-        let registry = lock_lift_registry();
-        let payload = registry.payload::<R2ILBlock>(key, LiftHandleKind::Block, "lifted block")?;
-        unsafe { *output = super::r2il_block_addr(payload) };
+        unsafe {
+            *output = R2SleighBlockViewV2 {
+                struct_size: size_of::<R2SleighBlockViewV2>() as u32,
+                block_type: super::r2il_block_type(payload),
+                size: super::r2il_block_size(payload),
+                addr: super::r2il_block_addr(payload),
+                jump: super::r2il_block_jump(payload),
+                fail: super::r2il_block_fail(payload),
+                op_count: super::r2il_block_op_count(payload),
+            };
+        }
         Ok(())
     })
 }
@@ -2106,42 +2995,6 @@ extern "C" fn lift_block_mnemonic(
         let bytes = unsafe { CString::from_raw(mnemonic) };
         let handle = registry.insert_owned_bytes(owner, R2SleighOwnedBytesV2 { bytes })?;
         unsafe { *output = handle };
-        Ok(())
-    })
-}
-
-extern "C" fn lift_block_type(block: *const R2ILBlock, output: *mut u32) -> u32 {
-    lift_boundary_for(block, || {
-        valid_output_ptr(output, "block type output")?;
-        unsafe { *output = 0 };
-        let key = lift_handle_key(block, "lifted block")?;
-        let registry = lock_lift_registry();
-        let payload = registry.payload::<R2ILBlock>(key, LiftHandleKind::Block, "lifted block")?;
-        unsafe { *output = super::r2il_block_type(payload) };
-        Ok(())
-    })
-}
-
-extern "C" fn lift_block_jump(block: *const R2ILBlock, output: *mut u64) -> u32 {
-    lift_boundary_for(block, || {
-        valid_output_ptr(output, "block jump output")?;
-        unsafe { *output = 0 };
-        let key = lift_handle_key(block, "lifted block")?;
-        let registry = lock_lift_registry();
-        let payload = registry.payload::<R2ILBlock>(key, LiftHandleKind::Block, "lifted block")?;
-        unsafe { *output = super::r2il_block_jump(payload) };
-        Ok(())
-    })
-}
-
-extern "C" fn lift_block_fail(block: *const R2ILBlock, output: *mut u64) -> u32 {
-    lift_boundary_for(block, || {
-        valid_output_ptr(output, "block fail output")?;
-        unsafe { *output = 0 };
-        let key = lift_handle_key(block, "lifted block")?;
-        let registry = lock_lift_registry();
-        let payload = registry.payload::<R2ILBlock>(key, LiftHandleKind::Block, "lifted block")?;
-        unsafe { *output = super::r2il_block_fail(payload) };
         Ok(())
     })
 }
@@ -2816,12 +3669,8 @@ static API_V2: R2SleighApiV2 = R2SleighApiV2 {
     lift_block_set_switch_info,
     lift_block_op_count,
     lift_block_direct_call_identity,
-    lift_block_size,
-    lift_block_addr,
+    lift_block_view,
     lift_block_mnemonic,
-    lift_block_type,
-    lift_block_jump,
-    lift_block_fail,
     owned_bytes_view,
     owned_bytes_free,
     analysis_render,
@@ -2830,6 +3679,49 @@ static API_V2: R2SleighApiV2 = R2SleighApiV2 {
     analysis_result_free,
     planner_query,
 };
+
+/// The engine budget for a program of this many functions, in microseconds.
+///
+/// Exported so the C side can give a single engine call a deadline without
+/// restating the policy. A call bounded by the whole sweep's budget cannot make
+/// a sweep worse than it was already allowed to be, and it turns a function that
+/// would run without end into one bounded refusal instead of the loss of every
+/// function queued behind it.
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_engine_budget_usec_v2(function_count: usize) -> u64 {
+    catch_unwind(AssertUnwindSafe(|| {
+        r2engine::post_analysis_budget_usec(function_count)
+    }))
+    .unwrap_or(r2engine::POST_ANALYSIS_MINIMUM_BUDGET_USEC)
+}
+
+/// Whether a function of this shape is past the size the engine will accept.
+///
+/// Exported so the capture can ask before it builds anything. Everything the
+/// engine refuses on size was, until now, first collected in full: the blocks,
+/// their bytes, the call graph and the type graph, then serialized to the wire
+/// and decoded again on this side, only for `decompile_complexity_limit_exceeded`
+/// to decline it one call later. On zlib built at -O2 that cost between three
+/// and six gigabytes resident and the kernel killed `r2` outright, which loses
+/// every function in the binary rather than the one that was too big.
+///
+/// The counts come from radare2's own basic blocks, which is a floor for what
+/// lifting produces -- lifting splits blocks and expands one instruction into
+/// several operations, never the reverse -- so a function this refuses is one
+/// the engine would have refused too.
+#[unsafe(no_mangle)]
+pub extern "C" fn r2sleigh_engine_complexity_limit_exceeded_v2(
+    block_count: usize,
+    op_count: usize,
+) -> u8 {
+    catch_unwind(AssertUnwindSafe(|| {
+        u8::from(r2engine::decompile_complexity_limit_exceeded(
+            block_count,
+            op_count,
+        ))
+    }))
+    .unwrap_or(0)
+}
 
 /// Return the immutable V2 API table. The table and all callback addresses are
 /// process-lifetime borrows and must not be freed.
@@ -2848,735 +3740,6 @@ mod tests {
             struct_size: u32_size::<R2SleighSessionConfigV2>(),
             required_capabilities: R2SLEIGH_CAP_DECOMPILE_V2,
         }
-    }
-
-    fn planner_request(kind: u32) -> R2SleighPlannerQueryRequestV2 {
-        R2SleighPlannerQueryRequestV2 {
-            abi_version: R2SLEIGH_ABI_V2,
-            struct_size: u32_size::<R2SleighPlannerQueryRequestV2>(),
-            schema_version: R2SLEIGH_PLANNER_QUERY_SCHEMA_V2,
-            kind,
-            ..R2SleighPlannerQueryRequestV2::default()
-        }
-    }
-
-    fn planner_query_for(
-        request: &R2SleighPlannerQueryRequestV2,
-    ) -> (u32, R2SleighPlannerQueryResponseV2) {
-        let mut response = R2SleighPlannerQueryResponseV2::default();
-        let status = (API_V2.planner_query)(request, &mut response);
-        (status, response)
-    }
-
-    #[test]
-    fn planner_query_table_routes_scalar_engine_plans() {
-        assert_ne!(API_V2.capabilities & R2SLEIGH_CAP_PLANNER_QUERY_V2, 0);
-        assert_eq!(
-            API_V2.planner_query_request_size as usize,
-            size_of::<R2SleighPlannerQueryRequestV2>()
-        );
-        assert_eq!(
-            API_V2.planner_query_response_size as usize,
-            size_of::<R2SleighPlannerQueryResponseV2>()
-        );
-
-        let mut request = planner_request(R2SLEIGH_PLANNER_ANALYSIS_POLICY_V2);
-        request.depth = r2engine::RADARE2_ANALYSIS_DEPTH_BASIC;
-        let (status, response) = planner_query_for(&request);
-        assert_eq!(status, R2SLEIGH_STATUS_OK_V2);
-        assert_eq!(response.kind, request.kind);
-        assert_eq!(response.analysis_policy.mode, R2SLEIGH_MODE_FAST_V2);
-        assert_eq!(
-            response.analysis_policy.type_writeback_mode,
-            R2SLEIGH_TYPE_WRITEBACK_OFF_V2
-        );
-
-        request = planner_request(R2SLEIGH_PLANNER_POST_ANALYSIS_V2);
-        request.function_count = 1;
-        let (status, response) = planner_query_for(&request);
-        assert_eq!(status, R2SLEIGH_STATUS_OK_V2);
-        assert_eq!(response.post_analysis.mode, R2SLEIGH_MODE_BALANCED_V2);
-        assert_eq!(response.post_analysis.function_count, 1);
-        assert_eq!(response.post_analysis.xref_enabled, 1);
-
-        request = planner_request(R2SLEIGH_PLANNER_AUTO_CALLBACK_V2);
-        request.depth = r2engine::RADARE2_ANALYSIS_DEPTH_AGGRESSIVE;
-        request.callback_kind = R2SLEIGH_AUTO_CALLBACK_DATA_REFS_V2;
-        request.basic_block_count = r2engine::AUTO_CALLBACK_MAX_BLOCKS as usize;
-        request.cost = r2engine::AUTO_CALLBACK_MAX_COST;
-        request.linear_size = r2engine::AUTO_CALLBACK_MAX_LINEAR_SIZE;
-        let (status, response) = planner_query_for(&request);
-        assert_eq!(status, R2SLEIGH_STATUS_OK_V2);
-        assert_eq!(response.auto_callback.allowed, 1);
-        assert_eq!(
-            response.auto_callback.reason,
-            R2SLEIGH_AUTO_CALLBACK_REASON_ALLOWED_V2
-        );
-    }
-
-    #[test]
-    fn planner_query_rejects_bad_tags_kinds_enums_and_booleans() {
-        let mut response = R2SleighPlannerQueryResponseV2::default();
-        assert_eq!(
-            (API_V2.planner_query)(ptr::null(), &mut response),
-            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
-        );
-        let request = planner_request(R2SLEIGH_PLANNER_ANALYSIS_POLICY_V2);
-        assert_eq!(
-            (API_V2.planner_query)(&request, ptr::null_mut()),
-            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
-        );
-
-        for request in [
-            R2SleighPlannerQueryRequestV2 {
-                abi_version: R2SLEIGH_ABI_V2 + 1,
-                ..request
-            },
-            R2SleighPlannerQueryRequestV2 {
-                struct_size: request.struct_size - 1,
-                ..request
-            },
-            R2SleighPlannerQueryRequestV2 {
-                schema_version: R2SLEIGH_PLANNER_QUERY_SCHEMA_V2 + 1,
-                ..request
-            },
-        ] {
-            let (status, response) = planner_query_for(&request);
-            assert_eq!(status, R2SLEIGH_STATUS_ABI_MISMATCH_V2);
-            assert_eq!(response, R2SleighPlannerQueryResponseV2::default());
-        }
-
-        let invalid = [
-            R2SleighPlannerQueryRequestV2 {
-                kind: u32::MAX,
-                ..request
-            },
-            // Callback kind 1 was RecoverVars and must remain tombstoned.
-            R2SleighPlannerQueryRequestV2 {
-                kind: R2SLEIGH_PLANNER_AUTO_CALLBACK_V2,
-                callback_kind: 1,
-                ..request
-            },
-            R2SleighPlannerQueryRequestV2 {
-                kind: R2SLEIGH_PLANNER_AUTO_CALLBACK_V2,
-                callback_kind: u32::MAX,
-                ..request
-            },
-        ];
-        for request in invalid {
-            let (status, response) = planner_query_for(&request);
-            assert_eq!(status, R2SLEIGH_STATUS_INVALID_ARGUMENT_V2);
-            assert_eq!(response, R2SleighPlannerQueryResponseV2::default());
-        }
-    }
-
-    #[test]
-    fn planner_query_rejects_deleted_raw_kinds_without_output() {
-        for kind in [4, 5, 6, 7] {
-            let request = planner_request(kind);
-            let (status, response) = planner_query_for(&request);
-            assert_eq!(status, R2SLEIGH_STATUS_INVALID_ARGUMENT_V2);
-            assert_eq!(response, R2SleighPlannerQueryResponseV2::default());
-        }
-    }
-
-    #[test]
-    fn planner_query_rejects_nonzero_inactive_fields_for_every_kind() {
-        let invalid = [
-            R2SleighPlannerQueryRequestV2 {
-                callback_kind: 1,
-                ..planner_request(R2SLEIGH_PLANNER_ANALYSIS_POLICY_V2)
-            },
-            R2SleighPlannerQueryRequestV2 {
-                function_count: 1,
-                ..planner_request(R2SLEIGH_PLANNER_ANALYSIS_POLICY_V2)
-            },
-            R2SleighPlannerQueryRequestV2 {
-                basic_block_count: 1,
-                ..planner_request(R2SLEIGH_PLANNER_ANALYSIS_POLICY_V2)
-            },
-            R2SleighPlannerQueryRequestV2 {
-                cost: 1,
-                ..planner_request(R2SLEIGH_PLANNER_ANALYSIS_POLICY_V2)
-            },
-            R2SleighPlannerQueryRequestV2 {
-                linear_size: 1,
-                ..planner_request(R2SLEIGH_PLANNER_ANALYSIS_POLICY_V2)
-            },
-            R2SleighPlannerQueryRequestV2 {
-                callback_kind: 1,
-                ..planner_request(R2SLEIGH_PLANNER_POST_ANALYSIS_V2)
-            },
-            R2SleighPlannerQueryRequestV2 {
-                basic_block_count: 1,
-                ..planner_request(R2SLEIGH_PLANNER_POST_ANALYSIS_V2)
-            },
-            R2SleighPlannerQueryRequestV2 {
-                cost: 1,
-                ..planner_request(R2SLEIGH_PLANNER_POST_ANALYSIS_V2)
-            },
-            R2SleighPlannerQueryRequestV2 {
-                linear_size: 1,
-                ..planner_request(R2SLEIGH_PLANNER_POST_ANALYSIS_V2)
-            },
-            R2SleighPlannerQueryRequestV2 {
-                function_count: 1,
-                callback_kind: R2SLEIGH_AUTO_CALLBACK_ANALYZE_FUNCTION_V2,
-                ..planner_request(R2SLEIGH_PLANNER_AUTO_CALLBACK_V2)
-            },
-        ];
-        for request in invalid {
-            let (status, response) = planner_query_for(&request);
-            assert_eq!(status, R2SLEIGH_STATUS_INVALID_ARGUMENT_V2);
-            assert_eq!(response, R2SleighPlannerQueryResponseV2::default());
-        }
-    }
-
-    #[test]
-    fn direct_call_identity_preserves_constant_space_id() {
-        let mut block = R2ILBlock::new(0x401000, 5);
-        block.push_with_metadata(
-            r2il::R2ILOp::Call {
-                target: r2il::Varnode::constant(0x402000, 8),
-            },
-            Some(r2il::OpMetadata {
-                instruction_addr: Some(0x401000),
-                ..r2il::OpMetadata::default()
-            }),
-        );
-        let mut identity = R2SleighDirectCallIdentityV2::default();
-        assert_eq!(
-            super::super::r2il_block_direct_call_identity(
-                &block,
-                0x401000,
-                0x402000,
-                &mut identity,
-            ),
-            1
-        );
-        assert_eq!(identity.op_index, 0);
-        assert_eq!(identity.target_space, R2SLEIGH_SOURCE_STORAGE_CONSTANT_V2);
-        assert_eq!(identity.target_custom_space, 0);
-        assert_eq!(identity.target_offset, 0x402000);
-        assert_eq!(identity.target_size, 8);
-    }
-
-    #[test]
-    #[cfg(feature = "x86")]
-    fn lift_core_table_round_trip_owns_strings_and_handles() {
-        let api = &API_V2;
-        assert_ne!(api.capabilities & R2SLEIGH_CAP_LIFT_CORE_V2, 0);
-        assert_eq!(api.struct_size as usize, size_of::<R2SleighApiV2>());
-        assert_eq!(
-            api.string_view_size as usize,
-            size_of::<R2SleighStringViewV2>()
-        );
-        assert_eq!(
-            api.switch_case_size as usize,
-            size_of::<R2SleighSwitchCaseV2>()
-        );
-        assert_eq!(
-            api.direct_call_identity_size as usize,
-            size_of::<R2SleighDirectCallIdentityV2>()
-        );
-
-        let arch = b"x86-64";
-        let mut context = ptr::null_mut();
-        assert_eq!(
-            (api.lift_context_create)(
-                R2SleighStringViewV2 {
-                    data: arch.as_ptr(),
-                    len: arch.len(),
-                },
-                &mut context,
-            ),
-            R2SLEIGH_STATUS_OK_V2
-        );
-        assert!(!context.is_null());
-        let context_token = context as usize;
-
-        let mut loaded = 0;
-        assert_eq!(
-            (api.lift_context_is_loaded)(context, &mut loaded),
-            R2SLEIGH_STATUS_OK_V2
-        );
-        assert_eq!(loaded, 1);
-
-        let mut arch_name = R2SleighByteViewV2::default();
-        assert_eq!(
-            (api.lift_context_arch_name)(context, &mut arch_name),
-            R2SLEIGH_STATUS_OK_V2
-        );
-        assert_eq!(
-            unsafe { slice::from_raw_parts(arch_name.data, arch_name.len) },
-            arch
-        );
-
-        let mut profile = ptr::null_mut();
-        assert_eq!(
-            (api.lift_context_reg_profile)(context, &mut profile),
-            R2SLEIGH_STATUS_OK_V2
-        );
-        assert!(!profile.is_null());
-        let mut profile_view = R2SleighByteViewV2::default();
-        assert_eq!(
-            (api.owned_bytes_view)(profile, &mut profile_view),
-            R2SLEIGH_STATUS_OK_V2
-        );
-        let profile_copy =
-            unsafe { slice::from_raw_parts(profile_view.data, profile_view.len).to_vec() };
-        assert!(profile_copy.windows(4).any(|window| window == b"=PC\t"));
-        assert_eq!((api.owned_bytes_free)(profile), R2SLEIGH_STATUS_OK_V2);
-
-        let bytes = [0x31, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        let byte_view = R2SleighByteViewV2 {
-            data: bytes.as_ptr(),
-            len: bytes.len(),
-        };
-        let mut block = ptr::null_mut();
-        assert_eq!(
-            (api.lift_instruction)(context, byte_view, 0x1000, &mut block),
-            R2SLEIGH_STATUS_OK_V2
-        );
-        assert!(!block.is_null());
-        assert_eq!(
-            (api.lift_block_validate)(context, block),
-            R2SLEIGH_STATUS_OK_V2
-        );
-        let mut addr = 0;
-        let mut size = 0;
-        let mut op_count = 0;
-        assert_eq!(
-            (api.lift_block_addr)(block, &mut addr),
-            R2SLEIGH_STATUS_OK_V2
-        );
-        assert_eq!(
-            (api.lift_block_size)(block, &mut size),
-            R2SLEIGH_STATUS_OK_V2
-        );
-        assert_eq!(
-            (api.lift_block_op_count)(block, &mut op_count),
-            R2SLEIGH_STATUS_OK_V2
-        );
-        assert_eq!(addr, 0x1000);
-        assert!(size > 0);
-        assert!(op_count > 0);
-
-        let block_handles = [block as *const R2ILBlock];
-        let render_request = R2SleighAnalysisRenderRequestV2 {
-            kind: R2SLEIGH_ANALYSIS_BLOCK_ESIL_V2,
-            context,
-            blocks: block_handles.as_ptr(),
-            num_blocks: block_handles.len(),
-            op_index: 0,
-            argument: R2SleighStringViewV2::default(),
-        };
-        let mut rendered = ptr::null_mut();
-        assert_eq!(
-            (api.analysis_render)(&render_request, &mut rendered),
-            R2SLEIGH_STATUS_OK_V2
-        );
-        let mut rendered_view = R2SleighByteViewV2::default();
-        assert_eq!(
-            (api.owned_bytes_view)(rendered, &mut rendered_view),
-            R2SLEIGH_STATUS_OK_V2
-        );
-        assert!(rendered_view.len > 0);
-
-        let query_request = R2SleighAnalysisQueryRequestV2 {
-            kind: R2SLEIGH_QUERY_BLOCK_VALUES_V2,
-            context,
-            blocks: block_handles.as_ptr(),
-            num_blocks: block_handles.len(),
-            function_addr: 0,
-        };
-        let mut analysis_result = ptr::null_mut();
-        assert_eq!(
-            (api.analysis_query)(&query_request, &mut analysis_result),
-            R2SLEIGH_STATUS_OK_V2
-        );
-        let mut analysis_view = R2SleighAnalysisResultViewV2::default();
-        assert_eq!(
-            (api.analysis_result_view)(analysis_result, &mut analysis_view),
-            R2SLEIGH_STATUS_OK_V2
-        );
-        assert_eq!(analysis_view.kind, R2SLEIGH_QUERY_BLOCK_VALUES_V2);
-        assert_eq!(
-            (api.analysis_result_free)(analysis_result),
-            R2SLEIGH_STATUS_OK_V2
-        );
-        assert_eq!(
-            (api.analysis_result_view)(analysis_result, &mut analysis_view),
-            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
-        );
-        // Query kind 7 was RecoveredVars and must remain tombstoned.
-        for deleted_kind in [4, 5, 6, 7] {
-            let deleted_request = R2SleighAnalysisQueryRequestV2 {
-                kind: deleted_kind,
-                ..query_request
-            };
-            let mut deleted_result = analysis_result;
-            assert_eq!(
-                (api.analysis_query)(&deleted_request, &mut deleted_result),
-                R2SLEIGH_STATUS_UNSUPPORTED_V2,
-                "deleted query ID {deleted_kind} must not alias another query"
-            );
-            assert!(deleted_result.is_null());
-        }
-        assert_eq!((api.owned_bytes_free)(rendered), R2SLEIGH_STATUS_OK_V2);
-
-        let mut mnemonic = ptr::null_mut();
-        assert_eq!(
-            (api.lift_block_mnemonic)(context, byte_view, 0x1000, &mut mnemonic),
-            R2SLEIGH_STATUS_OK_V2
-        );
-        let mut mnemonic_view = R2SleighByteViewV2::default();
-        assert_eq!(
-            (api.owned_bytes_view)(mnemonic, &mut mnemonic_view),
-            R2SLEIGH_STATUS_OK_V2
-        );
-        assert!(mnemonic_view.len > 0);
-        assert_eq!((api.owned_bytes_free)(mnemonic), R2SLEIGH_STATUS_OK_V2);
-        assert_eq!(
-            (api.lift_context_free)(context),
-            R2SLEIGH_STATUS_ENGINE_ERROR_V2,
-            "context consumption must reject live child handles"
-        );
-        let mut context_error = R2SleighByteViewV2::default();
-        assert_eq!(
-            (api.lift_context_error)(context, &mut context_error),
-            R2SLEIGH_STATUS_OK_V2
-        );
-        let context_error = unsafe { slice::from_raw_parts(context_error.data, context_error.len) };
-        assert!(String::from_utf8_lossy(context_error).contains("live child handles"));
-
-        let one_case = [R2SleighSwitchCaseV2 {
-            value: 0,
-            target: 0x1000,
-        }];
-        assert_eq!(
-            (api.lift_block_set_switch_info)(
-                block,
-                0x1000,
-                0,
-                0,
-                0,
-                2,
-                one_case.as_ptr(),
-                one_case.len(),
-            ),
-            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
-        );
-        let mut block_error = R2SleighByteViewV2::default();
-        assert_eq!(
-            (api.lift_context_error)(context, &mut block_error),
-            R2SLEIGH_STATUS_OK_V2
-        );
-        let block_error = unsafe { slice::from_raw_parts(block_error.data, block_error.len) };
-        assert!(String::from_utf8_lossy(block_error).contains("switch default flag"));
-        assert_eq!((api.lift_block_free)(block), R2SLEIGH_STATUS_OK_V2);
-        assert_eq!((api.lift_context_free)(context), R2SLEIGH_STATUS_OK_V2);
-
-        let mut next_context = ptr::null_mut();
-        assert_eq!(
-            (api.lift_context_create)(
-                R2SleighStringViewV2 {
-                    data: arch.as_ptr(),
-                    len: arch.len(),
-                },
-                &mut next_context,
-            ),
-            R2SLEIGH_STATUS_OK_V2
-        );
-        assert!(next_context as usize > context_token);
-        assert_eq!(
-            (api.lift_context_is_loaded)(context, &mut loaded),
-            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2,
-            "retired token must remain stale after later allocation"
-        );
-        assert_eq!((api.lift_context_free)(next_context), R2SLEIGH_STATUS_OK_V2);
-    }
-
-    #[test]
-    fn lift_core_rejects_malformed_pointers_and_byte_views() {
-        let api = &API_V2;
-        let arch = b"x86-64";
-        let arch_view = R2SleighStringViewV2 {
-            data: arch.as_ptr(),
-            len: arch.len(),
-        };
-        assert_eq!(
-            (api.lift_context_create)(arch_view, ptr::null_mut()),
-            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
-        );
-        let mut context_output_storage = std::mem::MaybeUninit::<[*mut R2ILContext; 2]>::uninit();
-        let misaligned_context_output = context_output_storage
-            .as_mut_ptr()
-            .cast::<u8>()
-            .wrapping_add(1)
-            .cast::<*mut R2ILContext>();
-        assert_eq!(
-            (api.lift_context_create)(arch_view, misaligned_context_output),
-            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
-        );
-        let mut block = ptr::null_mut();
-        assert_eq!(
-            (api.lift_instruction)(
-                ptr::null_mut(),
-                R2SleighByteViewV2 {
-                    data: ptr::null(),
-                    len: 1,
-                },
-                0,
-                &mut block,
-            ),
-            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
-        );
-        assert!(block.is_null());
-        assert_eq!(
-            (api.lift_instruction)(
-                std::ptr::NonNull::<R2ILContext>::dangling().as_ptr(),
-                R2SleighByteViewV2 {
-                    data: ptr::null(),
-                    len: R2SLEIGH_MAX_FUNCTION_INPUT_BYTES_V2 + 1,
-                },
-                0,
-                &mut block,
-            ),
-            R2SLEIGH_STATUS_LIMIT_EXCEEDED_V2
-        );
-        let mut op_count_output_storage = std::mem::MaybeUninit::<[usize; 2]>::uninit();
-        let misaligned_op_count_output = op_count_output_storage
-            .as_mut_ptr()
-            .cast::<u8>()
-            .wrapping_add(1)
-            .cast::<usize>();
-        assert_eq!(
-            (api.lift_block_op_count)(ptr::null(), misaligned_op_count_output),
-            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
-        );
-        let mut unknown_size = 0;
-        assert_eq!(
-            (api.lift_block_size)(
-                (align_of::<R2ILBlock>() * 128) as *const R2ILBlock,
-                &mut unknown_size,
-            ),
-            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2,
-            "an aligned fake handle must fail registry ownership proof"
-        );
-        let owned = lock_lift_registry()
-            .insert_owned_bytes(
-                0,
-                R2SleighOwnedBytesV2 {
-                    bytes: CString::new("wrong kind").unwrap(),
-                },
-            )
-            .expect("registered owned bytes");
-        let mut size = 0;
-        assert_eq!(
-            (api.lift_block_size)(owned.cast(), &mut size),
-            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
-        );
-        assert_eq!((api.owned_bytes_free)(owned), R2SLEIGH_STATUS_OK_V2);
-        assert_eq!(
-            (api.owned_bytes_free)(owned),
-            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
-        );
-        let mut error = R2SleighByteViewV2::default();
-        assert_eq!((api.lift_last_error)(&mut error), R2SLEIGH_STATUS_OK_V2);
-        let error = unsafe { slice::from_raw_parts(error.data, error.len) };
-        assert!(String::from_utf8_lossy(error).contains("stale"));
-
-        let cases = [R2SleighSwitchCaseV2::default()];
-        assert_eq!(
-            (api.lift_block_set_switch_info)(
-                std::ptr::NonNull::<R2ILBlock>::dangling().as_ptr(),
-                0,
-                0,
-                0,
-                0,
-                0,
-                cases.as_ptr(),
-                R2SLEIGH_MAX_SWITCH_CASES_V2 + 1,
-            ),
-            R2SLEIGH_STATUS_LIMIT_EXCEEDED_V2
-        );
-        assert_eq!(
-            (api.owned_bytes_free)(ptr::null_mut()),
-            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "x86")]
-    fn lift_core_rejects_cross_context_blocks() {
-        let api = &API_V2;
-        let arch_bytes = b"x86-64";
-        let arch = R2SleighStringViewV2 {
-            data: arch_bytes.as_ptr(),
-            len: arch_bytes.len(),
-        };
-        let mut first = ptr::null_mut();
-        let mut second = ptr::null_mut();
-        assert_eq!(
-            (api.lift_context_create)(arch, &mut first),
-            R2SLEIGH_STATUS_OK_V2
-        );
-        assert_eq!(
-            (api.lift_context_create)(arch, &mut second),
-            R2SLEIGH_STATUS_OK_V2
-        );
-        let bytes = [0x31, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        let mut block = ptr::null_mut();
-        assert_eq!(
-            (api.lift_instruction)(
-                first,
-                R2SleighByteViewV2 {
-                    data: bytes.as_ptr(),
-                    len: bytes.len(),
-                },
-                0x1000,
-                &mut block,
-            ),
-            R2SLEIGH_STATUS_OK_V2
-        );
-        assert_eq!(
-            (api.lift_block_validate)(second, block),
-            R2SLEIGH_STATUS_INVALID_ARGUMENT_V2
-        );
-        assert_eq!((api.lift_block_free)(block), R2SLEIGH_STATUS_OK_V2);
-        assert_eq!((api.lift_context_free)(first), R2SLEIGH_STATUS_OK_V2);
-        assert_eq!((api.lift_context_free)(second), R2SLEIGH_STATUS_OK_V2);
-    }
-
-    #[test]
-    fn lift_core_boundary_contains_panics() {
-        assert_eq!(
-            lift_boundary(|| -> Result<(), BoundaryError> {
-                panic!("lift-core boundary test panic")
-            }),
-            R2SLEIGH_STATUS_PANIC_V2
-        );
-    }
-
-    fn assert_semantic_kernel_render_diagnostics(
-        region: r2engine::EngineSemanticKernelRegion,
-        expected_region_name: &str,
-        expected_schema_version: u32,
-    ) {
-        assert_eq!(
-            engine_semantic_kernel_region_schema(region),
-            expected_schema_version
-        );
-        let diagnostics = r2engine::EngineDiagnostics {
-            semantic_kernel_render: Some(r2engine::EngineSemanticKernelRender {
-                region,
-                region_schema_version: expected_schema_version,
-                exact_obligation_closure: true,
-            }),
-            ..Default::default()
-        };
-        let encoded = response_diagnostics_json(&diagnostics).expect("supported diagnostics");
-        let decoded: serde_json::Value = serde_json::from_str(&encoded).expect("diagnostics JSON");
-        assert_eq!(
-            decoded["semantic_kernel_render"],
-            serde_json::json!({
-                "region_id": format!("{expected_region_name}_v{expected_schema_version}"),
-                "region_schema_version": expected_schema_version,
-                "exact_obligation_closure": true,
-            })
-        );
-    }
-
-    #[test]
-    fn aggregate_semantic_kernel_diagnostics_are_stable_json() {
-        assert_semantic_kernel_render_diagnostics(
-            r2engine::EngineSemanticKernelRegion::AggregateMemberTerminalReturnFunction,
-            "aggregate_member_terminal_return_function",
-            6,
-        );
-    }
-
-    #[test]
-    fn generic_semantic_kernel_diagnostics_are_stable_json() {
-        assert_semantic_kernel_render_diagnostics(
-            r2engine::EngineSemanticKernelRegion::TerminalReturnBlock,
-            "terminal_return_block",
-            r2dec::CERTIFIED_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
-        );
-    }
-
-    #[test]
-    fn every_current_semantic_kernel_region_has_a_stable_identifier() {
-        let regions = [
-            (
-                r2engine::EngineSemanticKernelRegion::TerminalReturnBlock,
-                "terminal_return_block",
-                r2dec::CERTIFIED_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
-            ),
-            (
-                r2engine::EngineSemanticKernelRegion::AggregateMemberTerminalReturnFunction,
-                "aggregate_member_terminal_return_function",
-                6,
-            ),
-            (
-                r2engine::EngineSemanticKernelRegion::PlainRamMemoryTerminalReturnFunction,
-                "plain_ram_memory_terminal_return_function",
-                4,
-            ),
-            (
-                r2engine::EngineSemanticKernelRegion::DirectCallTerminalReturnFunction,
-                "direct_call_terminal_return_function",
-                3,
-            ),
-            (
-                r2engine::EngineSemanticKernelRegion::PrivateFrameConditionalJoinFunction,
-                "private_frame_conditional_join_function",
-                1,
-            ),
-            (
-                r2engine::EngineSemanticKernelRegion::ConditionalTerminalReturnFunction,
-                "conditional_terminal_return_function",
-                3,
-            ),
-            (
-                r2engine::EngineSemanticKernelRegion::SwitchTerminalReturnFunction,
-                "switch_terminal_return_function",
-                3,
-            ),
-            (
-                r2engine::EngineSemanticKernelRegion::CarrierFreeLoopTerminalReturnFunction,
-                "carrier_free_loop_terminal_return_function",
-                3,
-            ),
-        ];
-        for (region, expected, expected_schema_version) in regions {
-            assert_eq!(engine_semantic_kernel_region_name(region), expected);
-            assert_semantic_kernel_render_diagnostics(region, expected, expected_schema_version);
-        }
-    }
-
-    #[test]
-    fn future_semantic_kernel_region_schema_is_refused() {
-        let region = r2engine::EngineSemanticKernelRegion::TerminalReturnBlock;
-        let expected_schema = engine_semantic_kernel_region_schema(region);
-        let future_schema = expected_schema.checked_add(1).expect("future schema");
-        let diagnostics = r2engine::EngineDiagnostics {
-            semantic_kernel_render: Some(r2engine::EngineSemanticKernelRender {
-                region,
-                region_schema_version: future_schema,
-                exact_obligation_closure: true,
-            }),
-            ..Default::default()
-        };
-        let error = response_diagnostics_json(&diagnostics).expect_err("future schema refusal");
-        assert_eq!(error.status, R2SLEIGH_STATUS_UNSUPPORTED_V2);
-        assert_eq!(
-            error.message,
-            format!(
-                "unsupported semantic-kernel region schema version {future_schema} for terminal_return_block; expected {expected_schema}"
-            )
-        );
     }
 
     #[test]
@@ -3700,8 +3863,6 @@ mod tests {
         }
     }
 
-
-
     #[test]
     fn engine_request_requires_a_serialized_snapshot_before_access() {
         let payload = R2SleighEngineRequestPayloadV2 {
@@ -3724,12 +3885,6 @@ mod tests {
             "engine request requires a serialized radare snapshot"
         );
     }
-
-
-
-
-
-
 
     #[test]
     fn execute_contains_panics_and_preserves_borrowed_error() {
@@ -3940,11 +4095,1083 @@ mod tests {
         assert_eq!(session_free(session), R2SLEIGH_STATUS_OK_V2);
     }
 
+    fn binding_shadow_domain(refused: usize) -> r2engine::BindingShadowDomainAudit {
+        r2engine::BindingShadowDomainAudit {
+            total: 1,
+            observed: 1,
+            agree_correct: 1,
+            old_wrong: 0,
+            shadow_wrong: 0,
+            both_wrong_equal: 0,
+            both_wrong_different: 0,
+            unclassified: 0,
+            refused,
+        }
+    }
 
+    fn binding_ledger(refused: usize) -> r2engine::BindingShadowAuditLedger {
+        r2engine::BindingShadowAuditLedger {
+            values: binding_shadow_domain(refused),
+            uses: binding_shadow_domain(0),
+            writes: binding_shadow_domain(0),
+        }
+    }
 
+    fn binding_observation_domain(
+        rendered: usize,
+        justified_elision: usize,
+        refused: usize,
+        unaccounted: usize,
+    ) -> r2engine::BindingObservationDomainAudit {
+        r2engine::BindingObservationDomainAudit {
+            total: rendered + justified_elision + refused + unaccounted,
+            rendered,
+            justified_elision,
+            refused,
+            unaccounted,
+        }
+    }
 
+    fn binding_observations(
+        rendered: usize,
+        justified_elision: usize,
+        refused: usize,
+        unaccounted: usize,
+    ) -> r2engine::BindingObservationAudit {
+        r2engine::BindingObservationAudit {
+            values: binding_observation_domain(rendered, justified_elision, refused, unaccounted),
+            uses: binding_observation_domain(1, 0, 0, 0),
+            writes: binding_observation_domain(1, 0, 0, 0),
+        }
+    }
 
+    fn every_binding_observation_journal_failure_wire_leaf()
+    -> Vec<r2engine::BindingObservationJournalFailure> {
+        use r2engine::{
+            BindingMachineProjectionFailure as MachineFailure,
+            BindingObservationJournalFailure as Failure,
+        };
 
+        let inst = r2ssa::InstId(11);
+        let value = r2ssa::ValueId(13);
+        let block = r2ssa::BlockId(17);
+        let object = r2ssa::ObjectId(19);
+        let site = r2ssa::UseSite {
+            inst,
+            input_idx: 23,
+        };
+        let obligation = r2ssa::SemanticObligationId {
+            instruction: r2ssa::CanonicalInstructionId {
+                block_addr: 0x8000,
+                site: r2ssa::CanonicalInstructionSite::Op(0),
+            },
+            kind: r2ssa::SemanticObligationKind::ControlTransfer,
+            component: r2ssa::SemanticObligationComponent::Whole,
+        };
+        let mut cases = vec![Failure::SourceAuthority, Failure::BindingPlanAuthority];
+        let mut machine = vec![
+            MachineFailure::UntrustedArtifactProvenance,
+            MachineFailure::IncompleteObligationInventory,
+            MachineFailure::MissingGraphValue { value },
+            MachineFailure::MissingGraphBlock { block },
+            MachineFailure::DuplicateBlockAddress { address: 0x1010 },
+            MachineFailure::TopologyMismatch,
+            MachineFailure::MachineContextMismatch,
+            MachineFailure::MissingInstruction { inst },
+            MachineFailure::MissingInstructionDisposition { inst },
+            MachineFailure::MissingUseDisposition { site },
+            MachineFailure::MissingWriteDisposition { inst },
+            MachineFailure::MissingOutput { inst },
+            MachineFailure::InvalidValueWidth {
+                value,
+                size_bytes: 4,
+            },
+            MachineFailure::ConstantTooWide {
+                value,
+                width_bits: 65,
+            },
+            MachineFailure::WrongOperandCount {
+                inst,
+                expected: 2,
+                actual: 3,
+            },
+            MachineFailure::WidthMismatch {
+                inst,
+                expected_bits: 64,
+                actual_bits: 32,
+            },
+        ];
+        for kind in [
+            r2ssa::MachineCastKind::ZeroExtend,
+            r2ssa::MachineCastKind::SignExtend,
+            r2ssa::MachineCastKind::Truncate,
+            r2ssa::MachineCastKind::BitReinterpret,
+            r2ssa::MachineCastKind::IntegerToAddress,
+            r2ssa::MachineCastKind::AddressToInteger,
+        ] {
+            machine.push(MachineFailure::InvalidCastWidth {
+                inst,
+                kind,
+                from_bits: 32,
+                to_bits: 64,
+            });
+        }
+        machine.extend([
+            MachineFailure::InvalidSubpiece {
+                inst,
+                source_bits: 64,
+                result_bits: 16,
+                lsb_bits: 8,
+            },
+            MachineFailure::InvalidChild {
+                expr_index: 29,
+                child_index: 31,
+            },
+            MachineFailure::InvalidExpressionType { expr_index: 37 },
+            MachineFailure::DuplicateEntity { value },
+            MachineFailure::EntityMismatch { inst },
+            MachineFailure::ObligationMismatch { inst },
+            MachineFailure::UseDispositionMismatch { site },
+            MachineFailure::WriteDispositionMismatch { inst },
+        ]);
+        for (index, space) in [
+            r2ssa::CanonicalStorageSpace::Ram,
+            r2ssa::CanonicalStorageSpace::Register,
+            r2ssa::CanonicalStorageSpace::Unique,
+            r2ssa::CanonicalStorageSpace::Constant,
+            r2ssa::CanonicalStorageSpace::Custom(41),
+            r2ssa::CanonicalStorageSpace::Unknown,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            machine.push(MachineFailure::ObligationSourceMismatch {
+                instruction: r2ssa::CanonicalInstructionId {
+                    block_addr: 0x2000,
+                    site: r2ssa::CanonicalInstructionSite::Phi(r2ssa::CanonicalStorageId {
+                        space,
+                        offset: 0x3000 + index as u64,
+                        size: 8,
+                    }),
+                },
+            });
+        }
+        machine.extend([
+            MachineFailure::ObligationSourceMismatch {
+                instruction: r2ssa::CanonicalInstructionId {
+                    block_addr: 0x4000,
+                    site: r2ssa::CanonicalInstructionSite::Op(43),
+                },
+            },
+            MachineFailure::ObligationSourceMismatch {
+                instruction: r2ssa::CanonicalInstructionId {
+                    block_addr: 0x5000,
+                    site: r2ssa::CanonicalInstructionSite::NativeSpan {
+                        instruction_addr: 0x5004,
+                        size: 4,
+                    },
+                },
+            },
+            MachineFailure::UnsupportedOperation { inst },
+        ]);
+        assert_eq!(machine.len(), 39, "machine wire-leaf inventory drifted");
+        cases.extend(
+            machine
+                .into_iter()
+                .map(Failure::BindingPlanMachineProjection),
+        );
+        cases.extend([
+            Failure::BindingPlanValueTopology { index: 47, value },
+            Failure::BindingPlanDispositionCount {
+                expected: 48,
+                actual: 49,
+            },
+            Failure::BindingPlanBindingCount {
+                expected: 50,
+                actual: 51,
+            },
+            Failure::BindingPlanInvalidBindingReference {
+                value,
+                binding_index: 52,
+            },
+            Failure::BindingPlanCertificateMembership { binding_index: 53 },
+            Failure::BindingPlanDeclarationWidth { binding_index: 54 },
+            Failure::BindingPlanInvalidLiteralInline { value },
+            Failure::BindingPlanInvalidElisionProof { value },
+            Failure::BindingPlanUnexpectedValueDisposition { value },
+            Failure::BindingPlanStackObjectCount {
+                expected: 55,
+                actual: 56,
+            },
+            Failure::BindingPlanUnexpectedStackObjectDisposition { object },
+            Failure::BindingPlanStackObjectCertificate {
+                object,
+                binding_index: 57,
+            },
+            Failure::BindingPlanStackObjectDeclarationWidth {
+                object,
+                binding_index: 58,
+            },
+            Failure::BindingPlanParameterCount {
+                expected: 73,
+                actual: 74,
+            },
+            Failure::BindingPlanUnexpectedParameterDisposition { slot: 75 },
+            Failure::BindingPlanParameterCertificate {
+                slot: 76,
+                binding_index: 77,
+            },
+            Failure::BindingPlanParameterDeclarationWidth {
+                slot: 78,
+                binding_index: 79,
+            },
+            Failure::NormalizationSourceAuthority,
+            Failure::NormalizationBlockTopology,
+            Failure::NormalizationRowCount {
+                block_address: 0x6000,
+            },
+            Failure::NormalizationOriginalInstruction {
+                block_address: 0x6004,
+                op_idx: 59,
+            },
+            Failure::NormalizationOriginalCoverage,
+            Failure::NormalizationPhiEdge {
+                block_address: 0x6008,
+                op_idx: 60,
+            },
+            Failure::NormalizationRelocatedInitializer {
+                block_address: 0x600c,
+                op_idx: 61,
+            },
+            Failure::NormalizationRemovedPhi,
+            Failure::NormalizationRemovedPhiEdge,
+            Failure::NormalizationInvalidCarrierCertificates,
+            Failure::TooManyObservations,
+            Failure::InvalidValue { value },
+            Failure::InvalidCertifiedValueRead { value, at: inst },
+            Failure::InvalidUse { site },
+            Failure::InvalidWrite { inst },
+            Failure::InvalidEffectObligation { obligation },
+            Failure::OutputlessWrite { inst },
+            Failure::InvalidNormalizedSite { block, op_idx: 62 },
+            Failure::MissingNormalizedBlock { address: 0x7000 },
+            Failure::MissingNormalizedSiteContext,
+            Failure::InvalidNormalizedInput {
+                block,
+                op_idx: 63,
+                input_idx: 64,
+            },
+            Failure::MissingNormalizedOutput { block, op_idx: 65 },
+            Failure::RefusedRenderedUse { site },
+            Failure::RefusedRenderedWrite { inst },
+            Failure::RenderedValueRequired { value },
+            Failure::PlannedElidedValueRendered { value },
+            Failure::PlannedRefusedValueRendered { value },
+            Failure::MissingPlannedValue { value },
+            Failure::InvalidPlannedInline {
+                value,
+                term_index: 66,
+            },
+            Failure::ExactUseRequiresRenderedOccurrence { site },
+            Failure::ExactWriteRequiresRenderedOccurrence { inst },
+            Failure::SymbolTableMismatch,
+            Failure::UnownedBindingSymbol {
+                value,
+                symbol_index: 67,
+            },
+            Failure::ConflictingValue { value },
+            Failure::ConflictingUse { site },
+            Failure::ConflictingWrite { inst },
+            Failure::ObservationDomainTooLarge { expected_count: 68 },
+            Failure::ObservationCapacityUnavailable { expected_count: 69 },
+            Failure::ObservationOutOfRange {
+                observation_id: 70,
+                expected_count: 71,
+            },
+            Failure::DuplicateObservation { observation_id: 72 },
+        ]);
+        assert_eq!(
+            cases.len(),
+            98,
+            "public journal wire-leaf inventory drifted"
+        );
+        cases
+    }
 
+    #[test]
+    fn diagnostics_json_preserves_every_binding_journal_failure_wire_leaf() {
+        use r2engine::{BindingShadowAuditFailure, BindingShadowAuditOutcome};
 
+        let cases = every_binding_observation_journal_failure_wire_leaf();
+        let mut kinds = std::collections::BTreeSet::new();
+        let mut causes = Vec::with_capacity(cases.len());
+        for cause in cases {
+            let expected_cause = binding_observation_journal_failure_json(cause);
+            let kind = expected_cause["kind"]
+                .as_str()
+                .expect("typed journal cause kind is a string");
+            assert!(kinds.insert(kind.to_string()), "duplicate wire kind {kind}");
+            for (failure, reason) in [
+                (
+                    BindingShadowAuditFailure::JournalConstruction(cause),
+                    "journal_construction_failure",
+                ),
+                (
+                    BindingShadowAuditFailure::JournalRecording(cause),
+                    "journal_recording_failure",
+                ),
+                (
+                    BindingShadowAuditFailure::JournalSeal(cause),
+                    "journal_seal_failure",
+                ),
+            ] {
+                let payload = binding_audit_json(Some(BindingShadowAuditOutcome::Failed(failure)));
+                assert_eq!(payload["schema_version"], 2);
+                assert_eq!(payload["status"], "failed");
+                assert_eq!(payload["reason"], reason);
+                assert_eq!(payload["cause"], expected_cause);
+                assert_eq!(
+                    payload.as_object().map(serde_json::Map::len),
+                    Some(4),
+                    "journal failure envelope retained a parallel or legacy field",
+                );
+            }
+            causes.push(expected_cause);
+        }
+        assert_eq!(kinds.len(), 98);
+
+        let checker = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../tests/corpus/check_binding_audit_schema.py");
+        let mut child = std::process::Command::new("python3")
+            .arg(&checker)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|error| panic!("failed to run {}: {error}", checker.display()));
+        let oracle_json = serde_json::to_vec(&causes).expect("serialize typed journal causes");
+        std::io::Write::write_all(
+            child.stdin.as_mut().expect("schema checker stdin"),
+            &oracle_json,
+        )
+        .expect("write typed journal causes to schema checker");
+        drop(child.stdin.take());
+        let output = child.wait_with_output().expect("wait for schema checker");
+        assert!(
+            output.status.success(),
+            "Python binding-audit schema rejected the Rust typed oracle: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "98");
+    }
+
+    fn every_placement_refusal_wire_leaf() -> Vec<r2engine::PlacementAuditRefusal> {
+        use r2engine::PlacementAuditRefusal as Refusal;
+
+        vec![
+            Refusal::MissingStructuredRegionArtifact,
+            Refusal::ObservationJournalUnavailable,
+            Refusal::SourceAuthorityMismatch,
+            Refusal::BindingOutsidePlan { binding_index: 1 },
+            Refusal::RegionOutsideArtifact { region_index: 2 },
+            Refusal::BlockOutsideFunction {
+                block_address: 0x3000,
+            },
+            Refusal::RegionDoesNotDominateOccurrence {
+                region_index: 3,
+                block_address: 0x3004,
+            },
+            Refusal::ExternalBindingOutsidePlan { binding_index: 4 },
+            Refusal::RegionMarkerUnsealed,
+            Refusal::RegionMarkerForeign { anchor_index: 5 },
+            Refusal::RegionMarkerDuplicate { region_index: 6 },
+            Refusal::RegionMarkerMissing { region_index: 7 },
+            Refusal::RegionMarkerParentMismatch { region_index: 8 },
+            Refusal::RegionMarkerOutOfOrder {
+                region_index: 9,
+                expected_region_index: 10,
+            },
+            Refusal::ObservationDomainTooLarge { expected_count: 8 },
+            Refusal::ObservationCapacityUnavailable { expected_count: 9 },
+            Refusal::ObservationOutOfRange {
+                observation_id: 10,
+                expected_count: 11,
+            },
+            Refusal::DuplicateObservation { observation_id: 12 },
+            Refusal::MissingObservationTarget { observation_id: 13 },
+            Refusal::InvalidUse {
+                instruction_id: 14,
+                input_index: 15,
+            },
+            Refusal::InvalidWrite { instruction_id: 16 },
+            Refusal::InvalidCertifiedValueRead {
+                value_id: 17,
+                instruction_id: 18,
+            },
+            Refusal::MissingPlannedValue { value_id: 19 },
+            Refusal::RefusedPlannedValue { value_id: 20 },
+            Refusal::UnscopedObservation { observation_id: 21 },
+            Refusal::UnauthorizedProgramVariable { symbol_index: 36 },
+            Refusal::UnobservedBindingRead { binding_index: 20 },
+            Refusal::UnobservedBindingWrite { binding_index: 21 },
+            Refusal::NoDominatingRegion { binding_index: 22 },
+            Refusal::MissingDefinition { binding_index: 23 },
+            Refusal::ReadBeforeAssignment {
+                binding_index: 24,
+                instruction_id: 25,
+                input_index: 26,
+            },
+            Refusal::CertifiedValueReadBeforeAssignment {
+                binding_index: 27,
+                value_id: 28,
+                instruction_id: 29,
+            },
+            Refusal::StackAccessReadBeforeAssignment {
+                binding_index: 28,
+                instruction_id: 29,
+                access_ordinal: 30,
+            },
+            Refusal::PreservedCarrierReadBeforeAssignment {
+                binding_index: 29,
+                instruction_id: 30,
+            },
+            Refusal::UnprovableExecutionOrder { binding_index: 30 },
+            Refusal::AmbiguousObservationExecutionOrder { observation_id: 31 },
+            Refusal::MissingBinding { binding_index: 27 },
+            Refusal::MissingBindingSymbol { binding_index: 28 },
+            Refusal::ExternalBindingMissingParameter { binding_index: 29 },
+            Refusal::MissingRegion { region_index: 30 },
+            Refusal::DuplicateRegion { region_index: 31 },
+            Refusal::MissingInlineWrite { instruction_id: 32 },
+            Refusal::DuplicateInlineWrite { instruction_id: 33 },
+            Refusal::MissingBindingRole { binding_index: 34 },
+            Refusal::UndeclaredNames { count: 35 },
+        ]
+    }
+
+    #[test]
+    fn diagnostics_json_preserves_every_placement_refusal_wire_leaf() {
+        use r2engine::{PlacementAudit, PlacementAuditRefusal};
+
+        let mut kinds = std::collections::BTreeSet::new();
+        let mut causes = Vec::new();
+        for refusal in every_placement_refusal_wire_leaf() {
+            let payload = placement_audit_json(Some(PlacementAudit::Refused(refusal)));
+            assert_eq!(payload["schema_version"], 1);
+            assert_eq!(payload["status"], "refused");
+            assert_eq!(payload.as_object().map(serde_json::Map::len), Some(3));
+            let cause = payload["cause"].clone();
+            let kind = cause["kind"]
+                .as_str()
+                .expect("typed placement cause kind is a string");
+            assert!(kinds.insert(kind.to_string()), "duplicate wire kind {kind}");
+            causes.push(cause);
+        }
+        assert_eq!(kinds.len(), 45);
+
+        let checker = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../tests/corpus/check_binding_audit_schema.py");
+        let mut child = std::process::Command::new("python3")
+            .arg(&checker)
+            .arg("--placement")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|error| panic!("failed to run {}: {error}", checker.display()));
+        let oracle_json = serde_json::to_vec(&causes).expect("serialize placement causes");
+        std::io::Write::write_all(
+            child.stdin.as_mut().expect("schema checker stdin"),
+            &oracle_json,
+        )
+        .expect("write typed placement causes to schema checker");
+        drop(child.stdin.take());
+        let output = child.wait_with_output().expect("wait for schema checker");
+        assert!(
+            output.status.success(),
+            "Python placement schema rejected the Rust typed oracle: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "45");
+
+        assert_eq!(
+            placement_audit_json(Some(PlacementAudit::Applied)),
+            serde_json::json!({"schema_version": 1, "status": "applied"}),
+        );
+        assert_eq!(
+            placement_audit_json(Some(PlacementAudit::NotRun)),
+            serde_json::json!({"schema_version": 1, "status": "not_run"}),
+        );
+        assert!(placement_audit_json(None).is_null());
+
+        let refusal =
+            PlacementAudit::Refused(PlacementAuditRefusal::MissingDefinition { binding_index: 7 });
+        let raw = response_diagnostics_json(
+            &r2engine::EngineDiagnostics::default(),
+            Some(r2engine::BindingShadowAuditOutcome::NotRun),
+            Some(r2engine::EffectObligationAudit::NOT_RUN),
+            Some(refusal),
+            None,
+        )
+        .expect("placement diagnostics JSON");
+        let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+        assert_eq!(parsed["outcome"], "refused");
+        assert_eq!(
+            parsed["placement_audit"]["cause"]["kind"],
+            "missing_definition"
+        );
+        assert_eq!(parsed["placement_audit"]["cause"]["binding_index"], 7);
+        assert_eq!(
+            response_outcome(
+                &r2engine::EngineDiagnostics::default(),
+                Some(r2engine::BindingShadowAuditOutcome::NotRun),
+                Some(r2engine::EffectObligationAudit::NOT_RUN),
+                Some(refusal),
+                None,
+            ),
+            R2SLEIGH_OUTCOME_REFUSED_V2,
+        );
+    }
+
+    #[test]
+    fn diagnostics_json_exposes_typed_render_refusal_and_refuses_it() {
+        let cases = [
+            (
+                r2engine::DecompileRenderRefusal::MissingMachineProjectionAuthorization(
+                    r2dec::MachineProjectionRefusalOrigin::op_lowering(),
+                ),
+                "missing_machine_projection_authorization",
+            ),
+            (
+                r2engine::DecompileRenderRefusal::MissingProgramVariableAuthorization,
+                "missing_program_variable_authorization",
+            ),
+            (
+                r2engine::DecompileRenderRefusal::DeclarationPlacement(
+                    r2engine::PlacementAuditRefusal::MissingDefinition { binding_index: 17 },
+                ),
+                "missing_definition",
+            ),
+            (
+                r2engine::DecompileRenderRefusal::RefusedBindingDisposition {
+                    observations: binding_observations(0, 0, 1, 0),
+                },
+                "refused_binding_disposition",
+            ),
+            (
+                r2engine::DecompileRenderRefusal::NormalizationOriginUnavailable,
+                "normalization_origin_unavailable",
+            ),
+            (
+                r2engine::DecompileRenderRefusal::UnrepresentableControlFlow,
+                "unrepresentable_control_flow",
+            ),
+            (
+                r2engine::DecompileRenderRefusal::IncompleteEffectInventory,
+                "incomplete_effect_inventory",
+            ),
+            (
+                r2engine::DecompileRenderRefusal::UnrepresentableOperation,
+                "unrepresentable_operation",
+            ),
+        ];
+
+        for (refusal, kind) in cases {
+            let raw = response_diagnostics_json(
+                &r2engine::EngineDiagnostics::default(),
+                Some(r2engine::BindingShadowAuditOutcome::NotRun),
+                Some(r2engine::EffectObligationAudit::NOT_RUN),
+                Some(r2engine::PlacementAudit::NotRun),
+                Some(refusal),
+            )
+            .expect("render-refusal diagnostics JSON");
+            let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+            assert_eq!(parsed["outcome"], "refused");
+            assert_eq!(parsed["render_refusal"]["status"], "refused");
+            assert_eq!(parsed["render_refusal"]["kind"], kind);
+            assert_eq!(
+                response_outcome(
+                    &r2engine::EngineDiagnostics::default(),
+                    Some(r2engine::BindingShadowAuditOutcome::NotRun),
+                    Some(r2engine::EffectObligationAudit::NOT_RUN),
+                    Some(r2engine::PlacementAudit::NotRun),
+                    Some(refusal),
+                ),
+                R2SLEIGH_OUTCOME_REFUSED_V2,
+            );
+        }
+
+        let placement = render_refusal_json(Some(
+            r2engine::DecompileRenderRefusal::DeclarationPlacement(
+                r2engine::PlacementAuditRefusal::ReadBeforeAssignment {
+                    binding_index: 19,
+                    instruction_id: 23,
+                    input_index: 29,
+                },
+            ),
+        ));
+        assert_eq!(placement["cause"]["kind"], "read_before_assignment");
+        assert_eq!(placement["cause"]["binding_index"], 19);
+        assert_eq!(placement["cause"]["instruction_id"], 23);
+        assert_eq!(placement["cause"]["input_index"], 29);
+
+        let observations = render_refusal_json(Some(
+            r2engine::DecompileRenderRefusal::RefusedBindingDisposition {
+                observations: binding_observations(0, 0, 1, 0),
+            },
+        ));
+        assert_eq!(observations["observations"]["values"]["refused"], 1);
+    }
+
+    #[test]
+    fn diagnostics_json_preserves_representative_binding_journal_failure_payloads() {
+        use r2engine::{
+            BindingObservationJournalFailure as Failure, BindingShadowAuditFailure,
+            BindingShadowAuditOutcome,
+        };
+
+        let site = r2ssa::UseSite {
+            inst: r2ssa::InstId(7),
+            input_idx: 2,
+        };
+        let cases = [
+            (Failure::SourceAuthority, "source_authority"),
+            (Failure::BindingPlanAuthority, "binding_plan_authority"),
+            (
+                Failure::NormalizationBlockTopology,
+                "normalization_block_topology",
+            ),
+            (Failure::TooManyObservations, "too_many_observations"),
+            (
+                Failure::InvalidValue {
+                    value: r2ssa::ValueId(3),
+                },
+                "invalid_value",
+            ),
+            (Failure::InvalidUse { site }, "invalid_use"),
+            (
+                Failure::InvalidWrite {
+                    inst: r2ssa::InstId(11),
+                },
+                "invalid_write",
+            ),
+            (
+                Failure::OutputlessWrite {
+                    inst: r2ssa::InstId(13),
+                },
+                "outputless_write",
+            ),
+            (
+                Failure::InvalidNormalizedSite {
+                    block: r2ssa::BlockId(17),
+                    op_idx: 5,
+                },
+                "invalid_normalized_site",
+            ),
+            (
+                Failure::MissingNormalizedBlock { address: 0x1234 },
+                "missing_normalized_block",
+            ),
+            (
+                Failure::MissingNormalizedSiteContext,
+                "missing_normalized_site_context",
+            ),
+            (
+                Failure::InvalidNormalizedInput {
+                    block: r2ssa::BlockId(19),
+                    op_idx: 6,
+                    input_idx: 4,
+                },
+                "invalid_normalized_input",
+            ),
+            (
+                Failure::MissingNormalizedOutput {
+                    block: r2ssa::BlockId(23),
+                    op_idx: 8,
+                },
+                "missing_normalized_output",
+            ),
+            (Failure::RefusedRenderedUse { site }, "refused_rendered_use"),
+            (
+                Failure::RefusedRenderedWrite {
+                    inst: r2ssa::InstId(29),
+                },
+                "refused_rendered_write",
+            ),
+            (
+                Failure::RenderedValueRequired {
+                    value: r2ssa::ValueId(31),
+                },
+                "rendered_value_required",
+            ),
+            (
+                Failure::PlannedElidedValueRendered {
+                    value: r2ssa::ValueId(32),
+                },
+                "planned_elided_value_rendered",
+            ),
+            (
+                Failure::PlannedRefusedValueRendered {
+                    value: r2ssa::ValueId(33),
+                },
+                "planned_refused_value_rendered",
+            ),
+            (
+                Failure::MissingPlannedValue {
+                    value: r2ssa::ValueId(34),
+                },
+                "missing_planned_value",
+            ),
+            (
+                Failure::InvalidPlannedInline {
+                    value: r2ssa::ValueId(35),
+                    term_index: 36,
+                },
+                "invalid_planned_inline",
+            ),
+            (
+                Failure::ExactUseRequiresRenderedOccurrence { site },
+                "exact_use_requires_rendered_occurrence",
+            ),
+            (
+                Failure::ExactWriteRequiresRenderedOccurrence {
+                    inst: r2ssa::InstId(37),
+                },
+                "exact_write_requires_rendered_occurrence",
+            ),
+            (Failure::SymbolTableMismatch, "symbol_table_mismatch"),
+            (
+                Failure::UnownedBindingSymbol {
+                    value: r2ssa::ValueId(40),
+                    symbol_index: 41,
+                },
+                "unowned_binding_symbol",
+            ),
+            (
+                Failure::ConflictingValue {
+                    value: r2ssa::ValueId(43),
+                },
+                "conflicting_value",
+            ),
+            (Failure::ConflictingUse { site }, "conflicting_use"),
+            (
+                Failure::ConflictingWrite {
+                    inst: r2ssa::InstId(47),
+                },
+                "conflicting_write",
+            ),
+            (
+                Failure::ObservationDomainTooLarge { expected_count: 53 },
+                "observation_domain_too_large",
+            ),
+            (
+                Failure::ObservationCapacityUnavailable { expected_count: 59 },
+                "observation_capacity_unavailable",
+            ),
+            (
+                Failure::ObservationOutOfRange {
+                    observation_id: 61,
+                    expected_count: 67,
+                },
+                "observation_out_of_range",
+            ),
+            (
+                Failure::DuplicateObservation { observation_id: 71 },
+                "duplicate_observation",
+            ),
+        ];
+
+        for (cause, kind) in cases {
+            let payload = binding_audit_json(Some(BindingShadowAuditOutcome::Failed(
+                BindingShadowAuditFailure::JournalSeal(cause),
+            )));
+            assert_eq!(payload["schema_version"], 2);
+            assert_eq!(payload["status"], "failed");
+            assert_eq!(payload["reason"], "journal_seal_failure");
+            assert_eq!(payload["cause"]["kind"], kind);
+
+            let construction = binding_audit_json(Some(BindingShadowAuditOutcome::Failed(
+                BindingShadowAuditFailure::JournalConstruction(cause),
+            )));
+            assert_eq!(construction["schema_version"], 2);
+            assert_eq!(construction["status"], "failed");
+            assert_eq!(construction["reason"], "journal_construction_failure");
+            assert_eq!(construction["cause"]["kind"], kind);
+
+            let recording = binding_audit_json(Some(BindingShadowAuditOutcome::Failed(
+                BindingShadowAuditFailure::JournalRecording(cause),
+            )));
+            assert_eq!(recording["schema_version"], 2);
+            assert_eq!(recording["status"], "failed");
+            assert_eq!(recording["reason"], "journal_recording_failure");
+            assert_eq!(recording["cause"]["kind"], kind);
+        }
+
+        let detailed = binding_observation_journal_failure_json(Failure::ObservationOutOfRange {
+            observation_id: 73,
+            expected_count: 79,
+        });
+        assert_eq!(detailed["observation_id"], 73);
+        assert_eq!(detailed["expected_count"], 79);
+        assert_eq!(detailed.as_object().map(serde_json::Map::len), Some(3));
+
+        let machine =
+            binding_observation_journal_failure_json(Failure::BindingPlanMachineProjection(
+                r2engine::BindingMachineProjectionFailure::WidthMismatch {
+                    inst: r2ssa::InstId(83),
+                    expected_bits: 64,
+                    actual_bits: 32,
+                },
+            ));
+        assert_eq!(machine["kind"], "binding_plan_machine_width_mismatch");
+        assert_eq!(machine["instruction_id"], 83);
+        assert_eq!(machine["expected_bits"], 64);
+        assert_eq!(machine["actual_bits"], 32);
+        assert_eq!(machine.as_object().map(serde_json::Map::len), Some(4));
+
+        let normalization =
+            binding_observation_journal_failure_json(Failure::NormalizationPhiEdge {
+                block_address: 0x1234,
+                op_idx: 5,
+            });
+        assert_eq!(normalization["kind"], "normalization_phi_edge");
+        assert_eq!(normalization["block_address"], 0x1234);
+        assert_eq!(normalization["op_index"], 5);
+        assert_eq!(normalization.as_object().map(serde_json::Map::len), Some(3));
+    }
+
+    #[test]
+    fn diagnostics_json_exposes_exact_binding_audit_counts() {
+        use r2engine::{BindingShadowAuditFailure, BindingShadowAuditOutcome};
+
+        let cases = [
+            (
+                BindingShadowAuditOutcome::Complete {
+                    ledger: binding_ledger(0),
+                    observations: binding_observations(1, 0, 0, 0),
+                },
+                "complete",
+                0,
+                0,
+            ),
+            (
+                BindingShadowAuditOutcome::Failed(
+                    BindingShadowAuditFailure::IncompleteObservations {
+                        ledger: binding_ledger(0),
+                        observations: binding_observations(0, 0, 0, 1),
+                    },
+                ),
+                "incomplete_observations",
+                1,
+                0,
+            ),
+            (
+                BindingShadowAuditOutcome::Failed(BindingShadowAuditFailure::NonQuality {
+                    ledger: binding_ledger(1),
+                    observations: binding_observations(0, 0, 1, 0),
+                }),
+                "non_quality",
+                0,
+                1,
+            ),
+            (BindingShadowAuditOutcome::NotRun, "not_run", 0, 0),
+        ];
+
+        for (audit, status, unaccounted, refused) in cases {
+            let raw = response_diagnostics_json(
+                &r2engine::EngineDiagnostics::default(),
+                Some(audit),
+                Some(r2engine::EffectObligationAudit::NOT_RUN),
+                Some(r2engine::PlacementAudit::NotRun),
+                None,
+            )
+            .expect("diagnostics JSON");
+            let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+            assert_eq!(parsed["outcome"], "completed");
+            let payload = &parsed["binding_audit"];
+            assert_eq!(payload["status"], status);
+            assert_eq!(payload["schema_version"], 2);
+            if status == "not_run" {
+                assert_eq!(payload.as_object().map(serde_json::Map::len), Some(2));
+            } else {
+                assert_eq!(
+                    payload["observations"]["values"]["unaccounted"],
+                    unaccounted
+                );
+                assert_eq!(payload["observations"]["values"]["refused"], refused);
+                assert_eq!(payload["shadow"]["values"]["refused"], refused);
+                assert!(payload.get("passes_quality").is_none());
+            }
+        }
+
+        let refused_observations = binding_audit_json(Some(BindingShadowAuditOutcome::Failed(
+            BindingShadowAuditFailure::NonQualityObservations {
+                observations: binding_observations(0, 0, 1, 0),
+            },
+        )));
+        assert_eq!(refused_observations["status"], "non_quality_observations");
+        assert_eq!(refused_observations["observations"]["values"]["refused"], 1);
+        assert!(refused_observations.get("shadow").is_none());
+
+        let placement = binding_audit_json(Some(BindingShadowAuditOutcome::Failed(
+            BindingShadowAuditFailure::Placement(
+                r2engine::PlacementAuditRefusal::MissingDefinition { binding_index: 31 },
+            ),
+        )));
+        assert_eq!(placement["status"], "failed");
+        assert_eq!(placement["reason"], "placement_refusal");
+        assert_eq!(placement["cause"]["kind"], "missing_definition");
+        assert_eq!(placement["cause"]["binding_index"], 31);
+
+        assert_eq!(
+            response_outcome(
+                &r2engine::EngineDiagnostics::default(),
+                Some(BindingShadowAuditOutcome::Failed(
+                    BindingShadowAuditFailure::NonQualityObservations {
+                        observations: binding_observations(0, 0, 1, 0),
+                    },
+                )),
+                Some(r2engine::EffectObligationAudit::NOT_RUN),
+                Some(r2engine::PlacementAudit::Applied),
+                None,
+            ),
+            R2SLEIGH_OUTCOME_REFUSED_V2,
+            "a binding-disposition admission refusal cannot be reported as completed",
+        );
+    }
+
+    #[test]
+    fn diagnostics_json_uses_the_canonical_refusal_outcome() {
+        let diagnostics = r2engine::EngineDiagnostics {
+            plan: Some(r2engine::EnginePlan::RefuseWithEvidence),
+            refusal: Some("typed refusal".to_string()),
+            ..r2engine::EngineDiagnostics::default()
+        };
+        let raw = response_diagnostics_json(
+            &diagnostics,
+            Some(r2engine::BindingShadowAuditOutcome::NotRun),
+            Some(r2engine::EffectObligationAudit::NOT_RUN),
+            Some(r2engine::PlacementAudit::NotRun),
+            None,
+        )
+        .expect("diagnostics JSON");
+        let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+
+        assert_eq!(parsed["outcome"], "refused");
+        assert_eq!(
+            response_outcome(
+                &diagnostics,
+                Some(r2engine::BindingShadowAuditOutcome::NotRun),
+                Some(r2engine::EffectObligationAudit::NOT_RUN),
+                Some(r2engine::PlacementAudit::NotRun),
+                None,
+            ),
+            R2SLEIGH_OUTCOME_REFUSED_V2
+        );
+    }
+
+    #[test]
+    fn diagnostics_json_exposes_exact_effect_obligations_and_refuses_failed_native_audits() {
+        let admitted = r2engine::EffectObligationAudit {
+            disposition: r2engine::EffectObligationDisposition::Admitted,
+            total: 13,
+            rendered: 7,
+            justified_elision: 6,
+            refused: 0,
+            unaccounted: 0,
+            conflicts: 0,
+            refused_obligation: None,
+            unaccounted_obligation: None,
+            conflicting_obligation: None,
+        };
+        let admitted_json = effect_obligations_json(Some(admitted));
+        assert_eq!(admitted_json["schema_version"], 1);
+        assert_eq!(admitted_json["status"], "admitted");
+        assert_eq!(admitted_json["total"], 13);
+        assert_eq!(admitted_json["rendered"], 7);
+        assert_eq!(admitted_json["justified_elision"], 6);
+        assert_eq!(admitted_json["refused"], 0);
+        assert_eq!(admitted_json["unaccounted"], 0);
+        assert_eq!(admitted_json["conflicts"], 0);
+        assert_eq!(admitted_json.as_object().map(serde_json::Map::len), Some(8));
+
+        let refused = r2engine::EffectObligationAudit {
+            disposition: r2engine::EffectObligationDisposition::Refused,
+            total: 9,
+            rendered: 4,
+            justified_elision: 1,
+            refused: 2,
+            unaccounted: 1,
+            conflicts: 1,
+            refused_obligation: None,
+            unaccounted_obligation: None,
+            conflicting_obligation: None,
+        };
+        let raw = response_diagnostics_json(
+            &r2engine::EngineDiagnostics::default(),
+            Some(r2engine::BindingShadowAuditOutcome::NotRun),
+            Some(refused),
+            Some(r2engine::PlacementAudit::NotRun),
+            None,
+        )
+        .expect("effect diagnostics JSON");
+        let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+        assert_eq!(parsed["outcome"], "refused");
+        assert_eq!(parsed["effect_obligations"]["status"], "refused");
+        assert_eq!(parsed["effect_obligations"]["refused"], 2);
+        assert_eq!(parsed["effect_obligations"]["unaccounted"], 1);
+        assert_eq!(parsed["effect_obligations"]["conflicts"], 1);
+        assert_eq!(
+            response_outcome(
+                &r2engine::EngineDiagnostics::default(),
+                Some(r2engine::BindingShadowAuditOutcome::NotRun),
+                Some(refused),
+                Some(r2engine::PlacementAudit::NotRun),
+                None,
+            ),
+            R2SLEIGH_OUTCOME_REFUSED_V2,
+            "an effect-refused native audit is a typed plugin refusal"
+        );
+        let inconsistent_admission = r2engine::EffectObligationAudit {
+            disposition: r2engine::EffectObligationDisposition::Admitted,
+            total: 1,
+            rendered: 0,
+            justified_elision: 0,
+            refused: 1,
+            unaccounted: 0,
+            conflicts: 0,
+            refused_obligation: None,
+            unaccounted_obligation: None,
+            conflicting_obligation: None,
+        };
+        assert_eq!(
+            response_outcome(
+                &r2engine::EngineDiagnostics::default(),
+                Some(r2engine::BindingShadowAuditOutcome::NotRun),
+                Some(inconsistent_admission),
+                Some(r2engine::PlacementAudit::NotRun),
+                None,
+            ),
+            R2SLEIGH_OUTCOME_REFUSED_V2,
+            "nonzero refusal counts fail closed independently of disposition"
+        );
+
+        let not_run = effect_obligations_json(Some(r2engine::EffectObligationAudit::NOT_RUN));
+        assert_eq!(not_run["status"], "not_run");
+        assert_eq!(not_run["total"], 0);
+        assert_eq!(
+            response_outcome(
+                &r2engine::EngineDiagnostics::default(),
+                Some(r2engine::BindingShadowAuditOutcome::NotRun),
+                Some(r2engine::EffectObligationAudit::NOT_RUN),
+                Some(r2engine::PlacementAudit::NotRun),
+                None,
+            ),
+            R2SLEIGH_OUTCOME_COMPLETED_V2,
+            "a non-native route is not refused merely because the audit did not run"
+        );
+        assert!(effect_obligations_json(None).is_null());
+    }
 }

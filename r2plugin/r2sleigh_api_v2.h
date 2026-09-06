@@ -39,7 +39,7 @@ typedef struct R2ILBlock R2ILBlock;
  */
 #define R2SLEIGH_RADARE_SNAPSHOT_CONTRACT_V2 1
 
-#define R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2 13
+#define R2SLEIGH_RADARE_FUNCTION_SNAPSHOT_SCHEMA_V2 16
 
 #define R2SLEIGH_RADARE_SNAPSHOT_ACCESSOR_SCHEMA_V2 5
 
@@ -60,6 +60,8 @@ typedef struct R2ILBlock R2ILBlock;
 #define R2SLEIGH_REQUEST_DECOMPILE_V2 1
 
 #define R2SLEIGH_REQUEST_TYPE_FUNCTION_V2 2
+
+#define R2SLEIGH_REQUEST_PROVEN_FACTS_V2 3
 
 #define R2SLEIGH_RESPONSE_INFO_SCHEMA_V2 2
 
@@ -302,9 +304,6 @@ typedef struct R2SleighResponseInfoV2 {
   struct R2SleighByteViewV2 diagnostics_json;
 } R2SleighResponseInfoV2;
 
-/**
- * Length-tagged UTF-8 source string.
- */
 typedef struct R2SleighStringViewV2 {
   const uint8_t *data;
   size_t len;
@@ -328,6 +327,25 @@ typedef struct R2SleighDirectCallIdentityV2 {
   uint64_t target_offset;
   uint32_t target_size;
 } R2SleighDirectCallIdentityV2;
+
+/**
+ * Length-tagged UTF-8 source string.
+ * Everything a caller needs to know about one lifted block.
+ *
+ * Six accessors used to answer this, and each one locked the lift registry and
+ * looked the handle up again to read a single field. Six lock acquisitions to
+ * describe one block is the cost; the maintenance is that both sides carry a
+ * declaration per field. One view answers under one lock.
+ */
+typedef struct R2SleighBlockViewV2 {
+  uint32_t struct_size;
+  uint32_t block_type;
+  uint32_t size;
+  uint64_t addr;
+  uint64_t jump;
+  uint64_t fail;
+  size_t op_count;
+} R2SleighBlockViewV2;
 
 /**
  * One bounded text-analysis request over registry-owned lift handles.
@@ -502,15 +520,11 @@ typedef struct R2SleighApiV2 {
                                               uint64_t,
                                               uint32_t*,
                                               struct R2SleighDirectCallIdentityV2*);
-  uint32_t (*lift_block_size)(const R2ILBlock*, uint32_t*);
-  uint32_t (*lift_block_addr)(const R2ILBlock*, uint64_t*);
+  uint32_t (*lift_block_view)(const R2ILBlock*, struct R2SleighBlockViewV2*);
   uint32_t (*lift_block_mnemonic)(const R2ILContext*,
                                   struct R2SleighByteViewV2,
                                   uint64_t,
                                   struct R2SleighOwnedBytesV2**);
-  uint32_t (*lift_block_type)(const R2ILBlock*, uint32_t*);
-  uint32_t (*lift_block_jump)(const R2ILBlock*, uint64_t*);
-  uint32_t (*lift_block_fail)(const R2ILBlock*, uint64_t*);
   uint32_t (*owned_bytes_view)(const struct R2SleighOwnedBytesV2*, struct R2SleighByteViewV2*);
   uint32_t (*owned_bytes_free)(struct R2SleighOwnedBytesV2*);
   uint32_t (*analysis_render)(const struct R2SleighAnalysisRenderRequestV2*,
@@ -561,6 +575,35 @@ extern "C" {
 uint32_t r2sleigh_snapshot_wire_decode_v2(const uint8_t *buffer,
                                           size_t len,
                                           struct R2SleighSnapshotWireFactsV2 *out);
+
+/**
+ * The engine budget for a program of this many functions, in microseconds.
+ *
+ * Exported so the C side can give a single engine call a deadline without
+ * restating the policy. A call bounded by the whole sweep's budget cannot make
+ * a sweep worse than it was already allowed to be, and it turns a function that
+ * would run without end into one bounded refusal instead of the loss of every
+ * function queued behind it.
+ */
+uint64_t r2sleigh_engine_budget_usec_v2(size_t function_count);
+
+/**
+ * Whether a function of this shape is past the size the engine will accept.
+ *
+ * Exported so the capture can ask before it builds anything. Everything the
+ * engine refuses on size was, until now, first collected in full: the blocks,
+ * their bytes, the call graph and the type graph, then serialized to the wire
+ * and decoded again on this side, only for `decompile_complexity_limit_exceeded`
+ * to decline it one call later. On zlib built at -O2 that cost between three
+ * and six gigabytes resident and the kernel killed `r2` outright, which loses
+ * every function in the binary rather than the one that was too big.
+ *
+ * The counts come from radare2's own basic blocks, which is a floor for what
+ * lifting produces -- lifting splits blocks and expands one instruction into
+ * several operations, never the reverse -- so a function this refuses is one
+ * the engine would have refused too.
+ */
+uint8_t r2sleigh_engine_complexity_limit_exceeded_v2(size_t block_count, size_t op_count);
 
 /**
  * Return the immutable V2 API table. The table and all callback addresses are

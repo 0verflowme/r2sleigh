@@ -1,0 +1,110 @@
+#!/bin/bash
+# Whole-binary render coverage: every function radare2 finds, not a named few.
+#
+# The 54-cell matrix scores nine hand-picked functions and checks that what they
+# render is correct. That is a canary and does not answer the other question --
+# how much of a binary renders at all -- which was measured by hand, and was
+# wrong twice: once by a factor of six, because import thunks were counted as
+# functions, and once by fourteen refusals, because the number was carried
+# forward from an older tree instead of remeasured.
+#
+# This decompiles every function in the corpus binaries and records, per
+# function, whether it rendered and the typed cause when it did not. The
+# baseline is blessed like the raw one. A function that rendered and now
+# refuses fails the gate; a function that now renders is reported and needs
+# --accept-baseline to be recorded.
+set -euo pipefail
+
+script_dir=$(cd "$(dirname "$0")" && pwd)
+repo_root=$(cd "$script_dir/../.." && pwd)
+corpus_dir="$repo_root/tests/corpus"
+artifact_root="$script_dir/artifacts"
+baseline_path="$script_dir/coverage-baseline.json"
+accept_baseline=0
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --accept-baseline)
+            accept_baseline=1
+            shift
+            ;;
+        *)
+            echo "usage: $0 [--accept-baseline]" >&2
+            exit 64
+            ;;
+    esac
+done
+
+mkdir -p "$artifact_root/bin" "$artifact_root/dumps"
+
+install_log="$artifact_root/plugin-install.log"
+make -C "$repo_root/r2plugin" RUST_FEATURES=all-archs install 2>&1 | tee "$install_log"
+if ! grep -q '^Installed to ' "$install_log"; then
+    echo "plugin install did not report its destination" >&2
+    exit 70
+fi
+
+configs=(x64_O0 x64_O1 x64_O2 arm64_O0 arm64_O1 arm64_O2)
+arches=(x86_64 x86_64 x86_64 arm64 arm64 arm64)
+levels=(0 1 2 0 1 2)
+sources=(hashes branchy)
+
+for index in "${!configs[@]}"; do
+    config=${configs[$index]}
+    arch=${arches[$index]}
+    level=${levels[$index]}
+    for source in "${sources[@]}"; do
+        binary="$artifact_root/bin/${source}_${config}"
+        clang -arch "$arch" "-O$level" -o "$binary" "$corpus_dir/${source}.c"
+        "$script_dir/sweep_binary.sh" "$binary" > "$artifact_root/dumps/${source}_${config}.txt"
+    done
+done
+
+# Binaries the repository ships as bytes.
+#
+# Every cell above is compiled here, by whichever clang this machine has, so
+# the cells move when the compiler moves and the report invalidates them when
+# the compiler string differs from the baseline's. These two do not move: the
+# bytes are in the repository, so the same cell means the same program on every
+# machine, which is what lets continuous integration gate on them. They are
+# also the only GCC-built code the gate measures, and the benchmark this
+# project is scored against uses GCC, so a defect that appears only in GCC's
+# output would otherwise reach the benchmark before it reached a gate.
+for binary in "$script_dir"/pinned/*; do
+    [[ -x $binary && -f $binary ]] || continue
+    name="pinned_$(basename "$binary")"
+    "$script_dir/sweep_binary.sh" "$binary" > "$artifact_root/dumps/${name}.txt"
+done
+
+# A binary this project did not compile.
+#
+# The two sources above are ours, and a gate over input we generate cannot say
+# how we do on input we did not: `/bin/ls` fell from 22 rendered functions to
+# 11 somewhere in this branch while this harness reported 243 of 313 unchanged
+# throughout, because it never looked. That is the corpus-as-specification
+# mistake moved from correctness to coverage.
+#
+# The dump name carries a short hash of the binary, so another machine's
+# `/bin/ls` is a different cell rather than a silent comparison against a
+# program it does not have: the report says `appeared` and `vanished` instead
+# of inventing a regression. A binary that is not present is skipped and said
+# so, because a gate that quietly measures less is the thing being fixed here.
+# These cells are measured and reported and never gate, because the machine
+# running the gate decides which program they name. The pinned cells above are
+# the gating half of the same idea.
+system_binaries=(${R2SLEIGH_COVERAGE_SYSTEM_BINARIES:-/bin/ls})
+for binary in "${system_binaries[@]}"; do
+    if [[ ! -r $binary ]]; then
+        echo "skipping absent system binary: $binary" >&2
+        continue
+    fi
+    digest=$(shasum -a 256 "$binary" | cut -c1-8)
+    name="system_$(basename "$binary")_$digest"
+    "$script_dir/sweep_binary.sh" "$binary" > "$artifact_root/dumps/${name}.txt"
+done
+
+python3 "$script_dir/report_coverage.py" \
+    --artifact-root "$artifact_root" \
+    --baseline "$baseline_path" \
+    --clang "$(clang --version | head -n 1)" \
+    $([[ $accept_baseline == 1 ]] && echo --accept-baseline)

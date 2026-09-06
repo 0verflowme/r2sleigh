@@ -1,0 +1,76 @@
+--- r2plugin/r_anal_sleigh.c	2026-09-04 10:27:02
++++ /private/tmp/claude-501/plugstage/r_anal_sleigh.c	2026-09-04 18:21:37
+@@ -16,6 +16,7 @@
+ #include <string.h>
+ #include "r2sleigh_api_v2.h"
+ #include "snapshot_wire.h"
++#include "snapshot_capture.h"
+ 
+ /* Support is decided by whether radare2 exposes the function-snapshot API, and
+  * by nothing else. Pinning a number -- the ABI number or the schema number --
+@@ -3521,11 +3522,25 @@
+ 		: NULL;
+ }
+ 
+-static RCodeMeta *sleigh_decompile(const RAnalFunctionSnapshot *snapshot) {
+-	R_RETURN_VAL_IF_FAIL (snapshot, NULL);
+-	/* Serialize once and hand the engine one buffer. The accessor table stays
+-	 * wired as the fallback while the two paths are compared; when it goes, so
+-	 * do its callbacks and their size handshakes. */
++/* radare2's `pdd` entry point.
++ *
++ * radare2 hands over the function rather than a snapshot of it: what a
++ * decompiler needs to know about a function is the decompiler's business, so
++ * the capture happens here, against radare2's public API under its own locks. */
++static RCodeMeta *sleigh_decompile(RAnal *anal, RAnalFunction *fcn) {
++	R_RETURN_VAL_IF_FAIL (anal && fcn, NULL);
++	RCore *core = anal->coreb.core;
++	if (!core) {
++		R_LOG_ERROR ("r2sleigh: decompilation needs a core to capture from");
++		return NULL;
++	}
++	const char *reason = NULL;
++	RAnalFunctionSnapshot *snapshot = r2sleigh_function_snapshot_take (core, fcn->addr, &reason);
++	if (!snapshot) {
++		R_LOG_ERROR ("r2sleigh: cannot capture '%s': %s", r_str_get (fcn->name),
++			r_str_get_fail (reason, "unknown reason"));
++		return NULL;
++	}
+ 	size_t buffer_len = 0;
+ 	uint8_t *buffer = NULL;
+ 	R2SleighWireWriter *writer = r2sleigh_wire_writer_new ();
+@@ -3535,6 +3550,7 @@
+ 		}
+ 		r2sleigh_wire_writer_free (writer);
+ 	}
++	r2sleigh_function_snapshot_free (snapshot);
+ 	const R2SleighEngineRequestPayloadV2 payload = {
+ 		.abi_version = R2SLEIGH_ABI_V2,
+ 		.struct_size = sizeof (payload),
+@@ -3548,7 +3564,7 @@
+ 		&payload);
+ 	free (buffer);
+ 	if (!result) {
+-		R_LOG_ERROR ("r2sleigh: borrowed snapshot decompilation was refused");
++		R_LOG_ERROR ("r2sleigh: decompilation was refused");
+ 		return NULL;
+ 	}
+ 	RCodeMeta *metadata = r_codemeta_new (result);
+@@ -4599,7 +4615,7 @@
+  * outlives the capture and the pointer tables the proof needs stay readable
+  * for as long as this holds it. */
+ static char *sleigh_proven_facts_json(RCore *core, ut64 function_addr) {
+-	RAnalFunctionSnapshot *snapshot = r_core_function_snapshot_take (
++	RAnalFunctionSnapshot *snapshot = r2sleigh_function_snapshot_take (
+ 		core, function_addr, NULL);
+ 	if (!snapshot) {
+ 		return NULL;
+@@ -4613,7 +4629,7 @@
+ 		}
+ 		r2sleigh_wire_writer_free (writer);
+ 	}
+-	r_anal_function_snapshot_free (snapshot);
++	r2sleigh_function_snapshot_free (snapshot);
+ 	if (!buffer) {
+ 		return NULL;
+ 	}

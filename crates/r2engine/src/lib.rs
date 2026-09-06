@@ -6,9 +6,7 @@
 //! needed for a request. Analysis artifacts are built directly for each
 //! source snapshot request.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fs::OpenOptions;
-use std::io::Write;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -20,45 +18,38 @@ use r2types::{
 };
 use serde::{Deserialize, Serialize};
 
+mod json;
+mod policy;
+mod program_cache;
+pub use json::*;
+pub use policy::*;
+pub use program_cache::{
+    PreparedRole, ProgramCacheStats, cache_callee_facts, cache_program_data_object_types,
+    cache_root_artifact, cached_callee_facts, cached_root_artifact, cached_root_fingerprint,
+    clear_program_cache, program_cache_stats,
+};
+
 mod route;
 
+pub use r2dec::{
+    BindingMachineProjectionFailure, BindingObservationAudit, BindingObservationDomainAudit,
+    BindingObservationJournalFailure, BindingShadowAuditFailure, BindingShadowAuditLedger,
+    BindingShadowAuditOutcome, BindingShadowDomainAudit, DecompileRenderRefusal,
+    EffectObligationAudit, EffectObligationDisposition, PlacementAudit, PlacementAuditRefusal,
+};
+use route::decompile_route_decision;
 pub use route::{
-    DecompileProbeDecision, EngineDiagnostics, EngineFunctionIdentity, EnginePlan,
-    EngineRequestKind, EngineRequestPlan, EngineRouteContext, EngineRouteDecision,
-    EngineSemanticKernelRegion, EngineSemanticKernelRender, EngineTypeRouteDecision,
-    EngineTypeRouteKind, EngineTypedRouteDecision, cfg_guard_reason, cfg_guard_reason_from_summary,
-    plan_type_request, prefer_symbolic_large_worker_decompile, select_engine_plan,
+    EngineDiagnostics, EngineFunctionIdentity, EnginePlan, EngineRequestKind, EngineRequestPlan,
+    EngineRouteContext, EngineRouteDecision, EngineTypeRouteDecision, EngineTypeRouteKind,
+    EngineTypedRouteDecision, cfg_guard_reason_from_summary, plan_type_request,
+    prefer_symbolic_large_worker_decompile, select_engine_plan,
     semantic_artifact_needs_fallback_type_payload, semantic_or_cfg_prefers_bounded_type_plan,
     should_guard_program_orchestrator_decompile, should_use_prepared_semantic_view,
     type_cfg_allows_semantic_plan, type_cfg_bounded_reason, type_cfg_forces_bounded_plan,
     type_cfg_prefers_bounded_plan, type_route_decision,
 };
 #[cfg(test)]
-use route::{decompile_probe_decision, plan_decompile_request, semantic_route_reason};
-use route::{decompile_probe_decision_for_identity, decompile_route_decision};
-pub const SYMBOLIC_PATHS_LIMIT: usize = 32;
-pub const SYMBOLIC_PATHS_CALL_FREE_MAX_STATES: usize = 16;
-pub const SYMBOLIC_PATHS_CALL_FREE_MAX_DEPTH: usize = 64;
-pub const SYMBOLIC_PATHS_CALL_HEAVY_MAX_STATES: usize = 8;
-pub const SYMBOLIC_PATHS_CALL_HEAVY_MAX_DEPTH: usize = 32;
-pub const SYMBOLIC_PATHS_TIMEOUT_MS: u64 = 500;
-pub const SYMBOLIC_PATHS_SOLUTION_LIMIT: usize = 4;
-pub const RADARE2_ANALYSIS_DEPTH_BASIC: u32 = 1;
-pub const RADARE2_ANALYSIS_DEPTH_AGGRESSIVE: u32 = 3;
-pub const POST_ANALYSIS_FAST_BUDGET_USEC: u64 = 2 * 1_000_000;
-pub const POST_ANALYSIS_BALANCED_BUDGET_USEC: u64 = 10 * 1_000_000;
-pub const POST_ANALYSIS_AGGRESSIVE_BUDGET_USEC: u64 = 30 * 1_000_000;
-pub const TAINT_GLOBAL_MAX_FUNCTIONS: usize = 128;
-pub const SIGNATURE_WRITEBACK_GLOBAL_MAX_FUNCTIONS: usize = 128;
-pub const TYPE_WRITEBACK_GLOBAL_MAX_FUNCTIONS: usize = 128;
-pub const ENGINE_DECOMPILE_MAX_BLOCKS: usize = 200;
-pub const ENGINE_DECOMPILE_MAX_OPS: usize = 512;
-pub const AUTO_CALLBACK_MAX_BLOCKS: u32 = 96;
-pub const AUTO_CALLBACK_MAX_COST: u32 = 512;
-pub const AUTO_CALLBACK_MAX_LINEAR_SIZE: u64 = 256 * 1024;
-pub const SYMBOLIC_SCOPE_MAX_FUNCTIONS: usize = 32;
-pub const RUNTIME_MATERIALIZED_MAX_BYTES: u64 = 0x4000;
-pub const RUNTIME_MATERIALIZED_SLOT_BYTES: u64 = 16;
+use route::{plan_decompile_request, semantic_route_reason};
 const MISSING_SOURCE_SNAPSHOT_REFUSAL: &str =
     "engine analysis requires an immutable source snapshot";
 
@@ -70,6 +61,7 @@ const MISSING_SOURCE_SNAPSHOT_REFUSAL: &str =
 pub struct EngineSourceSnapshot {
     revision_identity: Box<[u8]>,
     function_interface: Option<r2ssa::SourceFunctionInterface>,
+    machine_roles: r2ssa::SourceMachineRoles,
     call_site_interfaces: Box<[r2ssa::SourceCallSiteInterface]>,
 }
 
@@ -94,6 +86,20 @@ impl EngineSourceSnapshot {
     pub fn new(
         revision_identity: impl Into<Vec<u8>>,
         function_interface: Option<r2ssa::SourceFunctionInterface>,
+        call_site_interfaces: impl IntoIterator<Item = r2ssa::SourceCallSiteInterface>,
+    ) -> Result<Self, EngineSourceSnapshotError> {
+        Self::new_with_machine_roles(
+            revision_identity,
+            function_interface,
+            r2ssa::SourceMachineRoles::default(),
+            call_site_interfaces,
+        )
+    }
+
+    pub fn new_with_machine_roles(
+        revision_identity: impl Into<Vec<u8>>,
+        function_interface: Option<r2ssa::SourceFunctionInterface>,
+        machine_roles: r2ssa::SourceMachineRoles,
         call_site_interfaces: impl IntoIterator<Item = r2ssa::SourceCallSiteInterface>,
     ) -> Result<Self, EngineSourceSnapshotError> {
         let revision_identity = revision_identity.into();
@@ -127,6 +133,7 @@ impl EngineSourceSnapshot {
         Ok(Self {
             revision_identity: revision_identity.into_boxed_slice(),
             function_interface,
+            machine_roles,
             call_site_interfaces: call_site_interfaces.into_boxed_slice(),
         })
     }
@@ -137,6 +144,10 @@ impl EngineSourceSnapshot {
 
     pub const fn function_interface(&self) -> Option<&r2ssa::SourceFunctionInterface> {
         self.function_interface.as_ref()
+    }
+
+    pub const fn machine_roles(&self) -> &r2ssa::SourceMachineRoles {
+        &self.machine_roles
     }
 
     pub const fn call_site_interfaces(&self) -> &[r2ssa::SourceCallSiteInterface] {
@@ -161,17 +172,6 @@ pub fn direct_block_ast_residual_json(block_addr: u64) -> String {
     let value = serde_json::json!([{ "Comment": comment }]);
     serde_json::to_string_pretty(&value).unwrap_or_else(|_| "[]".to_string())
 }
-
-pub const TYPE_WRITEBACK_MUTATION_SIGNATURE_ID: u32 = 0;
-pub const TYPE_WRITEBACK_MUTATION_CALLCONV_ID: u32 = 1;
-pub const TYPE_WRITEBACK_MUTATION_VAR_ID: u32 = 2;
-pub const TYPE_WRITEBACK_MUTATION_VAR_RENAME_ID: u32 = 3;
-pub const TYPE_WRITEBACK_MUTATION_VAR_TYPE_ID: u32 = 4;
-pub const TYPE_WRITEBACK_MUTATION_XREF_ID: u32 = 5;
-pub const TYPE_WRITEBACK_MUTATION_COMMENT_ID: u32 = 6;
-pub const TYPE_WRITEBACK_MUTATION_FLAG_ID: u32 = 7;
-pub const TYPE_WRITEBACK_MUTATION_TYPE_DECL_ID: u32 = 8;
-pub const TYPE_WRITEBACK_MUTATION_TYPE_LINK_ID: u32 = 9;
 
 pub fn type_writeback_mutation_kind_id(kind: r2types::TypeWritebackMutationKind) -> u32 {
     match kind {
@@ -280,266 +280,6 @@ pub fn type_writeback_apply_policy_for_mode(
     }
 }
 
-pub const ENGINE_EXTERNAL_VAR_REGISTER: u32 = 0;
-pub const ENGINE_EXTERNAL_VAR_STACK: u32 = 1;
-pub const ENGINE_EXTERNAL_STACK_LOCAL: u32 = 0;
-pub const ENGINE_EXTERNAL_STACK_ARG: u32 = 1;
-pub const ENGINE_EXTERNAL_STACK_HOME: u32 = 2;
-pub const ENGINE_EXTERNAL_STACK_SAVED_REG: u32 = 3;
-pub const ENGINE_EXTERNAL_STACK_SAVED_FP: u32 = 4;
-pub const ENGINE_EXTERNAL_STACK_UNKNOWN: u32 = 5;
-pub const ENGINE_EXTERNAL_BASE_STRUCT: u32 = 0;
-pub const ENGINE_EXTERNAL_BASE_UNION: u32 = 1;
-pub const ENGINE_EXTERNAL_BASE_ENUM: u32 = 2;
-pub const ENGINE_EXTERNAL_BASE_TYPEDEF: u32 = 3;
-pub const ENGINE_EXTERNAL_BASE_ATOMIC: u32 = 4;
-pub const ENGINE_EXTERNAL_LINKAGE_UNKNOWN: u32 = 0;
-pub const ENGINE_EXTERNAL_LINKAGE_INTERNAL: u32 = 1;
-pub const ENGINE_EXTERNAL_LINKAGE_IMPORTED: u32 = 2;
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct EngineExternalContextInput {
-    pub schema_version: u32,
-    pub dirty_epoch: u64,
-    pub context_hash: u64,
-    pub type_dirty_epoch: u64,
-    pub signature: EngineExternalSignatureInput,
-    pub vars: Vec<EngineExternalVarInput>,
-    pub base_types: Vec<EngineExternalBaseTypeInput>,
-    pub callees: Vec<EngineExternalCalleeInput>,
-    pub assumptions_json: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct EngineExternalSignatureInput {
-    pub name: Option<String>,
-    pub ret_type: Option<String>,
-    pub callconv: Option<String>,
-    pub noreturn: bool,
-    pub params: Vec<EngineExternalSignatureParamInput>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct EngineExternalSignatureParamInput {
-    pub name: Option<String>,
-    pub ty: Option<String>,
-    pub cc_reg: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct EngineExternalVarInput {
-    pub kind: u32,
-    pub name: Option<String>,
-    pub ty: Option<String>,
-    pub reg: Option<String>,
-    pub base: Option<String>,
-    pub offset: Option<i64>,
-    pub role: u32,
-    pub param_index: Option<usize>,
-    pub param_name: Option<String>,
-    pub source_reg: Option<String>,
-    pub is_arg: bool,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct EngineExternalBaseTypeInput {
-    pub kind: u32,
-    pub name: Option<String>,
-    pub ty: Option<String>,
-    pub size_bits: Option<u64>,
-    pub members: Vec<EngineExternalBaseMemberInput>,
-    pub variants: Vec<EngineExternalEnumVariantInput>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct EngineExternalBaseMemberInput {
-    pub name: Option<String>,
-    pub ty: Option<String>,
-    pub offset: u64,
-    pub size_bits: Option<u64>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct EngineExternalEnumVariantInput {
-    pub name: Option<String>,
-    pub value: i64,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct EngineExternalCalleeInput {
-    pub call_addr: u64,
-    pub addr: u64,
-    pub name: Option<String>,
-    pub linkage: u32,
-    pub signature: EngineExternalSignatureInput,
-}
-
-pub fn parse_typed_external_context(
-    input: EngineExternalContextInput,
-    ptr_bits: u32,
-) -> r2types::ParsedExternalContext {
-    let signature = engine_external_signature_json(input.signature);
-    let vars = input
-        .vars
-        .into_iter()
-        .enumerate()
-        .map(engine_external_var_json)
-        .collect::<Vec<_>>();
-    let mut raw = r2types::ExternalContextJson {
-        context: Some(r2types::ExternalContextMetadataJson {
-            schema_version: (input.schema_version != 0).then_some(input.schema_version as u64),
-            dirty_epoch: (input.dirty_epoch != 0).then_some(input.dirty_epoch),
-            type_dirty_epoch: (input.type_dirty_epoch != 0).then_some(input.type_dirty_epoch),
-            context_hash: (input.context_hash != 0).then_some(input.context_hash),
-        }),
-        signature,
-        vars,
-        base_types: input
-            .base_types
-            .into_iter()
-            .map(engine_external_base_type_json)
-            .collect(),
-        callees: input
-            .callees
-            .into_iter()
-            .map(engine_external_callee_json)
-            .collect(),
-        known_signatures: Vec::new(),
-        assumptions: Vec::new(),
-    };
-
-    if let Some(assumptions) = input.assumptions_json
-        && let Ok(parsed) = r2types::parse_external_assumption_payload_json(&assumptions, ptr_bits)
-    {
-        raw.assumptions = parsed.items;
-    }
-
-    r2types::parse_external_context(raw, ptr_bits)
-}
-
-fn engine_external_signature_input_is_empty(signature: &EngineExternalSignatureInput) -> bool {
-    signature.name.is_none()
-        && signature.ret_type.is_none()
-        && signature.callconv.is_none()
-        && !signature.noreturn
-        && signature.params.is_empty()
-}
-
-fn engine_external_signature_json(
-    signature: EngineExternalSignatureInput,
-) -> Option<r2types::ExternalSignatureJson> {
-    (!engine_external_signature_input_is_empty(&signature)).then(|| {
-        r2types::ExternalSignatureJson {
-            name: signature.name,
-            ret_type: signature.ret_type,
-            callconv: signature.callconv,
-            noreturn: signature.noreturn,
-            params: signature
-                .params
-                .into_iter()
-                .map(|param| r2types::ExternalSignatureParamJson {
-                    name: param.name,
-                    ty: param.ty,
-                    cc_reg: param.cc_reg,
-                })
-                .collect(),
-        }
-    })
-}
-
-fn engine_external_var_json(
-    (idx, var): (usize, EngineExternalVarInput),
-) -> r2types::ExternalVarJson {
-    let (kind, is_register) = match var.kind {
-        ENGINE_EXTERNAL_VAR_REGISTER => (r2types::ExternalVarKind::Register, true),
-        _ => (r2types::ExternalVarKind::Stack, false),
-    };
-    let fallback_name = if is_register {
-        format!("arg{}", idx + 1)
-    } else {
-        format!("stack_{:x}", var.offset.unwrap_or_default())
-    };
-    r2types::ExternalVarJson {
-        kind,
-        name: var.name.unwrap_or(fallback_name),
-        ty: var.ty,
-        is_arg: var.is_arg,
-        reg: var.reg,
-        base: var.base,
-        offset: var.offset,
-        role: Some(engine_external_stack_role(var.role)),
-        param_index: var.param_index,
-        param_name: var.param_name,
-        source_reg: var.source_reg,
-    }
-}
-
-fn engine_external_stack_role(role: u32) -> r2types::ExternalStackSlotRole {
-    match role {
-        ENGINE_EXTERNAL_STACK_LOCAL => r2types::ExternalStackSlotRole::Local,
-        ENGINE_EXTERNAL_STACK_ARG => r2types::ExternalStackSlotRole::StackArg,
-        ENGINE_EXTERNAL_STACK_HOME => r2types::ExternalStackSlotRole::ParamHome,
-        ENGINE_EXTERNAL_STACK_SAVED_REG => r2types::ExternalStackSlotRole::SavedReg,
-        ENGINE_EXTERNAL_STACK_SAVED_FP => r2types::ExternalStackSlotRole::SavedFp,
-        ENGINE_EXTERNAL_STACK_UNKNOWN => r2types::ExternalStackSlotRole::Unknown,
-        _ => r2types::ExternalStackSlotRole::Unknown,
-    }
-}
-
-fn engine_external_base_type_kind(kind: u32) -> r2types::ExternalBaseTypeKind {
-    match kind {
-        ENGINE_EXTERNAL_BASE_STRUCT => r2types::ExternalBaseTypeKind::Struct,
-        ENGINE_EXTERNAL_BASE_UNION => r2types::ExternalBaseTypeKind::Union,
-        ENGINE_EXTERNAL_BASE_ENUM => r2types::ExternalBaseTypeKind::Enum,
-        ENGINE_EXTERNAL_BASE_TYPEDEF => r2types::ExternalBaseTypeKind::Typedef,
-        ENGINE_EXTERNAL_BASE_ATOMIC => r2types::ExternalBaseTypeKind::Atomic,
-        _ => r2types::ExternalBaseTypeKind::Atomic,
-    }
-}
-
-fn engine_external_base_type_json(
-    base_type: EngineExternalBaseTypeInput,
-) -> r2types::ExternalBaseTypeJson {
-    r2types::ExternalBaseTypeJson {
-        kind: engine_external_base_type_kind(base_type.kind),
-        name: base_type.name.unwrap_or_default(),
-        members: base_type
-            .members
-            .into_iter()
-            .map(|member| r2types::ExternalBaseTypeMemberJson {
-                name: member.name.unwrap_or_default(),
-                ty: member.ty.unwrap_or_else(|| "void *".to_string()),
-                offset: member.offset,
-                size_bits: member.size_bits,
-            })
-            .collect(),
-        variants: base_type
-            .variants
-            .into_iter()
-            .map(|variant| r2types::ExternalEnumVariantJson {
-                name: variant.name.unwrap_or_default(),
-                value: variant.value,
-            })
-            .collect(),
-        ty: base_type.ty,
-        size_bits: base_type.size_bits,
-    }
-}
-
-fn engine_external_callee_json(callee: EngineExternalCalleeInput) -> r2types::ExternalCalleeJson {
-    r2types::ExternalCalleeJson {
-        signature: engine_external_signature_json(callee.signature),
-        call_addr: Some(callee.call_addr),
-        addr: callee.addr,
-        name: callee.name,
-        linkage: match callee.linkage {
-            ENGINE_EXTERNAL_LINKAGE_INTERNAL => r2types::ExternalCalleeLinkageJson::Internal,
-            ENGINE_EXTERNAL_LINKAGE_IMPORTED => r2types::ExternalCalleeLinkageJson::Imported,
-            _ => r2types::ExternalCalleeLinkageJson::Unknown,
-        },
-    }
-}
-
 fn type_writeback_authority_report_for_policy(
     analysis: &r2types::TypeWritebackAnalysis,
     budget: r2types::TypeWritebackMutationBudget,
@@ -556,6 +296,9 @@ struct EngineTypeWritebackPlanReport {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineTypeWritebackPayload {
+    /// The target's pointer width, carried so the JSON edge can spell the
+    /// plan's types without guessing which target they were recovered for.
+    pub ptr_bits: u32,
     pub signature: r2types::InferredSignature,
     pub signature_render_authorized: bool,
     pub signature_writeback_authorized: bool,
@@ -599,92 +342,6 @@ pub struct EngineTypeWritebackFactCounts {
     pub incomplete_control_domains: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct EngineInferredParamJson {
-    pub name: String,
-    #[serde(rename = "type")]
-    pub param_type: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct EngineVarTypeCandidateJson {
-    pub name: String,
-    pub kind: String,
-    pub delta: i64,
-    #[serde(rename = "type")]
-    pub var_type: String,
-    pub isarg: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reg: Option<String>,
-    pub size: u32,
-    pub confidence: u8,
-    pub source: String,
-    pub evidence: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct EngineVarRenameCandidateJson {
-    pub name: String,
-    pub target_name: String,
-    pub confidence: u8,
-    pub source: String,
-    pub evidence: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct EngineStructFieldCandidateJson {
-    pub name: String,
-    pub offset: u64,
-    #[serde(rename = "type")]
-    pub field_type: String,
-    pub confidence: u8,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct EngineStructDeclCandidateJson {
-    pub name: String,
-    pub decl: String,
-    pub confidence: u8,
-    pub source: String,
-    pub fields: Vec<EngineStructFieldCandidateJson>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct EngineGlobalTypeLinkCandidateJson {
-    pub addr: u64,
-    #[serde(rename = "type")]
-    pub target_type: String,
-    pub confidence: u8,
-    pub source: String,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-pub struct EngineTypeWritebackDiagnosticsJson {
-    pub conflicts: Vec<String>,
-    pub warnings: Vec<String>,
-    pub solver_warnings: Vec<String>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-pub struct EngineTypeWritebackFactCountsJson {
-    pub register_params: usize,
-    pub stack_slots: usize,
-    pub param_home_stack_slots: usize,
-    pub hidden_home_bindings: usize,
-    pub field_access_certificates: usize,
-    pub array_index_certificates: usize,
-    pub scalar_array_render_candidates: usize,
-    pub render_member_accesses: usize,
-    pub render_array_accesses: usize,
-    pub certified_expressions: usize,
-    pub certified_parameters: usize,
-    pub certified_stack_slots: usize,
-    pub certified_memory_accesses: usize,
-    pub certified_returns: usize,
-    pub certified_control_domains: usize,
-    pub incomplete_control_domains: usize,
-}
-
 impl EngineTypeWritebackFactCountsJson {
     pub fn is_empty(&self) -> bool {
         self.register_params == 0
@@ -706,50 +363,6 @@ impl EngineTypeWritebackFactCountsJson {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct EngineTypeWritebackJsonCore {
-    pub function_name: String,
-    pub signature: String,
-    pub ret_type: String,
-    pub params: Vec<EngineInferredParamJson>,
-    pub callconv: String,
-    pub arch: String,
-    pub confidence: u8,
-    pub callconv_confidence: u8,
-    pub signature_render_authorized: bool,
-    pub signature_writeback_authorized: bool,
-    pub signature_action_decision: u32,
-    pub callconv_action_decision: u32,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub signature_certificate_sources: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub signature_writeback_refusal: Option<String>,
-    pub var_type_candidates: Vec<EngineVarTypeCandidateJson>,
-    pub var_rename_candidates: Vec<EngineVarRenameCandidateJson>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub external_struct_names: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub field_access_certificate_names: Vec<String>,
-    #[serde(
-        default,
-        skip_serializing_if = "EngineTypeWritebackFactCountsJson::is_empty"
-    )]
-    pub fact_counts: EngineTypeWritebackFactCountsJson,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub param_home_stack_slot_offsets: Vec<i64>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub certified_stack_slot_offsets: Vec<i64>,
-    pub struct_decls: Vec<EngineStructDeclCandidateJson>,
-    pub global_type_links: Vec<EngineGlobalTypeLinkCandidateJson>,
-    pub plans: r2types::AnalysisPlans,
-    #[serde(skip_serializing_if = "r2ssa::AssumptionSet::is_empty")]
-    pub assumptions: r2ssa::AssumptionSet,
-    #[serde(skip_serializing_if = "r2types::AssumptionUsageReport::is_empty")]
-    pub assumption_usage: r2types::AssumptionUsageReport,
-    pub mutation_plan: r2types::TypeWritebackMutationPlan,
-    pub diagnostics: EngineTypeWritebackDiagnosticsJson,
-}
-
 #[derive(Debug, Clone)]
 pub struct EngineFunctionAnalysisReportPayload {
     pub function_name: String,
@@ -767,68 +380,6 @@ pub struct EngineFunctionAnalysisReportPayload {
     pub prefer_bounded_type_plan: bool,
     pub callsite_count: usize,
     pub current_summary: Option<r2ssa::FunctionSemanticSummary>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct EngineCfgRiskSummaryJson {
-    pub block_count: usize,
-    pub loop_count: usize,
-    pub back_edge_count: usize,
-    pub switch_block_count: usize,
-    pub max_switch_cases: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct EngineDecompileRouteJson {
-    pub kind: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub comment: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct EngineFunctionAnalysisReportJsonCore {
-    pub function_name: String,
-    pub function_addr: u64,
-    pub cfg_risk: EngineCfgRiskSummaryJson,
-    pub plans: r2types::AnalysisPlans,
-    #[serde(skip_serializing_if = "r2ssa::AssumptionSet::is_empty")]
-    pub assumptions: r2ssa::AssumptionSet,
-    #[serde(skip_serializing_if = "r2types::AssumptionUsageReport::is_empty")]
-    pub assumption_usage: r2types::AssumptionUsageReport,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub semantic_build_plan: Option<r2sym::ArtifactBuildPlan>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub semantic_route: Option<EngineDecompileRouteJson>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub summary_diagnostics: Option<r2ssa::InterprocSummaryDiagnostics>,
-    pub prefer_bounded_type_plan: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct EngineInterprocSummaryJson {
-    pub callsite_count: usize,
-    pub iterations: usize,
-    pub max_iterations: usize,
-    pub converged: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub summary: Option<r2ssa::FunctionSemanticSummary>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub summary_json: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub scope: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct EngineInterprocSummaryJsonInput<'a> {
-    pub callsite_count: usize,
-    pub iterations: usize,
-    pub max_iterations: usize,
-    pub converged: bool,
-    pub summary: Option<&'a r2ssa::FunctionSemanticSummary>,
-    pub scope_report: Option<&'a serde_json::Value>,
-    pub symbolic_scope: Option<&'a r2sym::PreparedFunctionScope>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -890,13 +441,6 @@ pub enum EnginePhaseStatus {
     Refused,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EnginePhaseTimingJson {
-    pub phase: EnginePhase,
-    pub status: EnginePhaseStatus,
-    pub elapsed_us: u64,
-}
-
 impl EnginePhaseTimingJson {
     fn not_executed(phase: EnginePhase) -> Self {
         Self {
@@ -929,53 +473,12 @@ fn normalize_engine_phase_timings(
     normalized
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct EngineSemanticStatusJson {
-    pub available: bool,
-    pub reason: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct EngineInferredTypeWritebackJson {
-    #[serde(flatten)]
-    pub core: EngineTypeWritebackJsonCore,
-    pub interproc: EngineInterprocSummaryJson,
-    pub semantic_status: EngineSemanticStatusJson,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub semantics: Option<r2sym::SemanticArtifactReport>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub compiled_semantics: Option<r2sym::CompiledSemanticInfo>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub phase_timings: Vec<EnginePhaseTimingJson>,
-}
-
 impl std::ops::Deref for EngineInferredTypeWritebackJson {
     type Target = EngineTypeWritebackJsonCore;
 
     fn deref(&self) -> &Self::Target {
         &self.core
     }
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct EngineFunctionAnalysisSessionReportJson {
-    #[serde(flatten)]
-    pub core: EngineFunctionAnalysisReportJsonCore,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub semantic: Option<r2sym::CompiledSemanticInfo>,
-    pub type_writeback: EngineInferredTypeWritebackJson,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub phase_timings: Vec<EnginePhaseTimingJson>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct EngineFunctionAnalysisTypeWritebackJsonRequest<'a> {
-    pub report: &'a EngineFunctionAnalysisReportPayload,
-    pub iterations: usize,
-    pub max_iterations: usize,
-    pub converged: bool,
-    pub scope_report: Option<&'a serde_json::Value>,
-    pub symbolic_scope: Option<&'a r2sym::PreparedFunctionScope>,
 }
 
 fn type_writeback_plan_report_for_policy(
@@ -1014,6 +517,7 @@ fn type_writeback_payload_from_plan_report(
         solver_warnings: plan.diagnostics.solver_warnings,
     };
     EngineTypeWritebackPayload {
+        ptr_bits: plan.ptr_bits,
         signature: plan.signature,
         signature_render_authorized,
         signature_writeback_authorized: signature_writeback.authorized,
@@ -1065,379 +569,11 @@ pub fn type_writeback_payload_from_analysis_response(
     type_writeback_payload_for_policy(response.type_analysis(), budget, apply_policy)
 }
 
-fn writeback_evidence_json(evidence: &[r2types::WritebackEvidence]) -> Vec<String> {
-    evidence
-        .iter()
-        .map(|tag| tag.as_str().to_string())
-        .collect()
-}
-
-fn struct_fields_json(
-    fields: &[r2types::StructFieldCandidate],
-) -> Vec<EngineStructFieldCandidateJson> {
-    fields
-        .iter()
-        .map(|field| EngineStructFieldCandidateJson {
-            name: field.name.clone(),
-            offset: field.offset,
-            field_type: field.field_type.clone(),
-            confidence: field.confidence,
-        })
-        .collect()
-}
-
-pub fn type_writeback_json_core(
-    payload: EngineTypeWritebackPayload,
-) -> EngineTypeWritebackJsonCore {
-    EngineTypeWritebackJsonCore {
-        function_name: payload.signature.function_name,
-        signature: payload.signature.signature,
-        ret_type: payload.signature.ret_type,
-        params: payload
-            .signature
-            .params
-            .into_iter()
-            .map(|param| EngineInferredParamJson {
-                name: param.name,
-                param_type: param.param_type,
-            })
-            .collect(),
-        callconv: payload.signature.callconv,
-        arch: payload.signature.arch,
-        confidence: payload.signature.confidence,
-        callconv_confidence: payload.signature.callconv_confidence,
-        signature_render_authorized: payload.signature_render_authorized,
-        signature_writeback_authorized: payload.signature_writeback_authorized,
-        signature_action_decision: payload.signature_action_decision as u32,
-        callconv_action_decision: payload.callconv_action_decision as u32,
-        signature_certificate_sources: payload.signature_certificate_sources,
-        signature_writeback_refusal: payload.signature_writeback_refusal,
-        var_type_candidates: payload
-            .var_type_candidates
-            .into_iter()
-            .map(|candidate| EngineVarTypeCandidateJson {
-                name: candidate.name,
-                kind: candidate.kind,
-                delta: candidate.delta,
-                var_type: candidate.var_type,
-                isarg: candidate.isarg,
-                reg: candidate.reg,
-                size: candidate.size,
-                confidence: candidate.confidence,
-                source: candidate.source.as_str().to_string(),
-                evidence: writeback_evidence_json(&candidate.evidence),
-            })
-            .collect(),
-        var_rename_candidates: payload
-            .var_rename_candidates
-            .into_iter()
-            .map(|candidate| EngineVarRenameCandidateJson {
-                name: candidate.name,
-                target_name: candidate.target_name,
-                confidence: candidate.confidence,
-                source: candidate.source.as_str().to_string(),
-                evidence: writeback_evidence_json(&candidate.evidence),
-            })
-            .collect(),
-        external_struct_names: payload.external_struct_names,
-        field_access_certificate_names: payload.field_access_certificate_names,
-        fact_counts: EngineTypeWritebackFactCountsJson {
-            register_params: payload.fact_counts.register_params,
-            stack_slots: payload.fact_counts.stack_slots,
-            param_home_stack_slots: payload.fact_counts.param_home_stack_slots,
-            hidden_home_bindings: payload.fact_counts.hidden_home_bindings,
-            field_access_certificates: payload.fact_counts.field_access_certificates,
-            array_index_certificates: payload.fact_counts.array_index_certificates,
-            scalar_array_render_candidates: payload.fact_counts.scalar_array_render_candidates,
-            render_member_accesses: payload.fact_counts.render_member_accesses,
-            render_array_accesses: payload.fact_counts.render_array_accesses,
-            certified_expressions: payload.fact_counts.certified_expressions,
-            certified_parameters: payload.fact_counts.certified_parameters,
-            certified_stack_slots: payload.fact_counts.certified_stack_slots,
-            certified_memory_accesses: payload.fact_counts.certified_memory_accesses,
-            certified_returns: payload.fact_counts.certified_returns,
-            certified_control_domains: payload.fact_counts.certified_control_domains,
-            incomplete_control_domains: payload.fact_counts.incomplete_control_domains,
-        },
-        param_home_stack_slot_offsets: payload.param_home_stack_slot_offsets,
-        certified_stack_slot_offsets: payload.certified_stack_slot_offsets,
-        struct_decls: payload
-            .struct_decls
-            .into_iter()
-            .map(|decl| EngineStructDeclCandidateJson {
-                name: decl.name,
-                decl: decl.decl,
-                confidence: decl.confidence,
-                source: decl.source.as_str().to_string(),
-                fields: struct_fields_json(&decl.fields),
-            })
-            .collect(),
-        global_type_links: payload
-            .global_type_links
-            .into_iter()
-            .map(|candidate| EngineGlobalTypeLinkCandidateJson {
-                addr: candidate.addr,
-                target_type: candidate.target_type,
-                confidence: candidate.confidence,
-                source: candidate.source.as_str().to_string(),
-            })
-            .collect(),
-        plans: payload.plans,
-        assumptions: payload.assumptions,
-        assumption_usage: payload.assumption_usage,
-        mutation_plan: payload.mutation_plan,
-        diagnostics: EngineTypeWritebackDiagnosticsJson {
-            conflicts: payload.diagnostics.conflicts,
-            warnings: payload.diagnostics.warnings,
-            solver_warnings: payload.diagnostics.solver_warnings,
-        },
-    }
-}
-
-pub fn type_writeback_report_json(
-    payload: EngineTypeWritebackPayload,
-    interproc: EngineInterprocSummaryJson,
-    semantics: Option<r2sym::SemanticArtifactReport>,
-    compiled_semantics: Option<r2sym::CompiledSemanticInfo>,
-) -> EngineInferredTypeWritebackJson {
-    let semantic_status = semantic_status_json(semantics.as_ref(), None);
-    EngineInferredTypeWritebackJson {
-        core: type_writeback_json_core(payload),
-        interproc,
-        semantic_status,
-        semantics,
-        compiled_semantics,
-        phase_timings: empty_engine_phase_timings(),
-    }
-}
-
-fn semantic_status_json(
-    semantics: Option<&r2sym::SemanticArtifactReport>,
-    fallback_reason: Option<String>,
-) -> EngineSemanticStatusJson {
-    match semantics {
-        Some(artifact) => EngineSemanticStatusJson {
-            available: true,
-            reason: format!(
-                "{} {}",
-                semantic_granularity_label(artifact.granularity),
-                semantic_report_mode_label(artifact)
-            ),
-        },
-        None => EngineSemanticStatusJson {
-            available: false,
-            reason: fallback_reason.unwrap_or_else(|| "semantic artifact unavailable".to_string()),
-        },
-    }
-}
-
 fn semantic_granularity_label(granularity: r2sym::ArtifactGranularity) -> &'static str {
     match granularity {
         r2sym::ArtifactGranularity::WholeFunction => "whole_function",
         r2sym::ArtifactGranularity::Regioned => "regioned",
         r2sym::ArtifactGranularity::SummaryOnly => "summary_only",
-    }
-}
-
-pub fn type_writeback_report_json_from_function_analysis(
-    request: EngineFunctionAnalysisTypeWritebackJsonRequest<'_>,
-) -> EngineInferredTypeWritebackJson {
-    let semantics = request.report.semantic_report.clone();
-    let compiled_semantics = request.report.compiled_semantics.clone();
-    let mut report = type_writeback_report_json(
-        request.report.type_writeback.clone(),
-        interproc_summary_json(EngineInterprocSummaryJsonInput {
-            callsite_count: request.report.callsite_count,
-            iterations: request.iterations,
-            max_iterations: request.max_iterations,
-            converged: request.converged,
-            summary: request.report.current_summary.as_ref(),
-            scope_report: request.scope_report,
-            symbolic_scope: request.symbolic_scope,
-        }),
-        semantics,
-        compiled_semantics,
-    );
-    report.semantic_status = semantic_status_json(
-        report.semantics.as_ref(),
-        request
-            .report
-            .semantic_route
-            .as_ref()
-            .and_then(|route| route.reason.clone())
-            .or_else(|| {
-                request
-                    .report
-                    .summary_diagnostics
-                    .as_ref()
-                    .map(|diagnostics| format!("summary diagnostics: {diagnostics:?}"))
-            }),
-    );
-    report
-}
-
-pub fn symbolic_scope_report_json(
-    symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
-) -> Option<serde_json::Value> {
-    let scope = symbolic_scope?;
-    let payloads = scope
-        .helper_functions()
-        .filter_map(|function| {
-            function.name.as_ref().map(|name| {
-                serde_json::json!({
-                    "function_addr": function.id.0,
-                    "function_name": name,
-                })
-            })
-        })
-        .collect::<Vec<_>>();
-    let seeds = scope
-        .helper_functions()
-        .filter_map(|function| {
-            function.name.as_ref().map(|name| {
-                serde_json::json!({
-                    "id": function.id.0,
-                    "name": name,
-                })
-            })
-        })
-        .collect::<Vec<_>>();
-    if seeds.is_empty() && payloads.is_empty() {
-        return None;
-    }
-    Some(serde_json::json!({
-        "phase": "symbolic_scope",
-        "payloads": payloads,
-        "seeds": seeds,
-    }))
-}
-
-pub fn merged_interproc_scope_report_json(
-    scope_report: Option<&serde_json::Value>,
-    symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
-) -> Option<serde_json::Value> {
-    let Some(symbolic_scope_json) = symbolic_scope_report_json(symbolic_scope) else {
-        return scope_report.cloned();
-    };
-    let Some(mut merged) = scope_report.cloned() else {
-        return Some(symbolic_scope_json);
-    };
-    let (Some(merged_obj), Some(symbolic_obj)) =
-        (merged.as_object_mut(), symbolic_scope_json.as_object())
-    else {
-        return Some(merged);
-    };
-
-    if !merged_obj.contains_key("phase")
-        && let Some(phase) = symbolic_obj.get("phase")
-    {
-        merged_obj.insert("phase".to_string(), phase.clone());
-    }
-    for key in ["payloads", "seeds"] {
-        let Some(serde_json::Value::Array(symbolic_items)) = symbolic_obj.get(key) else {
-            continue;
-        };
-        let entry = merged_obj
-            .entry(key.to_string())
-            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
-        if let serde_json::Value::Array(items) = entry {
-            items.extend(symbolic_items.iter().cloned());
-        }
-    }
-
-    Some(merged)
-}
-
-pub fn interproc_summary_json(
-    input: EngineInterprocSummaryJsonInput<'_>,
-) -> EngineInterprocSummaryJson {
-    let iterations = input.iterations.max(1);
-    EngineInterprocSummaryJson {
-        callsite_count: input.callsite_count,
-        iterations,
-        max_iterations: input.max_iterations.max(iterations),
-        converged: input.converged,
-        summary: input.summary.cloned(),
-        summary_json: input
-            .summary
-            .and_then(|summary| serde_json::to_string(summary).ok()),
-        scope: merged_interproc_scope_report_json(input.scope_report, input.symbolic_scope),
-    }
-}
-
-fn cfg_risk_summary_json(summary: CFGRiskSummary) -> EngineCfgRiskSummaryJson {
-    EngineCfgRiskSummaryJson {
-        block_count: summary.block_count,
-        loop_count: summary.loop_count,
-        back_edge_count: summary.back_edge_count,
-        switch_block_count: summary.switch_block_count,
-        max_switch_cases: summary.max_switch_cases,
-    }
-}
-
-pub fn decompile_route_json(route: &r2types::DecompileRouteFacts) -> EngineDecompileRouteJson {
-    match route.kind {
-        r2types::DecompileRouteKind::Standard => EngineDecompileRouteJson {
-            kind: "standard".to_string(),
-            reason: None,
-            comment: None,
-        },
-        r2types::DecompileRouteKind::StructuredWorker => EngineDecompileRouteJson {
-            kind: "structured_worker".to_string(),
-            reason: route.reason.clone(),
-            comment: None,
-        },
-        r2types::DecompileRouteKind::LinearWorker => EngineDecompileRouteJson {
-            kind: "linear_worker".to_string(),
-            reason: route.reason.clone(),
-            comment: None,
-        },
-        r2types::DecompileRouteKind::SummaryIslands => EngineDecompileRouteJson {
-            kind: "summary_islands".to_string(),
-            reason: route.reason.clone(),
-            comment: None,
-        },
-        r2types::DecompileRouteKind::VmSummary => EngineDecompileRouteJson {
-            kind: "vm_summary".to_string(),
-            reason: route.reason.clone(),
-            comment: None,
-        },
-        r2types::DecompileRouteKind::FallbackComment => EngineDecompileRouteJson {
-            kind: "fallback_comment".to_string(),
-            reason: route.reason.clone(),
-            comment: route.fallback_comment.clone(),
-        },
-    }
-}
-
-pub fn function_analysis_report_json_core(
-    payload: &EngineFunctionAnalysisReportPayload,
-) -> EngineFunctionAnalysisReportJsonCore {
-    EngineFunctionAnalysisReportJsonCore {
-        function_name: payload.function_name.clone(),
-        function_addr: payload.function_addr,
-        cfg_risk: cfg_risk_summary_json(payload.cfg_summary),
-        plans: payload.plans.clone(),
-        assumptions: payload.assumptions.clone(),
-        assumption_usage: payload.assumption_usage.clone(),
-        semantic_build_plan: payload.semantic_build_plan.clone(),
-        semantic_route: payload.semantic_route.as_ref().map(decompile_route_json),
-        summary_diagnostics: payload.summary_diagnostics.clone(),
-        prefer_bounded_type_plan: payload.prefer_bounded_type_plan,
-    }
-}
-
-pub fn function_analysis_session_report_json(
-    payload: &EngineFunctionAnalysisReportPayload,
-    mut type_writeback: EngineInferredTypeWritebackJson,
-    phase_timings: Vec<EnginePhaseTimingJson>,
-) -> EngineFunctionAnalysisSessionReportJson {
-    type_writeback.phase_timings = normalize_engine_phase_timings(type_writeback.phase_timings);
-    EngineFunctionAnalysisSessionReportJson {
-        core: function_analysis_report_json_core(payload),
-        semantic: payload.compiled_semantics.clone(),
-        type_writeback,
-        phase_timings: normalize_engine_phase_timings(phase_timings),
     }
 }
 
@@ -1688,11 +824,10 @@ pub fn post_analysis_plan_for_policy(
     policy: EngineAnalysisPolicy,
     function_count: usize,
 ) -> EnginePostAnalysisPlan {
-    let post_budget_us = match policy.mode {
-        EngineAnalysisMode::Fast => POST_ANALYSIS_FAST_BUDGET_USEC,
-        EngineAnalysisMode::Balanced => POST_ANALYSIS_BALANCED_BUDGET_USEC,
-        EngineAnalysisMode::Full => POST_ANALYSIS_AGGRESSIVE_BUDGET_USEC,
-    };
+    // Derived from the work in front of the sweep rather than fixed per mode;
+    // see `post_analysis_budget_usec` for why one whole-program constant could
+    // not be right for both a 38-function binary and a 154-function one.
+    let post_budget_us = post_analysis_budget_usec(function_count);
     let xref_enabled = policy.mode.level() >= EngineAnalysisMode::Balanced.level();
     let taint_enabled = policy.mode == EngineAnalysisMode::Full;
     let signature_writeback_enabled = policy.mode.level() >= EngineAnalysisMode::Balanced.level();
@@ -2048,554 +1183,9 @@ impl EngineAnalysis {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EngineRuntimeMaterializedSource {
-    pub addr: u64,
-    pub size: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum EngineInterprocTargetSkipReason {
-    Imported,
-    SummaryModeled,
-    Unmaterialized,
-    OverBudget,
-}
-
-pub const ENGINE_INTERPROC_HELPER_MAX_BLOCKS: u32 = 64;
-pub const ENGINE_INTERPROC_HELPER_MAX_COST: u32 = 256;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EngineInterprocTargetMetrics {
-    pub basic_block_count: u32,
-    pub cost: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EngineInterprocTargetInput {
-    pub direct_target: u64,
-    pub name: Option<String>,
-    pub linkage: r2ssa::FunctionSemanticLinkage,
-    pub semantic_summary: Option<r2ssa::FunctionSemanticSummary>,
-    pub resolved_target: Option<u64>,
-    pub target_materialized: bool,
-    pub target_metrics: Option<EngineInterprocTargetMetrics>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EngineInterprocTargetDecision {
-    pub direct_target: u64,
-    pub resolved_target: Option<u64>,
-    pub queued_targets: Vec<u64>,
-    pub registration_target: bool,
-    pub runtime_copy_target: bool,
-    pub skip_reason: Option<EngineInterprocTargetSkipReason>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EngineInterprocTargetPlan {
-    pub queued_targets: Vec<u64>,
-    pub registration_targets: Vec<u64>,
-    pub runtime_copy_targets: Vec<u64>,
-    pub decisions: Vec<EngineInterprocTargetDecision>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum EngineSymbolicScopeFunctionReason {
-    Allowed,
-    ScopeFull,
-    InterprocDisabled,
-    TargetTerminal,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EngineSymbolicScopeFunctionInput {
-    pub current_scope_count: usize,
-    pub root_function: bool,
-    pub target_hint_function: bool,
-    pub interproc: EngineInterprocSessionPlan,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EngineSymbolicScopeFunctionPlan {
-    pub append_function: bool,
-    pub expand_targets: bool,
-    pub reason: EngineSymbolicScopeFunctionReason,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum EngineRuntimeMaterializedSourceReason {
-    Allowed,
-    ScopeFull,
-    EmptySource,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EngineRuntimeMaterializedSourcePlan {
-    pub append_source: bool,
-    pub capped_size: u64,
-    pub slot_bytes: u64,
-    pub reason: EngineRuntimeMaterializedSourceReason,
-}
-
-fn engine_linkage_is_imported(linkage: r2ssa::FunctionSemanticLinkage) -> bool {
-    matches!(linkage, r2ssa::FunctionSemanticLinkage::Imported)
-}
-
-fn target_name_is_import_authorized(
-    name: Option<&str>,
-    linkage: r2ssa::FunctionSemanticLinkage,
-) -> bool {
-    name.is_some_and(r2types::callee_name_is_import_like) && engine_linkage_is_imported(linkage)
-}
-
-fn imported_name_authorizes_runtime_role(
-    name: Option<&str>,
-    linkage: r2ssa::FunctionSemanticLinkage,
-    predicate: impl FnOnce(&str) -> bool,
-) -> bool {
-    engine_linkage_is_imported(linkage) && name.is_some_and(predicate)
-}
-
-fn interproc_target_skip_reason_from_evidence(
-    import_authorized: bool,
-    has_modeled_summary: bool,
-    target_materialized: bool,
-    metrics_within_budget: bool,
-) -> Option<EngineInterprocTargetSkipReason> {
-    if import_authorized {
-        Some(EngineInterprocTargetSkipReason::Imported)
-    } else if has_modeled_summary {
-        Some(EngineInterprocTargetSkipReason::SummaryModeled)
-    } else if !target_materialized {
-        Some(EngineInterprocTargetSkipReason::Unmaterialized)
-    } else if !metrics_within_budget {
-        Some(EngineInterprocTargetSkipReason::OverBudget)
-    } else {
-        None
-    }
-}
-
-fn interproc_target_metrics_within_budget(metrics: Option<&EngineInterprocTargetMetrics>) -> bool {
-    let Some(metrics) = metrics else {
-        return false;
-    };
-    metrics.basic_block_count <= ENGINE_INTERPROC_HELPER_MAX_BLOCKS
-        && metrics.cost <= ENGINE_INTERPROC_HELPER_MAX_COST
-}
-
-pub fn interproc_helper_scope_within_budget(basic_block_count: u32, cost: u32) -> bool {
-    interproc_target_metrics_within_budget(Some(&EngineInterprocTargetMetrics {
-        basic_block_count,
-        cost,
-    }))
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum EngineInterprocSessionPurpose {
-    TypeAnalysis,
-    Decompile,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EngineInterprocSessionPlan {
-    pub include_type_interproc_scope: bool,
-    pub include_root_symbolic_scope: bool,
-    pub interproc_iter: usize,
-    pub interproc_max_iters: usize,
-    pub interproc_converged: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EngineSessionPolicyPlan {
-    pub interproc: EngineInterprocSessionPlan,
-    pub type_writeback_mode: EngineTypeWritebackMode,
-    pub global_max_links: usize,
-    pub max_type_decls: usize,
-    pub max_mutations: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EngineSessionBudgetInput {
-    pub interproc_iter: usize,
-    pub interproc_max_iters: usize,
-    pub interproc_converged: bool,
-    pub global_max_links: usize,
-    pub max_type_decls: usize,
-    pub max_mutations: usize,
-    pub type_writeback_mode: EngineTypeWritebackMode,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EngineSessionBudget {
-    pub interproc_iter: usize,
-    pub interproc_max_iters: usize,
-    pub interproc_converged: bool,
-    pub writeback_budget: r2types::TypeWritebackMutationBudget,
-    pub writeback_apply_policy: r2types::TypeWritebackApplyPolicy,
-}
-
-impl EngineSessionBudget {
-    pub fn from_input(input: EngineSessionBudgetInput) -> Self {
-        let interproc_iter = input.interproc_iter.max(1);
-        let interproc_max_iters = input.interproc_max_iters.max(interproc_iter);
-        Self {
-            interproc_iter,
-            interproc_max_iters,
-            interproc_converged: input.interproc_converged,
-            writeback_budget: r2types::TypeWritebackMutationBudget::new(
-                input.global_max_links.max(1),
-                input.max_type_decls.max(1),
-                input.max_mutations.max(1),
-            ),
-            writeback_apply_policy: type_writeback_apply_policy_for_mode(input.type_writeback_mode),
-        }
-    }
-}
-
-pub fn interproc_session_plan(
-    policy: EngineAnalysisPolicy,
-    purpose: EngineInterprocSessionPurpose,
-    metrics: Option<EngineInterprocTargetMetrics>,
-) -> EngineInterprocSessionPlan {
-    let within_budget = interproc_target_metrics_within_budget(metrics.as_ref());
-    match purpose {
-        EngineInterprocSessionPurpose::TypeAnalysis if within_budget => {
-            EngineInterprocSessionPlan {
-                include_type_interproc_scope: true,
-                include_root_symbolic_scope: false,
-                interproc_iter: 1,
-                interproc_max_iters: policy.type_interproc_max_iters.max(1),
-                interproc_converged: true,
-            }
-        }
-        EngineInterprocSessionPurpose::TypeAnalysis => EngineInterprocSessionPlan {
-            include_type_interproc_scope: false,
-            include_root_symbolic_scope: true,
-            interproc_iter: 1,
-            interproc_max_iters: 1,
-            interproc_converged: false,
-        },
-        EngineInterprocSessionPurpose::Decompile if within_budget => EngineInterprocSessionPlan {
-            include_type_interproc_scope: true,
-            include_root_symbolic_scope: false,
-            interproc_iter: 1,
-            interproc_max_iters: 1,
-            interproc_converged: true,
-        },
-        EngineInterprocSessionPurpose::Decompile => EngineInterprocSessionPlan {
-            include_type_interproc_scope: false,
-            include_root_symbolic_scope: false,
-            interproc_iter: 1,
-            interproc_max_iters: 1,
-            interproc_converged: true,
-        },
-    }
-}
-
-pub fn session_policy_plan(
-    policy: EngineAnalysisPolicy,
-    purpose: EngineInterprocSessionPurpose,
-    metrics: Option<EngineInterprocTargetMetrics>,
-) -> EngineSessionPolicyPlan {
-    EngineSessionPolicyPlan {
-        interproc: interproc_session_plan(policy, purpose, metrics),
-        type_writeback_mode: policy.type_writeback_mode,
-        global_max_links: policy.type_global_max_links,
-        max_type_decls: policy.type_max_decls,
-        max_mutations: policy.type_max_mutations,
-    }
-}
-
-pub fn session_policy_plan_for_radare2_depth(
-    depth: u32,
-    purpose: EngineInterprocSessionPurpose,
-    metrics: Option<EngineInterprocTargetMetrics>,
-) -> EngineSessionPolicyPlan {
-    session_policy_plan(analysis_policy_for_radare2_depth(depth), purpose, metrics)
-}
-
-fn interproc_target_queue_pair(
-    direct_target: u64,
-    resolved_target: Option<u64>,
-    skip_reason: Option<EngineInterprocTargetSkipReason>,
-) -> (Option<u64>, Option<u64>) {
-    if skip_reason.is_some() {
-        return (None, None);
-    }
-    let effective_target = resolved_target.unwrap_or(direct_target);
-    if effective_target != direct_target {
-        (Some(direct_target), Some(effective_target))
-    } else {
-        (Some(effective_target), None)
-    }
-}
-
-pub fn interproc_scope_target_plan<I>(targets: I) -> EngineInterprocTargetPlan
-where
-    I: IntoIterator<Item = EngineInterprocTargetInput>,
-{
-    let mut queued_targets = BTreeSet::new();
-    let mut registration_targets = BTreeSet::new();
-    let mut runtime_copy_targets = BTreeSet::new();
-    let mut decisions = Vec::new();
-
-    for target in targets {
-        let direct_target = target.direct_target;
-        let resolved_target = target.resolved_target.filter(|addr| *addr != 0);
-        let name = target.name.as_deref();
-        let semantic_summary = target.semantic_summary.as_ref();
-
-        let registration_target = imported_name_authorizes_runtime_role(
-            name,
-            target.linkage,
-            r2types::callee_name_is_windows_runtime_registration,
-        );
-        if registration_target {
-            registration_targets.insert(direct_target);
-        }
-
-        let runtime_copy_target = imported_name_authorizes_runtime_role(
-            name,
-            target.linkage,
-            r2types::callee_name_is_runtime_copy,
-        ) || semantic_summary
-            .is_some_and(r2sym::semantic_summary_has_runtime_copy_role);
-        if runtime_copy_target {
-            runtime_copy_targets.insert(direct_target);
-        }
-
-        let skip_reason = interproc_target_skip_reason_from_evidence(
-            target_name_is_import_authorized(name, target.linkage),
-            semantic_summary.is_some_and(r2sym::semantic_summary_has_modeled_evidence),
-            target.target_materialized,
-            interproc_target_metrics_within_budget(target.target_metrics.as_ref()),
-        );
-
-        let mut decision_queued_targets = Vec::new();
-        let (first_queue_target, second_queue_target) =
-            interproc_target_queue_pair(direct_target, resolved_target, skip_reason);
-        for target in [first_queue_target, second_queue_target]
-            .into_iter()
-            .flatten()
-        {
-            queued_targets.insert(target);
-            decision_queued_targets.push(target);
-        }
-        decision_queued_targets.sort_unstable();
-        decision_queued_targets.dedup();
-
-        decisions.push(EngineInterprocTargetDecision {
-            direct_target,
-            resolved_target,
-            queued_targets: decision_queued_targets,
-            registration_target,
-            runtime_copy_target,
-            skip_reason,
-        });
-    }
-
-    decisions.sort_by_key(|decision| decision.direct_target);
-
-    EngineInterprocTargetPlan {
-        queued_targets: queued_targets.into_iter().collect(),
-        registration_targets: registration_targets.into_iter().collect(),
-        runtime_copy_targets: runtime_copy_targets.into_iter().collect(),
-        decisions,
-    }
-}
-
-pub fn symbolic_scope_function_plan(
-    input: EngineSymbolicScopeFunctionInput,
-) -> EngineSymbolicScopeFunctionPlan {
-    if input.current_scope_count >= SYMBOLIC_SCOPE_MAX_FUNCTIONS {
-        return EngineSymbolicScopeFunctionPlan {
-            append_function: false,
-            expand_targets: false,
-            reason: EngineSymbolicScopeFunctionReason::ScopeFull,
-        };
-    }
-
-    if input.root_function {
-        return EngineSymbolicScopeFunctionPlan {
-            append_function: true,
-            expand_targets: true,
-            reason: EngineSymbolicScopeFunctionReason::Allowed,
-        };
-    }
-
-    if input.target_hint_function {
-        return EngineSymbolicScopeFunctionPlan {
-            append_function: true,
-            expand_targets: false,
-            reason: EngineSymbolicScopeFunctionReason::TargetTerminal,
-        };
-    }
-
-    if !input.interproc.include_type_interproc_scope {
-        return EngineSymbolicScopeFunctionPlan {
-            append_function: false,
-            expand_targets: false,
-            reason: EngineSymbolicScopeFunctionReason::InterprocDisabled,
-        };
-    }
-
-    EngineSymbolicScopeFunctionPlan {
-        append_function: true,
-        expand_targets: true,
-        reason: EngineSymbolicScopeFunctionReason::Allowed,
-    }
-}
-
-pub fn runtime_materialized_source_plan(
-    current_scope_count: usize,
-    addr: u64,
-    size: u64,
-) -> EngineRuntimeMaterializedSourcePlan {
-    if current_scope_count >= SYMBOLIC_SCOPE_MAX_FUNCTIONS {
-        return EngineRuntimeMaterializedSourcePlan {
-            append_source: false,
-            capped_size: 0,
-            slot_bytes: RUNTIME_MATERIALIZED_SLOT_BYTES,
-            reason: EngineRuntimeMaterializedSourceReason::ScopeFull,
-        };
-    }
-    if addr == 0 || size == 0 {
-        return EngineRuntimeMaterializedSourcePlan {
-            append_source: false,
-            capped_size: 0,
-            slot_bytes: RUNTIME_MATERIALIZED_SLOT_BYTES,
-            reason: EngineRuntimeMaterializedSourceReason::EmptySource,
-        };
-    }
-
-    EngineRuntimeMaterializedSourcePlan {
-        append_source: true,
-        capped_size: size.min(RUNTIME_MATERIALIZED_MAX_BYTES),
-        slot_bytes: RUNTIME_MATERIALIZED_SLOT_BYTES,
-        reason: EngineRuntimeMaterializedSourceReason::Allowed,
-    }
-}
-
 #[cfg(kani)]
 mod kani_proofs {
     use super::*;
-
-    #[kani::proof]
-    fn interproc_target_skip_reason_is_fail_closed_and_priority_ordered() {
-        let import_authorized: bool = kani::any();
-        let has_modeled_summary: bool = kani::any();
-        let target_materialized: bool = kani::any();
-        let metrics_within_budget: bool = kani::any();
-
-        let skip_reason = interproc_target_skip_reason_from_evidence(
-            import_authorized,
-            has_modeled_summary,
-            target_materialized,
-            metrics_within_budget,
-        );
-
-        if import_authorized {
-            assert_eq!(skip_reason, Some(EngineInterprocTargetSkipReason::Imported));
-        } else if has_modeled_summary {
-            assert_eq!(
-                skip_reason,
-                Some(EngineInterprocTargetSkipReason::SummaryModeled)
-            );
-        } else if !target_materialized {
-            assert_eq!(
-                skip_reason,
-                Some(EngineInterprocTargetSkipReason::Unmaterialized)
-            );
-        } else if !metrics_within_budget {
-            assert_eq!(
-                skip_reason,
-                Some(EngineInterprocTargetSkipReason::OverBudget)
-            );
-        } else {
-            assert_eq!(skip_reason, None);
-        }
-
-        if skip_reason.is_none() {
-            assert!(target_materialized);
-            assert!(metrics_within_budget);
-            assert!(!has_modeled_summary);
-            assert!(!import_authorized);
-        }
-    }
-
-    #[kani::proof]
-    fn imported_name_runtime_role_requires_imported_linkage() {
-        let name_matches_runtime_role: bool = kani::any();
-        let linkage = match kani::any::<u8>() % 3 {
-            0 => r2ssa::FunctionSemanticLinkage::Unknown,
-            1 => r2ssa::FunctionSemanticLinkage::Internal,
-            _ => r2ssa::FunctionSemanticLinkage::Imported,
-        };
-
-        let authorized =
-            imported_name_authorizes_runtime_role(Some("runtime_role"), linkage, |_| {
-                name_matches_runtime_role
-            });
-
-        assert_eq!(
-            authorized,
-            name_matches_runtime_role
-                && matches!(linkage, r2ssa::FunctionSemanticLinkage::Imported)
-        );
-        if linkage != r2ssa::FunctionSemanticLinkage::Imported {
-            assert!(!authorized);
-        }
-    }
-
-    #[kani::proof]
-    fn interproc_target_metric_budget_is_owned_by_engine_thresholds() {
-        let basic_block_count: u32 = kani::any();
-        let cost: u32 = kani::any();
-        let metrics = EngineInterprocTargetMetrics {
-            basic_block_count,
-            cost,
-        };
-
-        let within_budget = interproc_target_metrics_within_budget(Some(&metrics));
-        assert_eq!(
-            within_budget,
-            basic_block_count <= ENGINE_INTERPROC_HELPER_MAX_BLOCKS
-                && cost <= ENGINE_INTERPROC_HELPER_MAX_COST
-        );
-        assert_eq!(
-            interproc_helper_scope_within_budget(basic_block_count, cost),
-            within_budget
-        );
-        assert!(!interproc_target_metrics_within_budget(None));
-    }
-
-    #[kani::proof]
-    fn interproc_target_queue_pair_queues_only_unskipped_targets() {
-        let direct_target = 0x1000 + u64::from(kani::any::<u16>());
-        let resolved_offset = u64::from(kani::any::<u8>() % 4);
-        let has_resolved_target: bool = kani::any();
-        let skipped: bool = kani::any();
-        let resolved_target = has_resolved_target.then_some(direct_target + resolved_offset);
-
-        let skip_reason = skipped.then_some(EngineInterprocTargetSkipReason::OverBudget);
-        let (first, second) =
-            interproc_target_queue_pair(direct_target, resolved_target, skip_reason);
-
-        if skipped {
-            assert_eq!(first, None);
-            assert_eq!(second, None);
-        } else {
-            let effective_target = resolved_target.unwrap_or(direct_target);
-            if effective_target != direct_target {
-                assert_eq!(first, Some(direct_target));
-                assert_eq!(second, Some(effective_target));
-            } else {
-                assert_eq!(first, Some(effective_target));
-                assert_eq!(second, None);
-            }
-        }
-    }
 
     #[kani::proof]
     fn analysis_policy_depths_have_nonzero_monotonic_budgets() {
@@ -2687,140 +1277,6 @@ mod kani_proofs {
             assert!(!prefers_bounded);
         }
     }
-}
-
-pub fn interproc_direct_call_targets(analysis: &EngineAnalysis) -> Vec<u64> {
-    let mut targets = BTreeSet::new();
-    for call in analysis.ssa_func.call_sites().by_id.values() {
-        if let Some(target) = analysis.ssa_func.resolved_call_target(call) {
-            targets.insert(target);
-        }
-    }
-    targets.into_iter().collect()
-}
-
-fn debug_runtime_scope_enabled() -> bool {
-    std::env::var_os("R2SLEIGH_DEBUG_RUNTIME_TARGETS").is_some()
-}
-
-fn debug_runtime_scope_log(message: &str) {
-    if !debug_runtime_scope_enabled() {
-        return;
-    }
-    let path = std::env::var("R2SLEIGH_DEBUG_RUNTIME_TARGETS_LOG")
-        .unwrap_or_else(|_| "/tmp/r2sleigh_runtime_targets.log".to_string());
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(file, "{message}");
-    }
-}
-
-fn arch_supports_windows_x64_runtime_scope(arch: Option<&r2il::ArchSpec>) -> bool {
-    let Some(arch) = arch else {
-        return false;
-    };
-    let lower_name = arch.name.to_ascii_lowercase();
-    (lower_name.contains("x86") || matches!(lower_name.as_str(), "x64" | "amd64"))
-        && (arch.addr_size == 8 || lower_name.contains("64"))
-}
-
-pub fn interproc_runtime_registration_targets(
-    analysis: &EngineAnalysis,
-    arch: Option<&r2il::ArchSpec>,
-    registration_call_targets: &[u64],
-) -> Vec<u64> {
-    if !arch_supports_windows_x64_runtime_scope(arch) || registration_call_targets.is_empty() {
-        debug_runtime_scope_log(&format!(
-            "skip supports_windows_x64={} arch={:?} registrations={}",
-            arch_supports_windows_x64_runtime_scope(arch),
-            arch.map(|arch| arch.name.as_str()),
-            registration_call_targets.len()
-        ));
-        return Vec::new();
-    }
-
-    let registrations = registration_call_targets
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>();
-    let observations =
-        r2ssa::observe_call_arguments(&analysis.ssa_func, &r2ssa::AbiProfile::windows_x64());
-    let mut targets = BTreeSet::new();
-    for (call_id, call) in &analysis.ssa_func.call_sites().by_id {
-        let Some(target) = analysis.ssa_func.resolved_call_target(call) else {
-            debug_runtime_scope_log(&format!("call_id={call_id:?} unresolved_target"));
-            continue;
-        };
-        if !registrations.contains(&target) {
-            debug_runtime_scope_log(&format!(
-                "call_id={call_id:?} target=0x{target:x} not_registration"
-            ));
-            continue;
-        }
-        let Some(args) = observations.get(call_id) else {
-            debug_runtime_scope_log(&format!(
-                "call_id={call_id:?} target=0x{target:x} missing_args"
-            ));
-            continue;
-        };
-        let Some(r2ssa::CallArgObservation::Const(handler)) = args.get(1) else {
-            debug_runtime_scope_log(&format!(
-                "call_id={call_id:?} target=0x{target:x} handler_arg={:?}",
-                args.get(1)
-            ));
-            continue;
-        };
-        if *handler >= 0x1000 {
-            debug_runtime_scope_log(&format!(
-                "call_id={call_id:?} target=0x{target:x} handler=0x{handler:x}"
-            ));
-            targets.insert(*handler);
-        }
-    }
-    targets.into_iter().collect()
-}
-
-pub fn interproc_runtime_materialized_sources(
-    analysis: &EngineAnalysis,
-    arch: Option<&r2il::ArchSpec>,
-    copy_call_targets: &[u64],
-) -> Vec<EngineRuntimeMaterializedSource> {
-    if !arch_supports_windows_x64_runtime_scope(arch) || copy_call_targets.is_empty() {
-        return Vec::new();
-    }
-
-    let copy_targets = copy_call_targets.iter().copied().collect::<BTreeSet<_>>();
-    let observations =
-        r2ssa::observe_call_arguments(&analysis.ssa_func, &r2ssa::AbiProfile::windows_x64());
-    let mut sources = BTreeMap::<u64, u64>::new();
-    for (call_id, call) in &analysis.ssa_func.call_sites().by_id {
-        let Some(target) = analysis.ssa_func.resolved_call_target(call) else {
-            continue;
-        };
-        if !copy_targets.contains(&target) {
-            continue;
-        }
-        let Some(args) = observations.get(call_id) else {
-            continue;
-        };
-        let (
-            Some(r2ssa::CallArgObservation::Const(source)),
-            Some(r2ssa::CallArgObservation::Const(size)),
-        ) = (args.get(1), args.get(2))
-        else {
-            continue;
-        };
-        if *source >= 0x1000 && *size > 0 {
-            sources
-                .entry(*source)
-                .and_modify(|existing| *existing = (*existing).max(*size))
-                .or_insert(*size);
-        }
-    }
-
-    sources
-        .into_iter()
-        .map(|(addr, size)| EngineRuntimeMaterializedSource { addr, size })
-        .collect()
 }
 
 #[derive(Debug)]
@@ -2940,12 +1396,20 @@ impl EngineExecutionControl {
         self.cancellation.clone()
     }
 
-    pub fn deadline(&self) -> Option<Instant> {
-        self.deadline
+    /// The same control, in the symbolic executor's terms.
+    ///
+    /// The two types carry the same two fields, and the engine's cancellation
+    /// token already wraps the symbolic one, so this is a clone rather than a
+    /// translation. It exists because nothing performed the clone: every
+    /// symbolic compilation the engine requested ran under
+    /// `SymExecutionControl::default()`, with no deadline and no cancellation,
+    /// however tight the budget the engine had been given.
+    pub fn symbolic(&self) -> r2sym::SymExecutionControl {
+        r2sym::SymExecutionControl::new(self.cancellation.symbolic.clone(), self.deadline)
     }
 
-    pub fn symbolic_execution_control(&self) -> r2sym::SymExecutionControl {
-        r2sym::SymExecutionControl::new(self.cancellation.symbolic.clone(), self.deadline)
+    pub fn deadline(&self) -> Option<Instant> {
+        self.deadline
     }
 
     pub fn ssa_execution_control(&self) -> r2ssa::SsaExecutionControl {
@@ -3068,12 +1532,15 @@ pub struct EngineAnalyzeRequest {
     pub arch: Option<r2il::ArchSpec>,
     pub source_snapshot: Option<Arc<EngineSourceSnapshot>>,
     trusted_ssa: Option<Arc<r2ssa::TrustedSsaArtifact>>,
+    /// Bodies of the functions the root calls, captured in the same transaction.
+    callee_facts: Vec<CalleeFacts>,
+    /// Each callee's own typed source context, retained until `r2types` derives
+    /// the source-owned signature that callers may consume.
     pub ptr_bits: u32,
     pub semantic_metadata_enabled: bool,
     pub reg_type_hints: HashMap<String, r2types::TypeHint>,
     pub parsed_context: r2types::ParsedExternalContext,
     pub interproc_max_iterations: usize,
-    pub symbolic_scope: Option<r2sym::PreparedFunctionScope>,
     pub semantic_mode: EngineSemanticMode,
     pub include_interproc_summary_set: bool,
     pub execution: EngineExecutionControl,
@@ -3091,7 +1558,6 @@ pub struct EngineAnalyzeRequestParts {
     pub reg_type_hints: HashMap<String, r2types::TypeHint>,
     pub parsed_context: r2types::ParsedExternalContext,
     pub interproc_max_iterations: usize,
-    pub symbolic_scope: Option<r2sym::PreparedFunctionScope>,
     pub include_interproc_summary_set: bool,
 }
 
@@ -3211,7 +1677,6 @@ pub struct EngineAnalyzeRequestInput {
     pub reg_type_hints: HashMap<String, r2types::TypeHint>,
     pub parsed_context: r2types::ParsedExternalContext,
     pub interproc_max_iterations: usize,
-    pub symbolic_scope: Option<r2sym::PreparedFunctionScope>,
     pub include_interproc_summary_set: bool,
 }
 
@@ -3222,8 +1687,468 @@ pub struct EngineAnalyzeFunctionRequestInput {
     pub reg_type_hints: HashMap<String, r2types::TypeHint>,
     pub parsed_context: r2types::ParsedExternalContext,
     pub interproc_max_iterations: usize,
-    pub symbolic_scope: Option<r2sym::PreparedFunctionScope>,
     pub include_interproc_summary_set: bool,
+}
+
+/// Names the source gave its stack slots, keyed the way the renderer looks them up.
+///
+/// These are presentation only: the role comes from the interface so a home or a
+/// saved carrier is not offered as a local, and a name that matches no slot is
+/// not carried at all.
+/// A source type rendered as the source spells it.
+///
+/// The shared parser canonicalises a spelling to structure, which is right for
+/// analysis and wrong for a name: it turns `char` into an eight-bit integer and
+/// `size_t` into an unsigned word, so the rendered C says `int8_t *` where the
+/// source said `char *`. Structure is already carried by the type graph, so the
+/// spelling is what this has to preserve.
+fn source_spelled_type(spelling: &str, ptr_bits: u32) -> Option<r2types::CTypeLike> {
+    let mut rest = spelling.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    let mut array_len = None;
+    if let Some(start) = rest.rfind('[')
+        && rest.ends_with(']')
+    {
+        let len = &rest[start + 1..rest.len() - 1];
+        array_len = Some(len.trim().parse::<usize>().ok());
+        rest = rest[..start].trim_end();
+    }
+    let mut pointers = 0usize;
+    while let Some(stripped) = rest.strip_suffix('*') {
+        pointers += 1;
+        rest = stripped.trim_end();
+    }
+    let base_words = rest
+        .split_whitespace()
+        .filter(|word| {
+            !matches!(
+                word.to_ascii_lowercase().as_str(),
+                "const" | "volatile" | "restrict" | "__restrict" | "__restrict__"
+            )
+        })
+        .collect::<Vec<_>>();
+    let base_spelling = base_words.join(" ");
+    if base_spelling.is_empty() {
+        return None;
+    }
+    // A structural spelling stays structural so width-aware analysis keeps
+    // working; a named one is carried by name so it renders as itself.
+    let mut ty = match r2types::parse_c_type_like(&base_spelling, ptr_bits) {
+        Some(r2types::CTypeLike::Void) => r2types::CTypeLike::Void,
+        Some(
+            structural @ (r2types::CTypeLike::Struct(_)
+            | r2types::CTypeLike::Union(_)
+            | r2types::CTypeLike::Enum(_)),
+        ) => structural,
+        Some(_) => r2types::CTypeLike::Typedef(base_spelling),
+        None => return None,
+    };
+    for _ in 0..pointers {
+        ty = r2types::CTypeLike::Pointer(Box::new(ty));
+    }
+    if let Some(len) = array_len {
+        ty = r2types::CTypeLike::Array(Box::new(ty), len);
+    }
+    Some(ty)
+}
+
+/// The struct layouts radare2 captured alongside the function, as the external
+/// type database the field-naming path reads.
+///
+/// The snapshot already carries an aggregate layout for every struct its
+/// signature mentions, but nothing turned those layouts into the database, so
+/// it stayed empty in every real decompile. Field certificates are only kept
+/// when the database confirms a field, so every struct access fell back to
+/// pointer arithmetic however completely radare2 knew the type: `list_sum`
+/// rendered `cur[1]` for `cur->next`.
+fn trusted_external_type_db(trusted: &r2ssa::TrustedSsaArtifact) -> r2types::ExternalTypeDb {
+    let mut db = r2types::ExternalTypeDb::default();
+    let Some(graph) = trusted
+        .source()
+        .function_interface()
+        .and_then(r2ssa::SourceFunctionInterface::type_graph)
+    else {
+        return db;
+    };
+    for aggregate in graph.aggregates() {
+        let name = aggregate.name();
+        if name.is_empty() {
+            continue;
+        }
+        let mut fields = std::collections::BTreeMap::new();
+        collect_external_struct_fields(graph, aggregate, 0, "", &mut fields, 0);
+        if fields.is_empty() {
+            continue;
+        }
+        db.structs.insert(
+            r2types::normalize_external_type_name(name).to_ascii_lowercase(),
+            r2types::ExternalStruct {
+                name: name.to_string(),
+                fields,
+            },
+        );
+    }
+    db
+}
+
+/// The scalar members of an aggregate, keyed by byte offset, with a nested
+/// aggregate flattened into the dotted path that reaches its members.
+///
+/// Code reads the scalars, never the aggregate that contains them, so naming a
+/// four-byte read after the eight-byte `Point` sharing its offset would claim a
+/// member the access is not. Flattening gives that read the name it deserves:
+/// `r->top_left.x` rather than an unnamed subscript.
+fn collect_external_struct_fields(
+    graph: &r2ssa::SourceTypeGraph,
+    aggregate: &r2ssa::SourceAggregateLayout,
+    base_offset: u64,
+    prefix: &str,
+    fields: &mut std::collections::BTreeMap<u64, r2types::ExternalField>,
+    depth: u32,
+) {
+    // A type graph is acyclic, but a bound keeps a malformed capture from
+    // walking forever.
+    if depth > 4 {
+        return;
+    }
+    for member in aggregate.members() {
+        // A member the capture could not name, or one that does not start on a
+        // byte, cannot be spelled as a field access.
+        if member.name().is_empty() || member.offset_bits() % 8 != 0 {
+            continue;
+        }
+        let Some(offset) = base_offset.checked_add(member.offset_bits() / 8) else {
+            continue;
+        };
+        let path = if prefix.is_empty() {
+            member.name().to_string()
+        } else {
+            format!("{prefix}.{}", member.name())
+        };
+        let member_type = usize::try_from(member.type_id())
+            .ok()
+            .and_then(|id| graph.types().get(id));
+        // A union's members share one offset, so no single name is the name
+        // of a read at it; the field stays unnamed rather than guessed.
+        if let Some(source_type) = member_type
+            && matches!(source_type.kind(), r2ssa::SourceTypeKind::Union { .. })
+        {
+            continue;
+        }
+        if let Some(source_type) = member_type
+            && let r2ssa::SourceTypeKind::Struct { aggregate_id } = source_type.kind()
+        {
+            if let Some(nested) = graph
+                .aggregates()
+                .iter()
+                .find(|candidate| candidate.id() == aggregate_id)
+            {
+                collect_external_struct_fields(graph, nested, offset, &path, fields, depth + 1);
+            }
+            continue;
+        }
+        fields.insert(
+            offset,
+            r2types::ExternalField {
+                name: path,
+                offset,
+                ty: source_member_type_spelling(graph, member),
+            },
+        );
+    }
+}
+
+/// How a captured aggregate member's type spells in C, so the width check that
+/// gates a field certificate has something exact to measure against.
+fn source_member_type_spelling(
+    graph: &r2ssa::SourceTypeGraph,
+    member: &r2ssa::SourceAggregateMember,
+) -> Option<String> {
+    let source_type = usize::try_from(member.type_id())
+        .ok()
+        .and_then(|id| graph.types().get(id))?;
+    let bits = source_type.size_bits();
+    let element = match source_type.kind() {
+        r2ssa::SourceTypeKind::SignedInteger => format!("int{bits}_t"),
+        r2ssa::SourceTypeKind::UnsignedInteger => format!("uint{bits}_t"),
+        r2ssa::SourceTypeKind::Pointer { .. } => "void *".to_string(),
+        // An inline aggregate member has no scalar width to check an access
+        // against, and an opaque kind is never a member at all.
+        r2ssa::SourceTypeKind::Struct { .. }
+        | r2ssa::SourceTypeKind::Union { .. }
+        | r2ssa::SourceTypeKind::Void
+        | r2ssa::SourceTypeKind::Code => return None,
+    };
+    // A member wider than one element repeats it. The capture states the repeat
+    // count, but the Rust contract for a member does not carry it, so the
+    // member's own width against the element width recovers the length. Without
+    // the length only the first element could be named, and every later one fell
+    // back to an offset placeholder: `st->r[2]` rendered as `st->f_8`.
+    let count = source_member_element_count(member, bits)?;
+    Some(if count > 1 {
+        format!("{element}[{count}]")
+    } else {
+        element
+    })
+}
+
+/// How many elements a captured member holds, from its own width against the
+/// width of one element. `None` when the two do not divide evenly, because a
+/// member that is not a whole number of elements is not an array of them.
+fn source_member_element_count(
+    member: &r2ssa::SourceAggregateMember,
+    element_bits: u64,
+) -> Option<u64> {
+    if element_bits == 0 {
+        return None;
+    }
+    let total_bits = member.size_bits();
+    if total_bits == 0 || total_bits == element_bits {
+        return Some(1);
+    }
+    total_bits
+        .is_multiple_of(element_bits)
+        .then(|| total_bits / element_bits)
+}
+
+/// The prototype the source recovered, spelled as the source spells it.
+///
+/// The type graph carries structure and the interface carries storage; only
+/// this says `size_t` rather than `uint64_t`, or `char *` rather than a pointer
+/// to an eight-bit integer.
+fn trusted_source_signature(
+    trusted: &r2ssa::TrustedSsaArtifact,
+    ptr_bits: u32,
+) -> Option<(r2types::FunctionSignatureSpec, Option<String>, bool)> {
+    let signature = trusted.source().presentation().signature()?;
+    let params = signature
+        .parameters()
+        .iter()
+        .enumerate()
+        .map(|(index, parameter)| r2types::FunctionParamSpec {
+            name: parameter
+                .name()
+                .filter(|name| !name.is_empty())
+                .map_or_else(|| format!("arg{index}"), str::to_string),
+            ty: parameter
+                .type_spelling()
+                .and_then(|spelling| source_spelled_type(spelling, ptr_bits)),
+        })
+        .collect();
+    let spec = r2types::FunctionSignatureSpec {
+        ret_type: signature
+            .return_type()
+            .and_then(|spelling| source_spelled_type(spelling, ptr_bits)),
+        params,
+    };
+    let callconv = signature
+        .calling_convention()
+        .filter(|convention| !convention.is_empty())
+        .map(str::to_string);
+    Some((spec, callconv, signature.noreturn()))
+}
+
+/// The prototype of each callee, keyed by the name the call renders with.
+///
+/// Without these an argument is typed by how wide its register is, so a call
+/// to `malloc` takes whatever fits rather than the `size_t` it declares.
+fn trusted_callee_signatures(
+    trusted: &r2ssa::TrustedSsaArtifact,
+    ptr_bits: u32,
+) -> std::collections::HashMap<String, r2types::FunctionType> {
+    trusted
+        .source()
+        .presentation()
+        .callee_signatures()
+        .iter()
+        // A prototype with no parameters and no result is what radare2 writes
+        // for a callee it knows nothing about. Carrying it would say the callee
+        // takes no arguments, which is a claim, and would truncate the ones the
+        // lift recovered.
+        .filter(|(_, signature)| {
+            !signature.parameters().is_empty()
+                || signature
+                    .return_type()
+                    .is_some_and(|spelling| spelling.trim() != "void" && !spelling.is_empty())
+        })
+        .map(|(name, signature)| {
+            (
+                name.to_string(),
+                r2types::FunctionType {
+                    return_type: signature
+                        .return_type()
+                        .and_then(|spelling| source_spelled_type(spelling, ptr_bits))
+                        .unwrap_or(r2types::CTypeLike::Unknown),
+                    // The ellipsis is not a parameter and has no type. Copying
+                    // it in as one, and then calling the whole prototype
+                    // non-variadic, said `fprintf` takes exactly three
+                    // arguments -- so every call to it was cut to three,
+                    // whatever the machine passed.
+                    params: signature
+                        .named_parameters()
+                        .iter()
+                        .map(|parameter| {
+                            parameter
+                                .type_spelling()
+                                .and_then(|spelling| source_spelled_type(spelling, ptr_bits))
+                                .unwrap_or(r2types::CTypeLike::Unknown)
+                        })
+                        .collect(),
+                    variadic: signature.is_variadic(),
+                },
+            )
+        })
+        .collect()
+}
+
+/// Everything one callee contributes to a caller's request.
+///
+/// Each field is derived from that callee's own snapshot and nothing else, so
+/// one derivation serves every caller of that function. The callee's prepared
+/// body is read to produce this and is then done with: what a caller reads of
+/// a callee is its interface, the local effect summary the interprocedural
+/// fixpoint iterates over, the C signature its own typed body proves, and the
+/// data objects its image observed. Holding the body instead, so that a later
+/// caller could redo those four derivations from it, is what made a session
+/// retain a prepared function per function in the program.
+#[derive(Debug, Clone)]
+pub struct CalleeFacts {
+    address: u64,
+    interface: r2ssa::SourceFunctionInterface,
+    summary: r2ssa::PreparedCalleeSummary,
+    signature: Option<r2types::SourceOwnedCalleeSignature>,
+    observed_data_objects: r2types::ProgramDataObjectTypeFacts,
+}
+
+impl CalleeFacts {
+    /// Derive a callee's contribution from the body that owns it. The body is
+    /// read here and not retained.
+    pub fn derive(callee: &Arc<r2ssa::TrustedSsaArtifact>, ptr_bits: u32) -> Option<Self> {
+        let shared = callee.shared_artifact();
+        let address = shared.function().entry;
+        let interface = shared.machine_context().function_interface()?.clone();
+        let summary =
+            r2ssa::PreparedCalleeSummary::derive(r2ssa::InterprocFunctionId(address), &shared)
+                .ok()?;
+        let external_type_db = trusted_external_type_db(callee);
+        let observed_data_objects = r2types::ProgramDataObjectTypeFacts::from_radare2(
+            callee
+                .source()
+                .image()
+                .data_symbols()
+                .iter()
+                .map(|object| (object.address(), object.type_spelling())),
+            ptr_bits,
+            &external_type_db,
+        );
+        let context = trusted_parsed_context(callee, ptr_bits);
+        let signature = r2types::build_source_owned_type_writeback_analysis(
+            r2types::TypeWritebackAnalysisRequest::new(Arc::clone(&shared), context).ok()?,
+        )
+        .ok()
+        .and_then(|analysis| analysis.source_owned_callee_signature());
+        Some(Self {
+            address,
+            interface,
+            summary,
+            signature,
+            observed_data_objects,
+        })
+    }
+
+    pub const fn address(&self) -> u64 {
+        self.address
+    }
+
+    pub const fn interface(&self) -> &r2ssa::SourceFunctionInterface {
+        &self.interface
+    }
+
+    /// Re-announce this callee's observed data objects to the program view.
+    /// Absorption is monotone, so replaying it is what a cached derivation
+    /// owes a session that did not run the derivation itself.
+    pub fn announce_data_objects(&self) {
+        let _ = cache_program_data_object_types(&self.observed_data_objects);
+    }
+}
+
+fn trusted_parsed_context(
+    trusted: &r2ssa::TrustedSsaArtifact,
+    ptr_bits: u32,
+) -> r2types::ParsedExternalContext {
+    let signature = trusted_source_signature(trusted, ptr_bits);
+    let external_type_db = trusted_external_type_db(trusted);
+    let observed_data_objects = r2types::ProgramDataObjectTypeFacts::from_radare2(
+        trusted
+            .source()
+            .image()
+            .data_symbols()
+            .iter()
+            .map(|object| (object.address(), object.type_spelling())),
+        ptr_bits,
+        &external_type_db,
+    );
+    let program_data_objects = cache_program_data_object_types(&observed_data_objects);
+    r2types::ParsedExternalContext {
+        known_function_signatures: trusted_callee_signatures(trusted, ptr_bits),
+        stack_slots: trusted_stack_slot_names(trusted, ptr_bits),
+        callconv: signature
+            .as_ref()
+            .and_then(|(_, callconv, _)| callconv.clone()),
+        noreturn: signature.as_ref().is_some_and(|(_, _, noreturn)| *noreturn),
+        current_signature: signature.as_ref().map(|(spec, _, _)| spec.clone()),
+        merged_signature: signature.map(|(spec, _, _)| spec),
+        external_type_db,
+        program_data_objects,
+        assumptions: trusted.artifact().facts().assumptions.clone(),
+        ..r2types::ParsedExternalContext::default()
+    }
+}
+
+fn trusted_stack_slot_names(
+    trusted: &r2ssa::TrustedSsaArtifact,
+    ptr_bits: u32,
+) -> std::collections::BTreeMap<r2types::StackSlotKey, r2types::ExternalStackSlotSpec> {
+    let snapshot = trusted.source();
+    let Some(interface) = snapshot.function_interface() else {
+        return Default::default();
+    };
+    let mut slots = std::collections::BTreeMap::new();
+    for slot_name in snapshot.presentation().stack_slot_names() {
+        let Some(slot) = interface
+            .stack_slots()
+            .iter()
+            .find(|slot| slot.base() == slot_name.base() && slot.offset() == slot_name.offset())
+        else {
+            continue;
+        };
+        // A home is the parameter it spills and is named through the parameter
+        // list, so only a slot that stands for itself is named here.
+        let role = match slot.role() {
+            r2ssa::SourceStackSlotRole::Local => r2types::ExternalStackSlotRole::Local,
+            r2ssa::SourceStackSlotRole::UnclassifiedResource => {
+                r2types::ExternalStackSlotRole::Unknown
+            }
+            r2ssa::SourceStackSlotRole::ParameterHome { .. } => continue,
+        };
+        slots.insert(
+            r2types::StackSlotKey {
+                base: slot_name.base(),
+                offset: slot_name.offset(),
+            },
+            r2types::ExternalStackSlotSpec {
+                name: slot_name.name().to_string(),
+                ty: slot_name
+                    .type_spelling()
+                    .and_then(|spelling| source_spelled_type(spelling, ptr_bits)),
+                role,
+                ..r2types::ExternalStackSlotSpec::default()
+            },
+        );
+    }
+    slots
 }
 
 impl EngineAnalyzeRequest {
@@ -3286,12 +2211,12 @@ impl EngineAnalyzeRequest {
             arch: parts.arch,
             source_snapshot: parts.source_snapshot,
             trusted_ssa: None,
+            callee_facts: Vec::new(),
             ptr_bits: parts.ptr_bits,
             semantic_metadata_enabled: parts.semantic_metadata_enabled,
             reg_type_hints: parts.reg_type_hints,
             parsed_context: parts.parsed_context,
             interproc_max_iterations: parts.interproc_max_iterations,
-            symbolic_scope: parts.symbolic_scope,
             semantic_mode,
             include_interproc_summary_set: parts.include_interproc_summary_set,
             execution: EngineExecutionControl::default(),
@@ -3306,7 +2231,7 @@ impl EngineAnalyzeRequest {
     /// Attach one request-local trusted SSA owner.
     ///
     /// The exact retained lift replaces every detached identity, block,
-    /// architecture, source snapshot, type hint, external context, scope, and
+    /// architecture, source snapshot, type hint, external context, and
     /// precomputed-semantic input. Root-only interprocedural solving remains
     /// enabled when requested because it derives solely from this exact owner.
     /// Trusted authority remains request-local.
@@ -3320,11 +2245,27 @@ impl EngineAnalyzeRequest {
         self.source_snapshot = None;
         self.semantic_metadata_enabled = true;
         self.reg_type_hints.clear();
-        self.parsed_context = r2types::ParsedExternalContext::default();
+        self.parsed_context = trusted_parsed_context(&trusted, self.ptr_bits);
         self.interproc_max_iterations = self.interproc_max_iterations.max(1);
-        self.symbolic_scope = None;
         self.semantic_mode = EngineSemanticMode::Full;
         self.trusted_ssa = Some(trusted);
+        self
+    }
+
+    /// Attach what the functions the root calls contribute to it.
+    ///
+    /// Without them the solver has no callee to look at and must assume every
+    /// direct call does anything to anything it was handed.
+    pub fn with_callee_facts(mut self, callees: impl IntoIterator<Item = CalleeFacts>) -> Self {
+        self.callee_facts.clear();
+        let mut seen = std::collections::BTreeSet::new();
+        for callee in callees {
+            if !seen.insert(callee.address()) {
+                continue;
+            }
+            callee.announce_data_objects();
+            self.callee_facts.push(callee);
+        }
         self
     }
 
@@ -3374,7 +2315,6 @@ fn engine_analyze_request_input_from_function(
         reg_type_hints: input.reg_type_hints,
         parsed_context: input.parsed_context,
         interproc_max_iterations: input.interproc_max_iterations,
-        symbolic_scope: input.symbolic_scope,
         include_interproc_summary_set: input.include_interproc_summary_set,
     }
 }
@@ -3396,7 +2336,6 @@ fn engine_analyze_request_parts_from_input(
         reg_type_hints: input.reg_type_hints,
         parsed_context: input.parsed_context,
         interproc_max_iterations: input.interproc_max_iterations,
-        symbolic_scope: input.symbolic_scope,
         include_interproc_summary_set: input.include_interproc_summary_set,
     }
 }
@@ -3437,10 +2376,10 @@ pub struct EngineFunctionDecompileRequestInput {
     ptr_bits: Option<u32>,
     parsed_context: r2types::ParsedExternalContext,
     interproc_max_iterations: usize,
-    symbolic_scope: Option<r2sym::PreparedFunctionScope>,
     input_quality: EngineFunctionInputQuality,
     execution: EngineExecutionControl,
     trusted_ssa: Option<Arc<r2ssa::TrustedSsaArtifact>>,
+    callee_facts: Vec<CalleeFacts>,
 }
 
 impl EngineFunctionDecompileRequestInput {
@@ -3455,10 +2394,10 @@ impl EngineFunctionDecompileRequestInput {
             ptr_bits,
             parsed_context,
             interproc_max_iterations: 1,
-            symbolic_scope: None,
             input_quality: EngineFunctionInputQuality::complete(function_block_count),
             execution: EngineExecutionControl::default(),
             trusted_ssa: None,
+            callee_facts: Vec::new(),
         }
     }
 
@@ -3474,6 +2413,12 @@ impl EngineFunctionDecompileRequestInput {
 
     pub fn with_trusted_ssa(mut self, trusted: Arc<r2ssa::TrustedSsaArtifact>) -> Self {
         self.trusted_ssa = Some(trusted);
+        self
+    }
+
+    /// Attach the bodies of the functions the root calls, captured with it.
+    pub fn with_callee_facts(mut self, callees: impl IntoIterator<Item = CalleeFacts>) -> Self {
+        self.callee_facts = callees.into_iter().collect();
         self
     }
 
@@ -3495,21 +2440,12 @@ impl EngineFunctionDecompileRequestInput {
         );
         self
     }
-
-    pub fn with_interproc_scope(
-        mut self,
-        interproc_max_iterations: usize,
-        symbolic_scope: Option<r2sym::PreparedFunctionScope>,
-    ) -> Self {
-        self.interproc_max_iterations = interproc_max_iterations.max(1);
-        self.symbolic_scope = symbolic_scope;
-        self
-    }
 }
 
 impl EngineFunctionDecompileRequest {
     pub(crate) fn full_semantics_for_function(input: EngineFunctionDecompileRequestInput) -> Self {
         let trusted_ssa = input.trusted_ssa;
+        let callee_facts = input.callee_facts;
         Self {
             input_quality: Some(input.input_quality),
             analysis: EngineAnalyzeRequest::full_semantics_for_function(
@@ -3519,157 +2455,18 @@ impl EngineFunctionDecompileRequest {
                     reg_type_hints: HashMap::new(),
                     parsed_context: input.parsed_context,
                     interproc_max_iterations: input.interproc_max_iterations,
-                    symbolic_scope: input.symbolic_scope,
                     include_interproc_summary_set: true,
                 },
             )
             .with_execution_control(input.execution)
-            .with_optional_trusted_ssa(trusted_ssa),
+            .with_optional_trusted_ssa(trusted_ssa)
+            .with_callee_facts(callee_facts),
         }
     }
 }
 
 pub struct EngineSignatureInferenceRequest<'a> {
     pub analysis: &'a EngineAnalysis,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum EngineSymbolicConfigProfile {
-    DefaultQuery,
-    PathListing,
-}
-
-pub enum EngineSymbolicStateSeed<'a> {
-    Default {
-        entry_addr: u64,
-    },
-    Scope {
-        entry_addr: u64,
-    },
-    Replay {
-        entry_addr: u64,
-        seed: &'a r2sym::ReplaySeed,
-    },
-}
-
-impl EngineSymbolicStateSeed<'_> {
-    pub fn entry_addr(&self) -> u64 {
-        match self {
-            Self::Default { entry_addr }
-            | Self::Scope { entry_addr }
-            | Self::Replay { entry_addr, .. } => *entry_addr,
-        }
-    }
-
-    pub fn display_entry_addr(&self) -> u64 {
-        match self {
-            Self::Replay { entry_addr, seed } => seed.entry_pc.unwrap_or(*entry_addr),
-            Self::Default { entry_addr } | Self::Scope { entry_addr } => *entry_addr,
-        }
-    }
-}
-
-pub struct EngineSymbolicContextRequest<'ctx, 'a> {
-    pub z3_ctx: &'ctx z3::Context,
-    pub prepared: &'a Arc<SsaArtifact>,
-    pub scope: Option<&'a r2sym::PreparedFunctionScope>,
-    pub arch: Option<&'a r2il::ArchSpec>,
-    pub symbols: &'a r2sym::FunctionSymbolSnapshot,
-    pub merge_states: bool,
-    pub config_profile: EngineSymbolicConfigProfile,
-    pub seed: EngineSymbolicStateSeed<'a>,
-}
-
-pub struct EngineSymbolicSummaryRequest<'ctx, 'a> {
-    pub context: EngineSymbolicContextRequest<'ctx, 'a>,
-    pub compile_semantics: bool,
-}
-
-pub struct EngineSymbolicSummaryResponse<'ctx> {
-    pub summary: r2sym::SymbolicFunctionSummary<'ctx>,
-    pub compiled: Option<r2sym::SemanticArtifact>,
-    pub query_policy: r2sym::QueryExecutionPolicy,
-    pub assumption_usage: r2ssa::AssumptionUsageReport,
-    pub assumption_conditioned: bool,
-}
-
-pub struct EngineSymbolicPathsRequest<'ctx, 'a> {
-    pub context: EngineSymbolicContextRequest<'ctx, 'a>,
-}
-
-pub struct EngineSymbolicPathsResponse<'ctx> {
-    pub summary: r2sym::SymbolicFunctionSummary<'ctx>,
-    pub explorer: r2sym::PathExplorer<'ctx>,
-    pub solution_limit: usize,
-    pub query_policy: r2sym::QueryExecutionPolicy,
-    pub assumption_usage: r2ssa::AssumptionUsageReport,
-    pub assumption_conditioned: bool,
-}
-
-pub struct EngineTargetExploreRequest<'ctx, 'a> {
-    pub context: EngineSymbolicContextRequest<'ctx, 'a>,
-    pub target_addr: u64,
-}
-
-pub struct EngineTargetExploreResponse<'ctx> {
-    pub reach: r2sym::ReachabilityResult<'ctx>,
-    pub explorer: r2sym::PathExplorer<'ctx>,
-    pub compiled: r2sym::SemanticArtifact,
-    pub selected_route: r2sym::TargetQueryRoutePlan,
-    pub query_policy: r2sym::QueryExecutionPolicy,
-}
-
-pub struct EngineTargetSolveRequest<'ctx, 'a> {
-    pub context: EngineSymbolicContextRequest<'ctx, 'a>,
-    pub target_addr: u64,
-}
-
-pub struct EngineTargetSolveResponse<'ctx> {
-    pub solve: r2sym::SolveResult<'ctx>,
-    pub explorer: r2sym::PathExplorer<'ctx>,
-    pub compiled: r2sym::SemanticArtifact,
-    pub selected_route: r2sym::TargetQueryRoutePlan,
-    pub query_policy: r2sym::QueryExecutionPolicy,
-}
-
-pub struct EngineRunSpecRequest<'ctx, 'a> {
-    pub context: EngineSymbolicContextRequest<'ctx, 'a>,
-    pub spec: &'a r2sym::ExplorationSpec,
-}
-
-pub struct EngineRunSpecResponse<'ctx> {
-    pub result: r2sym::path::SpecExploreResult<'ctx>,
-    pub explorer: r2sym::PathExplorer<'ctx>,
-    pub stats: r2sym::path::ExploreStats,
-    pub solver_stats: r2sym::SolverStats,
-    pub query_policy: r2sym::QueryExecutionPolicy,
-    pub assumption_usage: r2ssa::AssumptionUsageReport,
-    pub assumption_conditioned: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EngineSymbolicRunError {
-    InvalidSpec(String),
-    ExecutionStopped(r2sym::SymExecutionStopReason),
-}
-
-impl std::fmt::Display for EngineSymbolicRunError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InvalidSpec(reason) => formatter.write_str(reason),
-            Self::ExecutionStopped(reason) => reason.fmt(formatter),
-        }
-    }
-}
-
-impl std::error::Error for EngineSymbolicRunError {}
-
-#[derive(Debug, Clone)]
-pub struct EngineConditionedSymbolicScope {
-    pub scope: r2sym::PreparedFunctionScope,
-    pub prepared: Arc<r2ssa::SsaArtifact>,
-    pub assumption_usage: r2ssa::AssumptionUsageReport,
-    pub assumption_conditioned: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -3714,7 +2511,6 @@ pub struct EngineFunctionAnalysisArtifactRequestInput {
     pub ptr_bits: Option<u32>,
     pub parsed_context: r2types::ParsedExternalContext,
     pub interproc_max_iterations: usize,
-    pub symbolic_scope: Option<r2sym::PreparedFunctionScope>,
 }
 
 #[derive(Debug, Clone)]
@@ -3724,7 +2520,6 @@ pub struct EngineFunctionAnalysisReportRequestInput {
     pub parsed_context: r2types::ParsedExternalContext,
     pub interproc_max_iters: usize,
     pub interproc_converged: bool,
-    pub symbolic_scope: Option<r2sym::PreparedFunctionScope>,
     pub writeback_budget: r2types::TypeWritebackMutationBudget,
     pub writeback_apply_policy: r2types::TypeWritebackApplyPolicy,
 }
@@ -3739,7 +2534,6 @@ impl EngineFunctionAnalysisArtifactRequest {
                     reg_type_hints: HashMap::new(),
                     parsed_context: input.parsed_context,
                     interproc_max_iterations: input.interproc_max_iterations,
-                    symbolic_scope: input.symbolic_scope,
                     include_interproc_summary_set: true,
                 },
             ),
@@ -3761,7 +2555,6 @@ impl EngineFunctionAnalysisArtifactRequest {
                     reg_type_hints: HashMap::new(),
                     parsed_context: input.parsed_context,
                     interproc_max_iterations: input.interproc_max_iterations,
-                    symbolic_scope: input.symbolic_scope,
                     include_interproc_summary_set: true,
                 },
                 register_name,
@@ -3824,7 +2617,6 @@ impl EngineFunctionAnalysisReportRequest {
                     reg_type_hints: HashMap::new(),
                     parsed_context: input.parsed_context,
                     interproc_max_iterations: input.interproc_max_iters,
-                    symbolic_scope: input.symbolic_scope,
                     include_interproc_summary_set: true,
                 },
             ),
@@ -3850,7 +2642,6 @@ impl EngineFunctionAnalysisReportRequest {
                     reg_type_hints: HashMap::new(),
                     parsed_context: input.parsed_context,
                     interproc_max_iterations: input.interproc_max_iters,
-                    symbolic_scope: input.symbolic_scope,
                     include_interproc_summary_set: true,
                 },
                 register_name,
@@ -3939,6 +2730,10 @@ impl EngineTypeAnalysisResponse {
 #[derive(Debug, Clone)]
 pub struct EngineDecompileResponse {
     pub output: String,
+    pub binding_audit: BindingShadowAuditOutcome,
+    pub effect_obligations: EffectObligationAudit,
+    pub placement_audit: PlacementAudit,
+    pub render_refusal: Option<DecompileRenderRefusal>,
     pub function_facts: FunctionFacts,
     pub input_quality: Option<r2types::FunctionInputQualityFacts>,
     pub metrics: EngineMetrics,
@@ -3997,7 +2792,6 @@ impl EngineSession {
             scope_report,
         } = request;
         let analysis = analysis.canonicalize_trusted();
-        let symbolic_scope = analysis.symbolic_scope.clone();
         let response = self.analyze(analysis)?;
         let summary = response
             .artifact
@@ -4011,7 +2805,6 @@ impl EngineSession {
             converged,
             summary,
             scope_report: scope_report.as_ref(),
-            symbolic_scope: symbolic_scope.as_ref(),
         });
         Some(EngineInterprocSummaryReportResponse {
             report,
@@ -4080,7 +2873,11 @@ impl EngineSession {
             Ok(artifact) => artifact,
             Err(reason) => {
                 poll_engine_execution(&request.execution, EnginePhase::Types, &metrics)?;
-                return Err(engine_execution_refusal(reason, EnginePhase::Types, metrics));
+                return Err(engine_execution_refusal(
+                    reason,
+                    EnginePhase::Types,
+                    metrics,
+                ));
             }
         };
         let artifact_elapsed = artifact_started.elapsed();
@@ -4230,18 +3027,15 @@ impl EngineSession {
             analysis_request.arch.as_ref(),
             analysis_request.ptr_bits,
         );
-        let identity = EngineFunctionIdentity::new(
-            analysis_request.function_addr,
-            &canonical_name,
-            &display_name,
-        );
-        let probe = decompile_probe_decision_for_identity(&analysis_request.blocks, &identity);
-        if actual_lifted_blocks > ENGINE_DECOMPILE_MAX_BLOCKS
-            || probe.op_count > ENGINE_DECOMPILE_MAX_OPS
-        {
+        let op_count = analysis_request
+            .blocks
+            .iter()
+            .map(|block| block.ops.len())
+            .sum::<usize>();
+        if decompile_complexity_limit_exceeded(actual_lifted_blocks, op_count) {
             let reason = format!(
-                "decompile complexity limit exceeded: blocks={actual_lifted_blocks}/{} ops={}/{}",
-                ENGINE_DECOMPILE_MAX_BLOCKS, probe.op_count, ENGINE_DECOMPILE_MAX_OPS
+                "decompile complexity limit exceeded: blocks={actual_lifted_blocks}/{} ops={op_count}/{}",
+                ENGINE_DECOMPILE_MAX_BLOCKS, ENGINE_DECOMPILE_MAX_OPS
             );
             return refused_decompile_response(
                 &display_name,
@@ -4266,36 +3060,52 @@ impl EngineSession {
         let mut metrics = analyze_response.metrics;
         let analyze_diagnostics = analyze_response.diagnostics;
         let artifact = analyze_response.artifact;
+        let analyzed_function_facts = artifact.function_facts().clone();
         let Some(render_target) = EngineRenderTarget::for_prepared(artifact.ssa_func()) else {
             metrics.refuse_from(EnginePhase::Normalization);
-            return refused_decompile_response_with_metrics(
+            return refused_decompile_response_with_metrics_and_audits(
                 &display_name,
                 "source-owned machine context cannot define an exact render target",
                 input_quality_facts,
                 metrics,
                 analyze_diagnostics,
+                Some(analyzed_function_facts),
+                BindingShadowAuditOutcome::NotRun,
+                EffectObligationAudit::NOT_RUN,
+                PlacementAudit::NotRun,
+                None,
             );
         };
         if render_target != requested_render_target {
             metrics.refuse_from(EnginePhase::Normalization);
-            return refused_decompile_response_with_metrics(
+            return refused_decompile_response_with_metrics_and_audits(
                 &display_name,
                 "requested render target does not match the source-owned machine context",
                 input_quality_facts,
                 metrics,
                 analyze_diagnostics,
+                Some(analyzed_function_facts),
+                BindingShadowAuditOutcome::NotRun,
+                EffectObligationAudit::NOT_RUN,
+                PlacementAudit::NotRun,
+                None,
             );
         }
 
         if let Err(refusal) =
             poll_engine_execution(&execution, EnginePhase::Normalization, &metrics)
         {
-            return refused_decompile_response_with_metrics(
+            return refused_decompile_response_with_metrics_and_audits(
                 &display_name,
                 &refusal.reason,
                 input_quality_facts,
                 *refusal.metrics,
                 *refusal.diagnostics,
+                Some(analyzed_function_facts),
+                BindingShadowAuditOutcome::NotRun,
+                EffectObligationAudit::NOT_RUN,
+                PlacementAudit::NotRun,
+                None,
             );
         }
         let normalization_started = Instant::now();
@@ -4324,12 +3134,17 @@ impl EngineSession {
             Ok(facts) => facts,
             Err(_) => {
                 metrics.refuse_from(EnginePhase::Normalization);
-                return refused_decompile_response_with_metrics(
+                return refused_decompile_response_with_metrics_and_audits(
                     &display_name,
                     "requested decompile route is incompatible with source-owned facts",
                     input_quality_facts,
                     metrics,
                     analyze_diagnostics,
+                    Some(analyzed_function_facts),
+                    BindingShadowAuditOutcome::NotRun,
+                    EffectObligationAudit::NOT_RUN,
+                    PlacementAudit::NotRun,
+                    None,
                 );
             }
         };
@@ -4385,27 +3200,23 @@ impl EngineSession {
         request: EngineDecompileRequest,
         render_control: &C,
     ) -> EngineDecompileResponse {
-        self.decompile_with_r2dec_control_and_kernel_policy(request, render_control, true)
-    }
-
-    fn decompile_with_r2dec_control_and_kernel_policy<C: r2ssa::SsaWorkControl>(
-        &self,
-        request: EngineDecompileRequest,
-        render_control: &C,
-        try_semantic_kernel: bool,
-    ) -> EngineDecompileResponse {
         let started = Instant::now();
         let input_quality = request.input_quality.clone();
         let response_function_facts = request.function_facts().clone();
         if request.trusted_ssa.as_deref().is_some_and(|trusted| {
             !trusted.shares_artifact(&request.source_owned_facts.shared_source())
         }) {
-            return refused_decompile_response_with_metrics(
+            return refused_decompile_response_with_metrics_and_audits(
                 &request.function_name,
                 "trusted SSA does not match the source-owned function facts",
                 input_quality.clone(),
                 request.metrics,
                 EngineDiagnostics::default(),
+                Some(response_function_facts),
+                BindingShadowAuditOutcome::NotRun,
+                EffectObligationAudit::NOT_RUN,
+                PlacementAudit::NotRun,
+                None,
             );
         }
         let mut diagnostics = decompile_diagnostics_from_function_facts(request.function_facts());
@@ -4416,46 +3227,52 @@ impl EngineSession {
             EnginePhase::Certification,
             &request.metrics,
         ) {
-            return refused_decompile_response_with_metrics(
+            return refused_decompile_response_with_metrics_and_audits(
                 &request.function_name,
                 &refusal.reason,
                 input_quality.clone(),
                 *refusal.metrics,
                 *refusal.diagnostics,
+                Some(response_function_facts),
+                BindingShadowAuditOutcome::NotRun,
+                EffectObligationAudit::NOT_RUN,
+                PlacementAudit::NotRun,
+                None,
             );
         }
 
         let render_started = Instant::now();
-        let rendered =
-            match render_engine_decompile_request(&request, render_control, try_semantic_kernel) {
-                Ok(rendered) => rendered,
-                Err(stop) => {
-                    let render_time = render_started.elapsed();
-                    let metrics = engine_metrics_for_render_stop(
-                        request.metrics,
-                        &stop,
-                        planning_time,
-                        render_time,
-                    );
-                    let refusal = engine_render_execution_refusal(stop.reason, stop.phase, metrics);
-                    return refused_decompile_response_with_metrics(
-                        &request.function_name,
-                        &refusal.reason,
-                        input_quality.clone(),
-                        *refusal.metrics,
-                        *refusal.diagnostics,
-                    );
-                }
-            };
+        let rendered = match render_engine_decompile_request(&request, render_control) {
+            Ok(rendered) => rendered,
+            Err(stop) => {
+                let render_time = render_started.elapsed();
+                let metrics = engine_metrics_for_render_stop(
+                    request.metrics,
+                    &stop,
+                    planning_time,
+                    render_time,
+                );
+                let binding_audit = *stop.binding_audit;
+                let effect_obligations = *stop.effect_obligations;
+                let placement_audit = stop.placement_audit;
+                let render_refusal = stop.render_refusal.map(|refusal| *refusal);
+                let refusal = engine_render_execution_refusal(stop.reason, stop.phase, metrics);
+                return refused_decompile_response_with_metrics_and_audits(
+                    &request.function_name,
+                    &refusal.reason,
+                    input_quality.clone(),
+                    *refusal.metrics,
+                    *refusal.diagnostics,
+                    Some(response_function_facts),
+                    binding_audit,
+                    effect_obligations,
+                    placement_audit,
+                    render_refusal,
+                );
+            }
+        };
         let render_time = render_started.elapsed();
         let mut metrics = request.metrics;
-        if rendered.semantic_kernel_render.is_some() {
-            metrics.record_phase(
-                EnginePhase::Certification,
-                EnginePhaseStatus::Folded,
-                Duration::default(),
-            );
-        }
         if rendered.structuring_executed {
             metrics.record_phase(
                 EnginePhase::Structuring,
@@ -4463,597 +3280,230 @@ impl EngineSession {
                 Duration::default(),
             );
         }
-        metrics.record_phase(
-            EnginePhase::Rendering,
-            EnginePhaseStatus::Executed,
-            render_time,
-        );
+        match &rendered.stopped {
+            // A rendering and a stop. The phases that finished are folded and the
+            // one that stopped is refused, exactly as a discarded rendering would
+            // have recorded -- the difference is that the body survives.
+            Some(stop) => {
+                if stop.certification_completed {
+                    metrics.record_folded_if_not_executed(EnginePhase::Certification);
+                }
+                if stop.normalization_completed {
+                    metrics.record_folded_if_not_executed(EnginePhase::Normalization);
+                }
+                if stop.structuring_completed {
+                    metrics.record_folded_if_not_executed(EnginePhase::Structuring);
+                }
+                metrics.record_phase(stop.phase, EnginePhaseStatus::Refused, render_time);
+            }
+            None => metrics.record_phase(
+                EnginePhase::Rendering,
+                EnginePhaseStatus::Executed,
+                render_time,
+            ),
+        }
         diagnostics
             .warnings
             .extend(rendered.semantic_kernel_warnings);
+        if let Some(stop) = &rendered.stopped {
+            // The reason the run gives for itself is the stop, not the route it
+            // was taking when the stop arrived. The refusal is recorded too: the
+            // body above is what was reached, and a reader is entitled to know
+            // it is not the whole function.
+            diagnostics.route_reason = Some(stop.reason.clone());
+            diagnostics.refusal = Some(stop.reason.clone());
+        }
         metrics.planning_time += planning_time;
         metrics.render_time = render_time;
+        let rendering_stopped = rendered.stopped.is_some();
+        let (output, binding_audit, effect_obligations, placement_audit, render_refusal) =
+            rendered.product.finalize();
+        if !rendering_stopped && let Some(reason) = placement_refusal_reason(placement_audit) {
+            metrics.record_phase(
+                EnginePhase::Rendering,
+                EnginePhaseStatus::Refused,
+                render_time,
+            );
+            return refused_decompile_response_with_metrics_and_audits(
+                &request.function_name,
+                &reason,
+                input_quality,
+                metrics,
+                diagnostics,
+                Some(response_function_facts),
+                binding_audit,
+                effect_obligations,
+                placement_audit,
+                render_refusal,
+            );
+        }
+        if !rendering_stopped && let Some(refusal) = render_refusal {
+            let reason = render_refusal_reason(refusal);
+            metrics.record_phase(
+                EnginePhase::Rendering,
+                EnginePhaseStatus::Refused,
+                render_time,
+            );
+            return refused_decompile_response_with_metrics_and_audits(
+                &request.function_name,
+                &reason,
+                input_quality,
+                metrics,
+                diagnostics,
+                Some(response_function_facts),
+                binding_audit,
+                effect_obligations,
+                placement_audit,
+                Some(refusal),
+            );
+        }
+        if !rendering_stopped
+            && let Some(reason) = effect_obligation_refusal_reason(effect_obligations)
+        {
+            metrics.record_phase(
+                EnginePhase::Rendering,
+                EnginePhaseStatus::Refused,
+                render_time,
+            );
+            return refused_decompile_response_with_metrics_and_audits(
+                &request.function_name,
+                &reason,
+                input_quality,
+                metrics,
+                diagnostics,
+                Some(response_function_facts),
+                binding_audit,
+                effect_obligations,
+                placement_audit,
+                None,
+            );
+        }
         if let Err(refusal) =
             poll_engine_execution(&request.execution, EnginePhase::FfiConversion, &metrics)
         {
-            return refused_decompile_response_with_metrics(
+            return refused_decompile_response_with_metrics_and_audits(
                 &request.function_name,
                 &refusal.reason,
                 input_quality,
                 *refusal.metrics,
                 *refusal.diagnostics,
+                Some(response_function_facts),
+                binding_audit,
+                effect_obligations,
+                placement_audit,
+                None,
             );
         }
-        if let Some(status) = rendered.semantic_kernel_render {
-            let (plan, reason) = match status.region {
-                EngineSemanticKernelRegion::TerminalReturnBlock => (
-                    EnginePlan::FastLocal,
-                    "r2dec sealed exact terminal-return typed-output ownership",
-                ),
-                EngineSemanticKernelRegion::AggregateMemberTerminalReturnFunction => (
-                    EnginePlan::FastLocal,
-                    "r2dec sealed exact aggregate-member terminal-return typed-output ownership",
-                ),
-                EngineSemanticKernelRegion::PlainRamMemoryTerminalReturnFunction => (
-                    EnginePlan::FastLocal,
-                    "r2dec sealed exact plain-RAM-memory terminal-return typed-output ownership",
-                ),
-                EngineSemanticKernelRegion::DirectCallTerminalReturnFunction => (
-                    EnginePlan::SemanticStructured,
-                    "r2dec sealed exact direct-call terminal-return typed-output ownership",
-                ),
-                EngineSemanticKernelRegion::PrivateFrameConditionalJoinFunction => (
-                    EnginePlan::SemanticStructured,
-                    "r2dec sealed exact private-frame conditional-join typed-output ownership",
-                ),
-                EngineSemanticKernelRegion::ConditionalTerminalReturnFunction => (
-                    EnginePlan::SemanticStructured,
-                    "r2dec sealed exact conditional-return typed-output ownership",
-                ),
-                EngineSemanticKernelRegion::GuardedTerminalReturnFunction => (
-                    EnginePlan::SemanticStructured,
-                    "r2dec sealed exact guarded terminal-return typed-output ownership",
-                ),
-                EngineSemanticKernelRegion::SwitchTerminalReturnFunction => (
-                    EnginePlan::SemanticStructured,
-                    "r2dec sealed exact switch terminal-return typed-output ownership",
-                ),
-                EngineSemanticKernelRegion::CarrierFreeLoopTerminalReturnFunction => (
-                    EnginePlan::SemanticStructured,
-                    "r2dec sealed exact carrier-free loop terminal-return typed-output ownership",
-                ),
-            };
-            diagnostics.plan = Some(plan);
-            diagnostics.route_reason = Some(reason.to_string());
-            diagnostics.semantic_kernel_render = Some(status);
-            diagnostics.refusal = None;
-        }
-
+        let output = with_phase_timing_comment(output, &metrics);
         EngineDecompileResponse {
-            output: rendered.output,
+            output,
+            binding_audit,
+            effect_obligations,
+            placement_audit,
+            render_refusal,
             function_facts: response_function_facts,
             input_quality,
             metrics,
             diagnostics,
         }
     }
-
-    pub fn symbolic_summary<'ctx>(
-        &self,
-        request: EngineSymbolicSummaryRequest<'ctx, '_>,
-    ) -> EngineSymbolicSummaryResponse<'ctx> {
-        self.symbolic_summary_with_execution_control(request, EngineExecutionControl::default())
-            .expect("default symbolic execution control cannot stop")
-    }
-
-    pub fn symbolic_summary_with_execution_control<'ctx>(
-        &self,
-        request: EngineSymbolicSummaryRequest<'ctx, '_>,
-        execution: EngineExecutionControl,
-    ) -> Result<EngineSymbolicSummaryResponse<'ctx>, r2sym::SymExecutionStopReason> {
-        let symbolic_execution = execution.symbolic_execution_control();
-        symbolic_execution.poll()?;
-        let context = request.context;
-        let (assumption_usage, assumption_conditioned) =
-            prepared_assumption_conditioning(context.prepared);
-        let mut query_config = symbolic_query_config_for_context(&context);
-        let scope = symbolic_scope_for_context(&context);
-        let compiled = request.compile_semantics.then(|| {
-            r2sym::compile_semantic_artifact_with_scope(
-                context.z3_ctx,
-                context.prepared,
-                scope,
-                query_config.summary_profile,
-            )
-        });
-        symbolic_execution.poll()?;
-        if compiled
-            .as_ref()
-            .is_some_and(should_skip_expensive_symbolic_summary)
-        {
-            let initial_state = symbolic_initial_state(&context);
-            let query_policy = symbolic_query_policy_for_state(
-                &mut query_config,
-                context.prepared,
-                &initial_state,
-                None,
-            );
-            return Ok(EngineSymbolicSummaryResponse {
-                summary: empty_symbolic_summary(),
-                compiled,
-                query_policy,
-                assumption_usage,
-                assumption_conditioned,
-            });
-        }
-
-        let initial_state = symbolic_initial_state(&context);
-        let query_policy = symbolic_query_policy_for_state(
-            &mut query_config,
-            context.prepared,
-            &initial_state,
-            None,
-        );
-        let mut explorer =
-            query_config.make_explorer_with_execution_control(context.z3_ctx, symbolic_execution);
-        install_symbolic_hooks_for_context(&mut explorer, &context, &query_policy);
-        let summary = explorer.summarize_function(context.prepared, initial_state);
-        explorer.execution_stop_reason().map_or(
-            Ok(EngineSymbolicSummaryResponse {
-                summary,
-                compiled,
-                query_policy,
-                assumption_usage,
-                assumption_conditioned,
-            }),
-            Err,
-        )
-    }
-
-    pub fn symbolic_paths<'ctx>(
-        &self,
-        request: EngineSymbolicPathsRequest<'ctx, '_>,
-    ) -> EngineSymbolicPathsResponse<'ctx> {
-        self.symbolic_paths_with_execution_control(request, EngineExecutionControl::default())
-            .expect("default symbolic execution control cannot stop")
-    }
-
-    pub fn symbolic_paths_with_execution_control<'ctx>(
-        &self,
-        request: EngineSymbolicPathsRequest<'ctx, '_>,
-        execution: EngineExecutionControl,
-    ) -> Result<EngineSymbolicPathsResponse<'ctx>, r2sym::SymExecutionStopReason> {
-        let symbolic_execution = execution.symbolic_execution_control();
-        symbolic_execution.poll()?;
-        let context = request.context;
-        let (assumption_usage, assumption_conditioned) =
-            prepared_assumption_conditioning(context.prepared);
-        let mut query_config = symbolic_query_config_for_context(&context);
-        let initial_state = symbolic_initial_state(&context);
-        let query_policy = symbolic_query_policy_for_state(
-            &mut query_config,
-            context.prepared,
-            &initial_state,
-            None,
-        );
-        let mut explorer =
-            query_config.make_explorer_with_execution_control(context.z3_ctx, symbolic_execution);
-        install_symbolic_hooks_for_context(&mut explorer, &context, &query_policy);
-        let summary = explorer.summarize_function(context.prepared, initial_state);
-        let solution_limit = path_listing_solution_limit(summary.paths.len(), context.prepared);
-        explorer.execution_stop_reason().map_or(
-            Ok(EngineSymbolicPathsResponse {
-                summary,
-                explorer,
-                solution_limit,
-                query_policy,
-                assumption_usage,
-                assumption_conditioned,
-            }),
-            Err,
-        )
-    }
-
-    pub fn symbolic_target_explore<'ctx>(
-        &self,
-        request: EngineTargetExploreRequest<'ctx, '_>,
-    ) -> EngineTargetExploreResponse<'ctx> {
-        self.symbolic_target_explore_with_execution_control(
-            request,
-            EngineExecutionControl::default(),
-        )
-        .expect("default symbolic execution control cannot stop")
-    }
-
-    pub fn symbolic_target_explore_with_execution_control<'ctx>(
-        &self,
-        request: EngineTargetExploreRequest<'ctx, '_>,
-        execution: EngineExecutionControl,
-    ) -> Result<EngineTargetExploreResponse<'ctx>, r2sym::SymExecutionStopReason> {
-        let symbolic_execution = execution.symbolic_execution_control();
-        symbolic_execution.poll()?;
-        let context = request.context;
-        let mut query_config = symbolic_query_config_for_context(&context);
-        let scope = symbolic_scope_for_context(&context);
-        let compiled = r2sym::compile_query_semantic_artifact_with_scope(
-            context.z3_ctx,
-            context.prepared,
-            scope,
-            request.target_addr,
-            query_config.summary_profile,
-        );
-        symbolic_execution.poll()?;
-        let initial_state = symbolic_initial_state(&context);
-        let selected_route = target_query_route_decision(TargetQueryRouteInput {
-            z3_ctx: context.z3_ctx,
-            compiled: &compiled,
-            scope,
-            target_addr: request.target_addr,
-            arch: context.arch,
-            symbols: context.symbols,
-            explore_config: query_config.explore.clone(),
-            summary_profile: query_config.summary_profile,
-            assumption_conflicted: prepared_assumption_conflicted(compiled.prepared()),
-        });
-        let prepared = compiled.prepared();
-        let query_policy = symbolic_query_policy_for_state(
-            &mut query_config,
-            prepared,
-            &initial_state,
-            Some(&selected_route),
-        );
-        let mut explorer =
-            query_config.make_explorer_with_execution_control(context.z3_ctx, symbolic_execution);
-        install_symbolic_hooks_for_context(&mut explorer, &context, &query_policy);
-        let reach = explorer.can_reach_with_artifact_in_scope(
-            prepared,
-            scope,
-            Some(&compiled),
-            initial_state,
-            request.target_addr,
-        );
-        let selected_route = reach.selected_route.clone();
-        explorer.execution_stop_reason().map_or(
-            Ok(EngineTargetExploreResponse {
-                reach,
-                explorer,
-                compiled,
-                selected_route,
-                query_policy,
-            }),
-            Err,
-        )
-    }
-
-    pub fn symbolic_target_solve<'ctx>(
-        &self,
-        request: EngineTargetSolveRequest<'ctx, '_>,
-    ) -> EngineTargetSolveResponse<'ctx> {
-        self.symbolic_target_solve_with_execution_control(
-            request,
-            EngineExecutionControl::default(),
-        )
-        .expect("default symbolic execution control cannot stop")
-    }
-
-    pub fn symbolic_target_solve_with_execution_control<'ctx>(
-        &self,
-        request: EngineTargetSolveRequest<'ctx, '_>,
-        execution: EngineExecutionControl,
-    ) -> Result<EngineTargetSolveResponse<'ctx>, r2sym::SymExecutionStopReason> {
-        let symbolic_execution = execution.symbolic_execution_control();
-        symbolic_execution.poll()?;
-        let context = request.context;
-        let mut query_config = symbolic_query_config_for_context(&context);
-        let scope = symbolic_scope_for_context(&context);
-        let compiled = r2sym::compile_query_semantic_artifact_with_scope(
-            context.z3_ctx,
-            context.prepared,
-            scope,
-            request.target_addr,
-            query_config.summary_profile,
-        );
-        symbolic_execution.poll()?;
-        let initial_state = symbolic_initial_state(&context);
-        let selected_route = target_query_route_decision(TargetQueryRouteInput {
-            z3_ctx: context.z3_ctx,
-            compiled: &compiled,
-            scope,
-            target_addr: request.target_addr,
-            arch: context.arch,
-            symbols: context.symbols,
-            explore_config: query_config.explore.clone(),
-            summary_profile: query_config.summary_profile,
-            assumption_conflicted: prepared_assumption_conflicted(compiled.prepared()),
-        });
-        let prepared = compiled.prepared();
-        let query_policy = symbolic_query_policy_for_state(
-            &mut query_config,
-            prepared,
-            &initial_state,
-            Some(&selected_route),
-        );
-        let mut explorer =
-            query_config.make_explorer_with_execution_control(context.z3_ctx, symbolic_execution);
-        install_symbolic_hooks_for_context(&mut explorer, &context, &query_policy);
-        let solve = explorer.solve_for_target_with_artifact_in_scope(
-            prepared,
-            scope,
-            Some(&compiled),
-            initial_state,
-            request.target_addr,
-        );
-        let selected_route = solve.selected_route.clone();
-        explorer.execution_stop_reason().map_or(
-            Ok(EngineTargetSolveResponse {
-                solve,
-                explorer,
-                compiled,
-                selected_route,
-                query_policy,
-            }),
-            Err,
-        )
-    }
-
-    pub fn symbolic_run_spec<'ctx>(
-        &self,
-        request: EngineRunSpecRequest<'ctx, '_>,
-    ) -> Result<EngineRunSpecResponse<'ctx>, String> {
-        self.symbolic_run_spec_with_execution_control(request, EngineExecutionControl::default())
-            .map_err(|error| error.to_string())
-    }
-
-    pub fn symbolic_run_spec_with_execution_control<'ctx>(
-        &self,
-        request: EngineRunSpecRequest<'ctx, '_>,
-        execution: EngineExecutionControl,
-    ) -> Result<EngineRunSpecResponse<'ctx>, EngineSymbolicRunError> {
-        let symbolic_execution = execution.symbolic_execution_control();
-        symbolic_execution
-            .poll()
-            .map_err(EngineSymbolicRunError::ExecutionStopped)?;
-        let context = request.context;
-        let (assumption_usage, assumption_conditioned) =
-            prepared_assumption_conditioning(context.prepared);
-        let mut query_config = symbolic_query_config_for_context(&context);
-        let start_pc = request
-            .spec
-            .start_pc(context.seed.entry_addr())
-            .map_err(EngineSymbolicRunError::InvalidSpec)?;
-        let mut initial_state = symbolic_initial_state_at(&context, start_pc);
-        request.spec.apply_to_state(&mut initial_state);
-        let query_policy = symbolic_query_policy_for_state(
-            &mut query_config,
-            context.prepared,
-            &initial_state,
-            None,
-        );
-        let mut explorer = r2sym::PathExplorer::with_config_and_execution_control(
-            context.z3_ctx,
-            request.spec.to_explore_config(&query_config.explore),
-            symbolic_execution,
-        );
-        install_symbolic_hooks_for_context(&mut explorer, &context, &query_policy);
-        let result = explorer
-            .run_spec(context.prepared, initial_state, request.spec)
-            .map_err(EngineSymbolicRunError::InvalidSpec)?;
-        let stats = explorer.stats().clone();
-        let solver_stats = explorer.solver().stats();
-        if let Some(reason) = explorer.execution_stop_reason() {
-            return Err(EngineSymbolicRunError::ExecutionStopped(reason));
-        }
-        Ok(EngineRunSpecResponse {
-            result,
-            explorer,
-            stats,
-            solver_stats,
-            query_policy,
-            assumption_usage,
-            assumption_conditioned,
-        })
-    }
 }
 
-pub fn default_symbolic_query_config(merge_states: bool) -> r2sym::SymQueryConfig {
-    r2sym::SymQueryConfig {
-        explore: r2sym::ExploreConfig {
-            max_states: 200,
-            max_depth: 800,
-            merge_states,
-            timeout: Some(Duration::from_secs(20)),
-            ..Default::default()
-        },
-        mode: r2sym::QueryMode::TargetGuided,
-        summary_profile: r2sym::SummaryProfile::Default,
-        solve_tactics: r2sym::SolveTacticConfig::default(),
-    }
-}
-
-pub fn path_listing_query_config(
-    prepared: &r2ssa::SsaArtifact,
-    merge_states: bool,
-) -> r2sym::SymQueryConfig {
-    let mut config = default_symbolic_query_config(merge_states);
-    if prepared.call_sites().by_id.is_empty() {
-        config.explore.max_states = SYMBOLIC_PATHS_CALL_FREE_MAX_STATES;
-        config.explore.max_depth = SYMBOLIC_PATHS_CALL_FREE_MAX_DEPTH;
-    } else {
-        config.explore.max_states = SYMBOLIC_PATHS_CALL_HEAVY_MAX_STATES;
-        config.explore.max_depth = SYMBOLIC_PATHS_CALL_HEAVY_MAX_DEPTH;
-    }
-    config.explore.timeout = Some(Duration::from_millis(SYMBOLIC_PATHS_TIMEOUT_MS));
-    config.explore.max_completed_paths = Some(SYMBOLIC_PATHS_LIMIT);
-    config.summary_profile = r2sym::SummaryProfile::PathListing;
-    config
-}
-
-pub fn path_listing_solution_limit(result_count: usize, prepared: &r2ssa::SsaArtifact) -> usize {
-    if !prepared.call_sites().by_id.is_empty() {
-        return 0;
-    }
-    if result_count <= SYMBOLIC_PATHS_SOLUTION_LIMIT {
-        result_count
-    } else {
-        0
-    }
-}
-
-pub fn symbolic_query_policy_for_state(
-    config: &mut r2sym::SymQueryConfig,
-    prepared: &r2ssa::SsaArtifact,
-    initial_state: &r2sym::SymState<'_>,
-    route: Option<&r2sym::TargetQueryRoutePlan>,
-) -> r2sym::QueryExecutionPolicy {
-    let route = route
-        .cloned()
-        .unwrap_or_else(r2sym::TargetQueryRoutePlan::dynamic_fallback);
-    let policy = r2sym::QueryExecutionPolicy::for_route(config, prepared, initial_state, route);
-    r2sym::apply_query_execution_policy(config, &policy);
-    policy
-}
-
-pub fn prepared_assumption_conflicted(prepared: &r2ssa::SsaArtifact) -> bool {
-    !prepared.facts().assumption_usage.conflicts.is_empty()
-}
-
-pub fn prepared_assumption_conditioning(
-    prepared: &r2ssa::SsaArtifact,
-) -> (r2ssa::AssumptionUsageReport, bool) {
-    let usage = prepared.facts().assumption_usage.clone();
-    let conditioned = !usage.applied.is_empty() || !usage.conflicts.is_empty();
-    (usage, conditioned)
-}
-
-pub fn condition_symbolic_scope_with_assumptions(
-    scope: &r2sym::PreparedFunctionScope,
-    assumptions: &r2ssa::AssumptionSet,
-) -> Result<EngineConditionedSymbolicScope, &'static str> {
-    let root = scope.root().ok_or("failed to build root SSA function")?;
-    let prepared = if assumptions.is_empty() {
-        Arc::clone(&root.prepared)
-    } else {
-        Arc::new(root.prepared.with_assumptions(assumptions))
-    };
-    let scope = if assumptions.is_empty() {
-        scope.clone()
-    } else {
-        scope
-            .with_prepared_root(Arc::clone(&prepared))
-            .ok_or("failed to build symbolic scope")?
-    };
-    let (assumption_usage, assumption_conditioned) = prepared_assumption_conditioning(&prepared);
-    Ok(EngineConditionedSymbolicScope {
-        scope,
-        prepared,
-        assumption_usage,
-        assumption_conditioned,
-    })
-}
-
-fn symbolic_query_config_for_context(
-    context: &EngineSymbolicContextRequest<'_, '_>,
-) -> r2sym::SymQueryConfig {
-    match context.config_profile {
-        EngineSymbolicConfigProfile::DefaultQuery => {
-            default_symbolic_query_config(context.merge_states)
-        }
-        EngineSymbolicConfigProfile::PathListing => {
-            path_listing_query_config(context.prepared, context.merge_states)
-        }
-    }
-}
-
-fn symbolic_scope_for_context<'a>(
-    context: &'a EngineSymbolicContextRequest<'_, '_>,
-) -> Option<&'a r2sym::PreparedFunctionScope> {
-    context
-        .scope
-        .and_then(|scope| scope.exact_for_artifact(context.prepared.as_ref()))
-}
-
-fn symbolic_initial_state<'ctx>(
-    context: &EngineSymbolicContextRequest<'ctx, '_>,
-) -> r2sym::SymState<'ctx> {
-    symbolic_initial_state_at(context, context.seed.display_entry_addr())
-}
-
-fn symbolic_initial_state_at<'ctx>(
-    context: &EngineSymbolicContextRequest<'ctx, '_>,
-    entry_addr: u64,
-) -> r2sym::SymState<'ctx> {
-    let mut initial_state = r2sym::SymState::new(context.z3_ctx, entry_addr);
-    match context.seed {
-        EngineSymbolicStateSeed::Default { .. } => {
-            r2sym::seed_default_state_for_arch(&mut initial_state, context.prepared, context.arch);
-        }
-        EngineSymbolicStateSeed::Scope { .. } => {
-            if let Some(scope) = symbolic_scope_for_context(context) {
-                r2sym::seed_scope_state_for_arch(
-                    &mut initial_state,
-                    context.prepared,
-                    scope,
-                    context.arch,
-                );
-            } else {
-                r2sym::seed_default_state_for_arch(
-                    &mut initial_state,
-                    context.prepared,
-                    context.arch,
-                );
+fn effect_obligation_refusal_reason(audit: EffectObligationAudit) -> Option<String> {
+    (matches!(audit.disposition, EffectObligationDisposition::Refused)
+        || audit.refused != 0
+        || audit.unaccounted != 0
+        || audit.conflicts != 0)
+        .then(|| {
+            fn tally(
+                count: usize,
+                label: &str,
+                obligation: Option<r2ssa::SemanticObligationId>,
+            ) -> String {
+                obligation.map_or_else(
+                    || format!("{count} {label}"),
+                    |id| format!("{count} {label} ({} at {})", id.kind, id.instruction),
+                )
             }
+            format!(
+                "native effect obligations refused: {}, {}, {}",
+                tally(audit.refused, "refused", audit.refused_obligation),
+                tally(
+                    audit.unaccounted,
+                    "unaccounted",
+                    audit.unaccounted_obligation
+                ),
+                tally(audit.conflicts, "conflicts", audit.conflicting_obligation)
+            )
+        })
+}
+
+fn placement_refusal_reason(audit: PlacementAudit) -> Option<String> {
+    match audit {
+        PlacementAudit::Refused(refusal) => Some(format!(
+            "native declaration placement refused: {}",
+            refusal.kind()
+        )),
+        PlacementAudit::Applied | PlacementAudit::NotRun => None,
+    }
+}
+
+/// The name of an enum variant, taken from its `Debug` form.
+///
+/// The refusal causes are typed and precise; what reached the reader was the
+/// name of the *outer* variant alone, so sixty distinct journal failures all
+/// printed as "observation journal" and could not be counted apart. The payload
+/// already knows which one it is.
+fn refusal_variant_name(debug: &str) -> String {
+    debug
+        .split(['(', '{', ' '])
+        .next()
+        .unwrap_or(debug)
+        .to_string()
+}
+
+fn render_refusal_reason(refusal: DecompileRenderRefusal) -> String {
+    match refusal {
+        DecompileRenderRefusal::MissingMachineProjectionAuthorization(origin) => {
+            format!(
+                "native rendering refused: missing machine projection authorization: {origin:?}"
+            )
         }
-        EngineSymbolicStateSeed::Replay { seed, .. } => {
-            r2sym::seed_replay_state_for_arch(
-                &mut initial_state,
-                Some(context.prepared),
-                context.arch,
-                seed,
-            );
+        DecompileRenderRefusal::MissingProgramVariableAuthorization => {
+            "native rendering refused: missing program-variable authorization".to_string()
+        }
+        DecompileRenderRefusal::VariadicCallsiteArgumentCount(refusal) => format!(
+            "native rendering refused: variadic callsite argument count: {}",
+            refusal.kind()
+        ),
+        DecompileRenderRefusal::ObservationJournal(failure) => {
+            format!(
+                "native rendering refused: observation journal: {}",
+                refusal_variant_name(&format!("{failure:?}"))
+            )
+        }
+        DecompileRenderRefusal::DeclarationPlacement(refusal) => {
+            format!(
+                "native rendering refused: declaration placement: {}",
+                refusal_variant_name(&format!("{refusal:?}"))
+            )
+        }
+        DecompileRenderRefusal::RefusedBindingDisposition { .. } => {
+            "native rendering refused: refused binding disposition".to_string()
+        }
+        DecompileRenderRefusal::NormalizationOriginUnavailable => {
+            "native rendering refused: normalization origin unavailable".to_string()
+        }
+        DecompileRenderRefusal::UnrepresentableControlFlow => {
+            "native rendering refused: unrepresentable control flow".to_string()
+        }
+        DecompileRenderRefusal::IncompleteEffectInventory => {
+            "native rendering refused: incomplete effect inventory".to_string()
+        }
+        DecompileRenderRefusal::UnrepresentableOperation => {
+            "native rendering refused: unrepresentable operation".to_string()
         }
     }
-    initial_state
-}
-
-fn install_symbolic_hooks_for_context<'ctx>(
-    explorer: &mut r2sym::PathExplorer<'ctx>,
-    context: &EngineSymbolicContextRequest<'ctx, '_>,
-    policy: &r2sym::QueryExecutionPolicy,
-) {
-    if let Some(scope) = symbolic_scope_for_context(context) {
-        r2sym::install_symbolic_hooks_for_query_policy(
-            explorer,
-            r2sym::SymbolicHookInstallContext::new(
-                context.z3_ctx,
-                context.prepared.as_ref(),
-                scope,
-                context.arch,
-                context.symbols.imported_names(),
-                symbolic_query_config_for_context(context).summary_profile,
-                policy,
-            ),
-        );
-    }
-}
-
-fn empty_symbolic_summary<'ctx>() -> r2sym::SymbolicFunctionSummary<'ctx> {
-    r2sym::SymbolicFunctionSummary {
-        completion: r2sym::QueryCompletion::Complete,
-        paths: Vec::new(),
-        feasible_paths: 0,
-        stats: r2sym::path::ExploreStats::default(),
-        solver_stats: r2sym::SolverStats::default(),
-    }
-}
-
-fn should_skip_expensive_symbolic_summary(compiled: &r2sym::SemanticArtifact) -> bool {
-    compiled.diagnostics.skipped_large_cfg
-        || compiled
-            .prepared()
-            .function()
-            .cfg_risk_summary()
-            .block_count
-            > 96
 }
 
 fn decompile_diagnostics_from_function_facts(function_facts: &FunctionFacts) -> EngineDiagnostics {
@@ -5061,7 +3511,6 @@ fn decompile_diagnostics_from_function_facts(function_facts: &FunctionFacts) -> 
         return EngineDiagnostics {
             plan: None,
             route_reason: Some("missing FunctionFacts decompile route".to_string()),
-            semantic_kernel_render: None,
             warnings: vec![
                 "decompile request reached render without engine-stamped route facts".to_string(),
             ],
@@ -5071,7 +3520,6 @@ fn decompile_diagnostics_from_function_facts(function_facts: &FunctionFacts) -> 
     EngineDiagnostics {
         plan: Some(engine_plan_from_decompile_route_kind(route.kind)),
         route_reason: route.reason.clone(),
-        semantic_kernel_render: None,
         warnings: Vec::new(),
         refusal: route.fallback_comment.clone(),
     }
@@ -5088,125 +3536,73 @@ fn engine_plan_from_decompile_route_kind(kind: r2types::DecompileRouteKind) -> E
     }
 }
 
-#[derive(Debug)]
 struct EngineRenderedDecompile {
-    output: String,
-    semantic_kernel_render: Option<EngineSemanticKernelRender>,
+    product: EngineRenderedProduct,
     semantic_kernel_warnings: Vec<String>,
     structuring_executed: bool,
+    /// Set when rendering stopped and the output above is what it had reached.
+    ///
+    /// A rendering and a stop, not one or the other: the body is kept so the
+    /// reader gets what was produced, and the phase is still recorded as refused
+    /// so the accounting says the run did not finish.
+    stopped: Option<EngineRenderExecutionStop>,
 }
 
-const ENGINE_SEMANTIC_KERNEL_TRACE_LIMIT: usize = 8;
-const ENGINE_SEMANTIC_KERNEL_REASON_CHAR_LIMIT: usize = 512;
-const ENGINE_SEMANTIC_KERNEL_WARNING_TAG: &str = "semantic-kernel:";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EngineSemanticKernelProbe {
-    PrivateFrame,
-    Aggregate,
-    Memory,
-    DirectCall,
-    Conditional,
-    Guard,
-    Switch,
-    Loop,
-    Terminal,
+struct ReadyEngineRenderedProduct {
+    output: String,
+    binding_audit: BindingShadowAuditOutcome,
+    effect_obligations: EffectObligationAudit,
+    placement_audit: PlacementAudit,
+    render_refusal: Option<DecompileRenderRefusal>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EnginePrivateFrameProbeDisposition {
-    NotApplicable,
-    Refused,
+enum EngineRenderedProduct {
+    Ready(Box<ReadyEngineRenderedProduct>),
+    Pending(Box<r2dec::PendingDecompileBindingAudit>),
 }
 
-fn classify_private_frame_probe_error(
-    error: &r2dec::PrivateFrameConditionalJoinFunctionError,
-) -> EnginePrivateFrameProbeDisposition {
-    match error {
-        r2dec::PrivateFrameConditionalJoinFunctionError::MissingExactJoin => {
-            EnginePrivateFrameProbeDisposition::NotApplicable
-        }
-        _ => EnginePrivateFrameProbeDisposition::Refused,
-    }
-}
-
-impl EngineSemanticKernelProbe {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::PrivateFrame => "private-frame",
-            Self::Aggregate => "aggregate",
-            Self::Memory => "memory",
-            Self::DirectCall => "direct-call",
-            Self::Conditional => "conditional",
-            Self::Guard => "guard",
-            Self::Switch => "switch",
-            Self::Loop => "loop",
-            Self::Terminal => "terminal",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EngineSemanticKernelProbeOutcome {
-    NotApplicable,
-    Refused,
-}
-
-impl EngineSemanticKernelProbeOutcome {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::NotApplicable => "not_applicable",
-            Self::Refused => "refused",
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-struct EngineSemanticKernelTrace {
-    warnings: Vec<String>,
-}
-
-impl EngineSemanticKernelTrace {
-    fn record(
-        &mut self,
-        probe: EngineSemanticKernelProbe,
-        outcome: EngineSemanticKernelProbeOutcome,
-        reason: &str,
+impl EngineRenderedProduct {
+    fn finalize(
+        self,
+    ) -> (
+        String,
+        BindingShadowAuditOutcome,
+        EffectObligationAudit,
+        PlacementAudit,
+        Option<DecompileRenderRefusal>,
     ) {
-        if self.warnings.len() >= ENGINE_SEMANTIC_KERNEL_TRACE_LIMIT {
-            return;
+        match self {
+            Self::Ready(ready) => {
+                let ReadyEngineRenderedProduct {
+                    output,
+                    binding_audit,
+                    effect_obligations,
+                    placement_audit,
+                    render_refusal,
+                } = *ready;
+                (
+                    output,
+                    binding_audit,
+                    effect_obligations,
+                    placement_audit,
+                    render_refusal,
+                )
+            }
+            Self::Pending(pending) => {
+                let audited = (*pending).finalize();
+                let binding_audit = audited.binding_shadow();
+                let effect_obligations = audited.effect_obligations();
+                let placement_audit = audited.placement_audit();
+                let render_refusal = audited.render_refusal();
+                (
+                    audited.into_output(),
+                    binding_audit,
+                    effect_obligations,
+                    placement_audit,
+                    render_refusal,
+                )
+            }
         }
-        let reason: String = reason
-            .chars()
-            .take(ENGINE_SEMANTIC_KERNEL_REASON_CHAR_LIMIT)
-            .map(|ch| if ch.is_control() { ' ' } else { ch })
-            .collect();
-        let reason = if reason.is_empty() {
-            "unspecified"
-        } else {
-            reason.as_str()
-        };
-        self.warnings.push(format!(
-            "{ENGINE_SEMANTIC_KERNEL_WARNING_TAG}{}:{}:{reason}",
-            probe.as_str(),
-            outcome.as_str(),
-        ));
-    }
-
-    fn not_applicable(&mut self, probe: EngineSemanticKernelProbe, reason: &str) {
-        self.record(
-            probe,
-            EngineSemanticKernelProbeOutcome::NotApplicable,
-            reason,
-        );
-    }
-
-    fn refused(&mut self, probe: EngineSemanticKernelProbe, reason: &str) {
-        self.record(probe, EngineSemanticKernelProbeOutcome::Refused, reason);
-    }
-
-    fn into_warnings(self) -> Vec<String> {
-        self.warnings
     }
 }
 
@@ -5214,6 +3610,10 @@ impl EngineSemanticKernelTrace {
 struct EngineRenderExecutionStop {
     reason: String,
     phase: EnginePhase,
+    binding_audit: Box<BindingShadowAuditOutcome>,
+    effect_obligations: Box<EffectObligationAudit>,
+    placement_audit: PlacementAudit,
+    render_refusal: Option<Box<DecompileRenderRefusal>>,
     certification_completed: bool,
     normalization_completed: bool,
     structuring_completed: bool,
@@ -5256,6 +3656,10 @@ fn engine_render_stop_reason(
     EngineRenderExecutionStop {
         reason,
         phase,
+        binding_audit: Box::new(BindingShadowAuditOutcome::NotRun),
+        effect_obligations: Box::new(EffectObligationAudit::NOT_RUN),
+        placement_audit: PlacementAudit::NotRun,
+        render_refusal: None,
         certification_completed: false,
         normalization_completed: false,
         structuring_completed: false,
@@ -5285,6 +3689,10 @@ fn poll_engine_render_control_with_completion<C: r2ssa::SsaWorkControl + ?Sized>
 
 fn engine_render_stop_from_decompiler(
     stop: r2dec::DecompileExecutionStop,
+    binding_audit: BindingShadowAuditOutcome,
+    effect_obligations: EffectObligationAudit,
+    placement_audit: PlacementAudit,
+    render_refusal: Option<DecompileRenderRefusal>,
 ) -> EngineRenderExecutionStop {
     let phase = match stop.phase() {
         r2dec::DecompileWorkPhase::Normalization => EnginePhase::Normalization,
@@ -5292,6 +3700,10 @@ fn engine_render_stop_from_decompiler(
         r2dec::DecompileWorkPhase::Rendering => EnginePhase::Rendering,
     };
     let mut mapped = engine_render_stop_reason(stop.reason(), phase);
+    mapped.binding_audit = Box::new(binding_audit);
+    mapped.effect_obligations = Box::new(effect_obligations);
+    mapped.placement_audit = placement_audit;
+    mapped.render_refusal = render_refusal.map(Box::new);
     match stop.phase() {
         r2dec::DecompileWorkPhase::Normalization => {}
         r2dec::DecompileWorkPhase::Structuring => {
@@ -5305,351 +3717,10 @@ fn engine_render_stop_from_decompiler(
     mapped
 }
 
-fn engine_semantic_kernel_refusal(
-    reason: String,
-    phase: EnginePhase,
-    certification_completed: bool,
-    structuring_completed: bool,
-) -> EngineRenderExecutionStop {
-    EngineRenderExecutionStop {
-        reason,
-        phase,
-        certification_completed,
-        normalization_completed: false,
-        structuring_completed,
-    }
-}
-
-fn prepared_artifact_has_source_aggregate_pointer(artifact: &SsaArtifact) -> bool {
-    let Some(interface) = artifact.machine_context().function_interface() else {
-        return false;
-    };
-    let Some(graph) = interface.type_graph() else {
-        return false;
-    };
-    interface.parameter_logical_values().iter().any(|logical| {
-        let Some(source_type) = usize::try_from(logical.type_id())
-            .ok()
-            .and_then(|type_id| graph.types().get(type_id))
-        else {
-            return false;
-        };
-        let r2ssa::SourceTypeKind::Pointer { target_type_id } = source_type.kind() else {
-            return false;
-        };
-        usize::try_from(target_type_id)
-            .ok()
-            .and_then(|type_id| graph.types().get(type_id))
-            .is_some_and(|target| matches!(target.kind(), r2ssa::SourceTypeKind::Struct { .. }))
-    })
-}
-
-#[derive(Debug)]
-enum EngineSemanticKernelAttempt {
-    NotApplicable(Vec<String>),
-    Rendered(EngineRenderedDecompile),
-}
-
-fn complete_engine_semantic_kernel_attempt<C: r2ssa::SsaWorkControl + ?Sized>(
-    control: &C,
-    attempt: EngineSemanticKernelAttempt,
-) -> Result<EngineSemanticKernelAttempt, EngineRenderExecutionStop> {
-    match &attempt {
-        EngineSemanticKernelAttempt::Rendered(rendered) => {
-            poll_engine_render_control_with_completion(
-                control,
-                EnginePhase::Rendering,
-                true,
-                rendered.structuring_executed,
-            )?;
-        }
-        EngineSemanticKernelAttempt::NotApplicable(_) => {
-            poll_engine_render_control(control, EnginePhase::Rendering)?;
-        }
-    }
-    Ok(attempt)
-}
-
-fn resolve_engine_semantic_kernel_attempt(
-    attempt: EngineSemanticKernelAttempt,
-) -> Result<(Option<EngineRenderedDecompile>, Vec<String>), EngineRenderExecutionStop> {
-    match attempt {
-        EngineSemanticKernelAttempt::NotApplicable(warnings) => Ok((None, warnings)),
-        EngineSemanticKernelAttempt::Rendered(rendered) => Ok((Some(rendered), Vec::new())),
-    }
-}
-
-fn render_semantic_kernel_function<C: r2ssa::SsaWorkControl + ?Sized>(
-    request: &EngineDecompileRequest,
-    control: &C,
-) -> Result<EngineSemanticKernelAttempt, EngineRenderExecutionStop> {
-    poll_engine_render_control(control, EnginePhase::Rendering)?;
-    let Some(trusted) = request.trusted_ssa.as_deref() else {
-        return complete_engine_semantic_kernel_attempt(
-            control,
-            EngineSemanticKernelAttempt::NotApplicable(Vec::new()),
-        );
-    };
-    let mut trace = EngineSemanticKernelTrace::default();
-    match r2dec::CertifiedPrivateFrameConditionalJoinFunction::from_artifact(trusted) {
-        Ok(function) => {
-            let output = function.render_certified_c().map_err(|error| {
-                engine_semantic_kernel_refusal(
-                    format!(
-                        "private-frame conditional-join rendering refused after exact certification: {error}"
-                    ),
-                    EnginePhase::Rendering,
-                    true,
-                    true,
-                )
-            })?;
-            return complete_engine_semantic_kernel_attempt(
-                control,
-                EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
-                    output,
-                    structuring_executed: true,
-                    semantic_kernel_render: Some(EngineSemanticKernelRender {
-                        region: EngineSemanticKernelRegion::PrivateFrameConditionalJoinFunction,
-                        region_schema_version: function.schema_version(),
-                        exact_obligation_closure: true,
-                    }),
-                    semantic_kernel_warnings: trace.into_warnings(),
-                }),
-            );
-        }
-        Err(error) => match classify_private_frame_probe_error(&error) {
-            EnginePrivateFrameProbeDisposition::NotApplicable => {
-                trace.not_applicable(EngineSemanticKernelProbe::PrivateFrame, &error.to_string())
-            }
-            EnginePrivateFrameProbeDisposition::Refused => {
-                return Err(engine_semantic_kernel_refusal(
-                    format!(
-                        "private-frame conditional-join certification refused without fallback: {error}"
-                    ),
-                    EnginePhase::Certification,
-                    false,
-                    false,
-                ));
-            }
-        },
-    }
-    poll_engine_render_control(control, EnginePhase::Rendering)?;
-    match r2dec::CertifiedAggregateMemberSemanticCFunction::from_artifact(trusted) {
-        Ok(function) => match function.render_certified_c() {
-            Ok(output) => {
-                return complete_engine_semantic_kernel_attempt(
-                    control,
-                    EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
-                        output,
-                        structuring_executed: true,
-                        semantic_kernel_render: Some(EngineSemanticKernelRender {
-                            region:
-                                EngineSemanticKernelRegion::AggregateMemberTerminalReturnFunction,
-                            region_schema_version: function.schema_version(),
-                            exact_obligation_closure: true,
-                        }),
-                        semantic_kernel_warnings: trace.into_warnings(),
-                    }),
-                );
-            }
-            Err(error) => trace.refused(EngineSemanticKernelProbe::Aggregate, &error.to_string()),
-        },
-        Err(error) => {
-            trace.not_applicable(EngineSemanticKernelProbe::Aggregate, &error.to_string())
-        }
-    }
-    poll_engine_render_control(control, EnginePhase::Rendering)?;
-    if prepared_artifact_has_source_aggregate_pointer(trusted.artifact()) {
-        trace.not_applicable(
-            EngineSemanticKernelProbe::Memory,
-            "source aggregate pointer requires aggregate-member renderer",
-        );
-    } else {
-        match r2dec::CertifiedMemorySemanticCFunction::from_artifact(trusted) {
-            Ok(function) => match function.render_certified_c() {
-                Ok(output) => {
-                    return complete_engine_semantic_kernel_attempt(
-                        control,
-                        EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
-                            output,
-                            structuring_executed: true,
-                            semantic_kernel_render: Some(EngineSemanticKernelRender {
-                                region:
-                                    EngineSemanticKernelRegion::PlainRamMemoryTerminalReturnFunction,
-                                region_schema_version: function.schema_version(),
-                                exact_obligation_closure: true,
-                            }),
-                            semantic_kernel_warnings: trace.into_warnings(),
-                        }),
-                    );
-                }
-                Err(error) => trace.refused(EngineSemanticKernelProbe::Memory, &error.to_string()),
-            },
-            Err(error) => {
-                trace.not_applicable(EngineSemanticKernelProbe::Memory, &error.to_string())
-            }
-        }
-    }
-    poll_engine_render_control(control, EnginePhase::Rendering)?;
-    match r2dec::CertifiedDirectCallReturnFunction::from_artifact(trusted) {
-        Ok(function) => match function.render_certified_c() {
-            Ok(output) => {
-                return complete_engine_semantic_kernel_attempt(
-                    control,
-                    EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
-                        output,
-                        structuring_executed: true,
-                        semantic_kernel_render: Some(EngineSemanticKernelRender {
-                            region: EngineSemanticKernelRegion::DirectCallTerminalReturnFunction,
-                            region_schema_version: function.schema_version(),
-                            exact_obligation_closure: true,
-                        }),
-                        semantic_kernel_warnings: trace.into_warnings(),
-                    }),
-                );
-            }
-            Err(error) => trace.refused(EngineSemanticKernelProbe::DirectCall, &error.to_string()),
-        },
-        Err(error) => {
-            trace.not_applicable(EngineSemanticKernelProbe::DirectCall, &error.to_string())
-        }
-    }
-    poll_engine_render_control(control, EnginePhase::Rendering)?;
-    match r2dec::CertifiedConditionalReturnFunction::from_artifact(trusted) {
-        Ok(function) => match function.render_certified_c() {
-            Ok(output) => {
-                return complete_engine_semantic_kernel_attempt(
-                    control,
-                    EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
-                        output,
-                        structuring_executed: true,
-                        semantic_kernel_render: Some(EngineSemanticKernelRender {
-                            region: EngineSemanticKernelRegion::ConditionalTerminalReturnFunction,
-                            region_schema_version: function.schema_version(),
-                            exact_obligation_closure: true,
-                        }),
-                        semantic_kernel_warnings: trace.into_warnings(),
-                    }),
-                );
-            }
-            Err(error) => trace.refused(EngineSemanticKernelProbe::Conditional, &error.to_string()),
-        },
-        Err(error) => {
-            trace.not_applicable(EngineSemanticKernelProbe::Conditional, &error.to_string())
-        }
-    }
-    poll_engine_render_control(control, EnginePhase::Rendering)?;
-    match r2dec::CertifiedGuardedReturnFunction::from_artifact(trusted) {
-        Ok(function) => match function.render_certified_c() {
-            Ok(output) => {
-                return complete_engine_semantic_kernel_attempt(
-                    control,
-                    EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
-                        output,
-                        structuring_executed: true,
-                        semantic_kernel_render: Some(EngineSemanticKernelRender {
-                            region: EngineSemanticKernelRegion::GuardedTerminalReturnFunction,
-                            region_schema_version: function.schema_version(),
-                            exact_obligation_closure: true,
-                        }),
-                        semantic_kernel_warnings: trace.into_warnings(),
-                    }),
-                );
-            }
-            Err(error) => trace.refused(EngineSemanticKernelProbe::Guard, &error.to_string()),
-        },
-        Err(error) => trace.not_applicable(EngineSemanticKernelProbe::Guard, &error.to_string()),
-    }
-    poll_engine_render_control(control, EnginePhase::Rendering)?;
-    match r2dec::CertifiedSwitchReturnFunction::from_artifact(trusted) {
-        Ok(function) => match function.render_certified_c() {
-            Ok(output) => {
-                return complete_engine_semantic_kernel_attempt(
-                    control,
-                    EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
-                        output,
-                        structuring_executed: true,
-                        semantic_kernel_render: Some(EngineSemanticKernelRender {
-                            region: EngineSemanticKernelRegion::SwitchTerminalReturnFunction,
-                            region_schema_version: function.schema_version(),
-                            exact_obligation_closure: true,
-                        }),
-                        semantic_kernel_warnings: trace.into_warnings(),
-                    }),
-                );
-            }
-            Err(error) => trace.refused(EngineSemanticKernelProbe::Switch, &error.to_string()),
-        },
-        Err(error) => trace.not_applicable(EngineSemanticKernelProbe::Switch, &error.to_string()),
-    }
-    poll_engine_render_control(control, EnginePhase::Rendering)?;
-    match r2dec::CertifiedLoopReturnFunction::from_artifact(trusted) {
-        Ok(function) => match function.render_certified_c() {
-            Ok(output) => {
-                return complete_engine_semantic_kernel_attempt(
-                    control,
-                    EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
-                        output,
-                        structuring_executed: true,
-                        semantic_kernel_render: Some(EngineSemanticKernelRender {
-                            region:
-                                EngineSemanticKernelRegion::CarrierFreeLoopTerminalReturnFunction,
-                            region_schema_version: function.schema_version(),
-                            exact_obligation_closure: true,
-                        }),
-                        semantic_kernel_warnings: trace.into_warnings(),
-                    }),
-                );
-            }
-            Err(error) => trace.refused(EngineSemanticKernelProbe::Loop, &error.to_string()),
-        },
-        Err(error) => trace.not_applicable(EngineSemanticKernelProbe::Loop, &error.to_string()),
-    }
-    poll_engine_render_control(control, EnginePhase::Rendering)?;
-    match r2dec::CertifiedSemanticCFunction::from_artifact(trusted) {
-        Ok(function) => match function.render_certified_c() {
-            Ok(output) => {
-                return complete_engine_semantic_kernel_attempt(
-                    control,
-                    EngineSemanticKernelAttempt::Rendered(EngineRenderedDecompile {
-                        output,
-                        structuring_executed: true,
-                        semantic_kernel_render: Some(EngineSemanticKernelRender {
-                            region: EngineSemanticKernelRegion::TerminalReturnBlock,
-                            region_schema_version: function.schema_version(),
-                            exact_obligation_closure: true,
-                        }),
-                        semantic_kernel_warnings: trace.into_warnings(),
-                    }),
-                );
-            }
-            Err(error) => trace.refused(EngineSemanticKernelProbe::Terminal, &error.to_string()),
-        },
-        Err(error) => trace.not_applicable(EngineSemanticKernelProbe::Terminal, &error.to_string()),
-    }
-    complete_engine_semantic_kernel_attempt(
-        control,
-        EngineSemanticKernelAttempt::NotApplicable(trace.into_warnings()),
-    )
-}
-
 fn render_engine_decompile_request<C: r2ssa::SsaWorkControl>(
     request: &EngineDecompileRequest,
     control: &C,
-    try_semantic_kernel: bool,
 ) -> Result<EngineRenderedDecompile, EngineRenderExecutionStop> {
-    let semantic_kernel_warnings = if try_semantic_kernel {
-        let (rendered, warnings) = resolve_engine_semantic_kernel_attempt(
-            render_semantic_kernel_function(request, control)?,
-        )?;
-        if let Some(rendered) = rendered {
-            return Ok(rendered);
-        }
-        warnings
-    } else {
-        poll_engine_render_control(control, EnginePhase::Rendering)?;
-        Vec::new()
-    };
     poll_engine_render_control(control, EnginePhase::Rendering)?;
     if let Some(output) = render_semantic_route(
         &request.function_name,
@@ -5658,40 +3729,180 @@ fn render_engine_decompile_request<C: r2ssa::SsaWorkControl>(
     ) {
         poll_engine_render_control(control, EnginePhase::Rendering)?;
         return Ok(EngineRenderedDecompile {
-            output,
-            semantic_kernel_render: None,
-            semantic_kernel_warnings,
+            product: EngineRenderedProduct::Ready(Box::new(ReadyEngineRenderedProduct {
+                output,
+                binding_audit: BindingShadowAuditOutcome::NotRun,
+                effect_obligations: EffectObligationAudit::NOT_RUN,
+                placement_audit: PlacementAudit::NotRun,
+                render_refusal: None,
+            })),
+            semantic_kernel_warnings: Vec::new(),
             structuring_executed: false,
+            stopped: None,
         });
     }
 
     let input = decompiler_input_for_engine_request(request);
-    let output = r2dec::Decompiler::new(request.render_target.to_decompiler_config())
-        .decompile_input_with_control(&input, control)
-        .map_err(engine_render_stop_from_decompiler)?;
-    if !output.trim().is_empty() {
+    // Keep a rendering the decompiler reached before it stopped. Discarding it
+    // reports a function that ran out of budget as one that produced nothing,
+    // and takes the ledger that would have said so with it.
+    let audited = match r2dec::Decompiler::new(request.render_target.to_decompiler_config())
+        .decompile_input_keeping_partial_with_pending_binding_audit(&input, control)
+    {
+        Ok(pending) => pending,
+        Err((stop, Some(partial))) if !partial.output().trim().is_empty() => {
+            let audited = partial.finalize();
+            let binding_audit = audited.binding_shadow();
+            let effect_obligations = audited.effect_obligations();
+            let placement_audit = audited.placement_audit();
+            let render_refusal = audited.render_refusal();
+            let output = audited.into_output();
+            return Ok(EngineRenderedDecompile {
+                product: EngineRenderedProduct::Ready(Box::new(ReadyEngineRenderedProduct {
+                    output,
+                    binding_audit,
+                    effect_obligations,
+                    placement_audit,
+                    render_refusal,
+                })),
+                semantic_kernel_warnings: vec![format!(
+                    "rendering stopped in {:?}: {}; the body above is what was reached",
+                    stop.phase(),
+                    stop.reason()
+                )],
+                structuring_executed: true,
+                stopped: Some(engine_render_stop_from_decompiler(
+                    stop,
+                    binding_audit,
+                    effect_obligations,
+                    placement_audit,
+                    render_refusal,
+                )),
+            });
+        }
+        Err((stop, partial)) => {
+            let (binding_audit, effect_obligations, placement_audit, render_refusal) = partial
+                .map(r2dec::PendingDecompileBindingAudit::finalize)
+                .map_or(
+                    (
+                        BindingShadowAuditOutcome::NotRun,
+                        EffectObligationAudit::NOT_RUN,
+                        PlacementAudit::NotRun,
+                        None,
+                    ),
+                    |audit| {
+                        (
+                            audit.binding_shadow(),
+                            audit.effect_obligations(),
+                            audit.placement_audit(),
+                            audit.render_refusal(),
+                        )
+                    },
+                );
+            return Err(engine_render_stop_from_decompiler(
+                stop,
+                binding_audit,
+                effect_obligations,
+                placement_audit,
+                render_refusal,
+            ));
+        }
+    };
+    if !audited.output().trim().is_empty() {
         return Ok(EngineRenderedDecompile {
-            output,
-            semantic_kernel_render: None,
-            semantic_kernel_warnings,
+            product: EngineRenderedProduct::Pending(Box::new(audited)),
+            semantic_kernel_warnings: Vec::new(),
             structuring_executed: true,
+            stopped: None,
         });
     }
 
+    let audited = audited.finalize();
+    let binding_audit = audited.binding_shadow();
+    let effect_obligations = audited.effect_obligations();
+    let placement_audit = audited.placement_audit();
+    let render_refusal = audited.render_refusal();
     Ok(EngineRenderedDecompile {
-        output: decompile_route_output_from_function_facts(
-            &request.function_name,
-            request.function_facts(),
-        )
-        .unwrap_or_default(),
-        semantic_kernel_render: None,
-        semantic_kernel_warnings,
+        product: EngineRenderedProduct::Ready(Box::new(ReadyEngineRenderedProduct {
+            output: decompile_route_output_from_function_facts(
+                &request.function_name,
+                request.function_facts(),
+            )
+            .unwrap_or_default(),
+            binding_audit,
+            effect_obligations,
+            placement_audit,
+            render_refusal,
+        })),
+        semantic_kernel_warnings: Vec::new(),
         structuring_executed: false,
+        stopped: None,
     })
 }
 
 fn decompiler_input_for_engine_request(request: &EngineDecompileRequest) -> r2dec::DecompilerInput {
     r2dec::DecompilerInput::new(request.source_owned_facts.clone())
+}
+
+/// The measured cost of one decompile, per phase, appended to the rendered
+/// output when `R2SLEIGH_TIMING` is set.
+///
+/// The engine has recorded a complete phase inventory since it was written and
+/// no reachable command printed it, so a decompile could be timed only from
+/// outside the process, which measures radare2's analysis and the plugin load
+/// along with it. A refusal is timed too: refusing has to be cheaper than
+/// rendering, and a four-second refusal is exactly the case that measurement
+/// from outside could not distinguish from a slow render.
+///
+/// A phase the boundary did not execute is omitted; `folded` says the phase ran
+/// inside another phase's span, which is not the same as free.
+fn phase_timing_comment(metrics: &EngineMetrics) -> Option<String> {
+    std::env::var_os("R2SLEIGH_TIMING")?;
+    Some(format_phase_timing(metrics))
+}
+
+/// The comment's text, separate from the decision to emit it, so the format is
+/// testable without a process-global environment variable.
+fn format_phase_timing(metrics: &EngineMetrics) -> String {
+    let mut measured = String::new();
+    let mut total_us = 0u64;
+    // `EnginePhase::ALL` order, so two runs of one function print one line.
+    for timing in &metrics.phase_timings {
+        match timing.status {
+            EnginePhaseStatus::NotExecuted => continue,
+            EnginePhaseStatus::Executed => {
+                total_us = total_us.saturating_add(timing.elapsed_us);
+                measured.push_str(&format!(
+                    " {}={}us",
+                    timing.phase.as_str(),
+                    timing.elapsed_us
+                ));
+            }
+            EnginePhaseStatus::Folded => {
+                measured.push_str(&format!(" {}=folded", timing.phase.as_str()));
+            }
+            EnginePhaseStatus::Refused => {
+                measured.push_str(&format!(" {}=refused", timing.phase.as_str()));
+            }
+        }
+    }
+    format!("/* r2dec timing: measured={total_us}us{measured} */")
+}
+
+/// Append the timing comment to a rendered body, or leave it exactly as it was.
+fn with_phase_timing_comment(output: String, metrics: &EngineMetrics) -> String {
+    match phase_timing_comment(metrics) {
+        Some(comment) => {
+            let mut output = output;
+            if !output.ends_with('\n') {
+                output.push('\n');
+            }
+            output.push_str(&comment);
+            output.push('\n');
+            output
+        }
+        None => output,
+    }
 }
 
 fn refused_decompile_response(
@@ -5719,17 +3930,56 @@ fn refused_decompile_response_with_metrics(
     reason: &str,
     input_quality: Option<r2types::FunctionInputQualityFacts>,
     metrics: EngineMetrics,
-    mut diagnostics: EngineDiagnostics,
+    diagnostics: EngineDiagnostics,
 ) -> EngineDecompileResponse {
-    let function_facts = refused_decompile_function_facts(function_name, reason);
+    refused_decompile_response_with_metrics_and_audits(
+        function_name,
+        reason,
+        input_quality,
+        metrics,
+        diagnostics,
+        None,
+        BindingShadowAuditOutcome::NotRun,
+        EffectObligationAudit::NOT_RUN,
+        PlacementAudit::NotRun,
+        None,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the sole refusal constructor receives each independent typed ledger explicitly so none can be silently defaulted or reconstructed"
+)]
+fn refused_decompile_response_with_metrics_and_audits(
+    function_name: &str,
+    reason: &str,
+    input_quality: Option<r2types::FunctionInputQualityFacts>,
+    metrics: EngineMetrics,
+    mut diagnostics: EngineDiagnostics,
+    existing_function_facts: Option<FunctionFacts>,
+    binding_audit: BindingShadowAuditOutcome,
+    effect_obligations: EffectObligationAudit,
+    placement_audit: PlacementAudit,
+    render_refusal: Option<DecompileRenderRefusal>,
+) -> EngineDecompileResponse {
+    let function_facts = seal_refused_decompile_function_facts(
+        existing_function_facts.unwrap_or_default(),
+        function_name,
+        reason,
+    );
     let output = decompile_route_output_from_function_facts(function_name, &function_facts)
         .expect("refused decompile response must stamp a fallback route");
     let route_diagnostics = decompile_diagnostics_from_function_facts(&function_facts);
     diagnostics.plan = route_diagnostics.plan;
     diagnostics.route_reason = route_diagnostics.route_reason;
     diagnostics.refusal = route_diagnostics.refusal;
+    let output = with_phase_timing_comment(output, &metrics);
     EngineDecompileResponse {
         output,
+        binding_audit,
+        effect_obligations,
+        placement_audit,
+        render_refusal,
         function_facts,
         input_quality,
         metrics,
@@ -5737,16 +3987,19 @@ fn refused_decompile_response_with_metrics(
     }
 }
 
-fn refused_decompile_function_facts(function_name: &str, reason: &str) -> FunctionFacts {
+fn seal_refused_decompile_function_facts(
+    function_facts: FunctionFacts,
+    function_name: &str,
+    reason: &str,
+) -> FunctionFacts {
     let output = artifact_guard_fallback_comment(function_name, reason);
     let route = r2types::DecompileRouteFacts {
         kind: r2types::DecompileRouteKind::FallbackComment,
         reason: Some(reason.to_string()),
         fallback_comment: Some(output),
-        skip_runtime_type_inference: true,
         use_prepared_semantic_view: false,
     };
-    FunctionFacts::default().with_decompile_route(route)
+    function_facts.with_decompile_route(route)
 }
 
 fn decompile_route_output_from_function_facts(
@@ -5795,10 +4048,11 @@ fn build_engine_analysis_from_parts_with_control<C: r2ssa::SsaWorkControl + ?Siz
     control: &C,
 ) -> Result<EngineAnalysis, r2ssa::SsaPrepareError> {
     let ssa_func = Arc::new(
-        r2ssa::SsaArtifact::for_decompile_with_interfaces_and_control(
+        r2ssa::SsaArtifact::for_decompile_with_interfaces_machine_roles_and_control(
             blocks,
             arch,
             source_snapshot.function_interface().cloned(),
+            *source_snapshot.machine_roles(),
             source_snapshot.call_site_interfaces().to_vec(),
             control,
         )?
@@ -5811,45 +4065,46 @@ fn build_engine_analysis_from_parts_with_control<C: r2ssa::SsaWorkControl + ?Siz
 struct InterprocSummaryBuildInput<'a> {
     pub analysis: &'a EngineAnalysis,
     pub max_iterations: usize,
-    pub symbolic_scope: Option<&'a r2sym::PreparedFunctionScope>,
+    /// Bodies of the functions the root calls, captured with it. Without these
+    /// every direct call is an unresolved callee, and the solver has to mark
+    /// every pointer argument read, written and escaped.
+    pub callee_summaries: &'a [r2ssa::PreparedCalleeSummary],
 }
 
 fn build_prepared_interproc_summary_set(
     input: InterprocSummaryBuildInput<'_>,
 ) -> Result<r2ssa::PreparedInterprocSummarySet, r2ssa::PreparedInterprocSummaryError> {
     let root = r2ssa::InterprocFunctionId(input.analysis.ssa_func.function().entry);
-    let symbolic_scope = input.symbolic_scope.filter(|scope| {
-        scope.root_id() == root
-            && scope.root().is_some_and(|scope_root| {
-                scope_root.id == root
-                    && scope_root.prepared.function().entry == root.0
-                    && scope_root.prepared.authority() == input.analysis.ssa_func().authority()
-            })
-    });
-    let mut functions = vec![r2ssa::PreparedInterprocFunctionInput {
-        id: root,
-        name: input.analysis.ssa_func.function().name.clone(),
-        prepared: &input.analysis.ssa_func,
-    }];
-    if let Some(scope) = symbolic_scope {
-        for function in scope.functions().values() {
-            if function.id == root {
-                continue;
-            }
-            functions.push(r2ssa::PreparedInterprocFunctionInput {
-                id: function.id,
-                name: function.name.clone(),
-                prepared: &function.prepared,
-            });
+    let mut seen = std::collections::BTreeSet::new();
+    let mut callees = Vec::new();
+    for summary in input.callee_summaries {
+        if summary.id() == root || !seen.insert(summary.id()) {
+            continue;
         }
+        callees.push(summary.clone());
     }
-    r2ssa::solve_prepared_interproc_summary_set(
+    r2ssa::solve_prepared_interproc_summary_set_from_callee_summaries(
         Arc::clone(&input.analysis.ssa_func),
-        &functions,
+        &callees,
         r2ssa::InterprocSolveConfig {
             max_iterations: input.max_iterations.max(1),
         },
     )
+}
+
+/// Each captured callee's C signature, proved once from its own typed body.
+///
+/// A callee that cannot prove a complete signature contributes nothing; the
+/// root keeps the ordinary call-carrier fallback instead of manufacturing the
+/// missing source types.
+fn build_source_owned_callee_signatures(
+    request: &EngineAnalyzeRequest,
+) -> Vec<r2types::SourceOwnedCalleeSignature> {
+    request
+        .callee_facts
+        .iter()
+        .filter_map(|callee| callee.signature.clone())
+        .collect()
 }
 
 /// Build the analysis artifact, naming the cause when one cannot be built.
@@ -5880,7 +4135,11 @@ fn build_engine_analysis_artifact(
         match build_prepared_interproc_summary_set(InterprocSummaryBuildInput {
             analysis: &semantic_analysis,
             max_iterations: request.interproc_max_iterations,
-            symbolic_scope: request.symbolic_scope.as_ref(),
+            callee_summaries: &request
+                .callee_facts
+                .iter()
+                .map(|callee| callee.summary.clone())
+                .collect::<Vec<_>>(),
         }) {
             Ok(summary) => Some(summary),
             Err(
@@ -5897,20 +4156,10 @@ fn build_engine_analysis_artifact(
         None
     };
     let pattern_ssa_blocks = semantic_analysis.ssa_func.local_ssa_blocks();
-    let (arch_name, _, _) = EngineRenderTarget::for_arch(request.arch.as_ref());
-    let mut diagnostics = r2types::TypeWritebackDiagnostics::default();
-    let local_structs = r2types::infer_local_struct_artifacts_from_prepared_ssa(
-        &semantic_analysis.ssa_func,
-        Some(arch_name.as_str()),
-        request.ptr_bits,
-        &mut diagnostics,
-    );
-    let local_field_accesses = r2types::local_field_accesses_from_struct_artifacts(&local_structs);
     let optional_semantics_required = optional_semantics_required_for_analysis(
         &request.parsed_context,
         &semantic_analysis.ssa_func,
         &pattern_ssa_blocks,
-        !local_field_accesses.is_empty(),
     );
     let semantic_artifact = (|| {
         if matches!(request.semantic_mode, EngineSemanticMode::Full) {
@@ -5929,15 +4178,15 @@ fn build_engine_analysis_artifact(
             }
             return maybe_compile_semantic_artifact_for_analysis(
                 &semantic_analysis.ssa_func,
-                request.symbolic_scope.as_ref(),
                 interproc_summary_set.as_ref(),
+                &request.execution.symbolic(),
             );
         }
         optional_semantics_required.then(|| {
-            r2sym::compile_semantic_artifact_default_with_scope(
+            r2sym::compile_semantic_artifact_default_with_control(
                 &z3::Context::thread_local(),
                 &semantic_analysis.ssa_func,
-                request.symbolic_scope.as_ref(),
+                &request.execution.symbolic(),
             )
         })
     })();
@@ -5949,6 +4198,11 @@ fn build_engine_analysis_artifact(
         request.parsed_context.clone(),
     )
     .map_err(|error| format!("type writeback request rejected the source: {error:?}"))?;
+    writeback_request = writeback_request
+        .with_source_owned_callee_signatures(build_source_owned_callee_signatures(request))
+        .map_err(|error| {
+            format!("type writeback request rejected the captured callees: {error:?}")
+        })?;
     if let Some(semantic_artifact) = semantic_artifact {
         writeback_request = writeback_request
             .with_semantic_artifact(semantic_artifact)
@@ -5981,8 +4235,8 @@ fn build_engine_analysis_artifact(
 
 fn maybe_compile_semantic_artifact_for_analysis(
     ssa_func: &Arc<SsaArtifact>,
-    symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
     interproc_summaries: Option<&r2ssa::PreparedInterprocSummarySet>,
+    execution: &r2sym::SymExecutionControl,
 ) -> Option<r2sym::SemanticArtifact> {
     let root_summary = interproc_summaries.and_then(prepared_root_summary);
     if should_probe_native_worker_summary_before_full_semantics(ssa_func, root_summary) {
@@ -5993,12 +4247,8 @@ fn maybe_compile_semantic_artifact_for_analysis(
             return None;
         }
         if !vm_route_evidence
-            && let Some(artifact) = r2sym::compile_native_worker_summary_artifact(
-                ssa_func,
-                symbolic_scope,
-                interproc_summaries,
-                false,
-            )
+            && let Some(artifact) =
+                r2sym::compile_native_worker_summary_artifact(ssa_func, interproc_summaries, false)
             && artifact
                 .native_body()
                 .is_some_and(r2sym::NativeArtifactBody::has_primary_summary_islands)
@@ -6012,8 +4262,8 @@ fn maybe_compile_semantic_artifact_for_analysis(
     }
     Some(compile_semantic_artifact_for_analysis(
         ssa_func,
-        symbolic_scope,
         interproc_summaries,
+        execution,
     ))
 }
 
@@ -6037,39 +4287,32 @@ fn should_skip_unbounded_semantic_artifact_after_worker_preprobe(
 
 fn compile_semantic_artifact_for_analysis(
     ssa_func: &Arc<SsaArtifact>,
-    symbolic_scope: Option<&r2sym::PreparedFunctionScope>,
     interproc_summaries: Option<&r2ssa::PreparedInterprocSummarySet>,
+    execution: &r2sym::SymExecutionControl,
 ) -> r2sym::SemanticArtifact {
     let root_summary = interproc_summaries.and_then(prepared_root_summary);
     let vm_route_evidence = r2sym::has_strong_vm_evidence(ssa_func);
     if !vm_route_evidence
         && let Some(summaries) = interproc_summaries
-        && let Some(artifact) = r2sym::compile_summary_dense_worker_artifact_from_interproc_summary(
-            ssa_func,
-            symbolic_scope,
-            summaries,
-        )
+        && let Some(artifact) =
+            r2sym::compile_summary_dense_worker_artifact_from_interproc_summary(ssa_func, summaries)
     {
         return artifact;
     }
     if !vm_route_evidence
         && should_probe_native_worker_summary_before_full_semantics(ssa_func, root_summary)
-        && let Some(artifact) = r2sym::compile_native_worker_summary_artifact(
-            ssa_func,
-            symbolic_scope,
-            interproc_summaries,
-            false,
-        )
+        && let Some(artifact) =
+            r2sym::compile_native_worker_summary_artifact(ssa_func, interproc_summaries, false)
         && artifact
             .native_body()
             .is_some_and(r2sym::NativeArtifactBody::has_primary_summary_islands)
     {
         return artifact;
     }
-    let mut artifact = r2sym::compile_semantic_artifact_default_with_scope(
+    let mut artifact = r2sym::compile_semantic_artifact_default_with_control(
         &z3::Context::thread_local(),
         ssa_func,
-        symbolic_scope,
+        execution,
     );
     if let Some(summaries) = interproc_summaries {
         r2sym::augment_semantic_artifact_with_interproc_summary(&mut artifact, summaries);
@@ -6143,7 +4386,6 @@ fn optional_semantics_required_for_analysis(
     parsed_context: &r2types::ParsedExternalContext,
     ssa_func: &SsaArtifact,
     pattern_ssa_blocks: &[r2ssa::SSABlock],
-    _has_local_field_accesses: bool,
 ) -> bool {
     if parsed_context_has_layout_hints(parsed_context) {
         return true;
@@ -6622,7 +4864,6 @@ fn semantic_slice_class_label(slice_class: r2sym::SliceClass) -> &'static str {
     match slice_class {
         r2sym::SliceClass::Wrapper => "wrapper",
         r2sym::SliceClass::Worker => "worker",
-        r2sym::SliceClass::RecursiveGroup => "recursive_group",
         r2sym::SliceClass::InterpreterSwitch => "interpreter_switch",
         r2sym::SliceClass::InterpreterIndirect => "interpreter_indirect",
         r2sym::SliceClass::GenericLarge => "generic_large",
@@ -6633,8 +4874,6 @@ fn semantic_residual_reason_label(reason: r2sym::ResidualReason) -> &'static str
     match reason {
         r2sym::ResidualReason::MissingArch => "missing_arch",
         r2sym::ResidualReason::LargeCfg => "large_cfg",
-        r2sym::ResidualReason::SummaryBudgetExhausted => "summary_budget_exhausted",
-        r2sym::ResidualReason::SccBudgetExhausted => "scc_budget_exhausted",
         r2sym::ResidualReason::InterpreterRequiresStepSummary => {
             "interpreter_requires_step_summary"
         }
@@ -6660,59 +4899,6 @@ pub fn render_semantic_route(
     _config: &EngineRenderTarget,
 ) -> Option<String> {
     decompile_route_output_from_function_facts(function_name, function_facts)
-}
-
-pub struct TargetQueryRouteInput<'a> {
-    pub z3_ctx: &'a z3::Context,
-    pub compiled: &'a r2sym::SemanticArtifact,
-    pub scope: Option<&'a r2sym::PreparedFunctionScope>,
-    pub target_addr: u64,
-    pub arch: Option<&'a r2il::ArchSpec>,
-    pub symbols: &'a r2sym::FunctionSymbolSnapshot,
-    pub explore_config: r2sym::ExploreConfig,
-    pub summary_profile: r2sym::SummaryProfile,
-    pub assumption_conflicted: bool,
-}
-
-pub fn target_query_route_decision(
-    input: TargetQueryRouteInput<'_>,
-) -> r2sym::TargetQueryRoutePlan {
-    let TargetQueryRouteInput {
-        z3_ctx,
-        compiled,
-        scope,
-        target_addr,
-        arch,
-        symbols,
-        explore_config,
-        summary_profile,
-        assumption_conflicted,
-    } = input;
-    let scope = scope.and_then(|scope| scope.exact_for_artifact(compiled.prepared()));
-    let probe_config = r2sym::SymQueryConfig {
-        explore: explore_config,
-        mode: r2sym::QueryMode::TargetGuided,
-        summary_profile,
-        solve_tactics: r2sym::SolveTacticConfig::default(),
-    };
-    let mut explorer = probe_config.make_explorer(z3_ctx);
-    if let Some(scope) = scope {
-        r2sym::install_runtime_hooks_for_scope(
-            &mut explorer,
-            compiled.prepared(),
-            scope,
-            arch,
-            symbols.imported_names(),
-        );
-    }
-    r2sym::selected_target_query_route_in_scope(
-        &mut explorer,
-        compiled.prepared(),
-        scope,
-        Some(compiled),
-        target_addr,
-        assumption_conflicted,
-    )
 }
 
 fn current_interproc_summary(
@@ -6750,146 +4936,8 @@ mod tests {
             kind,
             reason: reason.map(str::to_string),
             fallback_comment: fallback_comment.map(str::to_string),
-            skip_runtime_type_inference: kind != r2types::DecompileRouteKind::Standard,
             use_prepared_semantic_view: kind == r2types::DecompileRouteKind::Standard,
         }
-    }
-
-    #[test]
-    fn typed_external_context_owner_ignores_raw_fallback_and_preserves_typed_inputs() {
-        let parsed = parse_typed_external_context(
-            EngineExternalContextInput {
-                schema_version: 2,
-                dirty_epoch: 11,
-                context_hash: 0xfeed,
-                type_dirty_epoch: 13,
-                signature: EngineExternalSignatureInput {
-                    name: Some("target".to_string()),
-                    ret_type: Some("int".to_string()),
-                    callconv: Some("amd64".to_string()),
-                    noreturn: false,
-                    params: vec![EngineExternalSignatureParamInput {
-                        name: Some("argc".to_string()),
-                        ty: Some("int".to_string()),
-                        cc_reg: Some("rdi".to_string()),
-                    }],
-                },
-                vars: vec![EngineExternalVarInput {
-                    kind: ENGINE_EXTERNAL_VAR_REGISTER,
-                    name: Some("argc".to_string()),
-                    ty: Some("int".to_string()),
-                    reg: Some("rdi".to_string()),
-                    is_arg: true,
-                    ..EngineExternalVarInput::default()
-                }],
-                base_types: Vec::new(),
-                callees: vec![EngineExternalCalleeInput {
-                    call_addr: 0x401000,
-                    addr: 0x402000,
-                    name: Some("setlocale".to_string()),
-                    linkage: ENGINE_EXTERNAL_LINKAGE_IMPORTED,
-                    signature: EngineExternalSignatureInput {
-                        name: Some("setlocale".to_string()),
-                        ret_type: Some("char *".to_string()),
-                        params: vec![EngineExternalSignatureParamInput {
-                            name: Some("category".to_string()),
-                            ty: Some("int".to_string()),
-                            cc_reg: None,
-                        }],
-                        ..EngineExternalSignatureInput::default()
-                    },
-                }],
-                assumptions_json: Some(
-                    r#"{"assumptions":[{"subject":{"register":{"name":"rdi"}},"value":{"constant":{"value":4660}}}]}"#
-                        .to_string(),
-                ),
-            },
-            64,
-        );
-
-        assert_eq!(parsed.context_schema_version, Some(2));
-        assert_eq!(parsed.type_dirty_epoch, Some(13));
-        assert_eq!(parsed.callconv.as_deref(), Some("amd64"));
-        assert_eq!(parsed.register_params[0].reg, "rdi");
-        assert!(
-            parsed.external_type_db.structs.is_empty(),
-            "typed context parsing must not import raw fallback base types"
-        );
-
-        assert!(!parsed.callee_facts.contains_key(&4198400));
-        let callee = parsed.callee_facts.get(&0x402000).expect("typed callee");
-        assert_eq!(callee.name.as_deref(), Some("setlocale"));
-        assert!(callee.linkage.authorizes_import_policy());
-        assert_eq!(
-            callee
-                .signature
-                .as_ref()
-                .map(|signature| signature.params.len()),
-            Some(1)
-        );
-
-        assert!(
-            parsed
-                .assumptions
-                .items
-                .iter()
-                .any(|assumption| assumption.subject
-                    == r2ssa::AssumptionSubject::Register {
-                        name: "rdi".to_string()
-                    })
-        );
-    }
-
-    #[test]
-    fn typed_external_context_empty_input_stays_empty_without_legacy_raw_context() {
-        let parsed = parse_typed_external_context(EngineExternalContextInput::default(), 64);
-
-        assert_eq!(parsed.context_schema_version, None);
-        assert_eq!(parsed.context_hash, None);
-        assert_eq!(parsed.current_signature, None);
-        assert!(parsed.stack_slots.is_empty());
-        assert!(parsed.external_type_db.structs.is_empty());
-        assert!(parsed.external_type_db.unions.is_empty());
-        assert!(parsed.external_type_db.enums.is_empty());
-        assert!(parsed.callee_facts.is_empty());
-    }
-
-    #[test]
-    fn typed_external_context_partial_input_does_not_fill_missing_groups_from_raw_json() {
-        let parsed = parse_typed_external_context(
-            EngineExternalContextInput {
-                schema_version: 3,
-                dirty_epoch: 0,
-                context_hash: 0,
-                type_dirty_epoch: 0,
-                signature: EngineExternalSignatureInput::default(),
-                vars: Vec::new(),
-                base_types: Vec::new(),
-                callees: Vec::new(),
-                assumptions_json: None,
-            },
-            64,
-        );
-
-        assert_eq!(parsed.context_schema_version, Some(3));
-        assert_eq!(parsed.callconv, None);
-        assert_eq!(parsed.current_signature, None);
-        assert!(
-            parsed.stack_slots.is_empty(),
-            "empty typed vars must stay empty instead of importing raw fallback vars"
-        );
-    }
-
-    #[test]
-    fn engine_arch_target_uses_effective_pointer_width_fallbacks() {
-        let mut arch = r2il::ArchSpec::new("x86-64");
-        arch.addr_size = 0;
-        arch.add_register(r2il::RegisterDef::new("rip", 0, 8));
-
-        let (arch_name, ptr_bits) = engine_arch_target(Some(&arch));
-
-        assert_eq!(arch_name, "x86-64");
-        assert_eq!(ptr_bits, 64);
     }
 
     fn const_return_blocks(addr: u64, value: u64) -> Vec<R2ILBlock> {
@@ -7031,879 +5079,6 @@ mod tests {
         .expect("source function interface")
     }
 
-    fn source_snapshot_terminal_function()
-    -> (Vec<R2ILBlock>, r2il::ArchSpec, Arc<EngineSourceSnapshot>) {
-        let revision = b"production-terminal-revision";
-        let mut arch = r2il::ArchSpec::new("production-terminal-test");
-        arch.addr_size = 8;
-        arch.set_memory_endianness(r2il::Endianness::Little);
-        arch.add_register(r2il::RegisterDef::new("rax", 0, 8));
-        arch.add_register(r2il::RegisterDef::new("rdi", 8, 8));
-        arch.add_register(r2il::RegisterDef::new("rip", 16, 8));
-        arch.add_register(r2il::RegisterDef::new("rsi", 24, 8));
-        let register = |offset| r2ssa::CanonicalStorageId {
-            space: r2ssa::CanonicalStorageSpace::Register,
-            offset,
-            size: 8,
-        };
-        let interface = r2ssa::SourceFunctionInterface::new(
-            revision.to_vec(),
-            "test-register-abi",
-            [r2ssa::SourceAbiParameterSpec::new(0, register(8))],
-            r2ssa::SourceFunctionReturn::Register {
-                storage: register(0),
-            },
-            Vec::<r2ssa::SourceStackSlotSpec>::new(),
-        )
-        .expect("source function interface");
-        let snapshot = EngineSourceSnapshot::new(revision.to_vec(), Some(interface), Vec::new())
-            .expect("source snapshot");
-        let mut block = R2ILBlock::new(0x7200, 4);
-        block.push(r2il::R2ILOp::IntAdd {
-            dst: r2il::Varnode::unique(0x10, 8),
-            a: r2il::Varnode::register(8, 8),
-            b: r2il::Varnode::constant(1, 8),
-        });
-        block.push(r2il::R2ILOp::Copy {
-            dst: r2il::Varnode::register(0, 8),
-            src: r2il::Varnode::unique(0x10, 8),
-        });
-        block.push(r2il::R2ILOp::Return {
-            target: r2il::Varnode::register(16, 8),
-        });
-        (vec![block], arch, Arc::new(snapshot))
-    }
-
-    fn source_snapshot_memory_terminal_function()
-    -> (Vec<R2ILBlock>, r2il::ArchSpec, Arc<EngineSourceSnapshot>) {
-        let revision = b"production-memory-terminal-revision";
-        let mut arch = r2il::ArchSpec::new("production-memory-terminal-test");
-        arch.addr_size = 8;
-        arch.set_memory_endianness(r2il::Endianness::Little);
-        arch.add_space(r2il::AddressSpace::ram(8));
-        arch.add_register(r2il::RegisterDef::new("eax", 0, 4));
-        arch.add_register(r2il::RegisterDef::new("rip", 16, 8));
-        let interface = r2ssa::SourceFunctionInterface::new(
-            revision.to_vec(),
-            "test-register-abi",
-            Vec::<r2ssa::SourceAbiParameterSpec>::new(),
-            r2ssa::SourceFunctionReturn::Register {
-                storage: r2ssa::CanonicalStorageId {
-                    space: r2ssa::CanonicalStorageSpace::Register,
-                    offset: 0,
-                    size: 4,
-                },
-            },
-            Vec::<r2ssa::SourceStackSlotSpec>::new(),
-        )
-        .expect("source function interface");
-        let snapshot = EngineSourceSnapshot::new(revision.to_vec(), Some(interface), Vec::new())
-            .expect("source snapshot");
-        let mut block = R2ILBlock::new(0x7280, 4);
-        block.push(r2il::R2ILOp::Load {
-            dst: r2il::Varnode::register(0, 4),
-            space: r2il::SpaceId::Ram,
-            addr: r2il::Varnode::constant(0x40, 8),
-        });
-        block.push(r2il::R2ILOp::Return {
-            target: r2il::Varnode::register(16, 8),
-        });
-        (vec![block], arch, Arc::new(snapshot))
-    }
-
-    fn aggregate_member_test_arch() -> r2il::ArchSpec {
-        let mut arch = r2il::ArchSpec::new("aarch64");
-        arch.addr_size = 8;
-        arch.alignment = 4;
-        arch.add_register(r2il::RegisterDef::new("x0", 0, 8));
-        arch.add_register(r2il::RegisterDef::new("w0", 0, 4));
-        arch.add_register(r2il::RegisterDef::new("x1", 8, 8));
-        arch.add_register(r2il::RegisterDef::new("w1", 8, 4));
-        arch.add_register(r2il::RegisterDef::new("x4", 32, 8));
-        arch.add_register(r2il::RegisterDef::new("w4", 32, 4));
-        arch.add_register(r2il::RegisterDef::new("x30", 48, 8));
-        arch.add_space(r2il::AddressSpace::ram(8));
-        arch.set_memory_endianness(r2il::Endianness::Little);
-        arch
-    }
-
-    fn aggregate_member_test_graph() -> r2ssa::SourceTypeGraph {
-        r2ssa::SourceTypeGraph::new(
-            [
-                r2ssa::SourceType::new(
-                    0,
-                    r2ssa::SourceTypeKind::Struct { aggregate_id: 0 },
-                    56 * 8,
-                    32,
-                ),
-                r2ssa::SourceType::new(1, r2ssa::SourceTypeKind::SignedInteger, 32, 32),
-                r2ssa::SourceType::new(
-                    2,
-                    r2ssa::SourceTypeKind::Pointer { target_type_id: 0 },
-                    64,
-                    64,
-                ),
-            ],
-            [r2ssa::SourceAggregateLayout::new(
-                0,
-                0,
-                56 * 8,
-                32,
-                "CosmeticAggregateName",
-                (0..14).map(|index| {
-                    r2ssa::SourceAggregateMember::new(
-                        index,
-                        1,
-                        u64::from(index) * 32,
-                        32,
-                        format!("cosmetic_member_{index}"),
-                    )
-                }),
-            )],
-        )
-        .expect("valid aggregate-member source graph")
-    }
-
-    fn source_snapshot_aggregate_member_load_return_function()
-    -> (Vec<R2ILBlock>, r2il::ArchSpec, Arc<EngineSourceSnapshot>) {
-        let revision = b"production-aggregate-member-load-revision";
-        let register = |offset, size| r2ssa::CanonicalStorageId {
-            space: r2ssa::CanonicalStorageSpace::Register,
-            offset,
-            size,
-        };
-        let interface = r2ssa::SourceFunctionInterface::new_exact_with_logical_types(
-            revision.to_vec(),
-            "aapcs64",
-            [r2ssa::SourceAbiParameterSpec::new(0, register(0, 8))],
-            r2ssa::SourceFunctionReturn::Register {
-                storage: register(32, 4),
-            },
-            [],
-            [r2ssa::SourceLogicalValue::new(
-                2,
-                r2ssa::SourceCarrierProjection::new(r2ssa::SourceCarrierKind::Full, 0, 64),
-            )],
-            Some(r2ssa::SourceLogicalValue::new(
-                1,
-                r2ssa::SourceCarrierProjection::new(r2ssa::SourceCarrierKind::Full, 0, 32),
-            )),
-            Some(aggregate_member_test_graph()),
-        )
-        .expect("exact aggregate-member load interface");
-        let snapshot = EngineSourceSnapshot::new(revision.to_vec(), Some(interface), Vec::new())
-            .expect("aggregate-member load source snapshot");
-        let mut block = R2ILBlock::new(0x7700, 4);
-        block.push(r2il::R2ILOp::IntAdd {
-            dst: r2il::Varnode::unique(0x10, 8),
-            a: r2il::Varnode::register(0, 8),
-            b: r2il::Varnode::constant(8, 8),
-        });
-        block.push(r2il::R2ILOp::Load {
-            dst: r2il::Varnode::register(32, 4),
-            space: r2il::SpaceId::Ram,
-            addr: r2il::Varnode::unique(0x10, 8),
-        });
-        block.push(r2il::R2ILOp::Return {
-            target: r2il::Varnode::register(48, 8),
-        });
-        (
-            vec![block],
-            aggregate_member_test_arch(),
-            Arc::new(snapshot),
-        )
-    }
-
-    fn source_snapshot_aggregate_member_store_function()
-    -> (Vec<R2ILBlock>, r2il::ArchSpec, Arc<EngineSourceSnapshot>) {
-        let revision = b"production-aggregate-member-store-revision";
-        let register = |offset, size| r2ssa::CanonicalStorageId {
-            space: r2ssa::CanonicalStorageSpace::Register,
-            offset,
-            size,
-        };
-        let interface = r2ssa::SourceFunctionInterface::new_exact_with_logical_types(
-            revision.to_vec(),
-            "aapcs64",
-            [
-                r2ssa::SourceAbiParameterSpec::new(0, register(0, 8)),
-                r2ssa::SourceAbiParameterSpec::new(1, register(8, 8)),
-            ],
-            r2ssa::SourceFunctionReturn::Void,
-            [],
-            [
-                r2ssa::SourceLogicalValue::new(
-                    2,
-                    r2ssa::SourceCarrierProjection::new(r2ssa::SourceCarrierKind::Full, 0, 64),
-                ),
-                r2ssa::SourceLogicalValue::new(
-                    1,
-                    r2ssa::SourceCarrierProjection::new(r2ssa::SourceCarrierKind::LowBits, 0, 32),
-                ),
-            ],
-            None,
-            Some(aggregate_member_test_graph()),
-        )
-        .expect("exact aggregate-member store interface");
-        let snapshot = EngineSourceSnapshot::new(revision.to_vec(), Some(interface), Vec::new())
-            .expect("aggregate-member store source snapshot");
-        let mut block = R2ILBlock::new(0x7710, 4);
-        block.push(r2il::R2ILOp::Subpiece {
-            dst: r2il::Varnode::unique(0x18, 4),
-            src: r2il::Varnode::register(8, 8),
-            offset: 0,
-        });
-        block.push(r2il::R2ILOp::IntAdd {
-            dst: r2il::Varnode::unique(0x20, 8),
-            a: r2il::Varnode::register(0, 8),
-            b: r2il::Varnode::constant(52, 8),
-        });
-        block.push(r2il::R2ILOp::Store {
-            space: r2il::SpaceId::Ram,
-            addr: r2il::Varnode::unique(0x20, 8),
-            val: r2il::Varnode::unique(0x18, 4),
-        });
-        block.push(r2il::R2ILOp::Return {
-            target: r2il::Varnode::register(48, 8),
-        });
-        (
-            vec![block],
-            aggregate_member_test_arch(),
-            Arc::new(snapshot),
-        )
-    }
-
-    fn source_snapshot_direct_call_return_function()
-    -> (Vec<R2ILBlock>, r2il::ArchSpec, Arc<EngineSourceSnapshot>) {
-        let revision = b"production-direct-call-return-revision";
-        let mut arch = r2il::ArchSpec::new("production-direct-call-return-test");
-        arch.addr_size = 8;
-        arch.set_memory_endianness(r2il::Endianness::Little);
-        arch.add_register(r2il::RegisterDef::new("rax", 0, 8));
-        arch.add_register(r2il::RegisterDef::new("rdi", 8, 8));
-        arch.add_register(r2il::RegisterDef::new("rip", 16, 8));
-        let register = |offset| r2ssa::CanonicalStorageId {
-            space: r2ssa::CanonicalStorageSpace::Register,
-            offset,
-            size: 8,
-        };
-        let function_interface = r2ssa::SourceFunctionInterface::new(
-            revision.to_vec(),
-            "caller-test-abi",
-            [r2ssa::SourceAbiParameterSpec::new(0, register(8))],
-            r2ssa::SourceFunctionReturn::Register {
-                storage: register(0),
-            },
-            Vec::<r2ssa::SourceStackSlotSpec>::new(),
-        )
-        .expect("source function interface");
-        let target = r2il::Varnode::constant(0x8600, 8);
-        let call_interface = r2ssa::SourceCallSiteInterface::new(
-            revision.to_vec(),
-            r2ssa::SourceCallSiteIdentity::new(
-                0x7500,
-                1,
-                r2ssa::CanonicalStorageId::from_varnode(&target),
-            ),
-            true,
-            "callee-test-abi",
-            [r2ssa::SourceCallArgumentSpec::new(0, register(8))],
-            false,
-            false,
-            r2ssa::SourceCallResult::Void,
-        )
-        .expect("source callsite interface");
-        let snapshot = EngineSourceSnapshot::new(
-            revision.to_vec(),
-            Some(function_interface),
-            [call_interface],
-        )
-        .expect("source snapshot");
-        let mut call = R2ILBlock::new(0x7500, 4);
-        call.push(r2il::R2ILOp::Copy {
-            dst: r2il::Varnode::register(8, 8),
-            src: r2il::Varnode::constant(0x11, 8),
-        });
-        call.push(r2il::R2ILOp::Call { target });
-        let mut returned = R2ILBlock::new(0x7504, 4);
-        returned.push(r2il::R2ILOp::Copy {
-            dst: r2il::Varnode::register(0, 8),
-            src: r2il::Varnode::constant(7, 8),
-        });
-        returned.push(r2il::R2ILOp::Return {
-            target: r2il::Varnode::register(16, 8),
-        });
-        (vec![call, returned], arch, Arc::new(snapshot))
-    }
-
-    fn source_snapshot_conditional_return_function()
-    -> (Vec<R2ILBlock>, r2il::ArchSpec, Arc<EngineSourceSnapshot>) {
-        let revision = b"production-conditional-return-revision";
-        let mut arch = r2il::ArchSpec::new("production-conditional-return-test");
-        arch.addr_size = 8;
-        arch.set_memory_endianness(r2il::Endianness::Little);
-        arch.add_register(r2il::RegisterDef::new("rax", 0, 8));
-        arch.add_register(r2il::RegisterDef::new("rdi", 8, 8));
-        arch.add_register(r2il::RegisterDef::new("rip", 16, 8));
-        let register = |offset| r2ssa::CanonicalStorageId {
-            space: r2ssa::CanonicalStorageSpace::Register,
-            offset,
-            size: 8,
-        };
-        let interface = r2ssa::SourceFunctionInterface::new(
-            revision.to_vec(),
-            "test-register-abi",
-            [r2ssa::SourceAbiParameterSpec::new(0, register(8))],
-            r2ssa::SourceFunctionReturn::Register {
-                storage: register(0),
-            },
-            Vec::<r2ssa::SourceStackSlotSpec>::new(),
-        )
-        .expect("source function interface");
-        let snapshot = EngineSourceSnapshot::new(revision.to_vec(), Some(interface), Vec::new())
-            .expect("source snapshot");
-
-        let mut header = R2ILBlock::new(0x7300, 4);
-        header.push(r2il::R2ILOp::IntNotEqual {
-            dst: r2il::Varnode::unique(0x10, 1),
-            a: r2il::Varnode::register(8, 8),
-            b: r2il::Varnode::constant(0, 8),
-        });
-        header.push(r2il::R2ILOp::CBranch {
-            target: r2il::Varnode::ram(0x7320, 8),
-            cond: r2il::Varnode::unique(0x10, 1),
-        });
-        let mut false_arm = R2ILBlock::new(0x7304, 4);
-        false_arm.push(r2il::R2ILOp::Copy {
-            dst: r2il::Varnode::register(0, 8),
-            src: r2il::Varnode::constant(0, 8),
-        });
-        false_arm.push(r2il::R2ILOp::Return {
-            target: r2il::Varnode::register(16, 8),
-        });
-        let mut true_arm = R2ILBlock::new(0x7320, 4);
-        true_arm.push(r2il::R2ILOp::Copy {
-            dst: r2il::Varnode::register(0, 8),
-            src: r2il::Varnode::constant(u64::MAX, 8),
-        });
-        true_arm.push(r2il::R2ILOp::Return {
-            target: r2il::Varnode::register(16, 8),
-        });
-        (vec![header, false_arm, true_arm], arch, Arc::new(snapshot))
-    }
-
-    fn source_snapshot_switch_return_function()
-    -> (Vec<R2ILBlock>, r2il::ArchSpec, Arc<EngineSourceSnapshot>) {
-        let revision = b"production-switch-return-revision";
-        let mut arch = r2il::ArchSpec::new("production-switch-return-test");
-        arch.addr_size = 8;
-        arch.set_memory_endianness(r2il::Endianness::Little);
-        arch.add_register(r2il::RegisterDef::new("rax", 0, 8));
-        arch.add_register(r2il::RegisterDef::new("rdi", 8, 8));
-        arch.add_register(r2il::RegisterDef::new("rip", 16, 8));
-        arch.add_register(r2il::RegisterDef::new("rsi", 24, 8));
-        let register = |offset| r2ssa::CanonicalStorageId {
-            space: r2ssa::CanonicalStorageSpace::Register,
-            offset,
-            size: 8,
-        };
-        let interface = r2ssa::SourceFunctionInterface::new(
-            revision.to_vec(),
-            "test-register-abi",
-            [r2ssa::SourceAbiParameterSpec::new(0, register(8))],
-            r2ssa::SourceFunctionReturn::Register {
-                storage: register(0),
-            },
-            Vec::<r2ssa::SourceStackSlotSpec>::new(),
-        )
-        .expect("source function interface");
-        let snapshot = EngineSourceSnapshot::new(revision.to_vec(), Some(interface), Vec::new())
-            .expect("source snapshot");
-
-        let mut header = R2ILBlock::new(0x7380, 4);
-        header.push(r2il::R2ILOp::BranchInd {
-            target: r2il::Varnode::register(8, 8),
-        });
-        header.set_switch_info(r2il::SwitchInfo {
-            switch_addr: 0x7380,
-            min_val: 1,
-            max_val: 7,
-            default_target: Some(0x73e0),
-            cases: vec![
-                r2il::SwitchCase {
-                    value: 1,
-                    target: 0x73a0,
-                },
-                r2il::SwitchCase {
-                    value: 7,
-                    target: 0x73c0,
-                },
-            ],
-        });
-        let arm = |addr, value| {
-            let mut block = R2ILBlock::new(addr, 4);
-            block.push(r2il::R2ILOp::Copy {
-                dst: r2il::Varnode::register(0, 8),
-                src: r2il::Varnode::constant(value, 8),
-            });
-            block.push(r2il::R2ILOp::Return {
-                target: r2il::Varnode::register(16, 8),
-            });
-            block
-        };
-        (
-            vec![header, arm(0x73a0, 11), arm(0x73c0, 22), arm(0x73e0, 33)],
-            arch,
-            Arc::new(snapshot),
-        )
-    }
-
-    fn source_snapshot_carrier_free_loop_return_function()
-    -> (Vec<R2ILBlock>, r2il::ArchSpec, Arc<EngineSourceSnapshot>) {
-        let revision = b"production-carrier-free-loop-return-revision";
-        let mut arch = r2il::ArchSpec::new("production-carrier-free-loop-return-test");
-        arch.addr_size = 8;
-        arch.set_memory_endianness(r2il::Endianness::Little);
-        arch.add_register(r2il::RegisterDef::new("rax", 0, 8));
-        arch.add_register(r2il::RegisterDef::new("dil", 8, 1));
-        arch.add_register(r2il::RegisterDef::new("rip", 16, 8));
-        arch.add_register(r2il::RegisterDef::new("sil", 24, 1));
-        let register = |offset, size| r2ssa::CanonicalStorageId {
-            space: r2ssa::CanonicalStorageSpace::Register,
-            offset,
-            size,
-        };
-        let interface = r2ssa::SourceFunctionInterface::new(
-            revision.to_vec(),
-            "test-register-abi",
-            [r2ssa::SourceAbiParameterSpec::new(0, register(8, 1))],
-            r2ssa::SourceFunctionReturn::Register {
-                storage: register(0, 8),
-            },
-            Vec::<r2ssa::SourceStackSlotSpec>::new(),
-        )
-        .expect("source function interface");
-        let snapshot = EngineSourceSnapshot::new(revision.to_vec(), Some(interface), Vec::new())
-            .expect("source snapshot");
-
-        let mut preheader = R2ILBlock::new(0x7400, 4);
-        preheader.push(r2il::R2ILOp::Branch {
-            target: r2il::Varnode::ram(0x7410, 8),
-        });
-        let mut header = R2ILBlock::new(0x7410, 4);
-        header.push(r2il::R2ILOp::CBranch {
-            target: r2il::Varnode::ram(0x7430, 8),
-            cond: r2il::Varnode::register(8, 1),
-        });
-        let mut exit = R2ILBlock::new(0x7414, 4);
-        exit.push(r2il::R2ILOp::Copy {
-            dst: r2il::Varnode::register(0, 8),
-            src: r2il::Varnode::constant(0x2a, 8),
-        });
-        exit.push(r2il::R2ILOp::Return {
-            target: r2il::Varnode::register(16, 8),
-        });
-        let mut body = R2ILBlock::new(0x7430, 4);
-        body.push(r2il::R2ILOp::Branch {
-            target: r2il::Varnode::ram(0x7410, 8),
-        });
-        (
-            vec![preheader, header, exit, body],
-            arch,
-            Arc::new(snapshot),
-        )
-    }
-
-    fn assert_handmade_analysis_only(artifact: &r2ssa::SsaArtifact) {
-        assert_ne!(
-            artifact.provenance_kind(),
-            r2ssa::SsaArtifactProvenanceKind::TrustedSource,
-            "caller-authored blocks and interfaces must remain analysis-only"
-        );
-    }
-
-    fn assert_handmade_engine_refusal(
-        function_name: &str,
-        function_addr: u64,
-        blocks: Vec<R2ILBlock>,
-        arch: r2il::ArchSpec,
-        source_snapshot: Arc<EngineSourceSnapshot>,
-        forbidden_output: &str,
-    ) {
-        let artifact = r2ssa::SsaArtifact::for_decompile_with_interfaces(
-            &blocks,
-            Some(&arch),
-            source_snapshot.function_interface().cloned(),
-            source_snapshot.call_site_interfaces().to_vec(),
-        )
-        .expect("handmade fixture remains analyzable");
-        assert_handmade_analysis_only(&artifact);
-
-        let response = EngineSession::new().decompile_function_from_input(
-            EngineFunctionDecompileRequestInput::single_function(
-                EngineFunctionInput {
-                    function_name: function_name.to_string(),
-                    function_addr,
-                    blocks,
-                    arch: Some(arch),
-                    source_snapshot: Some(source_snapshot),
-                    semantic_metadata_enabled: true,
-                },
-                Some(64),
-                r2types::ParsedExternalContext::default(),
-            ),
-        );
-        assert!(response.diagnostics.semantic_kernel_render.is_none());
-        assert!(
-            response.output.contains("r2dec residual:")
-                || response.output.contains("r2dec fallback:")
-        );
-        assert!(!response.output.contains(forbidden_output));
-    }
-
-    #[test]
-    fn handmade_terminal_fixture_refuses_certified_c() {
-        let (blocks, arch, source_snapshot) = source_snapshot_terminal_function();
-        assert_handmade_engine_refusal(
-            "sym.production_terminal",
-            0x7200,
-            blocks,
-            arch,
-            source_snapshot,
-            "certified_sub_7200",
-        );
-    }
-
-    #[test]
-    fn handmade_memory_terminal_fixture_refuses_certified_c() {
-        let (blocks, arch, source_snapshot) = source_snapshot_memory_terminal_function();
-        assert_handmade_engine_refusal(
-            "sym.production_memory_terminal",
-            0x7280,
-            blocks,
-            arch,
-            source_snapshot,
-            "certified_mem_sub_7280",
-        );
-    }
-
-    #[test]
-    fn handmade_aggregate_member_fixtures_refuse_certified_c() {
-        let (load_blocks, load_arch, load_snapshot) =
-            source_snapshot_aggregate_member_load_return_function();
-        let prepared_load = r2ssa::SsaArtifact::for_decompile_with_interface(
-            &load_blocks,
-            Some(&load_arch),
-            load_snapshot
-                .function_interface()
-                .cloned()
-                .expect("aggregate load interface"),
-        )
-        .expect("prepared aggregate load");
-        assert_handmade_analysis_only(&prepared_load);
-
-        let load = EngineSession::new().decompile_function_from_input(
-            EngineFunctionDecompileRequestInput::single_function(
-                EngineFunctionInput {
-                    function_name: "sym.production_aggregate_member_load".to_string(),
-                    function_addr: 0x7700,
-                    blocks: load_blocks.clone(),
-                    arch: Some(load_arch.clone()),
-                    source_snapshot: Some(Arc::clone(&load_snapshot)),
-                    semantic_metadata_enabled: true,
-                },
-                Some(64),
-                r2types::ParsedExternalContext::default(),
-            ),
-        );
-        assert!(load.diagnostics.semantic_kernel_render.is_none());
-        assert!(!load.output.contains("certified_aggregate_sub_7700"));
-
-        let (store_blocks, store_arch, store_snapshot) =
-            source_snapshot_aggregate_member_store_function();
-        let store = EngineSession::new().decompile_function_from_input(
-            EngineFunctionDecompileRequestInput::single_function(
-                EngineFunctionInput {
-                    function_name: "sym.production_aggregate_member_store".to_string(),
-                    function_addr: 0x7710,
-                    blocks: store_blocks,
-                    arch: Some(store_arch),
-                    source_snapshot: Some(store_snapshot),
-                    semantic_metadata_enabled: true,
-                },
-                Some(64),
-                r2types::ParsedExternalContext::default(),
-            ),
-        );
-        assert!(store.diagnostics.semantic_kernel_render.is_none());
-        assert!(!store.output.contains("certified_aggregate_sub_7710"));
-
-        let mut indirect_address = load_blocks;
-        indirect_address[0].ops.insert(
-            1,
-            r2il::R2ILOp::Copy {
-                dst: r2il::Varnode::unique(0x11, 8),
-                src: r2il::Varnode::unique(0x10, 8),
-            },
-        );
-        let r2il::R2ILOp::Load { addr, .. } = &mut indirect_address[0].ops[2] else {
-            panic!("aggregate near-miss load");
-        };
-        *addr = r2il::Varnode::unique(0x11, 8);
-        let prepared_near_miss = r2ssa::SsaArtifact::for_decompile_with_interface(
-            &indirect_address,
-            Some(&load_arch),
-            load_snapshot
-                .function_interface()
-                .cloned()
-                .expect("aggregate near-miss interface"),
-        )
-        .expect("prepared aggregate near miss");
-        assert_handmade_analysis_only(&prepared_near_miss);
-        let refused = EngineSession::new().decompile_function_from_input(
-            EngineFunctionDecompileRequestInput::single_function(
-                EngineFunctionInput {
-                    function_name: "sym.production_aggregate_member_near_miss".to_string(),
-                    function_addr: 0x7700,
-                    blocks: indirect_address,
-                    arch: Some(load_arch),
-                    source_snapshot: Some(load_snapshot),
-                    semantic_metadata_enabled: true,
-                },
-                Some(64),
-                r2types::ParsedExternalContext::default(),
-            ),
-        );
-        assert!(
-            (refused.output.contains("r2dec residual:")
-                || refused.output.contains("r2dec fallback:"))
-                && !refused.output.contains("certified_aggregate_sub_7700")
-                && !refused.output.contains("certified_mem_sub_7700"),
-            "non-direct aggregate address must not downgrade to generic memory C:\n{}",
-            refused.output
-        );
-        assert!(refused.diagnostics.semantic_kernel_render.is_none());
-    }
-
-    #[test]
-    fn handmade_direct_call_return_fixture_refuses_certified_c() {
-        let (blocks, arch, source_snapshot) = source_snapshot_direct_call_return_function();
-        let response = EngineSession::new().decompile_function_from_input(
-            EngineFunctionDecompileRequestInput::single_function(
-                EngineFunctionInput {
-                    function_name: "sym.production_direct_call_return".to_string(),
-                    function_addr: 0x7500,
-                    blocks: blocks.clone(),
-                    arch: Some(arch.clone()),
-                    source_snapshot: Some(Arc::clone(&source_snapshot)),
-                    semantic_metadata_enabled: true,
-                },
-                Some(64),
-                r2types::ParsedExternalContext::default(),
-            ),
-        );
-        assert!(response.diagnostics.semantic_kernel_render.is_none());
-        assert!(!response.output.contains("certified_call_sub_7500"));
-
-        let missing_callsite = Arc::new(
-            EngineSourceSnapshot::new(
-                source_snapshot.revision_identity().to_vec(),
-                source_snapshot.function_interface().cloned(),
-                Vec::new(),
-            )
-            .expect("snapshot without exact callsite interface"),
-        );
-        let refused = EngineSession::new().decompile_function_from_input(
-            EngineFunctionDecompileRequestInput::single_function(
-                EngineFunctionInput {
-                    function_name: "sym.production_direct_call_return".to_string(),
-                    function_addr: 0x7500,
-                    blocks,
-                    arch: Some(arch),
-                    source_snapshot: Some(missing_callsite),
-                    semantic_metadata_enabled: true,
-                },
-                Some(64),
-                r2types::ParsedExternalContext::default(),
-            ),
-        );
-        assert!(
-            (refused.output.contains("r2dec residual:")
-                || refused.output.contains("r2dec fallback:"))
-                && !refused.output.contains("certified_call_sub_7500"),
-            "missing callsite authority must fail closed:\n{}",
-            refused.output
-        );
-        assert!(refused.diagnostics.semantic_kernel_render.is_none());
-    }
-
-    #[test]
-    fn handmade_conditional_return_fixture_refuses_certified_c() {
-        let (blocks, arch, source_snapshot) = source_snapshot_conditional_return_function();
-        assert_handmade_engine_refusal(
-            "sym.production_conditional_return",
-            0x7300,
-            blocks,
-            arch,
-            source_snapshot,
-            "certified_sub_7300",
-        );
-    }
-
-    #[test]
-    fn handmade_switch_return_fixture_refuses_certified_c() {
-        let (blocks, arch, source_snapshot) = source_snapshot_switch_return_function();
-        let response = EngineSession::new().decompile_function_from_input(
-            EngineFunctionDecompileRequestInput::single_function(
-                EngineFunctionInput {
-                    function_name: "sym.production_switch_return".to_string(),
-                    function_addr: 0x7380,
-                    blocks: blocks.clone(),
-                    arch: Some(arch.clone()),
-                    source_snapshot: Some(Arc::clone(&source_snapshot)),
-                    semantic_metadata_enabled: true,
-                },
-                Some(64),
-                r2types::ParsedExternalContext::default(),
-            ),
-        );
-        assert!(response.diagnostics.semantic_kernel_render.is_none());
-        assert!(!response.output.contains("certified_sub_7380"));
-
-        let register = |offset| r2ssa::CanonicalStorageId {
-            space: r2ssa::CanonicalStorageSpace::Register,
-            offset,
-            size: 8,
-        };
-        let wrong_interface = r2ssa::SourceFunctionInterface::new(
-            source_snapshot.revision_identity().to_vec(),
-            "test-register-abi",
-            [r2ssa::SourceAbiParameterSpec::new(0, register(24))],
-            r2ssa::SourceFunctionReturn::Register {
-                storage: register(0),
-            },
-            Vec::<r2ssa::SourceStackSlotSpec>::new(),
-        )
-        .expect("wrong selector interface");
-        let wrong_storage = Arc::new(
-            EngineSourceSnapshot::new(
-                source_snapshot.revision_identity().to_vec(),
-                Some(wrong_interface),
-                Vec::new(),
-            )
-            .expect("wrong selector snapshot"),
-        );
-        let missing_interface = Arc::new(
-            EngineSourceSnapshot::new(
-                source_snapshot.revision_identity().to_vec(),
-                None,
-                Vec::new(),
-            )
-            .expect("snapshot without function interface"),
-        );
-        for source_snapshot in [missing_interface, wrong_storage] {
-            let refused = EngineSession::new().decompile_function_from_input(
-                EngineFunctionDecompileRequestInput::single_function(
-                    EngineFunctionInput {
-                        function_name: "sym.production_switch_return".to_string(),
-                        function_addr: 0x7380,
-                        blocks: blocks.clone(),
-                        arch: Some(arch.clone()),
-                        source_snapshot: Some(source_snapshot),
-                        semantic_metadata_enabled: true,
-                    },
-                    Some(64),
-                    r2types::ParsedExternalContext::default(),
-                ),
-            );
-            assert!(
-                (refused.output.contains("r2dec residual:")
-                    || refused.output.contains("r2dec fallback:"))
-                    && !refused.output.contains("certified_sub_7380"),
-                "missing or wrong selector authority must fail closed:\n{}",
-                refused.output
-            );
-            assert!(refused.diagnostics.semantic_kernel_render.is_none());
-        }
-    }
-
-    #[test]
-    fn handmade_carrier_free_loop_return_fixture_refuses_certified_c() {
-        let (blocks, arch, source_snapshot) = source_snapshot_carrier_free_loop_return_function();
-        let response = EngineSession::new().decompile_function_from_input(
-            EngineFunctionDecompileRequestInput::single_function(
-                EngineFunctionInput {
-                    function_name: "sym.production_carrier_free_loop_return".to_string(),
-                    function_addr: 0x7400,
-                    blocks: blocks.clone(),
-                    arch: Some(arch.clone()),
-                    source_snapshot: Some(Arc::clone(&source_snapshot)),
-                    semantic_metadata_enabled: true,
-                },
-                Some(64),
-                r2types::ParsedExternalContext::default(),
-            ),
-        );
-        assert!(response.diagnostics.semantic_kernel_render.is_none());
-        assert!(!response.output.contains("certified_sub_7400"));
-
-        let register = |offset, size| r2ssa::CanonicalStorageId {
-            space: r2ssa::CanonicalStorageSpace::Register,
-            offset,
-            size,
-        };
-        let wrong_interface = r2ssa::SourceFunctionInterface::new(
-            source_snapshot.revision_identity().to_vec(),
-            "test-register-abi",
-            [r2ssa::SourceAbiParameterSpec::new(0, register(24, 1))],
-            r2ssa::SourceFunctionReturn::Register {
-                storage: register(0, 8),
-            },
-            Vec::<r2ssa::SourceStackSlotSpec>::new(),
-        )
-        .expect("wrong loop condition interface");
-        let wrong_storage = Arc::new(
-            EngineSourceSnapshot::new(
-                source_snapshot.revision_identity().to_vec(),
-                Some(wrong_interface),
-                Vec::new(),
-            )
-            .expect("wrong loop condition snapshot"),
-        );
-        let missing_interface = Arc::new(
-            EngineSourceSnapshot::new(
-                source_snapshot.revision_identity().to_vec(),
-                None,
-                Vec::new(),
-            )
-            .expect("snapshot without loop function interface"),
-        );
-        for source_snapshot in [missing_interface, wrong_storage] {
-            let refused = EngineSession::new().decompile_function_from_input(
-                EngineFunctionDecompileRequestInput::single_function(
-                    EngineFunctionInput {
-                        function_name: "sym.production_carrier_free_loop_return".to_string(),
-                        function_addr: 0x7400,
-                        blocks: blocks.clone(),
-                        arch: Some(arch.clone()),
-                        source_snapshot: Some(source_snapshot),
-                        semantic_metadata_enabled: true,
-                    },
-                    Some(64),
-                    r2types::ParsedExternalContext::default(),
-                ),
-            );
-            assert!(
-                (refused.output.contains("r2dec residual:")
-                    || refused.output.contains("r2dec fallback:"))
-                    && !refused.output.contains("certified_sub_7400"),
-                "missing or wrong loop condition authority must fail closed:\n{}",
-                refused.output
-            );
-            assert!(refused.diagnostics.semantic_kernel_render.is_none());
-        }
-    }
-
     #[test]
     fn engine_source_snapshot_preserves_exact_ordered_interfaces() {
         let revision = b"source-revision-1";
@@ -7983,8 +5158,8 @@ mod tests {
             Vec::<r2ssa::SourceStackSlotSpec>::new(),
         )
         .expect("exact source interface")
-        .with_return_address_storage(register(0x10))
-        .and_then(|interface| interface.with_stack_pointer_storage(register(0x18)))
+        .with_return_address_storage(register(0x30))
+        .and_then(|interface| interface.with_stack_pointer_storage(register(0x28)))
         .expect("exact source machine carriers");
         let snapshot = Arc::new(
             EngineSourceSnapshot::new(
@@ -7998,11 +5173,9 @@ mod tests {
         );
         let mut blocks = direct_call_return_blocks(0x401000, 0x5000);
         blocks[0].ops[1] = r2il::R2ILOp::Return {
-            target: r2il::Varnode::register(0x10, 8),
+            target: r2il::Varnode::register(0x30, 8),
         };
-        let mut arch = x86_64_result_arch();
-        arch.add_register(r2il::RegisterDef::new("rip", 0x10, 8));
-        arch.add_register(r2il::RegisterDef::new("rsp", 0x18, 8));
+        let arch = x86_64_result_arch();
         let request =
             EngineAnalyzeRequest::full_semantics_for_function(EngineAnalyzeFunctionRequestInput {
                 function: EngineFunctionInput {
@@ -8017,7 +5190,6 @@ mod tests {
                 reg_type_hints: HashMap::new(),
                 parsed_context: r2types::ParsedExternalContext::default(),
                 interproc_max_iterations: 1,
-                symbolic_scope: None,
                 include_interproc_summary_set: false,
             });
         assert!(Arc::ptr_eq(
@@ -8074,7 +5246,6 @@ mod tests {
                 reg_type_hints: HashMap::new(),
                 parsed_context: r2types::ParsedExternalContext::default(),
                 interproc_max_iterations: 1,
-                symbolic_scope: None,
                 include_interproc_summary_set: false,
             });
 
@@ -8112,12 +5283,12 @@ mod tests {
                 arch: Some(arch),
                 source_snapshot: Some(exact_rdi_test_source_snapshot("sym.assumed/rev1")),
                 trusted_ssa: None,
+                callee_facts: Vec::new(),
                 ptr_bits: 64,
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
                 parsed_context,
                 interproc_max_iterations: 1,
-                symbolic_scope: None,
                 semantic_mode: EngineSemanticMode::Optional,
                 include_interproc_summary_set: true,
                 execution: EngineExecutionControl::default(),
@@ -8125,18 +5296,29 @@ mod tests {
             .expect("assumption-conditioned analysis");
 
         assert!(response.artifact.trusted_ssa.is_none());
-        let (usage, conditioned) = prepared_assumption_conditioning(response.artifact.ssa_func());
-        assert!(conditioned);
+        let usage = &response.artifact.ssa_func().facts().assumption_usage;
         assert_eq!(usage.applied.len(), 1);
+        assert!(usage.conflicts.is_empty());
     }
 
     fn x86_64_result_arch() -> r2il::ArchSpec {
         let mut arch = r2il::ArchSpec::new("x86-64");
         arch.addr_size = 8;
         arch.set_memory_endianness(r2il::Endianness::Little);
-        arch.add_register(r2il::RegisterDef::new("rax", 0, 8));
-        arch.add_register(r2il::RegisterDef::new("rsp", 0x28, 8));
-        arch.add_register(r2il::RegisterDef::new("rip", 0x30, 8));
+        for (name, offset) in [("rax", 0), ("rsp", 0x28), ("rip", 0x30)] {
+            let storage = r2il::RegisterStorage { offset, size: 8 };
+            arch.add_register(r2il::RegisterDef::new(name, offset, 8));
+            arch.register_projections.push(r2il::RegisterProjection {
+                written: storage,
+                disposition: r2il::RegisterProjectionDisposition::Bound {
+                    carrier: storage,
+                    slice: r2il::RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits: 64,
+                    },
+                },
+            });
+        }
         arch
     }
 
@@ -8330,30 +5512,7 @@ mod tests {
     }
 
     #[test]
-    fn engine_interproc_summary_json_merges_symbolic_scope_report() {
-        let root_blocks = const_return_blocks(0x401000, 0);
-        let helper_blocks = const_return_blocks(0x402000, 1);
-        let root_prepared =
-            Arc::new(r2ssa::SsaArtifact::for_symbolic(&root_blocks, None).expect("root prepared"));
-        let helper_prepared = Arc::new(
-            r2ssa::SsaArtifact::for_symbolic(&helper_blocks, None).expect("helper prepared"),
-        );
-        let scope = r2sym::PreparedFunctionScope::new(
-            0x401000,
-            vec![
-                r2sym::ScopedPreparedFunction {
-                    id: r2ssa::InterprocFunctionId(0x401000),
-                    name: Some("root".to_string()),
-                    prepared: root_prepared,
-                },
-                r2sym::ScopedPreparedFunction {
-                    id: r2ssa::InterprocFunctionId(0x402000),
-                    name: Some("helper".to_string()),
-                    prepared: helper_prepared,
-                },
-            ],
-        )
-        .expect("scope");
+    fn engine_interproc_summary_json_preserves_supplied_scope_report() {
         let existing_scope = serde_json::json!({
             "payloads": [{ "function_addr": 0x403000u64, "function_name": "seeded" }],
             "seeds": [{ "id": 0x403000u64, "name": "seeded" }],
@@ -8366,19 +5525,11 @@ mod tests {
             converged: true,
             summary: None,
             scope_report: Some(&existing_scope),
-            symbolic_scope: Some(&scope),
         });
-        let scope = interproc.scope.expect("merged scope");
 
         assert_eq!(interproc.iterations, 1);
         assert_eq!(interproc.max_iterations, 1);
-        assert_eq!(scope["phase"], "symbolic_scope");
-        assert_eq!(scope["payloads"].as_array().expect("payloads").len(), 2);
-        assert_eq!(scope["seeds"].as_array().expect("seeds").len(), 2);
-        assert_eq!(scope["payloads"][1]["function_addr"], 0x402000);
-        assert_eq!(scope["payloads"][1]["function_name"], "helper");
-        assert_eq!(scope["seeds"][1]["id"], 0x402000);
-        assert_eq!(scope["seeds"][1]["name"], "helper");
+        assert_eq!(interproc.scope, Some(existing_scope));
     }
 
     #[test]
@@ -8430,7 +5581,7 @@ mod tests {
     fn post_analysis_plan_owns_mode_budgets_and_focus_thresholds() {
         let fast = post_analysis_plan_for_radare2_depth(RADARE2_ANALYSIS_DEPTH_BASIC, 512);
         assert_eq!(fast.policy.mode, EngineAnalysisMode::Fast);
-        assert_eq!(fast.post_budget_us, POST_ANALYSIS_FAST_BUDGET_USEC);
+        assert_eq!(fast.post_budget_us, post_analysis_budget_usec(512));
         assert!(!fast.xref_enabled);
         assert!(!fast.taint_enabled);
         assert!(!fast.signature_writeback_enabled);
@@ -8442,7 +5593,7 @@ mod tests {
 
         let balanced = post_analysis_plan_for_radare2_depth(0, 1);
         assert_eq!(balanced.policy.mode, EngineAnalysisMode::Balanced);
-        assert_eq!(balanced.post_budget_us, POST_ANALYSIS_BALANCED_BUDGET_USEC);
+        assert_eq!(balanced.post_budget_us, post_analysis_budget_usec(1));
         assert!(balanced.xref_enabled);
         assert!(!balanced.taint_enabled);
         assert!(balanced.signature_writeback_enabled);
@@ -8454,7 +5605,7 @@ mod tests {
 
         let full = post_analysis_plan_for_radare2_depth(RADARE2_ANALYSIS_DEPTH_AGGRESSIVE, 129);
         assert_eq!(full.policy.mode, EngineAnalysisMode::Full);
-        assert_eq!(full.post_budget_us, POST_ANALYSIS_AGGRESSIVE_BUDGET_USEC);
+        assert_eq!(full.post_budget_us, post_analysis_budget_usec(129));
         assert!(full.xref_enabled);
         assert!(full.taint_enabled);
         assert!(full.signature_writeback_enabled);
@@ -8564,7 +5715,6 @@ mod tests {
             reg_type_hints: HashMap::new(),
             parsed_context: r2types::parse_external_context_json("{}", 64),
             interproc_max_iterations: 1,
-            symbolic_scope: None,
             include_interproc_summary_set: true,
         };
 
@@ -8600,7 +5750,6 @@ mod tests {
             reg_type_hints: HashMap::new(),
             parsed_context: r2types::parse_external_context_json("{}", 32),
             interproc_max_iterations: 2,
-            symbolic_scope: None,
             include_interproc_summary_set: true,
         };
 
@@ -8636,7 +5785,6 @@ mod tests {
                 reg_type_hints: HashMap::new(),
                 parsed_context: r2types::parse_external_context_json("{}", 32),
                 interproc_max_iterations: 1,
-                symbolic_scope: None,
                 include_interproc_summary_set: false,
             });
         assert_eq!(grouped.function_name, "sym.grouped");
@@ -8727,7 +5875,6 @@ mod tests {
             reg_type_hints: HashMap::new(),
             parsed_context: r2types::parse_external_context_json("{}", 64),
             interproc_max_iterations: 1,
-            symbolic_scope: None,
             include_interproc_summary_set: false,
         };
 
@@ -8757,7 +5904,7 @@ mod tests {
     }
 
     #[test]
-    fn interproc_summary_scope_requires_exact_root_and_source_helper_provenance() {
+    fn interproc_summary_build_uses_only_trusted_callee_bodies() {
         let root_addr = 0x401000;
         let helper_addr = 0x402000;
         let root_blocks = const_return_blocks(root_addr, 0);
@@ -8801,98 +5948,38 @@ mod tests {
             .expect("helper prepared"),
         );
         let analysis = EngineAnalysis::from_prepared_ssa(Arc::clone(&root_prepared));
-        let exact_scope = r2sym::PreparedFunctionScope::new(
-            root_addr,
-            vec![
-                r2sym::ScopedPreparedFunction {
-                    id: r2ssa::InterprocFunctionId(root_addr),
-                    name: Some("root".to_string()),
-                    prepared: Arc::clone(&root_prepared),
-                },
-                r2sym::ScopedPreparedFunction {
-                    id: r2ssa::InterprocFunctionId(helper_addr),
-                    name: Some("helper".to_string()),
-                    prepared: Arc::clone(&helper_prepared),
-                },
-            ],
-        )
-        .expect("exact scope");
-        let foreign_root = Arc::new(
-            r2ssa::SsaArtifact::for_decompile_with_interface(&root_blocks, Some(&arch), interface)
-                .expect("foreign root prepared"),
-        );
-        let foreign_scope = r2sym::PreparedFunctionScope::new(
-            root_addr,
-            vec![
-                r2sym::ScopedPreparedFunction {
-                    id: r2ssa::InterprocFunctionId(root_addr),
-                    name: Some("root".to_string()),
-                    prepared: foreign_root,
-                },
-                r2sym::ScopedPreparedFunction {
-                    id: r2ssa::InterprocFunctionId(helper_addr),
-                    name: Some("helper".to_string()),
-                    prepared: helper_prepared,
-                },
-            ],
-        )
-        .expect("foreign scope");
-        let solve = |symbolic_scope| {
+        // A body that is not source-owned is refused when its contribution is
+        // derived, which is before a caller can consult it at all.
+        let solve = |callees: &[Arc<r2ssa::SsaArtifact>]| {
+            let summaries = callees
+                .iter()
+                .map(|callee| {
+                    r2ssa::PreparedCalleeSummary::derive(
+                        r2ssa::InterprocFunctionId(callee.function().entry),
+                        callee,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             build_prepared_interproc_summary_set(InterprocSummaryBuildInput {
                 analysis: &analysis,
                 max_iterations: 1,
-                symbolic_scope,
+                callee_summaries: &summaries,
             })
         };
 
         assert_eq!(
-            solve(Some(&exact_scope)).expect_err("manual helper must not become source evidence"),
+            solve(&[helper_prepared]).expect_err("manual helper must not become source evidence"),
             r2ssa::PreparedInterprocSummaryError::ManualFunction
         );
 
-        let foreign = solve(Some(&foreign_scope)).expect("root-only prepared summary set");
-        assert_eq!(foreign.report().diagnostics.scope_size, 1);
+        let root_only = solve(&[]).expect("root-only prepared summary set");
+        assert_eq!(root_only.report().diagnostics.scope_size, 1);
         assert!(
-            !foreign
+            !root_only
                 .report()
                 .summaries
                 .contains_key(&r2ssa::InterprocFunctionId(helper_addr))
         );
-    }
-
-    fn windows_x64_runtime_scope_arch() -> r2il::ArchSpec {
-        let mut arch = r2il::ArchSpec::new("x86-64");
-        arch.addr_size = 8;
-        arch.add_register(r2il::RegisterDef::new("rax", 0, 8));
-        arch.add_register(r2il::RegisterDef::new("rcx", 8, 8));
-        arch.add_register(r2il::RegisterDef::new("rdx", 16, 8));
-        arch.add_register(r2il::RegisterDef::new("r8", 24, 8));
-        arch.add_register(r2il::RegisterDef::new("r9", 32, 8));
-        arch.add_register(r2il::RegisterDef::new("rip", 40, 8));
-        arch
-    }
-
-    fn x86_32_runtime_scope_arch() -> r2il::ArchSpec {
-        let mut arch = windows_x64_runtime_scope_arch();
-        arch.name = "x86".to_string();
-        arch.addr_size = 4;
-        arch
-    }
-
-    fn x86_64_generic_name_runtime_scope_arch() -> r2il::ArchSpec {
-        let mut arch = windows_x64_runtime_scope_arch();
-        arch.name = "x86".to_string();
-        arch.addr_size = 8;
-        arch
-    }
-
-    fn runtime_reg(offset: u64, size: u32) -> r2il::Varnode {
-        r2il::Varnode {
-            space: r2il::SpaceId::Register,
-            offset,
-            size,
-            meta: None,
-        }
     }
 
     const VM_TEST_RAX: u64 = 0;
@@ -8912,73 +5999,6 @@ mod tests {
 
     fn vm_const(value: u64, size: u32) -> r2il::Varnode {
         r2il::Varnode::constant(value, size)
-    }
-
-    fn symbolic_register_branch_blocks(addr: u64) -> Vec<R2ILBlock> {
-        let mut block = R2ILBlock::new(addr, 4);
-        block.push(r2il::R2ILOp::IntEqual {
-            dst: vm_reg(0x80, 1),
-            a: vm_reg(0x38, 8),
-            b: vm_const(1, 8),
-        });
-        block.push(r2il::R2ILOp::CBranch {
-            target: vm_const(addr + 0x10, 8),
-            cond: vm_reg(0x80, 1),
-        });
-
-        let mut fallthrough = R2ILBlock::new(addr + 4, 1);
-        fallthrough.push(r2il::R2ILOp::Return {
-            target: vm_const(0, 8),
-        });
-
-        let mut target = R2ILBlock::new(addr + 0x10, 1);
-        target.push(r2il::R2ILOp::Return {
-            target: vm_const(1, 8),
-        });
-
-        vec![block, fallthrough, target]
-    }
-
-    fn symbolic_register_assumption(prepared: &r2ssa::SsaArtifact) -> r2ssa::AnalysisAssumption {
-        let reg_name = prepared
-            .graph()
-            .values
-            .iter()
-            .find(|value| value.var.version == 0 && value.var.is_register() && value.var.size == 8)
-            .expect("version-zero input register")
-            .var
-            .name
-            .clone();
-        r2ssa::AnalysisAssumption {
-            id: Some("force-input-register".to_string()),
-            subject: r2ssa::AssumptionSubject::Register { name: reg_name },
-            value: r2ssa::AssumptionValue::Constant { value: 1 },
-            scope: r2ssa::AssumptionScope::Query,
-            provenance: r2ssa::AssumptionProvenance::User,
-        }
-    }
-
-    fn conflicting_predicate_assumption(
-        prepared: &r2ssa::SsaArtifact,
-    ) -> r2ssa::AnalysisAssumption {
-        let (predicate, fact) = prepared
-            .facts()
-            .predicates
-            .predicates
-            .iter()
-            .next()
-            .expect("predicate fact");
-        r2ssa::AnalysisAssumption {
-            id: Some("conflicting-branch".to_string()),
-            subject: r2ssa::AssumptionSubject::Predicate {
-                predicate: *predicate,
-                block_addr: fact.block_addr + 0x1000,
-                predecessor: None,
-            },
-            value: r2ssa::AssumptionValue::Branch { truth: true },
-            scope: r2ssa::AssumptionScope::Query,
-            provenance: r2ssa::AssumptionProvenance::User,
-        }
     }
 
     fn register_assumption(id: &str, name: &str, value: u64) -> r2ssa::AnalysisAssumption {
@@ -9097,7 +6117,6 @@ mod tests {
             &parsed,
             &ssa,
             &pattern_blocks,
-            true,
         ));
 
         parsed.stack_slots.insert(
@@ -9113,7 +6132,6 @@ mod tests {
                         signedness: r2types::Signedness::Signed,
                     },
                 ))),
-                base: r2types::ExternalStackBase::FramePointer,
                 role: r2types::ExternalStackSlotRole::Local,
                 ..r2types::ExternalStackSlotSpec::default()
             },
@@ -9123,7 +6141,6 @@ mod tests {
             &parsed,
             &ssa,
             &pattern_blocks,
-            false,
         ));
     }
 
@@ -9262,7 +6279,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_cfg_preprobe_summary_counts_back_edges_without_ssa() {
+    fn cfg_risk_summary_counts_a_switch_case_back_edge_alongside_a_self_loop() {
         let mut entry = R2ILBlock::new(0x1000, 4);
         entry.push(r2il::R2ILOp::CBranch {
             target: r2il::Varnode::constant(0x1000, 8),
@@ -9280,13 +6297,86 @@ mod tests {
             }],
         });
 
-        let summary = route::raw_cfg_risk_summary_for_preprobe(&[entry, switch]);
+        let blocks = [entry, switch];
+        let summary = r2ssa::CFG::from_blocks(&blocks)
+            .expect("cfg should build")
+            .risk_summary();
 
         assert_eq!(summary.block_count, 2);
         assert_eq!(summary.loop_count, 1);
+        // Two edges re-enter the entry: the block's own conditional branch and
+        // the switch case. A summary that folded them into one would under-count
+        // exactly the shape the guard's back-edge threshold exists to catch.
         assert_eq!(summary.back_edge_count, 2);
         assert_eq!(summary.switch_block_count, 1);
         assert_eq!(summary.max_switch_cases, 2);
+    }
+
+    fn self_looping_blocks(base: u64, loop_count: usize) -> Vec<R2ILBlock> {
+        let mut blocks = Vec::with_capacity(loop_count + 1);
+        for index in 0..loop_count {
+            let addr = base + (index as u64) * 4;
+            let mut block = R2ILBlock::new(addr, 4);
+            block.push(r2il::R2ILOp::CBranch {
+                target: r2il::Varnode::constant(addr, 8),
+                cond: r2il::Varnode::constant(1, 1),
+            });
+            blocks.push(block);
+        }
+        let mut exit = R2ILBlock::new(base + (loop_count as u64) * 4, 4);
+        exit.push(r2il::R2ILOp::Return {
+            target: r2il::Varnode::constant(0, 8),
+        });
+        blocks.push(exit);
+        blocks
+    }
+
+    #[test]
+    fn cfg_guard_reason_reads_the_same_counters_the_ssa_summary_reports() {
+        let blocks = self_looping_blocks(0x3000, 9);
+        let prepared =
+            r2ssa::SSAFunction::from_blocks_raw_no_arch(&blocks).expect("raw SSA should build");
+        let from_cfg = r2ssa::CFG::from_blocks(&blocks)
+            .expect("cfg should build")
+            .risk_summary();
+
+        assert_eq!(
+            from_cfg,
+            prepared.cfg_risk_summary(),
+            "the guard's cheap derivation must report what renamed SSA reports"
+        );
+        assert_eq!(
+            cfg_guard_reason_from_summary(&from_cfg),
+            cfg_guard_reason_from_summary(&prepared.cfg_risk_summary()),
+        );
+        assert!(cfg_guard_reason_from_summary(&from_cfg).is_some());
+    }
+
+    #[test]
+    fn cfg_risk_summary_answers_for_input_whose_raw_ssa_will_not_form() {
+        // An unreachable block that jumps into the entry leaves a predecessor
+        // outside the domain SSA retains, so preparation refuses the input.
+        let mut blocks = self_looping_blocks(0x4000, 9);
+        let mut orphan = R2ILBlock::new(0x4100, 4);
+        orphan.push(r2il::R2ILOp::Branch {
+            target: r2il::Varnode::constant(0x4000, 8),
+        });
+        blocks.push(orphan);
+
+        assert!(r2ssa::SSAFunction::from_blocks_raw_no_arch(&blocks).is_none());
+        // The two derivations do not accept the same inputs. Anything that
+        // reintroduces a block-level guard has to decide what this input is,
+        // because the CFG will happily call it complex while the SSA phase is
+        // going to refuse it as malformed under its own reason.
+        assert!(
+            cfg_guard_reason_from_summary(
+                &r2ssa::CFG::from_blocks(&blocks)
+                    .expect("cfg should build")
+                    .risk_summary()
+            )
+            .is_some(),
+            "the CFG alone is complex enough to trip the guard"
+        );
     }
 
     #[test]
@@ -9299,12 +6389,12 @@ mod tests {
             arch: Some(x86_64_result_arch()),
             source_snapshot: Some(exact_empty_test_source_snapshot("sym.zero/analyze/rev1")),
             trusted_ssa: None,
+            callee_facts: Vec::new(),
             ptr_bits: 64,
             semantic_metadata_enabled: false,
             reg_type_hints: HashMap::new(),
             parsed_context: r2types::ParsedExternalContext::default(),
             interproc_max_iterations: 1,
-            symbolic_scope: None,
             semantic_mode: EngineSemanticMode::Full,
             include_interproc_summary_set: true,
             execution: EngineExecutionControl::default(),
@@ -9373,18 +6463,31 @@ mod tests {
             reg_type_hints: HashMap::new(),
             parsed_context: r2types::ParsedExternalContext::default(),
             interproc_max_iterations: 1,
-            symbolic_scope: None,
             include_interproc_summary_set: false,
         })
     }
 
     fn controlled_r2dec_render_request() -> EngineDecompileRequest {
-        let blocks = const_return_blocks(0x614000, 7);
+        let mut block = R2ILBlock::new(0x614000, 4);
+        block.push(r2il::R2ILOp::Copy {
+            dst: r2il::Varnode::register(0, 8),
+            src: r2il::Varnode::constant(7, 8),
+        });
+        block.push(r2il::R2ILOp::Return {
+            target: r2il::Varnode::register(0x30, 8),
+        });
+        let blocks = vec![block];
         let interface = r2ssa::SourceFunctionInterface::new_exact(
             b"controlled-r2dec-source".to_vec(),
             "sysv64",
             std::iter::empty::<r2ssa::SourceAbiParameterSpec>(),
-            r2ssa::SourceFunctionReturn::Void,
+            r2ssa::SourceFunctionReturn::Register {
+                storage: r2ssa::CanonicalStorageId {
+                    space: r2ssa::CanonicalStorageSpace::Register,
+                    offset: 0,
+                    size: 8,
+                },
+            },
             std::iter::empty::<r2ssa::SourceStackSlotSpec>(),
         )
         .and_then(|interface| {
@@ -9491,30 +6594,47 @@ mod tests {
     }
 
     #[test]
-    fn r2dec_inner_stops_map_to_engine_refusals_without_native_output() {
+    fn r2dec_inner_stops_map_to_engine_refusals_and_keep_exact_audits() {
         let session = EngineSession::new();
         let request = controlled_r2dec_render_request();
         let decompiler_input = decompiler_input_for_engine_request(&request);
         let legacy_output = r2dec::Decompiler::new(request.render_target.to_decompiler_config())
             .decompile_input(&decompiler_input);
         let counting = CountingRenderControl::default();
-        let controlled = session.decompile_with_r2dec_control_and_kernel_policy(
-            request.clone(),
-            &counting,
-            false,
+        let controlled = session.decompile_with_r2dec_control(request.clone(), &counting);
+        assert!(
+            legacy_output.contains("return"),
+            "the exact control fixture must reach native rendering: {legacy_output}"
         );
-        assert_eq!(controlled.output, legacy_output);
+        assert!(
+            controlled.output.contains("return"),
+            "the engine path must render the same exact fixture: {}",
+            controlled.output
+        );
+        assert_ne!(
+            controlled.binding_audit,
+            BindingShadowAuditOutcome::NotRun,
+            "the completed native render must retain its exact r2dec audit: {}",
+            controlled.output
+        );
+        assert_ne!(
+            controlled.effect_obligations,
+            EffectObligationAudit::NOT_RUN,
+            "the completed native render must retain its exact effect audit"
+        );
+        assert_eq!(
+            controlled.render_refusal, None,
+            "the exact fixture must not cross a renderer refusal boundary"
+        );
+        let completed_binding_audit = controlled.binding_audit;
+        let completed_effect_obligations = controlled.effect_obligations;
         let total_polls = counting.polls.get();
         assert!(total_polls > 3, "r2dec pipeline must expose inner polls");
 
         let mut observed = HashMap::new();
         for stop_at in 1..=total_polls {
             let stop = StopRenderAtPoll::new(stop_at, r2ssa::SsaExecutionStopReason::Cancelled);
-            let response = session.decompile_with_r2dec_control_and_kernel_policy(
-                request.clone(),
-                &stop,
-                false,
-            );
+            let response = session.decompile_with_r2dec_control(request.clone(), &stop);
             let phase = [EnginePhase::Normalization, EnginePhase::Rendering]
                 .into_iter()
                 .find(|phase| {
@@ -9544,11 +6664,7 @@ mod tests {
                 r2ssa::SsaExecutionStopReason::Cancelled
             };
             let stop = StopRenderAtPoll::new(stop_at, reason);
-            let response = session.decompile_with_r2dec_control_and_kernel_policy(
-                request.clone(),
-                &stop,
-                false,
-            );
+            let response = session.decompile_with_r2dec_control(request.clone(), &stop);
             let expected_reason = match reason {
                 r2ssa::SsaExecutionStopReason::Cancelled => {
                     format!("engine request cancelled during {} phase", phase.as_str())
@@ -9596,24 +6712,45 @@ mod tests {
             );
             assert_eq!(
                 response.diagnostics.route_reason.as_deref(),
-                Some(expected_reason.as_str())
+                Some(expected_reason.as_str()),
+                "an execution stop remains primary over audits retained from the partial render"
             );
-            assert!(
-                response
-                    .diagnostics
-                    .refusal
-                    .as_deref()
-                    .is_some_and(|refusal| refusal.contains(&expected_reason))
-            );
-            assert_eq!(
-                response
-                    .function_facts
-                    .decompile_route()
-                    .map(|route| route.kind),
-                Some(r2types::DecompileRouteKind::FallbackComment)
-            );
-            assert!(response.output.starts_with("/* r2dec fallback:"));
-            assert!(!response.output.contains("() {"));
+            if phase == EnginePhase::Rendering {
+                assert_eq!(response.binding_audit, completed_binding_audit);
+                assert_eq!(response.effect_obligations, completed_effect_obligations);
+                assert!(
+                    !response.output.trim().is_empty(),
+                    "the stopped render retains the partial output it reached"
+                );
+                assert!(
+                    response
+                        .diagnostics
+                        .refusal
+                        .as_deref()
+                        .is_some_and(|value| value.contains(&expected_reason)),
+                    "the execution stop must remain the response refusal: {}",
+                    response.output
+                );
+            } else {
+                assert_eq!(response.binding_audit, BindingShadowAuditOutcome::NotRun);
+                assert_eq!(response.effect_obligations, EffectObligationAudit::NOT_RUN);
+                assert!(
+                    response
+                        .diagnostics
+                        .refusal
+                        .as_deref()
+                        .is_some_and(|refusal| refusal.contains(&expected_reason))
+                );
+                assert_eq!(
+                    response
+                        .function_facts
+                        .decompile_route()
+                        .map(|route| route.kind),
+                    Some(r2types::DecompileRouteKind::FallbackComment)
+                );
+                assert!(response.output.starts_with("/* r2dec fallback:"));
+                assert!(!response.output.contains("() {"));
+            }
         }
     }
 
@@ -9641,8 +6778,35 @@ mod tests {
             ] {
                 let mapped = engine_render_stop_from_decompiler(
                     r2dec::DecompileExecutionStop::new(decompile_phase, reason),
+                    BindingShadowAuditOutcome::NotRun,
+                    EffectObligationAudit {
+                        disposition: EffectObligationDisposition::Refused,
+                        total: 11,
+                        rendered: 5,
+                        justified_elision: 2,
+                        refused: 1,
+                        unaccounted: 2,
+                        conflicts: 1,
+                        refused_obligation: None,
+                        unaccounted_obligation: None,
+                        conflicting_obligation: None,
+                    },
+                    PlacementAudit::NotRun,
+                    Some(DecompileRenderRefusal::UnrepresentableOperation),
                 );
                 assert_eq!(mapped.phase, engine_phase);
+                assert_eq!(*mapped.binding_audit, BindingShadowAuditOutcome::NotRun);
+                assert_eq!(mapped.effect_obligations.total, 11);
+                assert_eq!(mapped.effect_obligations.rendered, 5);
+                assert_eq!(mapped.effect_obligations.justified_elision, 2);
+                assert_eq!(mapped.effect_obligations.refused, 1);
+                assert_eq!(mapped.effect_obligations.unaccounted, 2);
+                assert_eq!(mapped.effect_obligations.conflicts, 1);
+                assert_eq!(mapped.placement_audit, PlacementAudit::NotRun);
+                assert_eq!(
+                    mapped.render_refusal.as_deref(),
+                    Some(&DecompileRenderRefusal::UnrepresentableOperation)
+                );
                 assert_eq!(
                     mapped.normalization_completed,
                     !matches!(decompile_phase, r2dec::DecompileWorkPhase::Normalization)
@@ -9676,135 +6840,210 @@ mod tests {
     }
 
     #[test]
-    fn semantic_kernel_trace_preserves_order_and_classification_before_later_success() {
-        let mut trace = EngineSemanticKernelTrace::default();
-        trace.not_applicable(
-            EngineSemanticKernelProbe::PrivateFrame,
-            "private-frame constructor mismatch",
-        );
-        trace.not_applicable(
-            EngineSemanticKernelProbe::Aggregate,
-            "aggregate constructor mismatch",
-        );
-        trace.refused(EngineSemanticKernelProbe::Memory, "memory renderer refusal");
-
-        let warnings = trace.into_warnings();
+    fn refused_effect_obligations_produce_a_typed_engine_refusal() {
+        let obligation = r2ssa::SemanticObligationId {
+            instruction: r2ssa::CanonicalInstructionId {
+                block_addr: 0x401000,
+                site: r2ssa::CanonicalInstructionSite::Op(7),
+            },
+            kind: r2ssa::SemanticObligationKind::ObservableMemoryWrite,
+            component: r2ssa::SemanticObligationComponent::Whole,
+        };
+        let effect_obligations = EffectObligationAudit {
+            disposition: EffectObligationDisposition::Refused,
+            total: 9,
+            rendered: 4,
+            justified_elision: 1,
+            refused: 2,
+            unaccounted: 1,
+            conflicts: 1,
+            refused_obligation: Some(obligation),
+            unaccounted_obligation: Some(obligation),
+            conflicting_obligation: Some(obligation),
+        };
+        let reason = effect_obligation_refusal_reason(effect_obligations)
+            .expect("refused effects must refuse the native engine outcome");
         assert_eq!(
-            warnings,
-            vec![
-                "semantic-kernel:private-frame:not_applicable:private-frame constructor mismatch",
-                "semantic-kernel:aggregate:not_applicable:aggregate constructor mismatch",
-                "semantic-kernel:memory:refused:memory renderer refusal",
-            ],
-            "an earlier probe trace must survive a later successful probe"
+            reason,
+            "native effect obligations refused: 2 refused (memory-write at 0x401000:op:7), 1 unaccounted (memory-write at 0x401000:op:7), 1 conflicts (memory-write at 0x401000:op:7)"
         );
-    }
+        let render_time = Duration::from_micros(17);
+        let mut metrics = EngineMetrics::default();
+        metrics.record_phase(
+            EnginePhase::Rendering,
+            EnginePhaseStatus::Refused,
+            render_time,
+        );
+        let sentinel_quality = r2types::FunctionInputQualityFacts {
+            expected_blocks: 7,
+            lifted_blocks: 7,
+            actual_lifted_blocks: 7,
+            read_failures: 0,
+            invalid_blocks: 0,
+            null_lift_failures: 0,
+            truncated_blocks: 0,
+            refusal_reason: None,
+        };
+        let response = refused_decompile_response_with_metrics_and_audits(
+            "sym.effect_refusal",
+            &reason,
+            None,
+            metrics,
+            EngineDiagnostics::default(),
+            Some(FunctionFacts::default().with_input_quality(sentinel_quality.clone())),
+            BindingShadowAuditOutcome::NotRun,
+            effect_obligations,
+            PlacementAudit::NotRun,
+            None,
+        );
 
-    #[test]
-    fn private_frame_probe_continues_only_when_no_exact_join_exists() {
-        use r2dec::PrivateFrameConditionalJoinFunctionError as Error;
-
+        assert_eq!(response.effect_obligations, effect_obligations);
         assert_eq!(
-            classify_private_frame_probe_error(&Error::MissingExactJoin),
-            EnginePrivateFrameProbeDisposition::NotApplicable
+            response.metrics.phase_timings[EnginePhase::Rendering as usize].status,
+            EnginePhaseStatus::Refused
         );
-        for error in [
-            Error::MachineProjection(r2ssa::MachineBuildError::UntrustedArtifactProvenance),
-            Error::MultipleExactJoins,
-            Error::NonEntryExactJoin,
-        ] {
-            assert_eq!(
-                classify_private_frame_probe_error(&error),
-                EnginePrivateFrameProbeDisposition::Refused,
-                "{error} must stop before any lower semantic or legacy route"
-            );
-        }
-    }
-
-    #[test]
-    fn semantic_kernel_trace_bounds_entries_and_reason_characters() {
-        let probes = [
-            EngineSemanticKernelProbe::PrivateFrame,
-            EngineSemanticKernelProbe::Aggregate,
-            EngineSemanticKernelProbe::Memory,
-            EngineSemanticKernelProbe::DirectCall,
-            EngineSemanticKernelProbe::Conditional,
-            EngineSemanticKernelProbe::Switch,
-            EngineSemanticKernelProbe::Loop,
-            EngineSemanticKernelProbe::Terminal,
-        ];
-        let mut trace = EngineSemanticKernelTrace::default();
-        let long_reason = format!("{}\nignored", "x".repeat(600));
-        for probe in probes {
-            trace.not_applicable(probe, &long_reason);
-        }
-        trace.refused(EngineSemanticKernelProbe::Terminal, "ninth entry");
-
-        let warnings = trace.into_warnings();
-        assert_eq!(warnings.len(), ENGINE_SEMANTIC_KERNEL_TRACE_LIMIT);
+        assert_eq!(
+            response.diagnostics.route_reason.as_deref(),
+            Some(reason.as_str())
+        );
         assert!(
-            warnings
-                .iter()
-                .all(|warning| warning.starts_with(ENGINE_SEMANTIC_KERNEL_WARNING_TAG))
+            response
+                .diagnostics
+                .refusal
+                .as_deref()
+                .is_some_and(|value| value.contains(reason.as_str()))
         );
-        assert!(warnings.iter().all(|warning| !warning.contains('\n')));
-        let reason = warnings[0]
-            .rsplit_once(':')
-            .map(|(_, reason)| reason)
-            .expect("tagged reason");
+        assert!(response.output.starts_with("/* r2dec fallback:"));
+        assert!(effect_obligation_refusal_reason(EffectObligationAudit::NOT_RUN).is_none());
         assert_eq!(
-            reason.chars().count(),
-            ENGINE_SEMANTIC_KERNEL_REASON_CHAR_LIMIT
+            response.function_facts.input_quality(),
+            Some(&sentinel_quality),
+            "late effect refusal replaces only the route and retains existing function facts"
+        );
+        assert!(
+            effect_obligation_refusal_reason(EffectObligationAudit {
+                disposition: EffectObligationDisposition::Admitted,
+                total: 1,
+                rendered: 0,
+                justified_elision: 0,
+                refused: 1,
+                unaccounted: 0,
+                conflicts: 0,
+                refused_obligation: None,
+                unaccounted_obligation: None,
+                conflicting_obligation: None,
+            })
+            .is_some(),
+            "nonzero refusal counts fail closed independently of disposition"
         );
     }
 
     #[test]
-    fn semantic_kernel_region_schema_table_tracks_exact_r2dec_contracts() {
-        for (region, contract, expected_wire) in [
-            (
-                EngineSemanticKernelRegion::TerminalReturnBlock,
-                r2dec::CERTIFIED_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
-                4,
-            ),
-            (
-                EngineSemanticKernelRegion::AggregateMemberTerminalReturnFunction,
-                r2dec::CERTIFIED_AGGREGATE_MEMBER_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
-                6,
-            ),
-            (
-                EngineSemanticKernelRegion::PlainRamMemoryTerminalReturnFunction,
-                r2dec::CERTIFIED_MEMORY_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
-                4,
-            ),
-            (
-                EngineSemanticKernelRegion::DirectCallTerminalReturnFunction,
-                r2dec::CERTIFIED_DIRECT_CALL_RETURN_FUNCTION_SCHEMA_VERSION,
-                3,
-            ),
-            (
-                EngineSemanticKernelRegion::PrivateFrameConditionalJoinFunction,
-                r2dec::CERTIFIED_PRIVATE_FRAME_CONDITIONAL_JOIN_FUNCTION_SCHEMA_VERSION,
-                1,
-            ),
-            (
-                EngineSemanticKernelRegion::ConditionalTerminalReturnFunction,
-                r2dec::CERTIFIED_CONDITIONAL_RETURN_FUNCTION_SCHEMA_VERSION,
-                3,
-            ),
-            (
-                EngineSemanticKernelRegion::SwitchTerminalReturnFunction,
-                r2dec::CERTIFIED_SWITCH_RETURN_FUNCTION_SCHEMA_VERSION,
-                3,
-            ),
-            (
-                EngineSemanticKernelRegion::CarrierFreeLoopTerminalReturnFunction,
-                r2dec::CERTIFIED_LOOP_RETURN_FUNCTION_SCHEMA_VERSION,
-                3,
-            ),
-        ] {
-            assert_eq!(contract, expected_wire);
-            assert_eq!(region.current_schema_version(), expected_wire);
-        }
+    fn refused_placement_produces_a_typed_engine_refusal() {
+        let placement_audit =
+            PlacementAudit::Refused(PlacementAuditRefusal::ReadBeforeAssignment {
+                binding_index: 3,
+                instruction_id: 11,
+                input_index: 2,
+            });
+        let reason = placement_refusal_reason(placement_audit)
+            .expect("refused placement must refuse the native engine outcome");
+        let mut metrics = EngineMetrics::default();
+        metrics.record_phase(
+            EnginePhase::Rendering,
+            EnginePhaseStatus::Refused,
+            Duration::from_micros(18),
+        );
+        let response = refused_decompile_response_with_metrics_and_audits(
+            "sym.placement_refusal",
+            &reason,
+            None,
+            metrics,
+            EngineDiagnostics::default(),
+            None,
+            BindingShadowAuditOutcome::NotRun,
+            EffectObligationAudit::NOT_RUN,
+            placement_audit,
+            None,
+        );
+
+        assert_eq!(response.placement_audit, placement_audit);
+        assert_eq!(
+            response.metrics.phase_timings[EnginePhase::Rendering as usize].status,
+            EnginePhaseStatus::Refused,
+        );
+        assert_eq!(
+            response.diagnostics.route_reason.as_deref(),
+            Some(reason.as_str())
+        );
+        assert!(
+            response
+                .diagnostics
+                .refusal
+                .as_deref()
+                .is_some_and(|value| value.contains(&reason))
+        );
+        assert!(response.output.starts_with("/* r2dec fallback:"));
+        assert!(placement_refusal_reason(PlacementAudit::Applied).is_none());
+        assert!(placement_refusal_reason(PlacementAudit::NotRun).is_none());
+    }
+
+    #[test]
+    fn renderer_boundary_refusal_produces_a_typed_engine_refusal() {
+        let render_refusal = DecompileRenderRefusal::MissingMachineProjectionAuthorization(
+            r2dec::MachineProjectionRefusalOrigin::op_lowering(),
+        );
+        let reason = render_refusal_reason(render_refusal);
+        let render_time = Duration::from_micros(19);
+        let mut metrics = EngineMetrics::default();
+        metrics.record_phase(
+            EnginePhase::Rendering,
+            EnginePhaseStatus::Refused,
+            render_time,
+        );
+        let response = refused_decompile_response_with_metrics_and_audits(
+            "sym.render_refusal",
+            &reason,
+            None,
+            metrics,
+            EngineDiagnostics::default(),
+            None,
+            BindingShadowAuditOutcome::NotRun,
+            EffectObligationAudit::NOT_RUN,
+            PlacementAudit::NotRun,
+            Some(render_refusal),
+        );
+
+        assert_eq!(response.render_refusal, Some(render_refusal));
+        assert_eq!(response.effect_obligations, EffectObligationAudit::NOT_RUN);
+        assert_eq!(
+            response.metrics.phase_timings[EnginePhase::Rendering as usize].status,
+            EnginePhaseStatus::Refused
+        );
+        assert_eq!(
+            response.diagnostics.route_reason.as_deref(),
+            Some(reason.as_str())
+        );
+        assert!(
+            response
+                .diagnostics
+                .refusal
+                .as_deref()
+                .is_some_and(|value| value.contains(reason.as_str()))
+        );
+        assert!(response.output.starts_with("/* r2dec fallback:"));
+        assert!(!response.output.contains("() {"));
+    }
+
+    #[test]
+    fn variadic_count_refusal_names_the_missing_callsite_evidence() {
+        let reason = render_refusal_reason(DecompileRenderRefusal::VariadicCallsiteArgumentCount(
+            r2ssa::VariadicCallsiteArgumentCountRefusal::FormatArgumentNotLiteral,
+        ));
+        assert_eq!(
+            reason,
+            "native rendering refused: variadic callsite argument count: format_argument_not_literal"
+        );
     }
 
     fn analyze_with_injected_ssa_control<C: r2ssa::SsaWorkControl + ?Sized>(
@@ -9980,7 +7219,6 @@ mod tests {
                 reg_type_hints: HashMap::new(),
                 parsed_context: r2types::ParsedExternalContext::default(),
                 interproc_max_iterations: 1,
-                symbolic_scope: None,
                 include_interproc_summary_set: false,
             })
             .with_cancellation(cancellation);
@@ -10121,111 +7359,6 @@ mod tests {
     }
 
     #[test]
-    fn decompile_probe_decision_guards_named_large_worker() {
-        let mut blocks = const_return_blocks(0x4b30, 0);
-        for idx in 0..210 {
-            blocks.push(R2ILBlock::new(0x5000 + idx, 1));
-        }
-        let decision =
-            decompile_probe_decision(&blocks, 0x4b30, "fcn.00004b30", "readlinebuffer_delim");
-
-        assert!(!decision.display_summary_family);
-        assert!(!decision.named_worker_guarded);
-        assert!(decision.block_guarded);
-        assert!(decision.summary_probe_needed);
-        assert!(decision.summary_probe_skipped_large_cfg);
-        assert_eq!(decision.summary_probe_name, "readlinebuffer_delim");
-    }
-
-    #[test]
-    fn decompile_probe_decision_keeps_medium_non_workers_on_full_route() {
-        let mut blocks = (0..8)
-            .map(|idx| R2ILBlock::new(0x6000 + idx, 1))
-            .collect::<Vec<_>>();
-        for idx in 0..129 {
-            blocks[0].push(r2il::R2ILOp::Copy {
-                dst: r2il::Varnode::unique(0x100 + idx, 8),
-                src: r2il::Varnode::constant(idx, 8),
-            });
-        }
-
-        let decision =
-            decompile_probe_decision(&blocks, 0x6000, "dbg.medium_helper", "dbg.medium_helper");
-
-        assert!(!decision.block_guarded);
-        assert!(!decision.summary_probe_needed);
-        assert!(!decision.summary_probe_skipped_large_cfg);
-        assert_eq!(decision.summary_probe_name, "dbg.medium_helper");
-        assert!(!decision.named_worker_guarded);
-    }
-
-    #[test]
-    fn decompile_probe_decision_does_not_prefer_full_diagnostic_name_without_evidence() {
-        let mut blocks = const_return_blocks(0x4bc0, 0);
-        for idx in 0..600 {
-            blocks[0].push(r2il::R2ILOp::Copy {
-                dst: r2il::Varnode::unique(0x200 + idx, 8),
-                src: r2il::Varnode::constant(idx, 8),
-            });
-        }
-
-        let decision = decompile_probe_decision(&blocks, 0x4bc0, "sym.diagnose", "sym.diagnose");
-
-        assert!(!decision.display_summary_family);
-        assert!(decision.block_guarded);
-        assert!(decision.summary_probe_needed);
-        assert!(decision.summary_probe_skipped_large_cfg);
-    }
-
-    #[test]
-    fn decompile_probe_decision_uses_strict_block_count_guard_boundary() {
-        let exactly_limit = (0..200)
-            .map(|idx| R2ILBlock::new(0x7000 + idx, 1))
-            .collect::<Vec<_>>();
-        let over_limit = (0..201)
-            .map(|idx| R2ILBlock::new(0x8000 + idx, 1))
-            .collect::<Vec<_>>();
-
-        let at_limit = decompile_probe_decision(&exactly_limit, 0x7000, "dbg.helper", "dbg.helper");
-        let over_limit = decompile_probe_decision(&over_limit, 0x8000, "dbg.helper", "dbg.helper");
-
-        assert!(!at_limit.summary_probe_skipped_large_cfg);
-        assert!(!at_limit.block_guarded);
-        assert!(over_limit.summary_probe_skipped_large_cfg);
-        assert!(over_limit.block_guarded);
-    }
-
-    #[test]
-    fn decompile_probe_decision_uses_strict_op_count_guard_boundary() {
-        let mut exactly_limit = R2ILBlock::new(0x9000, 1);
-        let mut over_limit = R2ILBlock::new(0xa000, 1);
-        for idx in 0..512 {
-            exactly_limit.push(r2il::R2ILOp::Copy {
-                dst: r2il::Varnode::unique(0x300 + idx, 8),
-                src: r2il::Varnode::constant(idx, 8),
-            });
-            over_limit.push(r2il::R2ILOp::Copy {
-                dst: r2il::Varnode::unique(0x600 + idx, 8),
-                src: r2il::Varnode::constant(idx, 8),
-            });
-        }
-        over_limit.push(r2il::R2ILOp::Copy {
-            dst: r2il::Varnode::unique(0x900, 8),
-            src: r2il::Varnode::constant(0x900, 8),
-        });
-
-        let at_limit =
-            decompile_probe_decision(&[exactly_limit], 0x9000, "dbg.helper", "dbg.helper");
-        let over_limit =
-            decompile_probe_decision(&[over_limit], 0xa000, "dbg.helper", "dbg.helper");
-
-        assert!(!at_limit.summary_probe_skipped_large_cfg);
-        assert!(!at_limit.block_guarded);
-        assert!(over_limit.summary_probe_skipped_large_cfg);
-        assert!(over_limit.block_guarded);
-    }
-
-    #[test]
     fn decompile_complexity_caps_refuse_before_analysis_construction() {
         let over_blocks = (0..=ENGINE_DECOMPILE_MAX_BLOCKS)
             .map(|index| {
@@ -10285,28 +7418,6 @@ mod tests {
     }
 
     #[test]
-    fn decompile_probe_decision_probes_small_switch_cfg() {
-        let mut switch_block = R2ILBlock::new(0xb000, 4);
-        switch_block.switch_info = Some(r2il::SwitchInfo {
-            switch_addr: 0xb000,
-            min_val: 0,
-            max_val: 0,
-            default_target: None,
-            cases: vec![r2il::SwitchCase {
-                value: 0,
-                target: 0xb010,
-            }],
-        });
-        let blocks = vec![switch_block, R2ILBlock::new(0xb010, 1)];
-
-        let decision = decompile_probe_decision(&blocks, 0xb000, "dbg.helper", "dbg.helper");
-
-        assert!(!decision.summary_probe_skipped_large_cfg);
-        assert!(!decision.block_guarded);
-        assert!(decision.summary_probe_needed);
-    }
-
-    #[test]
     fn function_identity_keeps_ordered_aliases_for_summary_and_type_routes() {
         let identity = EngineFunctionIdentity::with_aliases(
             0x7000,
@@ -10326,40 +7437,6 @@ mod tests {
                 "dbg.limfield"
             ]
         );
-        assert_eq!(identity.summary_probe_name(), "sym.limfield.isra.0");
-        assert!(
-            !identity.has_summary_family(),
-            "name aliases alone must not create summary-family applicability"
-        );
-    }
-
-    #[test]
-    fn function_identity_rejects_raw_import_name_summary_family() {
-        let identity = EngineFunctionIdentity::with_aliases(
-            0x401000,
-            "sym.imp.memcpy",
-            "sym.imp.memcpy",
-            ["fcn.00401000", "memcpy"],
-        );
-
-        assert!(
-            !identity.has_summary_family(),
-            "raw import aliases must not create evidence-backed summary-family applicability"
-        );
-        assert_eq!(identity.summary_probe_name(), "sym.imp.memcpy");
-    }
-
-    #[test]
-    fn function_identity_uses_address_name_aliases_for_route_policy() {
-        let identity = EngineFunctionIdentity::with_aliases(
-            0x8b50,
-            "fcn.00008b50",
-            "fcn.00008b50",
-            ["dbg.init_node"],
-        );
-
-        assert!(!identity.has_summary_family());
-        assert_eq!(identity.summary_probe_name(), "fcn.00008b50");
     }
 
     #[test]
@@ -10371,7 +7448,11 @@ mod tests {
                 .with_name("dbg.init_node"),
         );
 
-        let artifact = compile_semantic_artifact_for_analysis(&ssa_func, None, None);
+        let artifact = compile_semantic_artifact_for_analysis(
+            &ssa_func,
+            None,
+            &r2sym::SymExecutionControl::default(),
+        );
 
         assert_ne!(
             artifact.granularity,
@@ -10419,29 +7500,13 @@ mod tests {
             target: r2il::Varnode::constant(0x9050, 8),
             cond: r2il::Varnode::constant(1, 1),
         });
-        let loop_ssa = r2ssa::SsaArtifact::for_decompile(&[entry.clone()], None)
+        let loop_ssa = r2ssa::SsaArtifact::for_decompile(&[entry], None)
             .expect("loop ssa")
             .with_name("dbg.flag_expanded_loop_worker");
-        let decision = decompile_probe_decision(
-            &[entry],
-            0x9050,
-            "dbg.flag_expanded_loop_worker",
-            "dbg.flag_expanded_loop_worker",
-        );
 
         assert!(should_probe_native_worker_summary_before_full_semantics(
             &loop_ssa, None
         ));
-        assert!(decision.summary_probe_needed);
-    }
-
-    #[test]
-    fn prefer_full_named_workers_need_evidence_before_decompile_preprobe() {
-        let blocks = const_return_blocks(0x401000, 0);
-        let decision = decompile_probe_decision(&blocks, 0x401000, "dbg.diagnose", "dbg.diagnose");
-
-        assert!(!decision.summary_probe_needed);
-        assert!(!decision.summary_probe_skipped_large_cfg);
     }
 
     #[test]
@@ -10458,7 +7523,14 @@ mod tests {
         );
 
         assert!(should_skip_unbounded_semantic_artifact_after_worker_preprobe(&loop_ssa, None));
-        assert!(maybe_compile_semantic_artifact_for_analysis(&loop_ssa, None, None).is_none());
+        assert!(
+            maybe_compile_semantic_artifact_for_analysis(
+                &loop_ssa,
+                None,
+                &r2sym::SymExecutionControl::default()
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -10480,622 +7552,15 @@ mod tests {
         );
         assert!(!should_skip_unbounded_semantic_artifact_after_worker_preprobe(&vm_ssa, None));
 
-        let artifact = maybe_compile_semantic_artifact_for_analysis(&vm_ssa, None, None)
-            .expect("vm artifact should not be refused before classification");
+        let artifact = maybe_compile_semantic_artifact_for_analysis(
+            &vm_ssa,
+            None,
+            &r2sym::SymExecutionControl::default(),
+        )
+        .expect("vm artifact should not be refused before classification");
 
         assert_eq!(artifact.execution, r2sym::ExecutionModel::Vm);
         assert!(artifact.vm_body().is_some());
-    }
-
-    #[test]
-    fn engine_owns_interproc_direct_call_target_collection() {
-        let arch = windows_x64_runtime_scope_arch();
-        let snapshot = test_source_snapshot("sym.wrapper/rev1");
-        let analysis = build_engine_analysis_from_parts(
-            "sym.wrapper",
-            &direct_call_return_blocks(0x401000, 0x2000),
-            Some(&arch),
-            &snapshot,
-        )
-        .expect("analysis");
-
-        assert_eq!(interproc_direct_call_targets(&analysis), vec![0x2000]);
-    }
-
-    fn small_interproc_target_metrics() -> EngineInterprocTargetMetrics {
-        EngineInterprocTargetMetrics {
-            basic_block_count: 1,
-            cost: 1,
-        }
-    }
-
-    fn oversized_interproc_target_metrics() -> EngineInterprocTargetMetrics {
-        EngineInterprocTargetMetrics {
-            basic_block_count: ENGINE_INTERPROC_HELPER_MAX_BLOCKS + 1,
-            cost: 1,
-        }
-    }
-
-    #[test]
-    fn interproc_helper_scope_budget_is_engine_owned() {
-        assert!(interproc_helper_scope_within_budget(
-            ENGINE_INTERPROC_HELPER_MAX_BLOCKS,
-            ENGINE_INTERPROC_HELPER_MAX_COST,
-        ));
-        assert!(!interproc_helper_scope_within_budget(
-            ENGINE_INTERPROC_HELPER_MAX_BLOCKS + 1,
-            ENGINE_INTERPROC_HELPER_MAX_COST,
-        ));
-        assert!(!interproc_helper_scope_within_budget(
-            ENGINE_INTERPROC_HELPER_MAX_BLOCKS,
-            ENGINE_INTERPROC_HELPER_MAX_COST + 1,
-        ));
-    }
-
-    #[test]
-    fn interproc_session_plan_owns_scope_and_budget_policy() {
-        let policy = analysis_policy_for_depth(EngineAnalysisDepth::Default);
-        let small = Some(small_interproc_target_metrics());
-        let oversized = Some(oversized_interproc_target_metrics());
-
-        let full_type =
-            interproc_session_plan(policy, EngineInterprocSessionPurpose::TypeAnalysis, small);
-        assert!(full_type.include_type_interproc_scope);
-        assert!(!full_type.include_root_symbolic_scope);
-        assert_eq!(full_type.interproc_iter, 1);
-        assert_eq!(
-            full_type.interproc_max_iters,
-            policy.type_interproc_max_iters
-        );
-        assert!(full_type.interproc_converged);
-
-        let bounded_type = interproc_session_plan(
-            policy,
-            EngineInterprocSessionPurpose::TypeAnalysis,
-            oversized,
-        );
-        assert!(!bounded_type.include_type_interproc_scope);
-        assert!(bounded_type.include_root_symbolic_scope);
-        assert_eq!(bounded_type.interproc_iter, 1);
-        assert_eq!(bounded_type.interproc_max_iters, 1);
-        assert!(!bounded_type.interproc_converged);
-
-        let full_decompile = interproc_session_plan(
-            policy,
-            EngineInterprocSessionPurpose::Decompile,
-            Some(small_interproc_target_metrics()),
-        );
-        assert!(full_decompile.include_type_interproc_scope);
-        assert!(!full_decompile.include_root_symbolic_scope);
-        assert_eq!(full_decompile.interproc_max_iters, 1);
-        assert!(full_decompile.interproc_converged);
-
-        let bounded_decompile = interproc_session_plan(
-            policy,
-            EngineInterprocSessionPurpose::Decompile,
-            Some(oversized_interproc_target_metrics()),
-        );
-        assert!(!bounded_decompile.include_type_interproc_scope);
-        assert!(!bounded_decompile.include_root_symbolic_scope);
-        assert_eq!(bounded_decompile.interproc_max_iters, 1);
-        assert!(bounded_decompile.interproc_converged);
-    }
-
-    #[test]
-    fn session_policy_plan_owns_budget_projection() {
-        let policy = analysis_policy_for_depth(EngineAnalysisDepth::Aggressive);
-        let plan = session_policy_plan(
-            policy,
-            EngineInterprocSessionPurpose::Decompile,
-            Some(small_interproc_target_metrics()),
-        );
-
-        assert!(plan.interproc.include_type_interproc_scope);
-        assert_eq!(plan.interproc.interproc_iter, 1);
-        assert_eq!(plan.interproc.interproc_max_iters, 1);
-        assert_eq!(plan.type_writeback_mode, policy.type_writeback_mode);
-        assert_eq!(plan.global_max_links, policy.type_global_max_links);
-        assert_eq!(plan.max_type_decls, policy.type_max_decls);
-        assert_eq!(plan.max_mutations, policy.type_max_mutations);
-
-        let bounded = session_policy_plan_for_radare2_depth(
-            RADARE2_ANALYSIS_DEPTH_BASIC,
-            EngineInterprocSessionPurpose::TypeAnalysis,
-            Some(oversized_interproc_target_metrics()),
-        );
-        let basic_policy = analysis_policy_for_radare2_depth(RADARE2_ANALYSIS_DEPTH_BASIC);
-        assert!(!bounded.interproc.include_type_interproc_scope);
-        assert!(bounded.interproc.include_root_symbolic_scope);
-        assert_eq!(
-            bounded.type_writeback_mode,
-            basic_policy.type_writeback_mode
-        );
-        assert_eq!(bounded.global_max_links, basic_policy.type_global_max_links);
-        assert_eq!(bounded.max_type_decls, basic_policy.type_max_decls);
-        assert_eq!(bounded.max_mutations, basic_policy.type_max_mutations);
-    }
-
-    #[test]
-    fn session_budget_input_normalizes_limits_in_engine() {
-        let budget = EngineSessionBudget::from_input(EngineSessionBudgetInput {
-            interproc_iter: 0,
-            interproc_max_iters: 0,
-            interproc_converged: true,
-            global_max_links: 0,
-            max_type_decls: 0,
-            max_mutations: 0,
-            type_writeback_mode: EngineTypeWritebackMode::Balanced,
-        });
-
-        assert_eq!(budget.interproc_iter, 1);
-        assert_eq!(budget.interproc_max_iters, 1);
-        assert!(budget.interproc_converged);
-        assert_eq!(budget.writeback_budget.global_max_links, 1);
-        assert_eq!(budget.writeback_budget.max_type_decls, 1);
-        assert_eq!(budget.writeback_budget.max_mutations, 1);
-        assert_eq!(
-            budget.writeback_apply_policy.mode,
-            r2types::TypeWritebackApplyMode::Balanced
-        );
-    }
-
-    #[test]
-    fn interproc_scope_target_plan_keeps_plugin_out_of_import_policy() {
-        let plan = interproc_scope_target_plan([
-            EngineInterprocTargetInput {
-                direct_target: 0x2000,
-                name: Some("sym.imp.printf".to_string()),
-                linkage: r2ssa::FunctionSemanticLinkage::Unknown,
-                semantic_summary: None,
-                resolved_target: Some(0x2000),
-                target_materialized: true,
-                target_metrics: Some(small_interproc_target_metrics()),
-            },
-            EngineInterprocTargetInput {
-                direct_target: 0x3000,
-                name: Some("sym.imp.memcpy".to_string()),
-                linkage: r2ssa::FunctionSemanticLinkage::Imported,
-                semantic_summary: None,
-                resolved_target: Some(0x3000),
-                target_materialized: true,
-                target_metrics: Some(small_interproc_target_metrics()),
-            },
-        ]);
-
-        assert_eq!(
-            plan.queued_targets,
-            vec![0x2000],
-            "import-shaped names must not skip helper scope without typed import linkage"
-        );
-        let imported = plan
-            .decisions
-            .iter()
-            .find(|decision| decision.direct_target == 0x3000)
-            .expect("imported decision");
-        assert_eq!(
-            imported.skip_reason,
-            Some(EngineInterprocTargetSkipReason::Imported)
-        );
-        assert_eq!(
-            plan.runtime_copy_targets,
-            vec![0x3000],
-            "runtime-copy role is still reported for imported memcpy calls"
-        );
-    }
-
-    #[test]
-    fn interproc_scope_target_plan_reports_runtime_roles_and_thunks() {
-        let runtime_copy_summary = r2sym::function_semantic_summary_seed_for_name_with_linkage(
-            r2ssa::InterprocFunctionId(0x4200),
-            "memcpy",
-            r2ssa::FunctionSemanticLinkage::Imported,
-        )
-        .expect("typed memcpy summary");
-        let plan = interproc_scope_target_plan([
-            EngineInterprocTargetInput {
-                direct_target: 0x4100,
-                name: Some("sym.imp.AddVectoredExceptionHandler".to_string()),
-                linkage: r2ssa::FunctionSemanticLinkage::Imported,
-                semantic_summary: None,
-                resolved_target: Some(0x4100),
-                target_materialized: true,
-                target_metrics: Some(small_interproc_target_metrics()),
-            },
-            EngineInterprocTargetInput {
-                direct_target: 0x4200,
-                name: Some("sym.local_memcpy_thunk".to_string()),
-                linkage: r2ssa::FunctionSemanticLinkage::Internal,
-                semantic_summary: Some(runtime_copy_summary),
-                resolved_target: Some(0x4200),
-                target_materialized: true,
-                target_metrics: Some(small_interproc_target_metrics()),
-            },
-            EngineInterprocTargetInput {
-                direct_target: 0x4300,
-                name: Some("sym.local_thunk".to_string()),
-                linkage: r2ssa::FunctionSemanticLinkage::Internal,
-                semantic_summary: None,
-                resolved_target: Some(0x4310),
-                target_materialized: true,
-                target_metrics: Some(small_interproc_target_metrics()),
-            },
-        ]);
-
-        assert_eq!(plan.registration_targets, vec![0x4100]);
-        assert_eq!(plan.runtime_copy_targets, vec![0x4200]);
-        assert_eq!(
-            plan.queued_targets,
-            vec![0x4300, 0x4310],
-            "thunked direct targets queue both the direct wrapper and resolved target"
-        );
-        let summary = plan
-            .decisions
-            .iter()
-            .find(|decision| decision.direct_target == 0x4200)
-            .expect("summary decision");
-        assert_eq!(
-            summary.skip_reason,
-            Some(EngineInterprocTargetSkipReason::SummaryModeled)
-        );
-    }
-
-    #[test]
-    fn interproc_scope_target_plan_rejects_name_only_runtime_roles() {
-        let plan = interproc_scope_target_plan([
-            EngineInterprocTargetInput {
-                direct_target: 0x4400,
-                name: Some("memcpy".to_string()),
-                linkage: r2ssa::FunctionSemanticLinkage::Internal,
-                semantic_summary: None,
-                resolved_target: Some(0x4400),
-                target_materialized: true,
-                target_metrics: Some(small_interproc_target_metrics()),
-            },
-            EngineInterprocTargetInput {
-                direct_target: 0x4500,
-                name: Some("sym.imp.AddVectoredExceptionHandler".to_string()),
-                linkage: r2ssa::FunctionSemanticLinkage::Unknown,
-                semantic_summary: None,
-                resolved_target: Some(0x4500),
-                target_materialized: true,
-                target_metrics: Some(small_interproc_target_metrics()),
-            },
-        ]);
-
-        assert!(
-            plan.registration_targets.is_empty(),
-            "runtime registration must require typed imported linkage"
-        );
-        assert!(
-            plan.runtime_copy_targets.is_empty(),
-            "runtime copy must require typed imported linkage or explicit modeled summary evidence"
-        );
-        assert_eq!(
-            plan.queued_targets,
-            vec![0x4400, 0x4500],
-            "name-only runtime-looking helpers should stay on the native helper queue"
-        );
-    }
-
-    #[test]
-    fn interproc_scope_target_plan_refuses_unmaterialized_and_over_budget_targets() {
-        let plan = interproc_scope_target_plan([
-            EngineInterprocTargetInput {
-                direct_target: 0x5000,
-                name: Some("sym.unmaterialized".to_string()),
-                linkage: r2ssa::FunctionSemanticLinkage::Internal,
-                semantic_summary: None,
-                resolved_target: None,
-                target_materialized: false,
-                target_metrics: None,
-            },
-            EngineInterprocTargetInput {
-                direct_target: 0x6000,
-                name: Some("sym.too_large".to_string()),
-                linkage: r2ssa::FunctionSemanticLinkage::Internal,
-                semantic_summary: None,
-                resolved_target: Some(0x6000),
-                target_materialized: true,
-                target_metrics: Some(oversized_interproc_target_metrics()),
-            },
-            EngineInterprocTargetInput {
-                direct_target: 0x7000,
-                name: Some("sym.unmeasured".to_string()),
-                linkage: r2ssa::FunctionSemanticLinkage::Internal,
-                semantic_summary: None,
-                resolved_target: Some(0x7000),
-                target_materialized: true,
-                target_metrics: None,
-            },
-        ]);
-
-        assert!(plan.queued_targets.is_empty());
-        assert_eq!(
-            plan.decisions
-                .iter()
-                .map(|decision| decision.skip_reason)
-                .collect::<Vec<_>>(),
-            vec![
-                Some(EngineInterprocTargetSkipReason::Unmaterialized),
-                Some(EngineInterprocTargetSkipReason::OverBudget),
-                Some(EngineInterprocTargetSkipReason::OverBudget),
-            ]
-        );
-    }
-
-    #[test]
-    fn symbolic_scope_function_plan_owns_queue_admission_policy() {
-        let allowed_interproc = EngineInterprocSessionPlan {
-            include_type_interproc_scope: true,
-            include_root_symbolic_scope: false,
-            interproc_iter: 1,
-            interproc_max_iters: 1,
-            interproc_converged: true,
-        };
-        let disabled_interproc = EngineInterprocSessionPlan {
-            include_type_interproc_scope: false,
-            include_root_symbolic_scope: true,
-            interproc_iter: 1,
-            interproc_max_iters: 1,
-            interproc_converged: false,
-        };
-
-        let root = symbolic_scope_function_plan(EngineSymbolicScopeFunctionInput {
-            current_scope_count: 0,
-            root_function: true,
-            target_hint_function: false,
-            interproc: disabled_interproc,
-        });
-        assert!(root.append_function);
-        assert!(root.expand_targets);
-        assert_eq!(root.reason, EngineSymbolicScopeFunctionReason::Allowed);
-
-        let helper = symbolic_scope_function_plan(EngineSymbolicScopeFunctionInput {
-            current_scope_count: 1,
-            root_function: false,
-            target_hint_function: false,
-            interproc: allowed_interproc,
-        });
-        assert!(helper.append_function);
-        assert!(helper.expand_targets);
-
-        let target_terminal = symbolic_scope_function_plan(EngineSymbolicScopeFunctionInput {
-            current_scope_count: 1,
-            root_function: false,
-            target_hint_function: true,
-            interproc: disabled_interproc,
-        });
-        assert!(target_terminal.append_function);
-        assert!(!target_terminal.expand_targets);
-        assert_eq!(
-            target_terminal.reason,
-            EngineSymbolicScopeFunctionReason::TargetTerminal
-        );
-
-        let disabled = symbolic_scope_function_plan(EngineSymbolicScopeFunctionInput {
-            current_scope_count: 1,
-            root_function: false,
-            target_hint_function: false,
-            interproc: disabled_interproc,
-        });
-        assert!(!disabled.append_function);
-        assert!(!disabled.expand_targets);
-        assert_eq!(
-            disabled.reason,
-            EngineSymbolicScopeFunctionReason::InterprocDisabled
-        );
-
-        let full = symbolic_scope_function_plan(EngineSymbolicScopeFunctionInput {
-            current_scope_count: SYMBOLIC_SCOPE_MAX_FUNCTIONS,
-            root_function: true,
-            target_hint_function: false,
-            interproc: allowed_interproc,
-        });
-        assert!(!full.append_function);
-        assert!(!full.expand_targets);
-        assert_eq!(full.reason, EngineSymbolicScopeFunctionReason::ScopeFull);
-    }
-
-    #[test]
-    fn runtime_materialized_source_plan_owns_caps() {
-        let allowed = runtime_materialized_source_plan(0, 0x9000, 0x20);
-        assert!(allowed.append_source);
-        assert_eq!(allowed.capped_size, 0x20);
-        assert_eq!(allowed.slot_bytes, RUNTIME_MATERIALIZED_SLOT_BYTES);
-        assert_eq!(
-            allowed.reason,
-            EngineRuntimeMaterializedSourceReason::Allowed
-        );
-
-        let capped =
-            runtime_materialized_source_plan(0, 0x9000, RUNTIME_MATERIALIZED_MAX_BYTES + 1);
-        assert!(capped.append_source);
-        assert_eq!(capped.capped_size, RUNTIME_MATERIALIZED_MAX_BYTES);
-
-        let empty = runtime_materialized_source_plan(0, 0, 0x20);
-        assert!(!empty.append_source);
-        assert_eq!(
-            empty.reason,
-            EngineRuntimeMaterializedSourceReason::EmptySource
-        );
-
-        let full = runtime_materialized_source_plan(SYMBOLIC_SCOPE_MAX_FUNCTIONS, 0x9000, 0x20);
-        assert!(!full.append_source);
-        assert_eq!(
-            full.reason,
-            EngineRuntimeMaterializedSourceReason::ScopeFull
-        );
-    }
-
-    #[test]
-    fn engine_owns_windows_runtime_registration_scope_targets() {
-        let arch = windows_x64_runtime_scope_arch();
-        let mut block = R2ILBlock::new(0x5000, 4);
-        block.push(r2il::R2ILOp::Copy {
-            dst: runtime_reg(8, 8),
-            src: r2il::Varnode::constant(1, 8),
-        });
-        block.push(r2il::R2ILOp::Copy {
-            dst: runtime_reg(16, 8),
-            src: r2il::Varnode::constant(0x1400_3d0f, 8),
-        });
-        block.push(r2il::R2ILOp::Call {
-            target: r2il::Varnode::constant(0x1800_1000, 8),
-        });
-        block.push(r2il::R2ILOp::Return {
-            target: r2il::Varnode::constant(0, 8),
-        });
-        let snapshot = test_source_snapshot("sym.runtime_seed/rev1");
-        let analysis =
-            build_engine_analysis_from_parts("sym.runtime_seed", &[block], Some(&arch), &snapshot)
-                .expect("analysis");
-
-        assert_eq!(
-            interproc_runtime_registration_targets(&analysis, Some(&arch), &[0x1800_1000]),
-            vec![0x1400_3d0f],
-            "handler comes from the canonical Windows x64 arg1 observation"
-        );
-        let generic_x86_64 = x86_64_generic_name_runtime_scope_arch();
-        assert_eq!(
-            interproc_runtime_registration_targets(
-                &analysis,
-                Some(&generic_x86_64),
-                &[0x1800_1000]
-            ),
-            vec![0x1400_3d0f],
-            "64-bit x86 should be accepted even when the arch name omits a 64 suffix"
-        );
-        assert!(
-            interproc_runtime_registration_targets(&analysis, Some(&arch), &[0x1800_2000])
-                .is_empty(),
-            "non-registration callees must not expand symbolic scope"
-        );
-    }
-
-    #[test]
-    fn runtime_registration_scope_is_gated_to_windows_x64() {
-        let arch = windows_x64_runtime_scope_arch();
-        let mut block = R2ILBlock::new(0x5000, 4);
-        block.push(r2il::R2ILOp::Copy {
-            dst: runtime_reg(16, 8),
-            src: r2il::Varnode::constant(0x1400_3d0f, 8),
-        });
-        block.push(r2il::R2ILOp::Call {
-            target: r2il::Varnode::constant(0x1800_1000, 8),
-        });
-        let snapshot = test_source_snapshot("sym.runtime_seed/gated/rev1");
-        let analysis =
-            build_engine_analysis_from_parts("sym.runtime_seed", &[block], Some(&arch), &snapshot)
-                .expect("analysis");
-
-        assert!(
-            interproc_runtime_registration_targets(&analysis, None, &[0x1800_1000]).is_empty(),
-            "missing architecture must not enable Windows runtime scope expansion"
-        );
-        let x86_32 = x86_32_runtime_scope_arch();
-        assert!(
-            interproc_runtime_registration_targets(&analysis, Some(&x86_32), &[0x1800_1000])
-                .is_empty(),
-            "32-bit x86 must not enable Windows x64 runtime scope expansion"
-        );
-    }
-
-    #[test]
-    fn engine_owns_runtime_materialized_source_collection() {
-        let arch = windows_x64_runtime_scope_arch();
-        let mut block = R2ILBlock::new(0x6000, 4);
-        block.push(r2il::R2ILOp::Copy {
-            dst: runtime_reg(8, 8),
-            src: r2il::Varnode::constant(0x7000, 8),
-        });
-        block.push(r2il::R2ILOp::Copy {
-            dst: runtime_reg(16, 8),
-            src: r2il::Varnode::constant(0x9000, 8),
-        });
-        block.push(r2il::R2ILOp::Copy {
-            dst: runtime_reg(24, 8),
-            src: r2il::Varnode::constant(0x20, 8),
-        });
-        block.push(r2il::R2ILOp::Call {
-            target: r2il::Varnode::constant(0x1800_2000, 8),
-        });
-        block.push(r2il::R2ILOp::Copy {
-            dst: runtime_reg(16, 8),
-            src: r2il::Varnode::constant(0x9000, 8),
-        });
-        block.push(r2il::R2ILOp::Copy {
-            dst: runtime_reg(24, 8),
-            src: r2il::Varnode::constant(0x40, 8),
-        });
-        block.push(r2il::R2ILOp::Call {
-            target: r2il::Varnode::constant(0x1800_2000, 8),
-        });
-        block.push(r2il::R2ILOp::Return {
-            target: r2il::Varnode::constant(0, 8),
-        });
-        let snapshot = test_source_snapshot("sym.runtime_copy/rev1");
-        let analysis =
-            build_engine_analysis_from_parts("sym.runtime_copy", &[block], Some(&arch), &snapshot)
-                .expect("analysis");
-
-        assert_eq!(
-            interproc_runtime_materialized_sources(&analysis, Some(&arch), &[0x1800_2000]),
-            vec![EngineRuntimeMaterializedSource {
-                addr: 0x9000,
-                size: 0x40
-            }],
-            "duplicate copy observations must collapse to the maximum materialized size"
-        );
-        let x86_32 = x86_32_runtime_scope_arch();
-        assert!(
-            interproc_runtime_materialized_sources(&analysis, Some(&x86_32), &[0x1800_2000])
-                .is_empty(),
-            "unsupported architectures must not report materialized runtime sources even when call args are otherwise valid"
-        );
-    }
-
-    #[test]
-    fn runtime_materialized_sources_reject_non_code_and_zero_size_inputs() {
-        let arch = windows_x64_runtime_scope_arch();
-        let mut block = R2ILBlock::new(0x6000, 4);
-        block.push(r2il::R2ILOp::Copy {
-            dst: runtime_reg(16, 8),
-            src: r2il::Varnode::constant(0x900, 8),
-        });
-        block.push(r2il::R2ILOp::Copy {
-            dst: runtime_reg(24, 8),
-            src: r2il::Varnode::constant(0x20, 8),
-        });
-        block.push(r2il::R2ILOp::Call {
-            target: r2il::Varnode::constant(0x1800_2000, 8),
-        });
-        block.push(r2il::R2ILOp::Copy {
-            dst: runtime_reg(16, 8),
-            src: r2il::Varnode::constant(0x9000, 8),
-        });
-        block.push(r2il::R2ILOp::Copy {
-            dst: runtime_reg(24, 8),
-            src: r2il::Varnode::constant(0, 8),
-        });
-        block.push(r2il::R2ILOp::Call {
-            target: r2il::Varnode::constant(0x1800_2000, 8),
-        });
-        let snapshot = test_source_snapshot("sym.runtime_copy/rejected/rev1");
-        let analysis =
-            build_engine_analysis_from_parts("sym.runtime_copy", &[block], Some(&arch), &snapshot)
-                .expect("analysis");
-
-        assert!(
-            interproc_runtime_materialized_sources(&analysis, Some(&arch), &[0x1800_2000])
-                .is_empty(),
-            "runtime materialization needs both a code-like source address and a nonzero size"
-        );
-        let x86_32 = x86_32_runtime_scope_arch();
-        assert!(
-            interproc_runtime_materialized_sources(&analysis, Some(&x86_32), &[0x1800_2000])
-                .is_empty(),
-            "32-bit x86 must not enable Windows x64 materialized-source collection"
-        );
     }
 
     #[test]
@@ -11228,12 +7693,12 @@ mod tests {
                 arch: None,
                 source_snapshot: Some(test_source_snapshot("dbg.main/type/rev1")),
                 trusted_ssa: None,
+                callee_facts: Vec::new(),
                 ptr_bits: 64,
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
                 parsed_context,
                 interproc_max_iterations: 1,
-                symbolic_scope: None,
                 semantic_mode: EngineSemanticMode::Full,
                 include_interproc_summary_set: true,
                 execution: EngineExecutionControl::default(),
@@ -11264,12 +7729,12 @@ mod tests {
                 arch: None,
                 source_snapshot: Some(test_source_snapshot("dbg.main/report/rev1")),
                 trusted_ssa: None,
+                callee_facts: Vec::new(),
                 ptr_bits: 64,
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
                 parsed_context,
                 interproc_max_iterations: 1,
-                symbolic_scope: None,
                 semantic_mode: EngineSemanticMode::Full,
                 include_interproc_summary_set: true,
                 execution: EngineExecutionControl::default(),
@@ -11304,7 +7769,6 @@ mod tests {
                 parsed_context: r2types::ParsedExternalContext::default(),
                 interproc_max_iters: 5,
                 interproc_converged: true,
-                symbolic_scope: None,
                 writeback_budget: r2types::TypeWritebackMutationBudget::new(7, 11, 13),
                 writeback_apply_policy: type_writeback_apply_policy_for_mode(
                     EngineTypeWritebackMode::Balanced,
@@ -11340,7 +7804,6 @@ mod tests {
                 ptr_bits: Some(64),
                 parsed_context: r2types::ParsedExternalContext::default(),
                 interproc_max_iterations: 9,
-                symbolic_scope: None,
             },
         );
 
@@ -11371,12 +7834,12 @@ mod tests {
                 arch: None,
                 source_snapshot: Some(test_source_snapshot("dbg.init_node/rev1")),
                 trusted_ssa: None,
+                callee_facts: Vec::new(),
                 ptr_bits: 64,
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
                 parsed_context,
                 interproc_max_iterations: 1,
-                symbolic_scope: None,
                 semantic_mode: EngineSemanticMode::Full,
                 include_interproc_summary_set: true,
                 execution: EngineExecutionControl::default(),
@@ -11409,7 +7872,6 @@ mod tests {
             ptr_bits: Some(64),
             parsed_context,
             interproc_max_iterations: 1,
-            symbolic_scope: None,
             input_quality: EngineFunctionInputQuality {
                 expected_blocks: 2,
                 lifted_blocks: 1,
@@ -11420,6 +7882,7 @@ mod tests {
             },
             execution: EngineExecutionControl::default(),
             trusted_ssa: None,
+            callee_facts: Vec::new(),
         });
 
         assert!(
@@ -11478,10 +7941,10 @@ mod tests {
             ptr_bits: Some(64),
             parsed_context,
             interproc_max_iterations: 1,
-            symbolic_scope: None,
             input_quality: EngineFunctionInputQuality::complete(2),
             execution: EngineExecutionControl::default(),
             trusted_ssa: None,
+            callee_facts: Vec::new(),
         });
 
         assert!(
@@ -11531,7 +7994,6 @@ mod tests {
             ptr_bits: Some(64),
             parsed_context,
             interproc_max_iterations: 1,
-            symbolic_scope: None,
             input_quality: EngineFunctionInputQuality {
                 expected_blocks: 1,
                 lifted_blocks: 0,
@@ -11542,6 +8004,7 @@ mod tests {
             },
             execution: EngineExecutionControl::default(),
             trusted_ssa: None,
+            callee_facts: Vec::new(),
         });
 
         assert!(
@@ -11590,10 +8053,10 @@ mod tests {
             ptr_bits: Some(64),
             parsed_context,
             interproc_max_iterations: 1,
-            symbolic_scope: None,
             input_quality: EngineFunctionInputQuality::complete(0),
             execution: EngineExecutionControl::default(),
             trusted_ssa: None,
+            callee_facts: Vec::new(),
         });
 
         assert!(
@@ -11642,10 +8105,10 @@ mod tests {
             ptr_bits: Some(64),
             parsed_context,
             interproc_max_iterations: 1,
-            symbolic_scope: None,
             input_quality: EngineFunctionInputQuality::complete(1),
             execution: EngineExecutionControl::default(),
             trusted_ssa: None,
+            callee_facts: Vec::new(),
         });
 
         let quality = response
@@ -11681,12 +8144,12 @@ mod tests {
                 arch: None,
                 source_snapshot: Some(test_source_snapshot("sym.direct_partial/rev1")),
                 trusted_ssa: None,
+                callee_facts: Vec::new(),
                 ptr_bits: 64,
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
                 parsed_context,
                 interproc_max_iterations: 1,
-                symbolic_scope: None,
                 semantic_mode: EngineSemanticMode::Full,
                 include_interproc_summary_set: true,
                 execution: EngineExecutionControl::default(),
@@ -11729,12 +8192,12 @@ mod tests {
                 arch: None,
                 source_snapshot: Some(test_source_snapshot("dbg.raw_name/rev1")),
                 trusted_ssa: None,
+                callee_facts: Vec::new(),
                 ptr_bits: 64,
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
                 parsed_context,
                 interproc_max_iterations: 1,
-                symbolic_scope: None,
                 semantic_mode: EngineSemanticMode::Full,
                 include_interproc_summary_set: true,
                 execution: EngineExecutionControl::default(),
@@ -11773,12 +8236,12 @@ mod tests {
                 arch: None,
                 source_snapshot: Some(test_source_snapshot("sym.caller/rev1")),
                 trusted_ssa: None,
+                callee_facts: Vec::new(),
                 ptr_bits: 64,
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
                 parsed_context,
                 interproc_max_iterations: 1,
-                symbolic_scope: None,
                 semantic_mode: EngineSemanticMode::Full,
                 include_interproc_summary_set: true,
                 execution: EngineExecutionControl::default(),
@@ -11815,12 +8278,12 @@ mod tests {
                 arch: None,
                 source_snapshot: Some(test_source_snapshot("sym.string_const/rev1")),
                 trusted_ssa: None,
+                callee_facts: Vec::new(),
                 ptr_bits: 64,
                 semantic_metadata_enabled: false,
                 reg_type_hints: HashMap::new(),
                 parsed_context,
                 interproc_max_iterations: 1,
-                symbolic_scope: None,
                 semantic_mode: EngineSemanticMode::Full,
                 include_interproc_summary_set: true,
                 execution: EngineExecutionControl::default(),
@@ -11849,10 +8312,10 @@ mod tests {
                 ptr_bits: Some(64),
                 parsed_context: r2types::ParsedExternalContext::default(),
                 interproc_max_iterations: 3,
-                symbolic_scope: None,
                 input_quality: EngineFunctionInputQuality::complete(0),
                 execution: EngineExecutionControl::default(),
                 trusted_ssa: None,
+                callee_facts: Vec::new(),
             },
         );
 
@@ -11952,208 +8415,6 @@ mod tests {
     }
 
     #[test]
-    fn symbolic_path_listing_runs_through_engine_policy() {
-        let blocks = const_return_blocks(0x401000, 0);
-        let prepared = Arc::new(r2ssa::SsaArtifact::for_symbolic(&blocks, None).expect("prepared"));
-        let scope = r2sym::PreparedFunctionScope::new(
-            0x401000,
-            vec![r2sym::ScopedPreparedFunction {
-                id: r2ssa::InterprocFunctionId(0x401000),
-                name: Some("sym.simple".to_string()),
-                prepared: Arc::clone(&prepared),
-            }],
-        )
-        .expect("scope");
-        let z3_ctx = z3::Context::thread_local();
-        let symbols = r2sym::FunctionSymbolSnapshot::default();
-        let session = EngineSession::new();
-
-        let response = session.symbolic_paths(EngineSymbolicPathsRequest {
-            context: EngineSymbolicContextRequest {
-                z3_ctx: &z3_ctx,
-                prepared: &prepared,
-                scope: Some(&scope),
-                arch: None,
-                symbols: &symbols,
-                merge_states: false,
-                config_profile: EngineSymbolicConfigProfile::PathListing,
-                seed: EngineSymbolicStateSeed::Default {
-                    entry_addr: 0x401000,
-                },
-            },
-        });
-
-        assert_eq!(
-            response.query_policy.route,
-            r2sym::TargetQueryRoutePlan::dynamic_fallback()
-        );
-        assert!(response.summary.stats.states_explored <= SYMBOLIC_PATHS_CALL_FREE_MAX_STATES);
-        assert_eq!(
-            response.solution_limit,
-            path_listing_solution_limit(response.summary.paths.len(), &prepared)
-        );
-    }
-
-    #[test]
-    fn engine_translates_pre_cancelled_control_into_symbolic_request() {
-        let blocks = const_return_blocks(0x401000, 0);
-        let prepared = Arc::new(r2ssa::SsaArtifact::for_symbolic(&blocks, None).expect("prepared"));
-        let z3_ctx = z3::Context::thread_local();
-        let symbols = r2sym::FunctionSymbolSnapshot::default();
-        let cancellation = EngineCancellationToken::default();
-        cancellation.cancel();
-
-        let result = EngineSession::new().symbolic_paths_with_execution_control(
-            EngineSymbolicPathsRequest {
-                context: EngineSymbolicContextRequest {
-                    z3_ctx: &z3_ctx,
-                    prepared: &prepared,
-                    scope: None,
-                    arch: None,
-                    symbols: &symbols,
-                    merge_states: false,
-                    config_profile: EngineSymbolicConfigProfile::PathListing,
-                    seed: EngineSymbolicStateSeed::Default {
-                        entry_addr: 0x401000,
-                    },
-                },
-            },
-            EngineExecutionControl::with_cancellation(cancellation),
-        );
-
-        assert!(matches!(
-            result,
-            Err(r2sym::SymExecutionStopReason::Cancelled)
-        ));
-    }
-
-    #[test]
-    fn engine_conditions_symbolic_scope_with_root_assumptions() {
-        let blocks = symbolic_register_branch_blocks(0x501000);
-        let prepared = Arc::new(r2ssa::SsaArtifact::for_symbolic(&blocks, None).expect("prepared"));
-        let scope = r2sym::PreparedFunctionScope::new(
-            0x501000,
-            vec![r2sym::ScopedPreparedFunction {
-                id: r2ssa::InterprocFunctionId(0x501000),
-                name: Some("sym.branch".to_string()),
-                prepared: Arc::clone(&prepared),
-            }],
-        )
-        .expect("scope");
-        let assumption = symbolic_register_assumption(&prepared);
-        let assumptions = r2ssa::AssumptionSet::new(vec![assumption.clone()]);
-
-        let conditioned = condition_symbolic_scope_with_assumptions(&scope, &assumptions)
-            .expect("conditioned scope");
-
-        assert!(conditioned.assumption_conditioned);
-        assert_eq!(
-            conditioned.assumption_usage.applied,
-            vec![assumption.clone()]
-        );
-        assert!(conditioned.assumption_usage.ignored.is_empty());
-        assert!(conditioned.assumption_usage.conflicts.is_empty());
-        assert_eq!(
-            conditioned.prepared.facts().assumption_usage.applied,
-            vec![assumption.clone()]
-        );
-        assert!(prepared.facts().assumption_usage.applied.is_empty());
-        assert!(
-            scope
-                .root()
-                .expect("scope root")
-                .prepared
-                .facts()
-                .assumption_usage
-                .applied
-                .is_empty()
-        );
-        assert_eq!(
-            conditioned
-                .scope
-                .root()
-                .expect("conditioned scope root")
-                .prepared
-                .facts()
-                .assumption_usage
-                .applied,
-            vec![assumption]
-        );
-    }
-
-    #[test]
-    fn engine_reports_conflicting_assumptions_as_conditioning() {
-        let blocks = symbolic_register_branch_blocks(0x501800);
-        let prepared = Arc::new(r2ssa::SsaArtifact::for_symbolic(&blocks, None).expect("prepared"));
-        let scope = r2sym::PreparedFunctionScope::new(
-            0x501800,
-            vec![r2sym::ScopedPreparedFunction {
-                id: r2ssa::InterprocFunctionId(0x501800),
-                name: Some("sym.branch".to_string()),
-                prepared: Arc::clone(&prepared),
-            }],
-        )
-        .expect("scope");
-        let assumption = conflicting_predicate_assumption(&prepared);
-        let assumptions = r2ssa::AssumptionSet::new(vec![assumption.clone()]);
-
-        let conditioned = condition_symbolic_scope_with_assumptions(&scope, &assumptions)
-            .expect("conditioned scope");
-
-        assert!(conditioned.assumption_conditioned);
-        assert!(conditioned.assumption_usage.applied.is_empty());
-        assert!(conditioned.assumption_usage.ignored.is_empty());
-        assert_eq!(conditioned.assumption_usage.conflicts.len(), 1);
-        assert_eq!(
-            conditioned.assumption_usage.conflicts[0].assumption,
-            assumption
-        );
-    }
-
-    #[test]
-    fn symbolic_summary_reports_prepared_assumption_usage() {
-        let blocks = symbolic_register_branch_blocks(0x502000);
-        let prepared = Arc::new(r2ssa::SsaArtifact::for_symbolic(&blocks, None).expect("prepared"));
-        let scope = r2sym::PreparedFunctionScope::new(
-            0x502000,
-            vec![r2sym::ScopedPreparedFunction {
-                id: r2ssa::InterprocFunctionId(0x502000),
-                name: Some("sym.branch".to_string()),
-                prepared: Arc::clone(&prepared),
-            }],
-        )
-        .expect("scope");
-        let assumption = symbolic_register_assumption(&prepared);
-        let assumptions = r2ssa::AssumptionSet::new(vec![assumption.clone()]);
-        let conditioned = condition_symbolic_scope_with_assumptions(&scope, &assumptions)
-            .expect("conditioned scope");
-        let z3_ctx = z3::Context::thread_local();
-        let symbols = r2sym::FunctionSymbolSnapshot::default();
-        let session = EngineSession::new();
-
-        let response = session.symbolic_summary(EngineSymbolicSummaryRequest {
-            context: EngineSymbolicContextRequest {
-                z3_ctx: &z3_ctx,
-                prepared: &conditioned.prepared,
-                scope: Some(&conditioned.scope),
-                arch: None,
-                symbols: &symbols,
-                merge_states: false,
-                config_profile: EngineSymbolicConfigProfile::PathListing,
-                seed: EngineSymbolicStateSeed::Scope {
-                    entry_addr: 0x502000,
-                },
-            },
-            compile_semantics: false,
-        });
-
-        assert!(response.assumption_conditioned);
-        assert_eq!(response.assumption_usage.applied, vec![assumption]);
-        assert!(response.assumption_usage.ignored.is_empty());
-        assert!(response.assumption_usage.conflicts.is_empty());
-    }
-
-    #[test]
     fn request_plan_preserves_refusal_diagnostics() {
         let comment = "/* r2dec fallback: semantic evidence unavailable */".to_string();
         let route = test_decompile_route(
@@ -12173,5 +8434,59 @@ mod tests {
         assert_eq!(request_plan.engine_plan(), EnginePlan::RefuseWithEvidence);
         assert_eq!(diagnostics.refusal, Some(comment.clone()));
         assert_eq!(diagnostics.route_reason, Some(comment.clone()));
+    }
+
+    #[test]
+    fn phase_timing_reports_executed_phases_and_omits_the_rest() {
+        let mut metrics = EngineMetrics::default();
+        metrics.record_phase(
+            EnginePhase::Ssa,
+            EnginePhaseStatus::Executed,
+            Duration::from_micros(4_000),
+        );
+        metrics.record_phase(
+            EnginePhase::Rendering,
+            EnginePhaseStatus::Executed,
+            Duration::from_micros(11_500),
+        );
+        metrics.record_phase(
+            EnginePhase::Types,
+            EnginePhaseStatus::Folded,
+            Duration::default(),
+        );
+        let comment = format_phase_timing(&metrics);
+        assert_eq!(
+            comment,
+            "/* r2dec timing: measured=15500us ssa=4000us types=folded rendering=11500us */"
+        );
+        // A phase this boundary never ran says nothing, rather than claiming
+        // it cost nothing.
+        assert!(!comment.contains("symbolic"));
+    }
+
+    #[test]
+    fn phase_timing_survives_a_refusal_so_refusing_can_be_compared_with_rendering() {
+        let mut metrics = EngineMetrics::default();
+        metrics.record_phase(
+            EnginePhase::SnapshotContext,
+            EnginePhaseStatus::Executed,
+            Duration::from_micros(120),
+        );
+        metrics.refuse_from(EnginePhase::LiftNormalize);
+        let comment = format_phase_timing(&metrics);
+        assert!(
+            comment.starts_with("/* r2dec timing: measured=120us"),
+            "{comment}"
+        );
+        assert!(comment.contains("lift_normalize=refused"), "{comment}");
+    }
+
+    #[test]
+    fn a_body_without_the_switch_is_returned_byte_for_byte() {
+        // The comment is opt-in, and every corpus gate compares bytes.
+        let body = "uint64_t sym__f(void)\n{\n    return 0;\n}\n".to_string();
+        let metrics = EngineMetrics::default();
+        unsafe { std::env::remove_var("R2SLEIGH_TIMING") };
+        assert_eq!(with_phase_timing_comment(body.clone(), &metrics), body);
     }
 }

@@ -25,6 +25,8 @@ pub enum SSAVarNameKind {
 
 impl SSAVarNameKind {
     pub fn classify(name: &str) -> Self {
+        let name = name.to_ascii_lowercase();
+        let name = name.as_str();
         if name.strip_prefix("reg:").is_some() {
             Self::RegisterAlias
         } else if name.strip_prefix("tmp:").is_some() || name.strip_prefix("unique:").is_some() {
@@ -107,6 +109,17 @@ pub struct SSAVar {
     /// not be parsed by proof-bearing consumers to recover a constant value.
     #[serde(default)]
     constant_bits: Option<u64>,
+    /// Deterministic construction-time discriminator for two exact source
+    /// storages that project to the same display name and width.
+    ///
+    /// This is identity only, not storage authority. Canonical storage remains
+    /// in the source-retained graph facts.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    rename_disambiguator: u32,
+}
+
+const fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 impl SSAVar {
@@ -117,6 +130,34 @@ impl SSAVar {
             version,
             size,
             constant_bits: None,
+            rename_disambiguator: 0,
+        }
+    }
+
+    /// Attach the deterministic source-identity projection selected by SSA
+    /// construction while leaving the user-facing name unchanged.
+    pub(crate) fn with_rename_disambiguator(mut self, disambiguator: u32) -> Self {
+        self.rename_disambiguator = disambiguator;
+        self
+    }
+
+    /// The construction-time discriminator that separates two exact storages
+    /// which project to the same display name and width.
+    ///
+    /// Public because anything building an identity key for a variable has to
+    /// include it, or the key collides on precisely the case this field exists
+    /// to keep apart.
+    pub const fn rename_disambiguator(&self) -> u32 {
+        self.rename_disambiguator
+    }
+
+    pub(crate) fn with_size(&self, size: u32) -> Self {
+        Self {
+            name: self.name.clone(),
+            version: self.version,
+            size,
+            constant_bits: self.constant_bits,
+            rename_disambiguator: self.rename_disambiguator,
         }
     }
 
@@ -132,6 +173,7 @@ impl SSAVar {
             version: 0,
             size,
             constant_bits: Some(value),
+            rename_disambiguator: 0,
         }
     }
 
@@ -145,6 +187,7 @@ impl SSAVar {
             version: self.version.checked_add(1)?,
             size: self.size,
             constant_bits: self.constant_bits,
+            rename_disambiguator: self.rename_disambiguator,
         })
     }
 
@@ -184,6 +227,15 @@ impl SSAVar {
     }
 
     /// Check if this is a temporary SSA value.
+    /// The register-space offset this name stands for, when it names one.
+    ///
+    /// A varnode the architecture does not name is spelled from its offset, so
+    /// that offset is recoverable and is the only thing identifying the storage.
+    pub fn register_offset(&self) -> Option<u64> {
+        let rest = self.name.strip_prefix("reg:")?;
+        u64::from_str_radix(rest, 16).ok()
+    }
+
     pub fn is_temp(&self) -> bool {
         self.name_kind().is_temporary()
     }
@@ -265,6 +317,10 @@ mod tests {
             assert_eq!(SSAVarNameKind::classify(name), expected);
             assert_eq!(SSAVar::new(name, 0, 8).name_kind(), expected);
         }
+        assert_eq!(
+            SSAVarNameKind::classify("CONST:0x42"),
+            SSAVarNameKind::Constant
+        );
     }
 
     #[test]

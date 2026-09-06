@@ -1,6 +1,23 @@
+use std::hash::Hash;
+
 use r2ssa::SSAVar;
 
 use crate::model::TypeId;
+
+/// A node of the type graph the solver assigns types to.
+///
+/// The solver is the same whether the nodes are SSA variables of one function
+/// or the values, objects and slots of a prepared artifact, so the node type is
+/// a parameter and only the label used in diagnostics differs.
+pub trait SolverNode: Clone + Eq + Hash {
+    fn solver_label(&self) -> String;
+}
+
+impl SolverNode for SSAVar {
+    fn solver_label(&self) -> String {
+        self.display_name()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConstraintSource {
@@ -26,37 +43,37 @@ pub enum MemoryCapability {
 }
 
 #[derive(Debug, Clone)]
-pub enum Constraint {
+pub enum Constraint<K = SSAVar> {
     SetType {
-        var: SSAVar,
+        var: K,
         ty: TypeId,
         source: ConstraintSource,
     },
     Equal {
-        a: SSAVar,
-        b: SSAVar,
+        a: K,
+        b: K,
         source: ConstraintSource,
     },
     Subtype {
-        var: SSAVar,
+        var: K,
         ty: TypeId,
         source: ConstraintSource,
     },
     HasCapability {
-        ptr: SSAVar,
+        ptr: K,
         capability: MemoryCapability,
         elem_ty: TypeId,
         source: ConstraintSource,
     },
     CallSig {
-        target: SSAVar,
-        args: Vec<SSAVar>,
+        target: K,
+        args: Vec<K>,
         params: Vec<TypeId>,
-        ret: Option<(SSAVar, TypeId)>,
+        ret: Option<(K, TypeId)>,
         source: ConstraintSource,
     },
     FieldAccess {
-        base_ptr: SSAVar,
+        base_ptr: K,
         offset: u64,
         field_ty: TypeId,
         field_name: Option<String>,
@@ -64,7 +81,7 @@ pub enum Constraint {
     },
 }
 
-impl Constraint {
+impl<K> Constraint<K> {
     pub fn source(&self) -> ConstraintSource {
         match self {
             Self::SetType { source, .. }

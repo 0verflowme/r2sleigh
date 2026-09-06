@@ -12,7 +12,7 @@
 //! 3. **Region Identification** (`region`): Identify control flow regions
 //! 4. **Control Flow Structuring** (`structure`): Convert CFG to structured code
 //! 5. **Type Facts** (`r2types`): Consume inferred type/layout facts
-//! 6. **Variable Recovery** (`variable`): Recover variable names and types
+//! 6. **Binding Planning** (`binding_plan`): Project exact SSA identities into C bindings
 //! 7. **Code Generation** (`codegen`): Generate readable C source code
 //!
 //! ## Usage
@@ -27,21 +27,9 @@
 //! println!("{}", c_code);
 //! ```
 
-pub(crate) mod address;
 pub(crate) mod analysis;
 pub mod ast;
-pub mod certified_call;
-pub mod certified_control;
-pub mod certified_if_guard;
-pub mod certified_if_return;
-pub mod certified_loop;
-pub mod certified_loop_return;
-pub mod certified_private_frame_join;
-pub mod certified_region;
-pub mod certified_return;
-pub mod certified_structure;
-pub mod certified_switch;
-pub mod certified_switch_return;
+mod binding_plan;
 pub(crate) mod codegen;
 #[cfg(test)]
 pub(crate) mod consumer_linear;
@@ -49,345 +37,58 @@ pub(crate) mod consumer_structured;
 pub(crate) mod consumer_summary;
 pub(crate) mod consumer_vm;
 pub mod control;
+mod effect_ledger;
 pub(crate) mod fold;
 pub mod highlight;
 pub(crate) mod normalize;
+mod observation_journal;
+mod placement;
 pub(crate) mod planner;
-pub(crate) mod post_rename;
 pub mod region;
-pub(crate) mod registers;
-pub mod semantic_aggregate_function;
-pub mod semantic_c;
-pub mod semantic_call_return;
-pub mod semantic_differential;
-pub mod semantic_function;
-pub mod semantic_memory_function;
-pub mod semantic_stmt;
+mod shadow_report;
+pub(crate) mod single_evaluation;
+pub(crate) mod stage_timing;
 pub mod structure;
-pub mod variable;
+mod structured_region;
+pub mod symbol;
+pub(crate) mod unrendered;
+mod variable;
 
+use crate::codegen::{CodeGenerator, EmissionReadyFunction, prepare_function_for_emission};
+use crate::fold::FoldingContext;
+use crate::fold::context::{FoldArchConfig, FoldInputs};
+use crate::observation_journal::{
+    LegacyObservationCoverage, LegacyObservationJournal, MarkedNativeDraft, SealedNativeFunction,
+};
 pub use ast::{BinaryOp, CExpr, CFunction, CStmt, CType, UnaryOp};
-pub use certified_call::{
-    CERTIFIED_DIRECT_CALL_REGION_SCHEMA_VERSION, CertifiedDirectCallBlockRegion,
-    DirectCallRegionAuditReport, DirectCallRegionError, DirectCallRegionScope,
-};
-pub use certified_control::{
-    CERTIFIED_CONDITIONAL_TRANSFER_REGION_SCHEMA_VERSION,
-    CERTIFIED_DIRECT_TRANSFER_REGION_SCHEMA_VERSION,
-    CERTIFIED_FALLTHROUGH_TRANSFER_REGION_SCHEMA_VERSION, CertifiedConditionalTransferBlockRegion,
-    CertifiedDirectTransferBlockRegion, CertifiedFallthroughTransferBlockRegion,
-    ConditionalTransferRegionAuditReport, ConditionalTransferRegionError,
-    ConditionalTransferRegionScope, DirectTransferRegionAuditReport, DirectTransferRegionError,
-    DirectTransferRegionScope, FallthroughTransferRegionAuditReport,
-    FallthroughTransferRegionError, FallthroughTransferRegionScope,
-};
-pub use certified_if_guard::{
-    CERTIFIED_GUARDED_RETURN_FUNCTION_SCHEMA_VERSION, CertifiedGuardedReturnFunction,
-    GuardPolarity, GuardedReturnFunctionAuditReport, GuardedReturnFunctionError,
-    GuardedReturnFunctionScope,
-};
-pub use certified_if_return::{
-    CERTIFIED_CONDITIONAL_RETURN_FUNCTION_SCHEMA_VERSION, CertifiedConditionalReturnArm,
-    CertifiedConditionalReturnFunction, ConditionalReturnFunctionAuditReport,
-    ConditionalReturnFunctionError, ConditionalReturnFunctionScope,
-};
-pub use certified_loop::{
-    CERTIFIED_HEADER_TESTED_LOOP_SCHEMA_VERSION, CertifiedHeaderTestedLoopFragment,
-    HeaderTestedLoopAuditReport, HeaderTestedLoopError, HeaderTestedLoopScope, LoopContinuationArm,
-};
-pub use certified_loop_return::{
-    CERTIFIED_LOOP_RETURN_FUNCTION_SCHEMA_VERSION, CertifiedLoopReturnExit,
-    CertifiedLoopReturnFunction, LoopExecutionOutcome, LoopReturnDifferentialCase,
-    LoopReturnDifferentialReport, LoopReturnFunctionAuditReport, LoopReturnFunctionError,
-    LoopReturnFunctionScope, LoopReturnValue, check_loop_return_differential,
-};
-pub use certified_private_frame_join::{
-    CERTIFIED_PRIVATE_FRAME_CONDITIONAL_JOIN_FUNCTION_SCHEMA_VERSION,
-    CERTIFIED_PRIVATE_FRAME_JOIN_REWRITE_SCHEMA_VERSION,
-    CertifiedPrivateFrameConditionalJoinFunction,
-    CertifiedPrivateFrameConditionalJoinFunctionScope, CertifiedPrivateFrameConditionalJoinRewrite,
-    CertifiedPrivateFrameConditionalJoinRewriteScope, CertifiedPrivateFrameDirectSubstitution,
-    CertifiedPrivateFrameJoinValue, CertifiedPrivateFrameJoinValueOrigin,
-    CertifiedPrivateFrameJoinedSelect, PrivateFrameConditionalJoinFunctionAuditReport,
-    PrivateFrameConditionalJoinFunctionError, PrivateFrameConditionalJoinRewriteError,
-};
-pub use certified_region::{
-    CERTIFIED_REGION_SCHEMA_VERSION, CertifiedRegionInstruction, CertifiedSingleBlockAccounting,
-    PrivateFrameConditionalJoinOwnerRole, RegionAuditReport, RegionBuildError,
-    RegionObligationDisposition, RegionObligationMapping, RegionResidualReason, RegionTypedOwner,
-    SingleBlockAccountingScope,
-};
-pub use certified_return::{
-    CERTIFIED_TERMINAL_RETURN_REGION_SCHEMA_VERSION, CertifiedTerminalReturnBlockRegion,
-    TerminalReturnRegionAuditReport, TerminalReturnRegionError, TerminalReturnRegionScope,
-};
-pub use certified_structure::{
-    CERTIFIED_IF_ELSE_DIAMOND_SCHEMA_VERSION, CertifiedDiamondArm, CertifiedIfElseDiamondFragment,
-    IfElseDiamondAuditReport, IfElseDiamondError, IfElseDiamondScope,
-};
-pub use certified_switch::{
-    CERTIFIED_SWITCH_TOPOLOGY_FRAGMENT_SCHEMA_VERSION, CertifiedSwitchTopologyFragment,
-    SwitchTopologyAuditReport, SwitchTopologyFragmentError, SwitchTopologyFragmentScope,
-};
-pub use certified_switch_return::{
-    CERTIFIED_SWITCH_RETURN_FUNCTION_SCHEMA_VERSION, CertifiedSwitchReturnArm,
-    CertifiedSwitchReturnCase, CertifiedSwitchReturnFunction, SwitchReturnDifferentialCase,
-    SwitchReturnDifferentialReport, SwitchReturnFunctionAuditReport, SwitchReturnFunctionError,
-    SwitchReturnFunctionScope, SwitchReturnOutcome, check_switch_return_differential,
-};
 pub use codegen::CodeGenConfig;
 pub use control::{DecompileExecutionStop, DecompileWorkControl, DecompileWorkPhase};
 pub use fold::lower_ssa_ops_to_stmts;
 pub use highlight::highlight_c_ansi;
-pub use region::{Region, RegionAnalyzer};
-pub use semantic_aggregate_function::{
-    CERTIFIED_AGGREGATE_MEMBER_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
-    CertifiedAggregateMemberRenderAccess, CertifiedAggregateMemberRenderDirection,
-    CertifiedAggregateMemberSemanticCFunction,
-    CertifiedAggregateMemberSemanticCFunctionAuditReport,
-    CertifiedAggregateMemberSemanticCFunctionError, CertifiedAggregateMemberSemanticCFunctionScope,
-    CertifiedAggregateScalarSignedness, CertifiedAggregateSemanticCParameter,
-    CertifiedAggregateSemanticCParameterKind, CertifiedAggregateSemanticCReturn,
-    CertifiedAggregateStructLayoutManifest, CertifiedAggregateStructMemberManifest,
-};
-pub use semantic_c::{
-    SemanticCCallArgument, SemanticCCallArgumentValue, SemanticCDirectCall, SemanticCError,
-    SemanticCExpressionLayer, SemanticCFunctionInterface, SemanticCFunctionReturn,
-    SemanticCIdentityScope, SemanticCInputOrigin, SemanticCParameter, SemanticCParameterProjection,
-    SemanticCReturn, SemanticCReturnValue, SemanticCScope, SemanticCStackSlot,
-};
-pub use semantic_call_return::{
-    CERTIFIED_DIRECT_CALL_RETURN_FUNCTION_SCHEMA_VERSION, CertifiedDirectCallReturnBlock,
-    CertifiedDirectCallReturnFunction, DirectCallArgumentManifest,
-    DirectCallReturnFunctionAuditReport, DirectCallReturnFunctionError,
-    DirectCallReturnFunctionScope,
-};
-pub use semantic_differential::{
-    DifferentialArtifactIdentity, DifferentialBitVector, DifferentialBoundaryOutcome,
-    DifferentialCallArgument, DifferentialCandidateAdmission, DifferentialCandidateIdentity,
-    DifferentialCandidateKind, DifferentialCaseDisposition, DifferentialConclusion,
-    DifferentialLimits, DifferentialMemoryEvent, DifferentialMemoryEventKind,
-    DifferentialMemoryLocation, DifferentialMismatch, DifferentialMismatchKind,
-    DifferentialObservedByte, DifferentialObservedRun, DifferentialObservedTrace,
-    DifferentialObservedValue, DifferentialReport, DifferentialSide, DifferentialState,
-    SEMANTIC_DIFFERENTIAL_EVALUATOR_CONTRACT_VERSION, SEMANTIC_DIFFERENTIAL_SCHEMA_VERSION,
-    check_block_differential, check_conditional_return_differential,
-    check_direct_call_differential, check_memory_terminal_return_differential,
-    check_private_frame_conditional_join_differential, check_terminal_return_differential,
-};
-pub use semantic_function::{
-    CERTIFIED_SEMANTIC_C_FUNCTION_SCHEMA_VERSION, CertifiedSemanticCFunction,
-    CertifiedSemanticCFunctionError, CertifiedSemanticCFunctionScope,
-};
-pub use semantic_memory_function::{
-    CERTIFIED_MEMORY_SEMANTIC_C_FUNCTION_SCHEMA_VERSION, CertifiedMemorySemanticCFunction,
-    CertifiedMemorySemanticCFunctionAuditReport, CertifiedMemorySemanticCFunctionError,
-    CertifiedMemorySemanticCFunctionScope,
-};
-pub use semantic_stmt::{
-    SemanticCBlockStepLayer, SemanticCEntityRef, SemanticCMemoryStatementRef, SemanticCSourceStep,
-    SemanticCStatementError, SemanticCStatementScope, SemanticCStepAuditReport,
-};
-pub(crate) use structure::ControlFlowStructurer;
-pub use variable::VariableRecovery;
-
-use crate::codegen::CodeGenerator;
-use crate::fold::FoldingContext;
-use crate::fold::context::{FoldArchConfig, FoldInputs};
 use r2ssa::SSAFunction;
+#[cfg(test)]
 use r2ssa::SSAOp;
 use r2ssa::cfg::BlockTerminator;
-use r2types::{
-    CTypeLike, DecompileRouteFacts, DecompileRouteKind, ExternalRegisterParamSpec, FunctionFacts,
-    FunctionSignatureSpec, FunctionTypeFacts, StackSlotKey, TypeInference, TypeOracle,
-    VisibleBinding, VisibleBindingKind,
-};
+use r2types::{DecompileRouteFacts, DecompileRouteKind, FunctionFacts, FunctionTypeFacts};
 #[cfg(test)]
 use r2types::{ExternalTypeDb, FunctionType};
-use std::collections::{HashMap, HashSet};
+pub use region::{Region, RegionAnalyzer};
+use std::collections::HashSet;
 use std::fmt::Write as _;
+use std::rc::Rc;
 #[cfg(test)]
 use std::sync::Arc;
+pub(crate) use structure::ControlFlowStructurer;
 
-fn is_generic_arg_name(name: &str) -> bool {
-    let lower = name.trim().to_ascii_lowercase();
-    lower
-        .strip_prefix("arg")
-        .map(|suffix| !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()))
-        .unwrap_or(false)
-}
+/// Whether a name is one radare2 generated for an unnamed parameter.
+///
+/// `r2types` owns this question -- it is the crate that decides what a
+/// signature's names mean -- and this was a byte-identical copy of its answer
+/// in a crate that already depends on it. Two copies of one rule are two
+/// answerers that drift, and the project has paid for that before.
+pub(crate) use r2types::is_generic_arg_name;
 
-fn seed_runtime_type_hints_from_facts_and_recovery(
-    type_facts: &FunctionTypeFacts,
-    var_recovery: &VariableRecovery,
-) -> std::collections::HashMap<String, CType> {
-    let mut type_hints = std::collections::HashMap::new();
-    let mut insert = |name: &str, ty: &CType| {
-        if matches!(ty, CType::Unknown | CType::Void) {
-            return;
-        }
-        type_hints.insert(name.to_string(), ty.clone());
-        type_hints.insert(name.to_ascii_lowercase(), ty.clone());
-    };
-
-    for var in var_recovery.parameters() {
-        insert(&var.name, &var.ty);
-    }
-    for var in var_recovery.locals() {
-        insert(&var.name, &var.ty);
-    }
-    for binding in &type_facts.visible_bindings {
-        if let Some(ty) = binding.ty.as_ref() {
-            insert(&binding.name, &type_like_to_ctype(ty));
-        }
-    }
-    for reg_param in &type_facts.register_params {
-        if let Some(ty) = reg_param.ty.as_ref() {
-            insert(&reg_param.name, &type_like_to_ctype(ty));
-        }
-    }
-    for slot in type_facts.stack_slots.values() {
-        if let Some(ty) = slot.ty.as_ref() {
-            insert(&slot.name, &type_like_to_ctype(ty));
-        }
-    }
-
-    type_hints
-}
-
-fn ctype_hint_specificity(ty: &CType) -> u8 {
-    match ty {
-        CType::Unknown => 0,
-        CType::Void => 1,
-        CType::Function { .. } => 2,
-        CType::Bool | CType::Int(_) | CType::UInt(_) | CType::Float(_) => 4,
-        CType::Typedef(_) | CType::Enum(_) => 5,
-        CType::Struct(_) | CType::Union(_) => 6,
-        CType::Array(inner, _) => 12 + ctype_hint_specificity(inner).min(12),
-        CType::Pointer(inner) => 10 + ctype_hint_specificity(inner).min(12),
-    }
-}
-
-fn candidate_ctype_hint_is_better(existing: &CType, candidate: &CType) -> bool {
-    if integer_same_width_signedness_override(existing, candidate) {
-        return true;
-    }
-    if integer_narrower_canonical_hint(existing, candidate) {
-        return true;
-    }
-    ctype_hint_specificity(candidate) > ctype_hint_specificity(existing)
-}
-
-fn integer_same_width_signedness_override(existing: &CType, candidate: &CType) -> bool {
-    match (existing, candidate) {
-        (CType::Int(bits), CType::UInt(candidate_bits))
-        | (CType::UInt(bits), CType::Int(candidate_bits)) => bits == candidate_bits,
-        _ => false,
-    }
-}
-
-fn integer_narrower_canonical_hint(existing: &CType, candidate: &CType) -> bool {
-    let (existing_bits, candidate_bits) = match (existing, candidate) {
-        (
-            CType::Int(existing_bits) | CType::UInt(existing_bits),
-            CType::Int(candidate_bits) | CType::UInt(candidate_bits),
-        ) => (*existing_bits, *candidate_bits),
-        _ => return false,
-    };
-
-    matches!(candidate_bits, 8 | 16 | 32) && candidate_bits < existing_bits
-}
-
-fn merge_runtime_type_hint(
-    type_hints: &mut std::collections::HashMap<String, CType>,
-    name: String,
-    ty: CType,
-) {
-    if matches!(ty, CType::Unknown | CType::Void) {
-        return;
-    }
-    type_hints
-        .entry(name)
-        .and_modify(|existing| {
-            if candidate_ctype_hint_is_better(existing, &ty) {
-                *existing = ty.clone();
-            }
-        })
-        .or_insert(ty);
-}
-
-fn merge_runtime_type_hints(
-    type_hints: &mut std::collections::HashMap<String, CType>,
-    canonical_hints: std::collections::HashMap<String, CType>,
-) {
-    for (name, ty) in canonical_hints {
-        merge_runtime_type_hint(type_hints, name, ty);
-    }
-}
-
-fn runtime_type_hint_for_name<'a>(
-    type_hints: &'a std::collections::HashMap<String, CType>,
-    name: &str,
-) -> Option<&'a CType> {
-    type_hints
-        .get(name)
-        .or_else(|| type_hints.get(&name.to_ascii_lowercase()))
-}
-
-fn choose_more_specific_runtime_type(base: CType, hint: Option<&CType>) -> CType {
-    match hint {
-        Some(hint) if candidate_ctype_hint_is_better(&base, hint) => hint.clone(),
-        _ => base,
-    }
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-fn ctype_to_type_like(ty: &CType) -> CTypeLike {
-    match ty {
-        CType::Void => CTypeLike::Void,
-        CType::Bool => CTypeLike::Bool,
-        CType::Int(bits) => CTypeLike::Int {
-            bits: *bits,
-            signedness: r2types::Signedness::Signed,
-        },
-        CType::UInt(bits) => CTypeLike::Int {
-            bits: *bits,
-            signedness: r2types::Signedness::Unsigned,
-        },
-        CType::Float(bits) => CTypeLike::Float(*bits),
-        CType::Pointer(inner) => CTypeLike::Pointer(Box::new(ctype_to_type_like(inner))),
-        CType::Array(inner, len) => CTypeLike::Array(Box::new(ctype_to_type_like(inner)), *len),
-        CType::Struct(name) => CTypeLike::Struct(name.clone()),
-        CType::Union(name) => CTypeLike::Union(name.clone()),
-        CType::Enum(name) => CTypeLike::Enum(name.clone()),
-        CType::Typedef(name) => CTypeLike::Typedef(name.clone()),
-        CType::Function { .. } | CType::Unknown => CTypeLike::Unknown,
-    }
-}
-
-fn type_like_to_ctype(ty: &CTypeLike) -> CType {
-    match ty {
-        CTypeLike::Void => CType::Void,
-        CTypeLike::Bool => CType::Bool,
-        CTypeLike::Int { bits, signedness } => match signedness {
-            r2types::Signedness::Unsigned => CType::UInt(*bits),
-            _ => CType::Int(*bits),
-        },
-        CTypeLike::Float(bits) => CType::Float(*bits),
-        CTypeLike::Pointer(inner) => CType::Pointer(Box::new(type_like_to_ctype(inner))),
-        CTypeLike::Array(inner, len) => CType::Array(Box::new(type_like_to_ctype(inner)), *len),
-        CTypeLike::Struct(name) => CType::Struct(name.clone()),
-        CTypeLike::Union(name) => CType::Union(name.clone()),
-        CTypeLike::Enum(name) => CType::Enum(name.clone()),
-        CTypeLike::Typedef(name) => CType::Typedef(name.clone()),
-        CTypeLike::Function | CTypeLike::Unknown => CType::Unknown,
-    }
-}
-
-pub(crate) fn certified_loop_carrier_name(phi: r2ssa::ValueId) -> String {
-    format!("loop_value_{}", phi.0)
-}
-
+#[cfg(test)]
 pub(crate) fn certified_memory_result_name(access: r2ssa::StructuredAccessId) -> String {
     format!("memory_value_{}_{}", access.inst.0, access.ordinal)
 }
@@ -740,16 +441,7 @@ pub(crate) fn format_vm_summary_kind(kind: r2sym::InterpreterKind) -> &'static s
 
 #[cfg(test)]
 pub(crate) fn is_autogenerated_function_name(name: &str) -> bool {
-    let underscore_hex_addr = name
-        .strip_prefix('_')
-        .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|ch| ch.is_ascii_hexdigit()));
-    name.is_empty()
-        || name.starts_with("fcn.")
-        || name.starts_with("fcn_")
-        || name.starts_with("sub.")
-        || name.starts_with("sub_")
-        || name.starts_with("loc.")
-        || underscore_hex_addr
+    r2source::display_names::is_generated_function_name(name)
 }
 
 pub(crate) fn semantic_mode_label(artifact: &r2sym::SemanticArtifactReport) -> &'static str {
@@ -768,7 +460,6 @@ pub(crate) fn semantic_slice_class_label(slice_class: r2sym::SliceClass) -> &'st
     match slice_class {
         r2sym::SliceClass::Wrapper => "wrapper",
         r2sym::SliceClass::Worker => "worker",
-        r2sym::SliceClass::RecursiveGroup => "recursive_group",
         r2sym::SliceClass::InterpreterSwitch => "interpreter_switch",
         r2sym::SliceClass::InterpreterIndirect => "interpreter_indirect",
         r2sym::SliceClass::GenericLarge => "generic_large",
@@ -779,8 +470,6 @@ pub(crate) fn semantic_residual_reason_label(reason: r2sym::ResidualReason) -> &
     match reason {
         r2sym::ResidualReason::MissingArch => "missing_arch",
         r2sym::ResidualReason::LargeCfg => "large_cfg",
-        r2sym::ResidualReason::SummaryBudgetExhausted => "summary_budget_exhausted",
-        r2sym::ResidualReason::SccBudgetExhausted => "scc_budget_exhausted",
         r2sym::ResidualReason::InterpreterRequiresStepSummary => {
             "interpreter_requires_step_summary"
         }
@@ -819,17 +508,23 @@ fn native_worker_summary_kind_label(kind: r2sym::NativeWorkerSummaryKind) -> &'s
     }
 }
 
-fn summary_memory_region_label(region: r2ssa::SummaryMemoryRegion) -> String {
+fn summary_memory_region_label(
+    region: r2ssa::SummaryMemoryRegion,
+    names: SummaryArgNames<'_>,
+) -> String {
     match region {
-        r2ssa::SummaryMemoryRegion::Arg { index } => format!("arg{index}"),
+        r2ssa::SummaryMemoryRegion::Arg { index } => names.label(index),
         r2ssa::SummaryMemoryRegion::Global { address } => format!("global[0x{address:x}]"),
         r2ssa::SummaryMemoryRegion::HeapReturn => "heap_return".to_string(),
         r2ssa::SummaryMemoryRegion::Unknown => "unknown".to_string(),
     }
 }
 
-fn summary_memory_location_label(location: &r2ssa::SummaryMemoryLocation) -> String {
-    let base = summary_memory_region_label(location.region);
+fn summary_memory_location_label(
+    location: &r2ssa::SummaryMemoryLocation,
+    names: SummaryArgNames<'_>,
+) -> String {
+    let base = summary_memory_region_label(location.region, names);
     if let Some(range) = location.range {
         let width = range
             .width
@@ -844,9 +539,12 @@ fn summary_memory_location_label(location: &r2ssa::SummaryMemoryLocation) -> Str
     }
 }
 
-fn summary_transfer_length_label(len: r2ssa::SummaryTransferLength) -> String {
+fn summary_transfer_length_label(
+    len: r2ssa::SummaryTransferLength,
+    names: SummaryArgNames<'_>,
+) -> String {
     match len {
-        r2ssa::SummaryTransferLength::Arg(index) => format!("arg{index}"),
+        r2ssa::SummaryTransferLength::Arg(index) => names.label(index),
         r2ssa::SummaryTransferLength::Const(value) => value.to_string(),
         r2ssa::SummaryTransferLength::Unknown => "unknown".to_string(),
     }
@@ -947,31 +645,120 @@ fn native_worker_loop_detail(loop_summary: &r2sym::NativeWorkerLoopSummary) -> S
     parts.join(" ")
 }
 
-fn native_worker_summary_pseudocode(summary: &r2sym::NativeWorkerSummary) -> Option<String> {
+/// Names for the argument slots a summary refers to by index.
+///
+/// A summary records `SummaryMemoryRegion::Arg { index }` -- structured, exact,
+/// and nameless. Rendering it as the literal `arg{index}` and then scanning the
+/// emitted C afterwards to substitute a real name is how this used to work, and
+/// two different producers wrote that token with two different index bases while
+/// one post-pass tried to undo both. The index is structured the whole way down;
+/// only the label needs a name, so the name is resolved here.
+#[derive(Clone, Copy)]
+pub(crate) struct SummaryArgNames<'a> {
+    type_facts: &'a r2types::FunctionTypeFacts,
+}
+
+impl<'a> SummaryArgNames<'a> {
+    pub(crate) fn new(type_facts: &'a r2types::FunctionTypeFacts) -> Self {
+        Self { type_facts }
+    }
+
+    /// Whether anything at all is known about this function's parameters.
+    ///
+    /// If something is, an unnamed slot still must not print as `arg2`: that
+    /// reads as a name the rendering recovered, and the summary route is
+    /// precisely the route that could not recover one.
+    fn function_has_parameter_facts(&self) -> bool {
+        // A merged signature does not count. It can exist for a function
+        // whose parameters were never established, and the summary route is
+        // reached precisely when that recovery did not happen.
+        !self.type_facts.register_params.is_empty()
+            || self.type_facts.render_authorized_signature().is_some()
+    }
+
+    /// The name for one argument slot, or a placeholder that says no source
+    /// named it.
+    pub(crate) fn label(&self, index: usize) -> String {
+        let named = |name: &str| {
+            let name = name.trim();
+            (!name.is_empty() && !is_generic_arg_name(name)).then(|| name.to_string())
+        };
+        self.type_facts
+            .merged_signature
+            .as_ref()
+            .and_then(|signature| signature.params.get(index))
+            .and_then(|param| named(&param.name))
+            .or_else(|| {
+                self.type_facts
+                    .render_authorized_signature()
+                    .and_then(|signature| signature.params.get(index))
+                    .and_then(|param| named(&param.name))
+            })
+            .or_else(|| {
+                self.type_facts
+                    .register_params
+                    .get(index)
+                    .and_then(|param| named(&param.name))
+            })
+            .unwrap_or_else(|| {
+                // Nothing named this slot. If the function is known to take
+                // parameters at all, saying `arg0` would read as a name the
+                // rendering had recovered, so it gets a placeholder that
+                // plainly is not one. With no parameter facts at all the slot
+                // index is the honest label: the summary really does mean
+                // "argument 0" and says nothing more.
+                if !self.function_has_parameter_facts() {
+                    format!("arg{index}")
+                } else {
+                    format!("summary_input{index}")
+                }
+            })
+    }
+}
+
+fn native_worker_summary_pseudocode(
+    summary: &r2sym::NativeWorkerSummary,
+    names: SummaryArgNames<'_>,
+) -> Option<String> {
     match summary.kind {
         r2sym::NativeWorkerSummaryKind::ProgramOrchestrator => {
             Some("orchestrate program phases from argc, argv, and environment".to_string())
         }
         r2sym::NativeWorkerSummaryKind::MemoryTransfer => {
-            let dst = summary.dst.as_ref().map(summary_memory_location_label)?;
-            let src = summary.src.as_ref().map(summary_memory_location_label)?;
+            let dst = summary
+                .dst
+                .as_ref()
+                .map(|location| summary_memory_location_label(location, names))?;
+            let src = summary
+                .src
+                .as_ref()
+                .map(|location| summary_memory_location_label(location, names))?;
             let len = summary
                 .len
-                .map(summary_transfer_length_label)
+                .map(|len| summary_transfer_length_label(len, names))
                 .unwrap_or_else(|| "unknown".to_string());
             Some(format!("copy {len} bytes from {src} to {dst}"))
         }
         r2sym::NativeWorkerSummaryKind::FileTransfer => {
-            let dst = summary.dst.as_ref().map(summary_memory_location_label)?;
-            let src = summary.src.as_ref().map(summary_memory_location_label)?;
+            let dst = summary
+                .dst
+                .as_ref()
+                .map(|location| summary_memory_location_label(location, names))?;
+            let src = summary
+                .src
+                .as_ref()
+                .map(|location| summary_memory_location_label(location, names))?;
             let len = summary
                 .len
-                .map(summary_transfer_length_label)
+                .map(|len| summary_transfer_length_label(len, names))
                 .unwrap_or_else(|| "bounded chunks".to_string());
             Some(format!("copy file data from {src} to {dst} ({len})"))
         }
         r2sym::NativeWorkerSummaryKind::StringScan => {
-            let memory = summary.memory.as_ref().map(summary_memory_location_label)?;
+            let memory = summary
+                .memory
+                .as_ref()
+                .map(|location| summary_memory_location_label(location, names))?;
             let terminator = summary
                 .loop_summary
                 .as_ref()
@@ -981,7 +768,10 @@ fn native_worker_summary_pseudocode(summary: &r2sym::NativeWorkerSummary) -> Opt
             Some(format!("scan {memory} until {terminator}"))
         }
         r2sym::NativeWorkerSummaryKind::MemoryRead | r2sym::NativeWorkerSummaryKind::TableWalk => {
-            let memory = summary.memory.as_ref().map(summary_memory_location_label)?;
+            let memory = summary
+                .memory
+                .as_ref()
+                .map(|location| summary_memory_location_label(location, names))?;
             let terminator = summary
                 .loop_summary
                 .as_ref()
@@ -991,35 +781,59 @@ fn native_worker_summary_pseudocode(summary: &r2sym::NativeWorkerSummary) -> Opt
             Some(format!("scan {memory} until {terminator}"))
         }
         r2sym::NativeWorkerSummaryKind::PathWalk => {
-            let memory = summary.memory.as_ref().map(summary_memory_location_label)?;
+            let memory = summary
+                .memory
+                .as_ref()
+                .map(|location| summary_memory_location_label(location, names))?;
             Some(format!("walk path components from {memory}"))
         }
         r2sym::NativeWorkerSummaryKind::DirectoryTraversal => {
-            let memory = summary.memory.as_ref().map(summary_memory_location_label)?;
+            let memory = summary
+                .memory
+                .as_ref()
+                .map(|location| summary_memory_location_label(location, names))?;
             Some(format!("traverse directory entries from {memory}"))
         }
         r2sym::NativeWorkerSummaryKind::RecordStream => {
-            let memory = summary.memory.as_ref().map(summary_memory_location_label)?;
+            let memory = summary
+                .memory
+                .as_ref()
+                .map(|location| summary_memory_location_label(location, names))?;
             Some(format!("read records from {memory}"))
         }
         r2sym::NativeWorkerSummaryKind::FieldSelection => {
-            let memory = summary.memory.as_ref().map(summary_memory_location_label)?;
+            let memory = summary
+                .memory
+                .as_ref()
+                .map(|location| summary_memory_location_label(location, names))?;
             Some(format!("select fields using {memory}"))
         }
         r2sym::NativeWorkerSummaryKind::OutputStream => {
-            let memory = summary.memory.as_ref().map(summary_memory_location_label)?;
+            let memory = summary
+                .memory
+                .as_ref()
+                .map(|location| summary_memory_location_label(location, names))?;
             Some(format!("write output stream from {memory}"))
         }
         r2sym::NativeWorkerSummaryKind::FormatRender => {
-            let memory = summary.memory.as_ref().map(summary_memory_location_label)?;
+            let memory = summary
+                .memory
+                .as_ref()
+                .map(|location| summary_memory_location_label(location, names))?;
             Some(format!("render formatted output from {memory}"))
         }
         r2sym::NativeWorkerSummaryKind::MetadataProbe => {
-            let memory = summary.memory.as_ref().map(summary_memory_location_label)?;
+            let memory = summary
+                .memory
+                .as_ref()
+                .map(|location| summary_memory_location_label(location, names))?;
             Some(format!("probe file metadata for {memory}"))
         }
         r2sym::NativeWorkerSummaryKind::SortMerge => {
-            let memory = summary.memory.as_ref().map(summary_memory_location_label)?;
+            let memory = summary
+                .memory
+                .as_ref()
+                .map(|location| summary_memory_location_label(location, names))?;
             Some(format!("merge sorted records from {memory}"))
         }
         r2sym::NativeWorkerSummaryKind::NumericTransform => {
@@ -1032,10 +846,10 @@ fn native_worker_summary_pseudocode(summary: &r2sym::NativeWorkerSummary) -> Opt
                 let memory = summary
                     .memory
                     .as_ref()
-                    .map(summary_memory_location_label)
+                    .map(|location| summary_memory_location_label(location, names))
                     .unwrap_or_else(|| "summary_input".to_string());
                 let length = summary_worker_length(summary)
-                    .map(summary_transfer_length_label)
+                    .map(|len| summary_transfer_length_label(len, names))
                     .unwrap_or_else(|| "unknown length".to_string());
                 if let Some(predicate) = fold.predicate.as_ref() {
                     return Some(format!(
@@ -1058,12 +872,15 @@ fn native_worker_summary_pseudocode(summary: &r2sym::NativeWorkerSummary) -> Opt
             let dst = summary
                 .dst
                 .as_ref()
-                .map(summary_memory_location_label)
+                .map(|location| summary_memory_location_label(location, names))
                 .unwrap_or_else(|| "return value".to_string());
             Some(format!("compute numeric transform into {dst}"))
         }
         r2sym::NativeWorkerSummaryKind::HashFold => {
-            let memory = summary.memory.as_ref().map(summary_memory_location_label)?;
+            let memory = summary
+                .memory
+                .as_ref()
+                .map(|location| summary_memory_location_label(location, names))?;
             let fold = summary.loop_summary.as_ref()?.fold.as_ref()?;
             Some(format!(
                 "{} fold over {} into {}",
@@ -1073,7 +890,10 @@ fn native_worker_summary_pseudocode(summary: &r2sym::NativeWorkerSummary) -> Opt
             ))
         }
         r2sym::NativeWorkerSummaryKind::Parser => {
-            let memory = summary.memory.as_ref().map(summary_memory_location_label)?;
+            let memory = summary
+                .memory
+                .as_ref()
+                .map(|location| summary_memory_location_label(location, names))?;
             let parser = summary
                 .parser
                 .as_ref()
@@ -1085,7 +905,7 @@ fn native_worker_summary_pseudocode(summary: &r2sym::NativeWorkerSummary) -> Opt
             let fmt = summary
                 .memory
                 .as_ref()
-                .map(summary_memory_location_label)
+                .map(|location| summary_memory_location_label(location, names))
                 .unwrap_or_else(|| "format argument".to_string());
             Some(format!("diagnose formatted error from {fmt}"))
         }
@@ -1093,12 +913,12 @@ fn native_worker_summary_pseudocode(summary: &r2sym::NativeWorkerSummary) -> Opt
             let dst = summary
                 .dst
                 .as_ref()
-                .map(summary_memory_location_label)
+                .map(|location| summary_memory_location_label(location, names))
                 .unwrap_or_else(|| "argument table".to_string());
             let src = summary
                 .src
                 .as_ref()
-                .map(summary_memory_location_label)
+                .map(|location| summary_memory_location_label(location, names))
                 .unwrap_or_else(|| "va_list".to_string());
             Some(format!("fetch printf arguments from {src} into {dst}"))
         }
@@ -1118,35 +938,45 @@ fn summary_worker_length(
     })
 }
 
-fn native_worker_summary_detail(summary: &r2sym::NativeWorkerSummary) -> String {
+fn native_worker_summary_detail(
+    summary: &r2sym::NativeWorkerSummary,
+    names: SummaryArgNames<'_>,
+) -> String {
     let mut parts = Vec::new();
     if let Some(dst) = summary.dst.as_ref() {
-        parts.push(format!("dst={}", summary_memory_location_label(dst)));
+        parts.push(format!("dst={}", summary_memory_location_label(dst, names)));
     }
     if let Some(src) = summary.src.as_ref() {
-        parts.push(format!("src={}", summary_memory_location_label(src)));
+        parts.push(format!("src={}", summary_memory_location_label(src, names)));
     }
     if let Some(memory) = summary.memory.as_ref() {
-        parts.push(format!("mem={}", summary_memory_location_label(memory)));
+        parts.push(format!(
+            "mem={}",
+            summary_memory_location_label(memory, names)
+        ));
     }
     if let Some(len) = summary.len {
-        parts.push(format!("len={}", summary_transfer_length_label(len)));
+        parts.push(format!("len={}", summary_transfer_length_label(len, names)));
     }
     if let Some(allocation) = summary.allocation {
         parts.push(format!(
             "alloc_size={} zeroed={}",
             allocation
                 .size_arg
-                .map(|index| format!("arg{index}"))
+                .map(|index| names.label(index))
                 .unwrap_or_else(|| "unknown".to_string()),
             allocation.zeroed
         ));
     }
     if let Some(lifetime) = summary.lifetime {
-        parts.push(format!("lifetime={:?}(arg{})", lifetime.op, lifetime.arg));
+        parts.push(format!(
+            "lifetime={:?}({})",
+            lifetime.op,
+            names.label(lifetime.arg)
+        ));
     }
     if let Some(sync) = summary.sync {
-        parts.push(format!("sync={:?}(arg{})", sync.op, sync.arg));
+        parts.push(format!("sync={:?}({})", sync.op, names.label(sync.arg)));
     }
     if let Some(atomic) = summary.atomic {
         parts.push(format!("atomic={:?}/{:?}", atomic.op, atomic.ordering));
@@ -1212,14 +1042,23 @@ fn native_region_loop_detail(loop_summary: &r2sym::NativeLoopSummary) -> String 
     parts.join(" ")
 }
 
-fn native_region_access_pseudocode(access: &r2sym::NativeMemoryAccessSummary) -> Option<String> {
+fn native_region_access_pseudocode(
+    access: &r2sym::NativeMemoryAccessSummary,
+    names: SummaryArgNames<'_>,
+) -> Option<String> {
     match access.kind {
         r2sym::NativeMemoryAccessKind::Transfer => {
-            let dst = access.dst.as_ref().map(summary_memory_location_label)?;
-            let src = access.src.as_ref().map(summary_memory_location_label)?;
+            let dst = access
+                .dst
+                .as_ref()
+                .map(|location| summary_memory_location_label(location, names))?;
+            let src = access
+                .src
+                .as_ref()
+                .map(|location| summary_memory_location_label(location, names))?;
             let len = access
                 .len
-                .map(summary_transfer_length_label)
+                .map(|len| summary_transfer_length_label(len, names))
                 .unwrap_or_else(|| "unknown".to_string());
             Some(format!("copy {len} bytes from {src} to {dst}"))
         }
@@ -1227,33 +1066,36 @@ fn native_region_access_pseudocode(access: &r2sym::NativeMemoryAccessSummary) ->
             let memory = access
                 .location
                 .as_ref()
-                .map(summary_memory_location_label)?;
+                .map(|location| summary_memory_location_label(location, names))?;
             Some(format!("read stream from {memory}"))
         }
         r2sym::NativeMemoryAccessKind::Write => {
             let memory = access
                 .location
                 .as_ref()
-                .map(summary_memory_location_label)?;
+                .map(|location| summary_memory_location_label(location, names))?;
             Some(format!("write stream to {memory}"))
         }
         r2sym::NativeMemoryAccessKind::Atomic => {
             let memory = access
                 .location
                 .as_ref()
-                .map(summary_memory_location_label)?;
+                .map(|location| summary_memory_location_label(location, names))?;
             Some(format!("atomic update at {memory}"))
         }
         _ => None,
     }
 }
 
-fn native_region_summary_pseudocode(summary: &r2sym::NativeRegionSummary) -> Option<String> {
+fn native_region_summary_pseudocode(
+    summary: &r2sym::NativeRegionSummary,
+    names: SummaryArgNames<'_>,
+) -> Option<String> {
     if let Some(reduction) = summary.reductions.first() {
         let source = reduction
             .source
             .as_ref()
-            .map(summary_memory_location_label)
+            .map(|location| summary_memory_location_label(location, names))
             .unwrap_or_else(|| "unknown".to_string());
         return Some(format!(
             "{} fold over {} into {}",
@@ -1268,7 +1110,7 @@ fn native_region_summary_pseudocode(summary: &r2sym::NativeRegionSummary) -> Opt
         let memory = access
             .location
             .as_ref()
-            .map(summary_memory_location_label)?;
+            .map(|location| summary_memory_location_label(location, names))?;
         return Some(format!("scan {memory} until zero byte"));
     }
     if matches!(summary.kind, r2sym::NativeWorkerSummaryKind::Parser)
@@ -1277,7 +1119,7 @@ fn native_region_summary_pseudocode(summary: &r2sym::NativeRegionSummary) -> Opt
         let memory = access
             .location
             .as_ref()
-            .map(summary_memory_location_label)?;
+            .map(|location| summary_memory_location_label(location, names))?;
         let parser = summary
             .parser
             .as_ref()
@@ -1312,7 +1154,7 @@ fn native_region_summary_pseudocode(summary: &r2sym::NativeRegionSummary) -> Opt
         let memory = access
             .location
             .as_ref()
-            .map(summary_memory_location_label)?;
+            .map(|location| summary_memory_location_label(location, names))?;
         return Some(format!("walk path components from {memory}"));
     }
     if matches!(
@@ -1348,7 +1190,7 @@ fn native_region_summary_pseudocode(summary: &r2sym::NativeRegionSummary) -> Opt
     summary
         .memory_accesses
         .iter()
-        .find_map(native_region_access_pseudocode)
+        .find_map(|access| native_region_access_pseudocode(access, names))
 }
 
 fn native_region_summary_detail(summary: &r2sym::NativeRegionSummary) -> String {
@@ -1478,6 +1320,303 @@ fn append_semantic_summary_return_comment_to_function_if_needed(
     }
 }
 
+/// Count the residual markers the structurer left in a rendered body.
+///
+/// The structurer already refuses per construct: an unresolved branch, loop,
+/// switch selector or case value becomes a `r2dec residual:` comment where that
+/// construct would have been. Counting them is a reading of the body, not a
+/// second opinion about what was proven.
+fn count_residual_markers(stmts: &[CStmt]) -> usize {
+    fn walk(stmts: &[CStmt], found: &mut usize) {
+        for stmt in stmts {
+            walk_one(stmt, found);
+        }
+    }
+    fn walk_one(stmt: &CStmt, found: &mut usize) {
+        match stmt.unobserved() {
+            CStmt::Comment(text) => {
+                if text.contains("r2dec residual:") {
+                    *found += 1;
+                }
+            }
+            CStmt::Block(body) => walk(body, found),
+            CStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                walk_one(then_body, found);
+                if let Some(else_body) = else_body {
+                    walk_one(else_body, found);
+                }
+            }
+            CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => walk_one(body, found),
+            CStmt::For { init, body, .. } => {
+                if let Some(init) = init {
+                    walk_one(init, found);
+                }
+                walk_one(body, found);
+            }
+            CStmt::Switch { cases, default, .. } => {
+                for case in cases {
+                    walk(&case.body, found);
+                }
+                if let Some(default) = default {
+                    walk(default, found);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut found = 0;
+    walk(stmts, &mut found);
+    found
+}
+
+/// State what the rendering did and did not show.
+///
+/// "Nothing was marked" and "everything was shown to be right" are different
+/// claims, and only the second earns silence. Nothing here makes the second, so
+/// the note is always emitted: it reports how many constructs carry a residual
+/// marker, and then reports the ledger, which says what became of every effect
+/// the source obliges.
+///
+/// The ledger's columns sum to its total, so an effect that went missing is a
+/// number in the line rather than an absence from it. An unaccounted count is
+/// never zero because nothing went wrong; it is zero only when every obligation
+/// was reached by a rule that named its fate.
+fn note_unproven_constructs(
+    func: &mut CFunction,
+    ledger: Option<&r2ssa::ledger::ObligationLedger>,
+    radare2_variadic_format_counts: usize,
+) {
+    let rendered_nothing = func.body.is_empty();
+    let residuals = count_residual_markers(&func.body);
+    let detail = if rendered_nothing {
+        "rendering produced no statements".to_string()
+    } else {
+        match residuals {
+            0 => "no individual construct is marked".to_string(),
+            1 => "1 construct is marked below".to_string(),
+            n => format!("{n} constructs are marked below"),
+        }
+    };
+    let mut detail = match ledger.map(r2ssa::ledger::ObligationLedger::close) {
+        Some(closure) if closure.total > 0 => {
+            let mut line = format!(
+                "{detail}; {} source obligations: {} rendered, {} elided, {} refused",
+                closure.total, closure.rendered, closure.elided, closure.refused
+            );
+            // The column that used to have no name. Saying nothing here is what let a
+            // gutted body report as clean, so it is spelled out whenever it is not zero.
+            if closure.unattributed > 0 {
+                let _ = write!(&mut line, ", {} unaccounted", closure.unattributed);
+            }
+            if closure.conflicts > 0 {
+                let _ = write!(&mut line, ", {} conflicting", closure.conflicts);
+            }
+            let _ = write!(
+                &mut line,
+                "; {} statements rendered",
+                count_body_statements(&func.body)
+            );
+            line
+        }
+        _ => detail,
+    };
+    let radare_typed_objects =
+        func.extern_objects
+            .iter()
+            .filter(|object| {
+                object.type_fact.as_ref().is_some_and(|fact| {
+                    fact.provenance == r2types::DataObjectTypeProvenance::Radare2
+                })
+            })
+            .count();
+    let refused_object_types = func
+        .extern_objects
+        .iter()
+        .filter(|object| object.type_fact.is_none() && object.type_refusal.is_some())
+        .count();
+    if radare_typed_objects > 0 {
+        let noun = if radare_typed_objects == 1 {
+            "data object type"
+        } else {
+            "data object types"
+        };
+        let _ = write!(
+            &mut detail,
+            "; {radare_typed_objects} {noun} supplied by radare2"
+        );
+    }
+    if refused_object_types > 0 {
+        let noun = if refused_object_types == 1 {
+            "data object type"
+        } else {
+            "data object types"
+        };
+        let _ = write!(&mut detail, "; {refused_object_types} {noun} refused");
+    }
+    if radare2_variadic_format_counts > 0 {
+        let noun = if radare2_variadic_format_counts == 1 {
+            "variadic callsite argument count"
+        } else {
+            "variadic callsite argument counts"
+        };
+        let _ = write!(
+            &mut detail,
+            "; {radare2_variadic_format_counts} {noun} supplied by radare2 format literals"
+        );
+    }
+    func.body.insert(
+        0,
+        CStmt::comment(sanitize_comment_text(&format!("r2dec proof: {detail}"))),
+    );
+}
+
+/// Statements the body holds, counting the ones nested inside control flow.
+fn count_body_statements(stmts: &[CStmt]) -> usize {
+    fn visit(stmt: &CStmt) -> usize {
+        match stmt.unobserved() {
+            CStmt::Comment(_) | CStmt::Empty => 0,
+            CStmt::Block(inner) => inner.iter().map(visit).sum(),
+            CStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => 1 + visit(then_body) + else_body.as_deref().map(visit).unwrap_or(0),
+            CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => 1 + visit(body),
+            CStmt::For { init, body, .. } => {
+                1 + init.as_deref().map(visit).unwrap_or(0) + visit(body)
+            }
+            CStmt::Switch { cases, default, .. } => {
+                1 + cases
+                    .iter()
+                    .map(|case| case.body.iter().map(visit).sum::<usize>())
+                    .sum::<usize>()
+                    + default
+                        .as_ref()
+                        .map(|body| body.iter().map(visit).sum::<usize>())
+                        .unwrap_or(0)
+            }
+            _ => 1,
+        }
+    }
+    stmts.iter().map(visit).sum()
+}
+
+/// Whether a run was asked to report what the rendering left unaccounted for.
+pub(crate) fn unowned_report_requested() -> bool {
+    static REQUESTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *REQUESTED.get_or_init(|| std::env::var_os("R2SLEIGH_DEBUG_UNOWNED").is_some())
+}
+
+/// Write the whole ledger out on request, so a count has somewhere to look.
+///
+/// The rendered note says how many obligations landed in each column, which tells
+/// a reader that a function is short without saying short of what. This names the
+/// kinds left undecided, the reasons given for eliding, and the layer behind every
+/// refusal, which is what turns those numbers into a place to start.
+fn debug_log_ledger(prepared: &r2ssa::SsaArtifact, ledger: &r2ssa::ledger::ObligationLedger) {
+    if !unowned_report_requested() {
+        return;
+    }
+    let closure = ledger.close();
+    // Largest first, and by name where two entries tie, so the report reads the
+    // same way twice over the same binary.
+    fn ranked<K: std::fmt::Display>(counts: std::collections::BTreeMap<K, usize>) -> String {
+        let mut entries = counts.into_iter().collect::<Vec<_>>();
+        entries.sort_by(|(left_key, left), (right_key, right)| {
+            right
+                .cmp(left)
+                .then_with(|| left_key.to_string().cmp(&right_key.to_string()))
+        });
+        entries
+            .into_iter()
+            .map(|(key, count)| format!("{key}={count}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+    let refusals = ranked(
+        ledger
+            .refusals_by_layer()
+            .into_iter()
+            .map(|((layer, reason), count)| (format!("{layer}/{reason}"), count))
+            .collect(),
+    );
+    let refused_ids = ledger
+        .entries()
+        .filter_map(|(id, outcome)| match outcome {
+            r2ssa::ledger::Outcome::Refused { layer, reason } => {
+                Some(format!("{id}={layer}/{reason}"))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let message = format!(
+        "LEDGER fn={:#x} total={} rendered={} elided={} refused={} unaccounted={} conflicts={} | unaccounted-kinds: {} | elided: {} | refused: {} | refused-ids: {}",
+        prepared.function().entry,
+        closure.total,
+        closure.rendered,
+        closure.elided,
+        closure.refused,
+        closure.unattributed,
+        closure.conflicts,
+        ranked(ledger.unattributed_by_kind()),
+        ranked(ledger.elisions_by_reason()),
+        refusals,
+        refused_ids,
+    );
+    let path = std::env::var("R2SLEIGH_DEBUG_UNOWNED_LOG")
+        .unwrap_or_else(|_| "/tmp/r2sleigh_unowned.log".to_string());
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        use std::io::Write;
+        let _ = writeln!(file, "{message}");
+    }
+}
+
+fn debug_log_render_contract_error(
+    prepared: &r2ssa::SsaArtifact,
+    stage: &str,
+    error: &impl std::fmt::Debug,
+) {
+    if !unowned_report_requested() {
+        return;
+    }
+    let path = std::env::var("R2SLEIGH_DEBUG_UNOWNED_LOG")
+        .unwrap_or_else(|_| "/tmp/r2sleigh_unowned.log".to_string());
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        use std::io::Write;
+        let _ = writeln!(
+            file,
+            "RENDER_CONTRACT fn={:#x} stage={stage} error={error:?}",
+            prepared.function().entry
+        );
+    }
+}
+
+/// Why the source obligation inventory cannot account for this function, if it cannot.
+fn incomplete_source_obligations_reason(prepared: &r2ssa::SsaArtifact) -> Option<String> {
+    let obligations = prepared.obligations();
+    if obligations.is_complete() {
+        return None;
+    }
+    let failures = obligations.construction_failures().len();
+    let cycles = obligations.unstructured_cycle_blocks().len();
+    Some(format!(
+        "r2dec refusal: the source obligation inventory did not close, so what this function owes was never enumerated ({failures} construction failures, {cycles} unstructured cycle blocks)"
+    ))
+}
+
 fn residual_function_for_render_boundary(func_name: &str, reason: &str) -> CFunction {
     let mut func = CFunction::new(func_name.to_string(), CType::Unknown).with_unknown_params();
     func.body = vec![CStmt::comment(sanitize_comment_text(reason))];
@@ -1500,10 +1639,6 @@ fn route_fallback_reason(route: &DecompileRouteFacts) -> Option<&str> {
             .or(route.fallback_comment.as_deref())
             .unwrap_or("source-owned fallback route")
     })
-}
-
-fn route_is_standard(route: &DecompileRouteFacts) -> bool {
-    route.kind == DecompileRouteKind::Standard
 }
 
 fn route_is_summary_boundary(route: &DecompileRouteFacts) -> bool {
@@ -1573,12 +1708,12 @@ fn summary_non_void_return_type(
         .type_facts()
         .render_authorized_signature()
         .and_then(|sig| sig.ret_type.as_ref())
-        .map(type_like_to_ctype)
+        .cloned()
         .filter(|ty| !matches!(ty, CType::Void | CType::Unknown))
 }
 
 fn summary_stmt_contains_return(stmt: &CStmt) -> bool {
-    match stmt {
+    match stmt.unobserved() {
         CStmt::Return(_) => true,
         CStmt::Block(stmts) => stmts.iter().any(summary_stmt_contains_return),
         CStmt::If {
@@ -1637,183 +1772,6 @@ fn summary_rollup_return_expr(function_facts: &FunctionFacts) -> Option<CExpr> {
     }
 }
 
-fn rewrite_summary_arg_labels(output: String, type_facts: &FunctionTypeFacts) -> String {
-    let mut replacements: Vec<Option<String>> = Vec::new();
-    let extra_index_base;
-    if let Some(signature) = type_facts.render_authorized_signature() {
-        extra_index_base = 0usize;
-        for (idx, param) in signature.params.iter().enumerate() {
-            let name = param.name.trim();
-            if name.is_empty() || is_generic_arg_name(name) {
-                continue;
-            }
-            if replacements.len() <= idx {
-                replacements.resize(idx + 1, None);
-            }
-            replacements[idx] = Some(name.to_string());
-        }
-    } else if !type_facts.register_params.is_empty() {
-        extra_index_base = 1usize;
-        replacements = type_facts
-            .register_params
-            .iter()
-            .enumerate()
-            .map(|(idx, param)| {
-                let name = param.name.trim();
-                if name.is_empty() || is_generic_arg_name(name) {
-                    Some(format!("summary_input{}", idx + 1))
-                } else {
-                    Some(name.to_string())
-                }
-            })
-            .collect();
-    } else {
-        return output;
-    }
-
-    let bytes = output.as_bytes();
-    let mut rewritten = String::with_capacity(output.len());
-    let mut copied = 0usize;
-    let mut cursor = 0usize;
-    while cursor < output.len() {
-        if cursor + 3 <= output.len()
-            && &bytes[cursor..cursor + 3] == b"arg"
-            && (cursor == 0 || !is_summary_ident_byte(bytes[cursor - 1]))
-        {
-            let mut end = cursor + 3;
-            while end < output.len() && bytes[end].is_ascii_digit() {
-                end += 1;
-            }
-            if end > cursor + 3
-                && (end == output.len() || !bytes[end].is_ascii_alphanumeric())
-                && let Ok(index) = output[cursor + 3..end].parse::<usize>()
-            {
-                let replacement = replacements
-                    .get(index)
-                    .and_then(Option::as_ref)
-                    .cloned()
-                    .or_else(|| Some(format!("summary_input{}", index + extra_index_base)));
-                if let Some(name) = replacement {
-                    rewritten.push_str(&output[copied..cursor]);
-                    rewritten.push_str(&name);
-                    copied = end;
-                    cursor = end;
-                    continue;
-                }
-            }
-        }
-
-        cursor += output[cursor..]
-            .chars()
-            .next()
-            .map(char::len_utf8)
-            .unwrap_or(1);
-    }
-    rewritten.push_str(&output[copied..]);
-    rewritten
-}
-
-fn is_summary_ident_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_'
-}
-
-fn merge_params_with_external_signature(
-    recovered_params: Vec<ast::CParam>,
-    signature: Option<&FunctionSignatureSpec>,
-) -> Vec<ast::CParam> {
-    let Some(signature) = signature else {
-        return recovered_params;
-    };
-
-    if signature.params.is_empty() {
-        return recovered_params;
-    }
-
-    (0..signature.params.len())
-        .map(|idx| {
-            let fallback_name = format!("arg{idx}");
-            let mut param = recovered_params.get(idx).cloned().unwrap_or(ast::CParam {
-                ty: CType::Int(32),
-                name: fallback_name,
-            });
-
-            if let Some(ext) = signature.params.get(idx) {
-                if !is_generic_arg_name(&ext.name) {
-                    param.name = ext.name.clone();
-                }
-                if let Some(ext_ty) = &ext.ty {
-                    param.ty = type_like_to_ctype(ext_ty);
-                }
-            }
-
-            param
-        })
-        .collect()
-}
-
-fn register_alias_names(reg_name: &str) -> Vec<String> {
-    let lower = reg_name.trim().to_ascii_lowercase();
-    if lower.is_empty() {
-        return Vec::new();
-    }
-
-    match lower.as_str() {
-        "rdi" | "edi" | "di" | "dil" => {
-            return vec!["rdi", "edi", "di", "dil"]
-                .into_iter()
-                .map(str::to_string)
-                .collect();
-        }
-        "rsi" | "esi" | "si" | "sil" => {
-            return vec!["rsi", "esi", "si", "sil"]
-                .into_iter()
-                .map(str::to_string)
-                .collect();
-        }
-        "rdx" | "edx" | "dx" | "dl" => {
-            return vec!["rdx", "edx", "dx", "dl"]
-                .into_iter()
-                .map(str::to_string)
-                .collect();
-        }
-        "rcx" | "ecx" | "cx" | "cl" => {
-            return vec!["rcx", "ecx", "cx", "cl"]
-                .into_iter()
-                .map(str::to_string)
-                .collect();
-        }
-        _ => {}
-    }
-
-    for base in ["r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"] {
-        if lower == base
-            || lower == format!("{base}d")
-            || lower == format!("{base}w")
-            || lower == format!("{base}b")
-        {
-            return vec![
-                base.to_string(),
-                format!("{base}d"),
-                format!("{base}w"),
-                format!("{base}b"),
-            ];
-        }
-    }
-
-    if let Some(rest) = lower.strip_prefix('x')
-        && rest.chars().all(|c| c.is_ascii_digit())
-    {
-        return vec![lower.clone(), format!("w{rest}")];
-    }
-    if let Some(rest) = lower.strip_prefix('w')
-        && rest.chars().all(|c| c.is_ascii_digit())
-    {
-        return vec![format!("x{rest}"), lower];
-    }
-
-    vec![lower]
-}
-
 pub fn normalize_sig_arch_name(arch: Option<&r2il::ArchSpec>) -> Option<String> {
     let arch = arch?;
     let lower = arch.name.to_ascii_lowercase();
@@ -1824,44 +1782,6 @@ pub fn normalize_sig_arch_name(arch: Option<&r2il::ArchSpec>) -> Option<String> 
         return Some("x86".to_string());
     }
     Some(arch.name.clone())
-}
-
-fn build_param_register_aliases(
-    params: &[ast::CParam],
-    recovered_params: &[(r2ssa::SSAVar, ast::CParam)],
-    register_params: &[ExternalRegisterParamSpec],
-    abi_arg_regs: &[String],
-    allow_positional_aliases: bool,
-) -> std::collections::HashMap<String, String> {
-    let mut aliases = std::collections::HashMap::new();
-
-    if allow_positional_aliases {
-        for (idx, reg_name) in abi_arg_regs.iter().enumerate() {
-            let Some(param) = params.get(idx) else {
-                continue;
-            };
-            for alias in register_alias_names(reg_name) {
-                aliases.insert(alias, param.name.clone());
-            }
-        }
-
-        for (idx, (ssa_var, _)) in recovered_params.iter().enumerate() {
-            if let Some(param) = params.get(idx) {
-                aliases.insert(ssa_var.name.to_ascii_lowercase(), param.name.clone());
-            }
-        }
-    }
-
-    for (idx, reg_param) in register_params.iter().enumerate() {
-        let Some(param) = params.get(idx) else {
-            continue;
-        };
-        for alias in register_alias_names(&reg_param.reg) {
-            aliases.entry(alias).or_insert_with(|| param.name.clone());
-        }
-    }
-
-    aliases
 }
 
 /// Decompiler configuration.
@@ -1928,10 +1848,25 @@ impl DecompilerConfig {
             ("riscv64", _) | ("rv64", _) | ("rv64gc", _) => Self::riscv64(),
             ("riscv", _) if ptr_bits == 32 => Self::riscv32(),
             ("riscv", _) => Self::riscv64(),
-            _ => Self {
-                ptr_size: ptr_bits,
-                ..Self::default()
-            },
+            _ => Self::unrecognized(ptr_bits),
+        }
+    }
+
+    /// A target whose registers this renderer does not know.
+    ///
+    /// Falling back to the defaults meant falling back to x86-64: an
+    /// unrecognized target was rendered with rsp, rbp and the SysV argument
+    /// registers, naming registers it does not have. Naming none of them is
+    /// the honest answer, and it leaves the residual machinery to say so.
+    fn unrecognized(ptr_bits: u32) -> Self {
+        Self {
+            ptr_size: ptr_bits,
+            sp_name: String::new(),
+            fp_name: String::new(),
+            arg_regs: Vec::new(),
+            ret_regs: Vec::new(),
+            caller_saved_regs: Default::default(),
+            ..Self::default()
         }
     }
 
@@ -2049,21 +1984,10 @@ impl DecompilerConfig {
     }
 }
 
-#[cfg(test)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LocalStructFieldAccess {
-    pub arg_index: usize,
-    pub field_offset: u64,
-    pub access_size: u32,
-    pub is_write: bool,
-}
-
 #[derive(Debug, Clone, Default)]
 struct DecompilerContext {
     #[cfg(test)]
     pub function_names: std::collections::HashMap<u64, String>,
-    #[cfg(test)]
-    pub strings: std::collections::HashMap<u64, String>,
     #[cfg(test)]
     pub symbols: std::collections::HashMap<u64, String>,
     /// Canonical combined type and semantic facts.
@@ -2086,25 +2010,9 @@ impl DecompilerContext {
             #[cfg(test)]
             function_names: std::collections::HashMap::new(),
             #[cfg(test)]
-            strings: std::collections::HashMap::new(),
-            #[cfg(test)]
             symbols: std::collections::HashMap::new(),
             function_facts: function_facts.report().clone(),
         }
-    }
-
-    fn skip_runtime_type_inference(&self, prepared: &r2ssa::SsaArtifact) -> bool {
-        let _ = prepared;
-        self.function_facts
-            .decompile_route()
-            .is_some_and(|route| route.skip_runtime_type_inference)
-    }
-
-    fn use_prepared_semantic_view(&self, prepared: &r2ssa::SsaArtifact) -> bool {
-        let _ = prepared;
-        self.function_facts
-            .decompile_route()
-            .is_some_and(|route| route.use_prepared_semantic_view)
     }
 }
 
@@ -2132,6 +2040,1594 @@ impl DecompilerInput {
 
     fn context_projection(&self) -> DecompilerContext {
         DecompilerContext::from_source_owned(&self.source_owned_facts)
+    }
+}
+
+#[derive(Debug)]
+enum BindingShadowFailure {
+    Pairing,
+    Report,
+    IncompleteObservations {
+        ledger: crate::shadow_report::ShadowLedger,
+        coverage: LegacyObservationCoverage,
+    },
+    NonQuality {
+        ledger: crate::shadow_report::ShadowLedger,
+        coverage: LegacyObservationCoverage,
+    },
+}
+
+#[derive(Debug)]
+struct BindingShadow {
+    ledger: crate::shadow_report::ShadowLedger,
+    coverage: LegacyObservationCoverage,
+}
+
+#[derive(Debug)]
+enum BindingShadowOutcome {
+    Complete(BindingShadow),
+    Failed(BindingShadowFailure),
+}
+
+impl BindingShadowOutcome {
+    fn build(
+        plan: &crate::binding_plan::BindingPlan,
+        source: &r2types::function_facts::SourceOwnedFunctionFacts,
+        legacy: &crate::shadow_report::LegacyAnalysisSnapshot,
+        coverage: LegacyObservationCoverage,
+    ) -> Self {
+        if crate::fold::op_lower::PlannedLoweringInput::try_new(source, plan).is_err() {
+            return Self::Failed(BindingShadowFailure::Pairing);
+        }
+        let report = match crate::shadow_report::ShadowReport::build(plan, source, legacy) {
+            Ok(report) => report,
+            Err(_) => return Self::Failed(BindingShadowFailure::Report),
+        };
+        if report.validate_against(plan, source, legacy).is_err() {
+            return Self::Failed(BindingShadowFailure::Report);
+        }
+        let ledger = report.ledger(source);
+        if !coverage.is_complete() {
+            return Self::Failed(BindingShadowFailure::IncompleteObservations { ledger, coverage });
+        }
+        if !ledger.passes_quality() || !coverage.passes_quality() {
+            return Self::Failed(BindingShadowFailure::NonQuality { ledger, coverage });
+        }
+        Self::Complete(BindingShadow { ledger, coverage })
+    }
+}
+
+/// Public, renderer-independent counts for one binding-shadow domain.
+///
+/// These are audit results, not rendering inputs. Keeping the complete ledger
+/// visible prevents a refusal or an unclassified cell from being counted as a
+/// successful shadow run merely because no C was emitted for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BindingShadowDomainAudit {
+    pub total: usize,
+    pub observed: usize,
+    pub agree_correct: usize,
+    pub old_wrong: usize,
+    pub shadow_wrong: usize,
+    pub both_wrong_equal: usize,
+    pub both_wrong_different: usize,
+    pub unclassified: usize,
+    pub refused: usize,
+}
+
+impl BindingShadowDomainAudit {
+    pub const fn equations_hold(self) -> bool {
+        let Some(both_wrong) = self.both_wrong_equal.checked_add(self.both_wrong_different) else {
+            return false;
+        };
+        let Some(classified) = self.agree_correct.checked_add(self.old_wrong) else {
+            return false;
+        };
+        let Some(classified) = classified.checked_add(self.shadow_wrong) else {
+            return false;
+        };
+        let Some(classified) = classified.checked_add(both_wrong) else {
+            return false;
+        };
+        let Some(accounted) = classified.checked_add(self.unclassified) else {
+            return false;
+        };
+        self.total == self.observed && self.observed == accounted
+    }
+
+    pub const fn passes_quality(self) -> bool {
+        self.equations_hold()
+            && self.shadow_wrong == 0
+            && self.both_wrong_equal == 0
+            && self.both_wrong_different == 0
+            && self.unclassified == 0
+            && self.refused == 0
+    }
+}
+
+impl From<crate::shadow_report::DomainLedger> for BindingShadowDomainAudit {
+    fn from(ledger: crate::shadow_report::DomainLedger) -> Self {
+        Self {
+            total: ledger.total,
+            observed: ledger.observed,
+            agree_correct: ledger.agree_correct,
+            old_wrong: ledger.old_wrong,
+            shadow_wrong: ledger.shadow_wrong,
+            both_wrong_equal: ledger.both_wrong_equal,
+            both_wrong_different: ledger.both_wrong_different,
+            unclassified: ledger.unclassified,
+            refused: ledger.refused,
+        }
+    }
+}
+
+/// Public count of exact legacy-render observations for one source domain.
+///
+/// This is deliberately separate from the shadow classification ledger. A
+/// dense shadow report can classify `LegacyAbsent` as an old-renderer defect;
+/// only this equation proves that the renderer actually accounted for every
+/// source value, use, and write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BindingObservationDomainAudit {
+    pub total: usize,
+    pub rendered: usize,
+    pub justified_elision: usize,
+    pub refused: usize,
+    pub unaccounted: usize,
+}
+
+impl BindingObservationDomainAudit {
+    pub const fn equations_hold(self) -> bool {
+        let Some(accounted) = self.rendered.checked_add(self.justified_elision) else {
+            return false;
+        };
+        let Some(accounted) = accounted.checked_add(self.refused) else {
+            return false;
+        };
+        let Some(accounted) = accounted.checked_add(self.unaccounted) else {
+            return false;
+        };
+        accounted == self.total
+    }
+
+    pub const fn is_complete(self) -> bool {
+        self.equations_hold() && self.unaccounted == 0
+    }
+
+    pub const fn passes_quality(self) -> bool {
+        self.is_complete() && self.refused == 0
+    }
+}
+
+impl From<crate::observation_journal::LegacyObservationDomainCoverage>
+    for BindingObservationDomainAudit
+{
+    fn from(coverage: crate::observation_journal::LegacyObservationDomainCoverage) -> Self {
+        Self {
+            total: coverage.total,
+            rendered: coverage.rendered,
+            justified_elision: coverage.justified_elision,
+            refused: coverage.refused,
+            unaccounted: coverage.unaccounted,
+        }
+    }
+}
+
+/// Exact V/U/W observation coverage, independent of shadow correctness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BindingObservationAudit {
+    pub values: BindingObservationDomainAudit,
+    pub uses: BindingObservationDomainAudit,
+    pub writes: BindingObservationDomainAudit,
+}
+
+impl BindingObservationAudit {
+    pub const fn equations_hold(self) -> bool {
+        self.values.equations_hold() && self.uses.equations_hold() && self.writes.equations_hold()
+    }
+
+    pub const fn is_complete(self) -> bool {
+        self.values.is_complete() && self.uses.is_complete() && self.writes.is_complete()
+    }
+
+    pub const fn passes_quality(self) -> bool {
+        self.values.passes_quality() && self.uses.passes_quality() && self.writes.passes_quality()
+    }
+}
+
+impl From<LegacyObservationCoverage> for BindingObservationAudit {
+    fn from(coverage: LegacyObservationCoverage) -> Self {
+        Self {
+            values: coverage.values.into(),
+            uses: coverage.uses.into(),
+            writes: coverage.writes.into(),
+        }
+    }
+}
+
+/// Observable Stage 4 ledger, kept separate from all renderer inputs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BindingShadowAuditLedger {
+    pub values: BindingShadowDomainAudit,
+    pub uses: BindingShadowDomainAudit,
+    pub writes: BindingShadowDomainAudit,
+}
+
+impl BindingShadowAuditLedger {
+    pub const fn equations_hold(self) -> bool {
+        self.values.equations_hold() && self.uses.equations_hold() && self.writes.equations_hold()
+    }
+
+    pub const fn passes_quality(self) -> bool {
+        self.values.passes_quality() && self.uses.passes_quality() && self.writes.passes_quality()
+    }
+}
+
+impl From<crate::shadow_report::ShadowLedger> for BindingShadowAuditLedger {
+    fn from(ledger: crate::shadow_report::ShadowLedger) -> Self {
+        Self {
+            values: ledger.values.into(),
+            uses: ledger.uses.into(),
+            writes: ledger.writes.into(),
+        }
+    }
+}
+
+/// Stable public cause retained when the observation journal cannot be built or sealed.
+///
+/// The journal's implementation error type remains private because it also
+/// carries renderer-only contracts.  This projection preserves every error
+/// category and the canonical IDs or counts that are safe to expose across the
+/// `r2dec`/`r2engine` boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingMachineProjectionFailure {
+    UntrustedArtifactProvenance,
+    IncompleteObligationInventory,
+    MissingGraphValue {
+        value: r2ssa::ValueId,
+    },
+    MissingGraphBlock {
+        block: r2ssa::BlockId,
+    },
+    DuplicateBlockAddress {
+        address: u64,
+    },
+    TopologyMismatch,
+    MachineContextMismatch,
+    MissingInstruction {
+        inst: r2ssa::InstId,
+    },
+    MissingInstructionDisposition {
+        inst: r2ssa::InstId,
+    },
+    MissingUseDisposition {
+        site: r2ssa::UseSite,
+    },
+    MissingWriteDisposition {
+        inst: r2ssa::InstId,
+    },
+    MissingOutput {
+        inst: r2ssa::InstId,
+    },
+    InvalidValueWidth {
+        value: r2ssa::ValueId,
+        size_bytes: u32,
+    },
+    ConstantTooWide {
+        value: r2ssa::ValueId,
+        width_bits: u32,
+    },
+    WrongOperandCount {
+        inst: r2ssa::InstId,
+        expected: usize,
+        actual: usize,
+    },
+    WidthMismatch {
+        inst: r2ssa::InstId,
+        expected_bits: u32,
+        actual_bits: u32,
+    },
+    InvalidCastWidth {
+        inst: r2ssa::InstId,
+        kind: r2ssa::MachineCastKind,
+        from_bits: u32,
+        to_bits: u32,
+    },
+    InvalidSubpiece {
+        inst: r2ssa::InstId,
+        source_bits: u32,
+        result_bits: u32,
+        lsb_bits: u32,
+    },
+    InvalidChild {
+        expr_index: usize,
+        child_index: usize,
+    },
+    InvalidExpressionType {
+        expr_index: usize,
+    },
+    DuplicateEntity {
+        value: r2ssa::ValueId,
+    },
+    EntityMismatch {
+        inst: r2ssa::InstId,
+    },
+    ObligationMismatch {
+        inst: r2ssa::InstId,
+    },
+    UseDispositionMismatch {
+        site: r2ssa::UseSite,
+    },
+    WriteDispositionMismatch {
+        inst: r2ssa::InstId,
+    },
+    ObligationSourceMismatch {
+        instruction: r2ssa::CanonicalInstructionId,
+    },
+    UnsupportedOperation {
+        inst: r2ssa::InstId,
+    },
+}
+
+impl BindingMachineProjectionFailure {
+    pub const fn kind(self) -> &'static str {
+        match self {
+            Self::UntrustedArtifactProvenance => {
+                "binding_plan_machine_untrusted_artifact_provenance"
+            }
+            Self::IncompleteObligationInventory => {
+                "binding_plan_machine_incomplete_obligation_inventory"
+            }
+            Self::MissingGraphValue { .. } => "binding_plan_machine_missing_graph_value",
+            Self::MissingGraphBlock { .. } => "binding_plan_machine_missing_graph_block",
+            Self::DuplicateBlockAddress { .. } => "binding_plan_machine_duplicate_block_address",
+            Self::TopologyMismatch => "binding_plan_machine_topology_mismatch",
+            Self::MachineContextMismatch => "binding_plan_machine_context_mismatch",
+            Self::MissingInstruction { .. } => "binding_plan_machine_missing_instruction",
+            Self::MissingInstructionDisposition { .. } => {
+                "binding_plan_machine_missing_instruction_disposition"
+            }
+            Self::MissingUseDisposition { .. } => "binding_plan_machine_missing_use_disposition",
+            Self::MissingWriteDisposition { .. } => {
+                "binding_plan_machine_missing_write_disposition"
+            }
+            Self::MissingOutput { .. } => "binding_plan_machine_missing_output",
+            Self::InvalidValueWidth { .. } => "binding_plan_machine_invalid_value_width",
+            Self::ConstantTooWide { .. } => "binding_plan_machine_constant_too_wide",
+            Self::WrongOperandCount { .. } => "binding_plan_machine_wrong_operand_count",
+            Self::WidthMismatch { .. } => "binding_plan_machine_width_mismatch",
+            Self::InvalidCastWidth { kind, .. } => match kind {
+                r2ssa::MachineCastKind::ZeroExtend => {
+                    "binding_plan_machine_invalid_zero_extend_width"
+                }
+                r2ssa::MachineCastKind::SignExtend => {
+                    "binding_plan_machine_invalid_sign_extend_width"
+                }
+                r2ssa::MachineCastKind::Truncate => "binding_plan_machine_invalid_truncate_width",
+                r2ssa::MachineCastKind::BitReinterpret => {
+                    "binding_plan_machine_invalid_bit_reinterpret_width"
+                }
+                r2ssa::MachineCastKind::IntegerToAddress => {
+                    "binding_plan_machine_invalid_integer_to_address_width"
+                }
+                r2ssa::MachineCastKind::AddressToInteger => {
+                    "binding_plan_machine_invalid_address_to_integer_width"
+                }
+            },
+            Self::InvalidSubpiece { .. } => "binding_plan_machine_invalid_subpiece",
+            Self::InvalidChild { .. } => "binding_plan_machine_invalid_child",
+            Self::InvalidExpressionType { .. } => "binding_plan_machine_invalid_expression_type",
+            Self::DuplicateEntity { .. } => "binding_plan_machine_duplicate_entity",
+            Self::EntityMismatch { .. } => "binding_plan_machine_entity_mismatch",
+            Self::ObligationMismatch { .. } => "binding_plan_machine_obligation_mismatch",
+            Self::UseDispositionMismatch { .. } => "binding_plan_machine_use_disposition_mismatch",
+            Self::WriteDispositionMismatch { .. } => {
+                "binding_plan_machine_write_disposition_mismatch"
+            }
+            Self::ObligationSourceMismatch { instruction } => match instruction.site {
+                r2ssa::CanonicalInstructionSite::Phi(storage) => match storage.space {
+                    r2ssa::CanonicalStorageSpace::Ram => {
+                        "binding_plan_machine_obligation_source_mismatch_phi_ram"
+                    }
+                    r2ssa::CanonicalStorageSpace::Register => {
+                        "binding_plan_machine_obligation_source_mismatch_phi_register"
+                    }
+                    r2ssa::CanonicalStorageSpace::Unique => {
+                        "binding_plan_machine_obligation_source_mismatch_phi_unique"
+                    }
+                    r2ssa::CanonicalStorageSpace::Constant => {
+                        "binding_plan_machine_obligation_source_mismatch_phi_constant"
+                    }
+                    r2ssa::CanonicalStorageSpace::Custom(_) => {
+                        "binding_plan_machine_obligation_source_mismatch_phi_custom"
+                    }
+                    r2ssa::CanonicalStorageSpace::Unknown => {
+                        "binding_plan_machine_obligation_source_mismatch_phi_unknown"
+                    }
+                },
+                r2ssa::CanonicalInstructionSite::Op(_) => {
+                    "binding_plan_machine_obligation_source_mismatch_op"
+                }
+                r2ssa::CanonicalInstructionSite::NativeSpan { .. } => {
+                    "binding_plan_machine_obligation_source_mismatch_native_span"
+                }
+            },
+            Self::UnsupportedOperation { .. } => "binding_plan_machine_unsupported_operation",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingObservationJournalFailure {
+    SourceAuthority,
+    BindingPlanAuthority,
+    BindingPlanMachineProjection(BindingMachineProjectionFailure),
+    BindingPlanValueTopology {
+        index: usize,
+        value: r2ssa::ValueId,
+    },
+    BindingPlanDispositionCount {
+        expected: usize,
+        actual: usize,
+    },
+    BindingPlanBindingCount {
+        expected: usize,
+        actual: usize,
+    },
+    BindingPlanInvalidBindingReference {
+        value: r2ssa::ValueId,
+        binding_index: usize,
+    },
+    BindingPlanCertificateMembership {
+        binding_index: usize,
+    },
+    BindingPlanDeclarationWidth {
+        binding_index: usize,
+    },
+    BindingPlanInvalidLiteralInline {
+        value: r2ssa::ValueId,
+    },
+    BindingPlanInvalidElisionProof {
+        value: r2ssa::ValueId,
+    },
+    BindingPlanUnexpectedValueDisposition {
+        value: r2ssa::ValueId,
+    },
+    BindingPlanStackObjectCount {
+        expected: usize,
+        actual: usize,
+    },
+    BindingPlanUnexpectedStackObjectDisposition {
+        object: r2ssa::ObjectId,
+    },
+    BindingPlanStackObjectCertificate {
+        object: r2ssa::ObjectId,
+        binding_index: usize,
+    },
+    BindingPlanStackObjectDeclarationWidth {
+        object: r2ssa::ObjectId,
+        binding_index: usize,
+    },
+    BindingPlanParameterCount {
+        expected: usize,
+        actual: usize,
+    },
+    BindingPlanUnexpectedParameterDisposition {
+        slot: u32,
+    },
+    BindingPlanParameterCertificate {
+        slot: u32,
+        binding_index: usize,
+    },
+    BindingPlanParameterDeclarationWidth {
+        slot: u32,
+        binding_index: usize,
+    },
+    NormalizationSourceAuthority,
+    NormalizationBlockTopology,
+    NormalizationRowCount {
+        block_address: u64,
+    },
+    NormalizationOriginalInstruction {
+        block_address: u64,
+        op_idx: usize,
+    },
+    NormalizationOriginalCoverage,
+    NormalizationPhiEdge {
+        block_address: u64,
+        op_idx: usize,
+    },
+    NormalizationRelocatedInitializer {
+        block_address: u64,
+        op_idx: usize,
+    },
+    NormalizationRemovedPhi,
+    NormalizationRemovedPhiEdge,
+    NormalizationInvalidCarrierCertificates,
+    TooManyObservations,
+    InvalidValue {
+        value: r2ssa::ValueId,
+    },
+    InvalidCertifiedValueRead {
+        value: r2ssa::ValueId,
+        at: r2ssa::InstId,
+    },
+    InvalidUse {
+        site: r2ssa::UseSite,
+    },
+    InvalidWrite {
+        inst: r2ssa::InstId,
+    },
+    InvalidEffectObligation {
+        obligation: r2ssa::SemanticObligationId,
+    },
+    OutputlessWrite {
+        inst: r2ssa::InstId,
+    },
+    InvalidNormalizedSite {
+        block: r2ssa::BlockId,
+        op_idx: usize,
+    },
+    MissingNormalizedBlock {
+        address: u64,
+    },
+    MissingNormalizedSiteContext,
+    InvalidNormalizedInput {
+        block: r2ssa::BlockId,
+        op_idx: usize,
+        input_idx: usize,
+    },
+    MissingNormalizedOutput {
+        block: r2ssa::BlockId,
+        op_idx: usize,
+    },
+    RefusedRenderedUse {
+        site: r2ssa::UseSite,
+    },
+    RefusedRenderedWrite {
+        inst: r2ssa::InstId,
+    },
+    RenderedValueRequired {
+        value: r2ssa::ValueId,
+    },
+    PlannedElidedValueRendered {
+        value: r2ssa::ValueId,
+    },
+    PlannedRefusedValueRendered {
+        value: r2ssa::ValueId,
+    },
+    MissingPlannedValue {
+        value: r2ssa::ValueId,
+    },
+    InvalidPlannedInline {
+        value: r2ssa::ValueId,
+        term_index: usize,
+    },
+    ExactUseRequiresRenderedOccurrence {
+        site: r2ssa::UseSite,
+    },
+    ExactWriteRequiresRenderedOccurrence {
+        inst: r2ssa::InstId,
+    },
+    SymbolTableMismatch,
+    UnownedBindingSymbol {
+        value: r2ssa::ValueId,
+        symbol_index: usize,
+    },
+    ConflictingValue {
+        value: r2ssa::ValueId,
+    },
+    ConflictingUse {
+        site: r2ssa::UseSite,
+    },
+    ConflictingWrite {
+        inst: r2ssa::InstId,
+    },
+    ObservationDomainTooLarge {
+        expected_count: usize,
+    },
+    ObservationCapacityUnavailable {
+        expected_count: usize,
+    },
+    ObservationOutOfRange {
+        observation_id: u32,
+        expected_count: usize,
+    },
+    DuplicateObservation {
+        observation_id: u32,
+    },
+}
+
+impl BindingObservationJournalFailure {
+    /// Stable machine-readable category used by the plugin JSON boundary.
+    pub const fn kind(self) -> &'static str {
+        match self {
+            Self::SourceAuthority => "source_authority",
+            Self::BindingPlanAuthority => "binding_plan_authority",
+            Self::BindingPlanMachineProjection(failure) => failure.kind(),
+            Self::BindingPlanValueTopology { .. } => "binding_plan_value_topology",
+            Self::BindingPlanDispositionCount { .. } => "binding_plan_disposition_count",
+            Self::BindingPlanBindingCount { .. } => "binding_plan_binding_count",
+            Self::BindingPlanInvalidBindingReference { .. } => {
+                "binding_plan_invalid_binding_reference"
+            }
+            Self::BindingPlanCertificateMembership { .. } => "binding_plan_certificate_membership",
+            Self::BindingPlanDeclarationWidth { .. } => "binding_plan_declaration_width",
+            Self::BindingPlanInvalidLiteralInline { .. } => "binding_plan_invalid_literal_inline",
+            Self::BindingPlanInvalidElisionProof { .. } => "binding_plan_invalid_elision_proof",
+            Self::BindingPlanUnexpectedValueDisposition { .. } => {
+                "binding_plan_unexpected_value_disposition"
+            }
+            Self::BindingPlanStackObjectCount { .. } => "binding_plan_stack_object_count",
+            Self::BindingPlanUnexpectedStackObjectDisposition { .. } => {
+                "binding_plan_unexpected_stack_object_disposition"
+            }
+            Self::BindingPlanStackObjectCertificate { .. } => {
+                "binding_plan_stack_object_certificate"
+            }
+            Self::BindingPlanStackObjectDeclarationWidth { .. } => {
+                "binding_plan_stack_object_declaration_width"
+            }
+            Self::BindingPlanParameterCount { .. } => "binding_plan_parameter_count",
+            Self::BindingPlanUnexpectedParameterDisposition { .. } => {
+                "binding_plan_unexpected_parameter_disposition"
+            }
+            Self::BindingPlanParameterCertificate { .. } => "binding_plan_parameter_certificate",
+            Self::BindingPlanParameterDeclarationWidth { .. } => {
+                "binding_plan_parameter_declaration_width"
+            }
+            Self::NormalizationSourceAuthority => "normalization_source_authority",
+            Self::NormalizationBlockTopology => "normalization_block_topology",
+            Self::NormalizationRowCount { .. } => "normalization_row_count",
+            Self::NormalizationOriginalInstruction { .. } => "normalization_original_instruction",
+            Self::NormalizationOriginalCoverage => "normalization_original_coverage",
+            Self::NormalizationPhiEdge { .. } => "normalization_phi_edge",
+            Self::NormalizationRelocatedInitializer { .. } => "normalization_relocated_initializer",
+            Self::NormalizationRemovedPhi => "normalization_removed_phi",
+            Self::NormalizationRemovedPhiEdge => "normalization_removed_phi_edge",
+            Self::NormalizationInvalidCarrierCertificates => {
+                "normalization_invalid_carrier_certificates"
+            }
+            Self::TooManyObservations => "too_many_observations",
+            Self::InvalidValue { .. } => "invalid_value",
+            Self::InvalidCertifiedValueRead { .. } => "invalid_certified_value_read",
+            Self::InvalidUse { .. } => "invalid_use",
+            Self::InvalidWrite { .. } => "invalid_write",
+            Self::InvalidEffectObligation { .. } => "invalid_effect_obligation",
+            Self::OutputlessWrite { .. } => "outputless_write",
+            Self::InvalidNormalizedSite { .. } => "invalid_normalized_site",
+            Self::MissingNormalizedBlock { .. } => "missing_normalized_block",
+            Self::MissingNormalizedSiteContext => "missing_normalized_site_context",
+            Self::InvalidNormalizedInput { .. } => "invalid_normalized_input",
+            Self::MissingNormalizedOutput { .. } => "missing_normalized_output",
+            Self::RefusedRenderedUse { .. } => "refused_rendered_use",
+            Self::RefusedRenderedWrite { .. } => "refused_rendered_write",
+            Self::RenderedValueRequired { .. } => "rendered_value_required",
+            Self::PlannedElidedValueRendered { .. } => "planned_elided_value_rendered",
+            Self::PlannedRefusedValueRendered { .. } => "planned_refused_value_rendered",
+            Self::MissingPlannedValue { .. } => "missing_planned_value",
+            Self::InvalidPlannedInline { .. } => "invalid_planned_inline",
+            Self::ExactUseRequiresRenderedOccurrence { .. } => {
+                "exact_use_requires_rendered_occurrence"
+            }
+            Self::ExactWriteRequiresRenderedOccurrence { .. } => {
+                "exact_write_requires_rendered_occurrence"
+            }
+            Self::SymbolTableMismatch => "symbol_table_mismatch",
+            Self::UnownedBindingSymbol { .. } => "unowned_binding_symbol",
+            Self::ConflictingValue { .. } => "conflicting_value",
+            Self::ConflictingUse { .. } => "conflicting_use",
+            Self::ConflictingWrite { .. } => "conflicting_write",
+            Self::ObservationDomainTooLarge { .. } => "observation_domain_too_large",
+            Self::ObservationCapacityUnavailable { .. } => "observation_capacity_unavailable",
+            Self::ObservationOutOfRange { .. } => "observation_out_of_range",
+            Self::DuplicateObservation { .. } => "duplicate_observation",
+        }
+    }
+}
+
+/// Typed reason a production binding-shadow audit did not complete cleanly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingShadowAuditFailure {
+    PlanBuild,
+    SourcePairing,
+    JournalConstruction(BindingObservationJournalFailure),
+    JournalRecording(BindingObservationJournalFailure),
+    JournalSeal(BindingObservationJournalFailure),
+    Placement(PlacementAuditRefusal),
+    NonQualityObservations {
+        observations: BindingObservationAudit,
+    },
+    Report,
+    IncompleteObservations {
+        ledger: BindingShadowAuditLedger,
+        observations: BindingObservationAudit,
+    },
+    NonQuality {
+        ledger: BindingShadowAuditLedger,
+        observations: BindingObservationAudit,
+    },
+}
+
+/// Non-consuming binding audit exposed to corpus and integration tooling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingShadowAuditOutcome {
+    Complete {
+        ledger: BindingShadowAuditLedger,
+        observations: BindingObservationAudit,
+    },
+    Failed(BindingShadowAuditFailure),
+    /// The selected route never entered the native Standard renderer.
+    NotRun,
+}
+
+impl BindingShadowAuditOutcome {
+    fn from_internal(outcome: &BindingShadowOutcome) -> Self {
+        match outcome {
+            BindingShadowOutcome::Complete(shadow) => Self::Complete {
+                ledger: shadow.ledger.into(),
+                observations: shadow.coverage.into(),
+            },
+            BindingShadowOutcome::Failed(BindingShadowFailure::Pairing) => {
+                Self::Failed(BindingShadowAuditFailure::SourcePairing)
+            }
+            BindingShadowOutcome::Failed(BindingShadowFailure::Report) => {
+                Self::Failed(BindingShadowAuditFailure::Report)
+            }
+            BindingShadowOutcome::Failed(BindingShadowFailure::IncompleteObservations {
+                ledger,
+                coverage,
+            }) => Self::Failed(BindingShadowAuditFailure::IncompleteObservations {
+                ledger: (*ledger).into(),
+                observations: (*coverage).into(),
+            }),
+            BindingShadowOutcome::Failed(BindingShadowFailure::NonQuality { ledger, coverage }) => {
+                Self::Failed(BindingShadowAuditFailure::NonQuality {
+                    ledger: (*ledger).into(),
+                    observations: (*coverage).into(),
+                })
+            }
+        }
+    }
+}
+
+/// Whether the final emission tree satisfied the source effect inventory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffectObligationDisposition {
+    Admitted,
+    Refused,
+    /// The selected route never entered the native Standard renderer.
+    NotRun,
+}
+
+/// Stable source-effect tuple exposed independently of binding quality.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EffectObligationAudit {
+    pub disposition: EffectObligationDisposition,
+    pub total: usize,
+    pub rendered: usize,
+    pub justified_elision: usize,
+    pub refused: usize,
+    pub unaccounted: usize,
+    pub conflicts: usize,
+    /// First refused obligation in canonical source order, for diagnostics.
+    pub refused_obligation: Option<r2ssa::SemanticObligationId>,
+    /// First obligation with no occurrence or certificate, for diagnostics.
+    pub unaccounted_obligation: Option<r2ssa::SemanticObligationId>,
+    /// First obligation with incompatible occurrences, for diagnostics.
+    pub conflicting_obligation: Option<r2ssa::SemanticObligationId>,
+}
+
+impl EffectObligationAudit {
+    pub const NOT_RUN: Self = Self {
+        disposition: EffectObligationDisposition::NotRun,
+        total: 0,
+        rendered: 0,
+        justified_elision: 0,
+        refused: 0,
+        unaccounted: 0,
+        conflicts: 0,
+        refused_obligation: None,
+        unaccounted_obligation: None,
+        conflicting_obligation: None,
+    };
+
+    fn from_ledger(ledger: &r2ssa::ledger::ObligationLedger) -> Self {
+        let closure = ledger.close();
+        let admitted = closure.refused == 0
+            && closure.unattributed == 0
+            && closure.conflicts == 0
+            && closure.is_closed();
+        Self {
+            disposition: if admitted {
+                EffectObligationDisposition::Admitted
+            } else {
+                EffectObligationDisposition::Refused
+            },
+            total: closure.total,
+            rendered: closure.rendered,
+            justified_elision: closure.elided,
+            refused: closure.refused,
+            unaccounted: closure.unattributed,
+            conflicts: closure.conflicts,
+            refused_obligation: ledger.entries().find_map(|(id, outcome)| {
+                matches!(outcome, r2ssa::ledger::Outcome::Refused { .. }).then_some(*id)
+            }),
+            unaccounted_obligation: ledger.unattributed().next().copied(),
+            conflicting_obligation: ledger.conflicts().next().map(|(id, _)| *id),
+        }
+    }
+
+    pub const fn is_admitted(self) -> bool {
+        matches!(self.disposition, EffectObligationDisposition::Admitted)
+    }
+}
+
+/// Stable reason the final native declaration-placement pass refused C.
+///
+/// Payloads contain only deterministic dense identities and counts. Private
+/// renderer errors are projected into this type before crossing the r2dec API
+/// boundary; their debug representations are never part of the contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlacementAuditRefusal {
+    MissingStructuredRegionArtifact,
+    ObservationJournalUnavailable,
+    SourceAuthorityMismatch,
+    BindingOutsidePlan {
+        binding_index: usize,
+    },
+    RegionOutsideArtifact {
+        region_index: usize,
+    },
+    BlockOutsideFunction {
+        block_address: u64,
+    },
+    RegionDoesNotDominateOccurrence {
+        region_index: usize,
+        block_address: u64,
+    },
+    ExternalBindingOutsidePlan {
+        binding_index: usize,
+    },
+    RegionMarkerUnsealed,
+    RegionMarkerForeign {
+        anchor_index: usize,
+    },
+    RegionMarkerDuplicate {
+        region_index: usize,
+    },
+    RegionMarkerMissing {
+        region_index: usize,
+    },
+    RegionMarkerParentMismatch {
+        region_index: usize,
+    },
+    RegionMarkerOutOfOrder {
+        region_index: usize,
+        expected_region_index: usize,
+    },
+    ObservationDomainTooLarge {
+        expected_count: usize,
+    },
+    ObservationCapacityUnavailable {
+        expected_count: usize,
+    },
+    ObservationOutOfRange {
+        observation_id: u32,
+        expected_count: usize,
+    },
+    DuplicateObservation {
+        observation_id: u32,
+    },
+    MissingObservationTarget {
+        observation_id: u32,
+    },
+    InvalidUse {
+        instruction_id: u32,
+        input_index: usize,
+    },
+    InvalidWrite {
+        instruction_id: u32,
+    },
+    InvalidCertifiedValueRead {
+        value_id: u32,
+        instruction_id: u32,
+    },
+    MissingPlannedValue {
+        value_id: u32,
+    },
+    RefusedPlannedValue {
+        value_id: u32,
+    },
+    UnscopedObservation {
+        observation_id: u32,
+    },
+    UnauthorizedProgramVariable {
+        symbol_index: usize,
+    },
+    UnobservedBindingRead {
+        binding_index: usize,
+    },
+    UnobservedBindingWrite {
+        binding_index: usize,
+    },
+    NoDominatingRegion {
+        binding_index: usize,
+    },
+    MissingDefinition {
+        binding_index: usize,
+    },
+    ReadBeforeAssignment {
+        binding_index: usize,
+        instruction_id: u32,
+        input_index: usize,
+    },
+    CertifiedValueReadBeforeAssignment {
+        binding_index: usize,
+        value_id: u32,
+        instruction_id: u32,
+    },
+    StackAccessReadBeforeAssignment {
+        binding_index: usize,
+        instruction_id: u32,
+        access_ordinal: u32,
+    },
+    PreservedCarrierReadBeforeAssignment {
+        binding_index: usize,
+        instruction_id: u32,
+    },
+    UnprovableExecutionOrder {
+        binding_index: usize,
+    },
+    AmbiguousObservationExecutionOrder {
+        observation_id: u32,
+    },
+    MissingBinding {
+        binding_index: usize,
+    },
+    MissingBindingSymbol {
+        binding_index: usize,
+    },
+    ExternalBindingMissingParameter {
+        binding_index: usize,
+    },
+    MissingRegion {
+        region_index: usize,
+    },
+    DuplicateRegion {
+        region_index: usize,
+    },
+    MissingInlineWrite {
+        instruction_id: u32,
+    },
+    DuplicateInlineWrite {
+        instruction_id: u32,
+    },
+    MissingBindingRole {
+        binding_index: usize,
+    },
+    UndeclaredNames {
+        count: usize,
+    },
+}
+
+impl PlacementAuditRefusal {
+    /// Stable machine-readable category used by engine and plugin boundaries.
+    pub const fn kind(self) -> &'static str {
+        match self {
+            Self::MissingStructuredRegionArtifact => "missing_structured_region_artifact",
+            Self::ObservationJournalUnavailable => "observation_journal_unavailable",
+            Self::SourceAuthorityMismatch => "source_authority_mismatch",
+            Self::BindingOutsidePlan { .. } => "binding_outside_plan",
+            Self::RegionOutsideArtifact { .. } => "region_outside_artifact",
+            Self::BlockOutsideFunction { .. } => "block_outside_function",
+            Self::RegionDoesNotDominateOccurrence { .. } => "region_does_not_dominate_occurrence",
+            Self::ExternalBindingOutsidePlan { .. } => "external_binding_outside_plan",
+            Self::RegionMarkerUnsealed => "region_marker_unsealed",
+            Self::RegionMarkerForeign { .. } => "region_marker_foreign",
+            Self::RegionMarkerDuplicate { .. } => "region_marker_duplicate",
+            Self::RegionMarkerMissing { .. } => "region_marker_missing",
+            Self::RegionMarkerParentMismatch { .. } => "region_marker_parent_mismatch",
+            Self::RegionMarkerOutOfOrder { .. } => "region_marker_out_of_order",
+            Self::ObservationDomainTooLarge { .. } => "observation_domain_too_large",
+            Self::ObservationCapacityUnavailable { .. } => "observation_capacity_unavailable",
+            Self::ObservationOutOfRange { .. } => "observation_out_of_range",
+            Self::DuplicateObservation { .. } => "duplicate_observation",
+            Self::MissingObservationTarget { .. } => "missing_observation_target",
+            Self::InvalidUse { .. } => "invalid_use",
+            Self::InvalidWrite { .. } => "invalid_write",
+            Self::InvalidCertifiedValueRead { .. } => "invalid_certified_value_read",
+            Self::MissingPlannedValue { .. } => "missing_planned_value",
+            Self::RefusedPlannedValue { .. } => "refused_planned_value",
+            Self::UnscopedObservation { .. } => "unscoped_observation",
+            Self::UnauthorizedProgramVariable { .. } => "unauthorized_program_variable",
+            Self::UnobservedBindingRead { .. } => "unobserved_binding_read",
+            Self::UnobservedBindingWrite { .. } => "unobserved_binding_write",
+            Self::NoDominatingRegion { .. } => "no_dominating_region",
+            Self::MissingDefinition { .. } => "missing_definition",
+            Self::ReadBeforeAssignment { .. } => "read_before_assignment",
+            Self::CertifiedValueReadBeforeAssignment { .. } => {
+                "certified_value_read_before_assignment"
+            }
+            Self::StackAccessReadBeforeAssignment { .. } => "stack_access_read_before_assignment",
+            Self::PreservedCarrierReadBeforeAssignment { .. } => {
+                "preserved_carrier_read_before_assignment"
+            }
+            Self::UnprovableExecutionOrder { .. } => "unprovable_execution_order",
+            Self::AmbiguousObservationExecutionOrder { .. } => {
+                "ambiguous_observation_execution_order"
+            }
+            Self::MissingBinding { .. } => "missing_binding",
+            Self::MissingBindingSymbol { .. } => "missing_binding_symbol",
+            Self::ExternalBindingMissingParameter { .. } => "external_binding_missing_parameter",
+            Self::MissingRegion { .. } => "missing_region",
+            Self::DuplicateRegion { .. } => "duplicate_region",
+            Self::MissingInlineWrite { .. } => "missing_inline_write",
+            Self::DuplicateInlineWrite { .. } => "duplicate_inline_write",
+            Self::MissingBindingRole { .. } => "missing_binding_role",
+            Self::UndeclaredNames { .. } => "undeclared_names",
+        }
+    }
+}
+
+/// Independent final-tree declaration-placement audit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlacementAudit {
+    Applied,
+    Refused(PlacementAuditRefusal),
+    /// The selected route never entered native declaration placement.
+    NotRun,
+}
+
+impl PlacementAudit {
+    pub const fn is_applied(self) -> bool {
+        matches!(self, Self::Applied)
+    }
+}
+
+/// Which upstream authority failed when a machine projection was refused.
+///
+/// Every one of these used to become the same payload-free
+/// `MissingMachineProjectionAuthorization`, so twelve refusing functions on
+/// `/bin/ls` reported one cause between them and could not be told apart. The
+/// upstream error already knows which authority it was; this carries that the
+/// last step to the reader.
+#[derive(Clone, Copy, Eq)]
+pub enum MachineProjectionRefusalOrigin {
+    ShadowAuditPlanBuild,
+    ShadowAuditSourcePairing,
+    ShadowAuditReport,
+    ShadowAuditIncompleteObservations,
+    ShadowAuditNonQuality,
+    /// One of the lowering predicates declined, named by its site.
+    ///
+    /// Every lowering refusal in the pipeline arrived here as one word, and on
+    /// `/bin/ls` that word covered two unrelated causes -- an incomplete return
+    /// boundary and a call whose arguments could not be spelled -- reported as
+    /// a single count of seven. The site the witness carries is free and says
+    /// which.
+    OpLowering(&'static std::panic::Location<'static>),
+    RenderedIdentityMachineUse,
+    RenderedIdentityMachineWrite,
+    RenderedIdentityMissingUseDisposition,
+    RenderedIdentityMissingWriteDisposition,
+    RenderedIdentityMissingLiteralProjection,
+    RenderedIdentityUnmodelledUserOperation,
+    RenderedIdentityIncoherentUseProjection,
+    RenderedIdentityIncoherentWriteProjection,
+    BindingPlanBuild,
+    PlannedLoweringInput,
+}
+
+impl MachineProjectionRefusalOrigin {
+    /// An op-lowering refusal decided here.
+    ///
+    /// Production builds these from the lowering witness, which took the line
+    /// from `#[track_caller]`. A caller that only means "the lowering authority
+    /// declined" -- a test asserting the cause, say -- uses this and gets its
+    /// own line, which equality ignores.
+    #[track_caller]
+    #[must_use]
+    pub fn op_lowering() -> Self {
+        Self::OpLowering(std::panic::Location::caller())
+    }
+}
+
+/// The cause, and the site only where the cause alone does not identify it.
+impl std::fmt::Debug for MachineProjectionRefusalOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ShadowAuditPlanBuild => f.write_str("ShadowAuditPlanBuild"),
+            Self::ShadowAuditSourcePairing => f.write_str("ShadowAuditSourcePairing"),
+            Self::ShadowAuditReport => f.write_str("ShadowAuditReport"),
+            Self::ShadowAuditIncompleteObservations => {
+                f.write_str("ShadowAuditIncompleteObservations")
+            }
+            Self::ShadowAuditNonQuality => f.write_str("ShadowAuditNonQuality"),
+            Self::OpLowering(site) => {
+                let file = site.file();
+                let base = file.rsplit('/').next().unwrap_or(file);
+                write!(f, "OpLowering({base}:{})", site.line())
+            }
+            Self::RenderedIdentityMachineUse => f.write_str("RenderedIdentityMachineUse"),
+            Self::RenderedIdentityMachineWrite => f.write_str("RenderedIdentityMachineWrite"),
+            Self::RenderedIdentityMissingUseDisposition => {
+                f.write_str("RenderedIdentityMissingUseDisposition")
+            }
+            Self::RenderedIdentityMissingWriteDisposition => {
+                f.write_str("RenderedIdentityMissingWriteDisposition")
+            }
+            Self::RenderedIdentityMissingLiteralProjection => {
+                f.write_str("RenderedIdentityMissingLiteralProjection")
+            }
+            Self::RenderedIdentityUnmodelledUserOperation => {
+                f.write_str("RenderedIdentityUnmodelledUserOperation")
+            }
+            Self::RenderedIdentityIncoherentUseProjection => {
+                f.write_str("RenderedIdentityIncoherentUseProjection")
+            }
+            Self::RenderedIdentityIncoherentWriteProjection => {
+                f.write_str("RenderedIdentityIncoherentWriteProjection")
+            }
+            Self::BindingPlanBuild => f.write_str("BindingPlanBuild"),
+            Self::PlannedLoweringInput => f.write_str("PlannedLoweringInput"),
+        }
+    }
+}
+
+/// Two refusals from the same authority are the same refusal.
+///
+/// `OpLowering` carries the line that decided it so a reader can open the
+/// predicate, but a refusal's identity is the authority that failed, not which
+/// of its predicates got there first. Comparing the line would make every
+/// equality assertion in the tree brittle against moving one, and would split a
+/// gate's baseline on a refactor that changed no behaviour.
+impl PartialEq for MachineProjectionRefusalOrigin {
+    fn eq(&self, other: &Self) -> bool {
+        core::mem::discriminant(self) == core::mem::discriminant(other)
+    }
+}
+
+impl std::hash::Hash for MachineProjectionRefusalOrigin {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        core::mem::discriminant(self).hash(state);
+    }
+}
+
+/// Rendered C paired with the non-consuming Stage 4 binding audit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecompileRenderRefusal {
+    MissingMachineProjectionAuthorization(MachineProjectionRefusalOrigin),
+    MissingProgramVariableAuthorization,
+    VariadicCallsiteArgumentCount(r2ssa::VariadicCallsiteArgumentCountRefusal),
+    /// The legacy observation journal could not be constructed.
+    ///
+    /// The journal already computes a precise typed cause. Reporting this as a
+    /// missing machine-projection authorization named a different authority
+    /// than the one that actually failed, so the corpus attributed every such
+    /// cell to the projection seam and the real cause was never counted.
+    ObservationJournal(BindingObservationJournalFailure),
+    DeclarationPlacement(PlacementAuditRefusal),
+    RefusedBindingDisposition {
+        observations: BindingObservationAudit,
+    },
+    NormalizationOriginUnavailable,
+    UnrepresentableControlFlow,
+    IncompleteEffectInventory,
+    UnrepresentableOperation,
+}
+
+impl DecompileRenderRefusal {
+    /// Stable machine-readable category used by engine and corpus boundaries.
+    pub const fn kind(self) -> &'static str {
+        match self {
+            Self::MissingMachineProjectionAuthorization(_) => {
+                "missing_machine_projection_authorization"
+            }
+            Self::MissingProgramVariableAuthorization => "missing_program_variable_authorization",
+            Self::VariadicCallsiteArgumentCount(_) => "variadic_callsite_argument_count",
+            Self::ObservationJournal(failure) => failure.kind(),
+            Self::DeclarationPlacement(refusal) => refusal.kind(),
+            Self::RefusedBindingDisposition { .. } => "refused_binding_disposition",
+            Self::NormalizationOriginUnavailable => "normalization_origin_unavailable",
+            Self::UnrepresentableControlFlow => "unrepresentable_control_flow",
+            Self::IncompleteEffectInventory => "incomplete_effect_inventory",
+            Self::UnrepresentableOperation => "unrepresentable_operation",
+        }
+    }
+}
+
+fn validate_sealed_region_occurrence_counts(
+    occurrences: usize,
+    region_nodes: usize,
+) -> Result<(), DecompileRenderRefusal> {
+    if occurrences == region_nodes {
+        Ok(())
+    } else {
+        Err(DecompileRenderRefusal::UnrepresentableControlFlow)
+    }
+}
+
+fn validate_sealed_region_occurrence_coverage(
+    body: &crate::structured_region::SealedStructuredBody,
+) -> Result<(), DecompileRenderRefusal> {
+    let mut occurrences = 0usize;
+    body.visit_occurrences(|_| occurrences += 1);
+    validate_sealed_region_occurrence_counts(occurrences, body.regions().nodes().len())
+}
+
+impl From<BindingShadowAuditFailure> for DecompileRenderRefusal {
+    fn from(failure: BindingShadowAuditFailure) -> Self {
+        match failure {
+            BindingShadowAuditFailure::Placement(refusal) => Self::DeclarationPlacement(refusal),
+            BindingShadowAuditFailure::NonQualityObservations { observations } => {
+                Self::RefusedBindingDisposition { observations }
+            }
+            // Each journal failure already carries the exact obligation that
+            // could not be sealed. Collapsing them into a machine-projection
+            // refusal named an authority that had not failed, so every such
+            // cell was attributed to the projection seam and the real cause
+            // was only visible in the separate shadow-audit record.
+            BindingShadowAuditFailure::JournalConstruction(failure)
+            | BindingShadowAuditFailure::JournalRecording(failure)
+            | BindingShadowAuditFailure::JournalSeal(failure) => Self::ObservationJournal(failure),
+            BindingShadowAuditFailure::PlanBuild => Self::MissingMachineProjectionAuthorization(
+                MachineProjectionRefusalOrigin::ShadowAuditPlanBuild,
+            ),
+            BindingShadowAuditFailure::SourcePairing => {
+                Self::MissingMachineProjectionAuthorization(
+                    MachineProjectionRefusalOrigin::ShadowAuditSourcePairing,
+                )
+            }
+            BindingShadowAuditFailure::Report => Self::MissingMachineProjectionAuthorization(
+                MachineProjectionRefusalOrigin::ShadowAuditReport,
+            ),
+            BindingShadowAuditFailure::IncompleteObservations { .. } => {
+                Self::MissingMachineProjectionAuthorization(
+                    MachineProjectionRefusalOrigin::ShadowAuditIncompleteObservations,
+                )
+            }
+            BindingShadowAuditFailure::NonQuality { .. } => {
+                Self::MissingMachineProjectionAuthorization(
+                    MachineProjectionRefusalOrigin::ShadowAuditNonQuality,
+                )
+            }
+        }
+    }
+}
+
+impl From<crate::fold::op_lower::OpLoweringRefusal> for DecompileRenderRefusal {
+    fn from(refusal: crate::fold::op_lower::OpLoweringRefusal) -> Self {
+        match refusal {
+            crate::fold::op_lower::OpLoweringRefusal::MissingMachineProjectionAuthorization(
+                origin,
+            ) => Self::MissingMachineProjectionAuthorization(
+                MachineProjectionRefusalOrigin::OpLowering(origin.site()),
+            ),
+            crate::fold::op_lower::OpLoweringRefusal::MissingProgramVariableAuthorization(..) => {
+                Self::MissingProgramVariableAuthorization
+            }
+            crate::fold::op_lower::OpLoweringRefusal::UnrepresentableOperation(..) => {
+                Self::UnrepresentableOperation
+            }
+            crate::fold::op_lower::OpLoweringRefusal::VariadicCallsiteArgumentCount(refusal) => {
+                Self::VariadicCallsiteArgumentCount(refusal)
+            }
+        }
+    }
+}
+
+fn rendered_identity_refusal_category(
+    refusal: crate::binding_plan::RenderedIdentityRefusal,
+) -> DecompileRenderRefusal {
+    use crate::binding_plan::{RenderedIdentityRefusal, ValueRefusal};
+
+    use MachineProjectionRefusalOrigin as Origin;
+
+    match refusal {
+        RenderedIdentityRefusal::MachineUse { .. } => {
+            DecompileRenderRefusal::MissingMachineProjectionAuthorization(
+                Origin::RenderedIdentityMachineUse,
+            )
+        }
+        RenderedIdentityRefusal::MachineWrite { .. } => {
+            DecompileRenderRefusal::MissingMachineProjectionAuthorization(
+                Origin::RenderedIdentityMachineWrite,
+            )
+        }
+        RenderedIdentityRefusal::MissingUseDisposition { .. } => {
+            DecompileRenderRefusal::MissingMachineProjectionAuthorization(
+                Origin::RenderedIdentityMissingUseDisposition,
+            )
+        }
+        RenderedIdentityRefusal::MissingWriteDisposition { .. } => {
+            DecompileRenderRefusal::MissingMachineProjectionAuthorization(
+                Origin::RenderedIdentityMissingWriteDisposition,
+            )
+        }
+        RenderedIdentityRefusal::Value {
+            reason: ValueRefusal::MissingLiteralProjection { .. },
+            ..
+        } => DecompileRenderRefusal::MissingMachineProjectionAuthorization(
+            Origin::RenderedIdentityMissingLiteralProjection,
+        ),
+        RenderedIdentityRefusal::Value {
+            reason: ValueRefusal::UnmodelledUserOperation { .. },
+            ..
+        } => DecompileRenderRefusal::MissingMachineProjectionAuthorization(
+            Origin::RenderedIdentityUnmodelledUserOperation,
+        ),
+        RenderedIdentityRefusal::Value {
+            reason: ValueRefusal::IncoherentUseProjection { .. },
+            ..
+        } => DecompileRenderRefusal::MissingMachineProjectionAuthorization(
+            Origin::RenderedIdentityIncoherentUseProjection,
+        ),
+        RenderedIdentityRefusal::Value {
+            reason: ValueRefusal::IncoherentWriteProjection { .. },
+            ..
+        } => DecompileRenderRefusal::MissingMachineProjectionAuthorization(
+            Origin::RenderedIdentityIncoherentWriteProjection,
+        ),
+        RenderedIdentityRefusal::Value {
+            reason:
+                ValueRefusal::MissingBindingCertificate { .. }
+                | ValueRefusal::UnsupportedDeclarationWidth { .. },
+            ..
+        }
+        | RenderedIdentityRefusal::Parameter { .. }
+        | RenderedIdentityRefusal::StackObject { .. }
+        | RenderedIdentityRefusal::StackObjectElided { .. }
+        | RenderedIdentityRefusal::MissingBinding { .. }
+        | RenderedIdentityRefusal::MissingValueDisposition { .. }
+        | RenderedIdentityRefusal::MissingParameterDisposition { .. }
+        | RenderedIdentityRefusal::MissingStackDisposition { .. } => {
+            DecompileRenderRefusal::MissingProgramVariableAuthorization
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecompileBindingAudit {
+    output: String,
+    binding_shadow: BindingShadowAuditOutcome,
+    effect_obligations: EffectObligationAudit,
+    placement_audit: PlacementAudit,
+    render_refusal: Option<DecompileRenderRefusal>,
+}
+
+impl DecompileBindingAudit {
+    fn not_run(output: String) -> Self {
+        Self {
+            output,
+            binding_shadow: BindingShadowAuditOutcome::NotRun,
+            effect_obligations: EffectObligationAudit::NOT_RUN,
+            placement_audit: PlacementAudit::NotRun,
+            render_refusal: None,
+        }
+    }
+
+    pub fn output(&self) -> &str {
+        &self.output
+    }
+
+    pub fn into_output(self) -> String {
+        self.output
+    }
+
+    pub const fn binding_shadow(&self) -> BindingShadowAuditOutcome {
+        self.binding_shadow
+    }
+
+    pub const fn effect_obligations(&self) -> EffectObligationAudit {
+        self.effect_obligations
+    }
+
+    pub const fn placement_audit(&self) -> PlacementAudit {
+        self.placement_audit
+    }
+
+    pub const fn render_refusal(&self) -> Option<DecompileRenderRefusal> {
+        self.render_refusal
+    }
+}
+
+/// Rendered C whose same-run binding classification is deliberately deferred.
+///
+/// The engine uses this boundary to make every production cancellation and
+/// deadline decision before the diagnostic shadow comparison runs. Finalizing
+/// consumes the exact rendered product; dropping it emits the same C without
+/// paying for or consulting the audit.
+pub struct PendingDecompileBindingAudit {
+    output: String,
+    product: Option<(
+        InternalBuildProduct,
+        r2types::function_facts::SourceOwnedFunctionFacts,
+    )>,
+    ready: BindingShadowAuditOutcome,
+    ready_effects: EffectObligationAudit,
+    ready_placement: PlacementAudit,
+    ready_refusal: Option<DecompileRenderRefusal>,
+}
+
+impl PendingDecompileBindingAudit {
+    fn from_audit(audit: DecompileBindingAudit) -> Self {
+        Self {
+            output: audit.output,
+            product: None,
+            ready: audit.binding_shadow,
+            ready_effects: audit.effect_obligations,
+            ready_placement: audit.placement_audit,
+            ready_refusal: audit.render_refusal,
+        }
+    }
+
+    fn from_product(
+        output: String,
+        product: InternalBuildProduct,
+        source: r2types::function_facts::SourceOwnedFunctionFacts,
+    ) -> Self {
+        Self {
+            output,
+            product: Some((product, source)),
+            ready: BindingShadowAuditOutcome::NotRun,
+            ready_effects: EffectObligationAudit::NOT_RUN,
+            ready_placement: PlacementAudit::NotRun,
+            ready_refusal: None,
+        }
+    }
+
+    pub fn output(&self) -> &str {
+        &self.output
+    }
+
+    pub fn into_output(self) -> String {
+        self.output
+    }
+
+    pub fn finalize(self) -> DecompileBindingAudit {
+        let (binding_shadow, effect_obligations, placement_audit, render_refusal) =
+            self.product.map_or(
+                (
+                    self.ready,
+                    self.ready_effects,
+                    self.ready_placement,
+                    self.ready_refusal,
+                ),
+                |(product, source)| {
+                    (
+                        product.binding_shadow(&source),
+                        product.effect_obligations(),
+                        product.placement_audit(),
+                        product.render_refusal(),
+                    )
+                },
+            );
+        DecompileBindingAudit {
+            output: self.output,
+            binding_shadow,
+            effect_obligations,
+            placement_audit,
+            render_refusal,
+        }
+    }
+}
+
+/// Private result of one source-authority-bound native build.
+///
+/// Native output retains the exact binding plan and final-AST observations.
+/// Residual output is marker-free and carries no pretend native audit.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "all variants are request-local products; boxing native output would add allocation only to hide its typed audit payload"
+)]
+enum InternalBuildProduct {
+    Native(SealedNativeFunction),
+    Residual(EmissionReadyFunction),
+    Refused {
+        emission: EmissionReadyFunction,
+        refusal: DecompileRenderRefusal,
+        binding_shadow: BindingShadowAuditOutcome,
+        placement_audit: PlacementAudit,
+    },
+}
+
+#[expect(
+    clippy::large_enum_variant,
+    reason = "both variants are request-local decompile products; boxing either would add allocation without shrinking the dominant audit payload"
+)]
+enum PreparedDecompile {
+    Immediate(DecompileBindingAudit),
+    NativeOrResidual(InternalBuildProduct),
+}
+
+impl InternalBuildProduct {
+    fn residual(function: CFunction) -> Self {
+        Self::Residual(prepare_function_for_emission(&function))
+    }
+
+    fn refused(function: CFunction, refusal: DecompileRenderRefusal) -> Self {
+        Self::Refused {
+            emission: prepare_function_for_emission(&function),
+            refusal,
+            binding_shadow: BindingShadowAuditOutcome::NotRun,
+            placement_audit: PlacementAudit::NotRun,
+        }
+    }
+
+    fn refused_after_native_admission(
+        function: CFunction,
+        failure: BindingShadowAuditFailure,
+    ) -> Self {
+        let refusal = DecompileRenderRefusal::from(failure);
+        let placement_audit = match failure {
+            BindingShadowAuditFailure::Placement(refusal) => PlacementAudit::Refused(refusal),
+            BindingShadowAuditFailure::NonQualityObservations { .. } => PlacementAudit::Applied,
+            _ => PlacementAudit::NotRun,
+        };
+        Self::Refused {
+            emission: prepare_function_for_emission(&function),
+            refusal,
+            binding_shadow: BindingShadowAuditOutcome::Failed(failure),
+            placement_audit,
+        }
+    }
+
+    fn emission(&self) -> &EmissionReadyFunction {
+        match self {
+            Self::Native(native) => native.emission(),
+            Self::Residual(ready) => ready,
+            Self::Refused { emission, .. } => emission,
+        }
+    }
+
+    fn into_function(self) -> CFunction {
+        match self {
+            Self::Native(native) => native.into_function(),
+            Self::Residual(ready) => ready.into_function(),
+            Self::Refused { emission, .. } => emission.into_function(),
+        }
+    }
+
+    fn binding_shadow(
+        &self,
+        source: &r2types::SourceOwnedFunctionFacts,
+    ) -> BindingShadowAuditOutcome {
+        let native = match self {
+            Self::Native(native) => native,
+            Self::Refused { binding_shadow, .. } => return *binding_shadow,
+            Self::Residual(_) => return BindingShadowAuditOutcome::NotRun,
+        };
+        let (observations, coverage) = match native.audit_observations() {
+            Ok(observations) => observations,
+            Err(failure) => return BindingShadowAuditOutcome::Failed(failure),
+        };
+        let outcome = BindingShadowOutcome::build(native.plan(), source, observations, coverage);
+        BindingShadowAuditOutcome::from_internal(&outcome)
+    }
+
+    fn effect_obligations(&self) -> EffectObligationAudit {
+        match self {
+            Self::Native(native) => native.effect_obligation_audit(),
+            Self::Residual(_) | Self::Refused { .. } => EffectObligationAudit::NOT_RUN,
+        }
+    }
+
+    fn placement_audit(&self) -> PlacementAudit {
+        match self {
+            Self::Native(native) => native.placement_audit(),
+            Self::Refused {
+                placement_audit, ..
+            } => *placement_audit,
+            Self::Residual(_) => PlacementAudit::NotRun,
+        }
+    }
+
+    fn render_refusal(&self) -> Option<DecompileRenderRefusal> {
+        match self {
+            Self::Refused { refusal, .. } => Some(*refusal),
+            Self::Native(_) | Self::Residual(_) => None,
+        }
     }
 }
 
@@ -2215,6 +3711,29 @@ impl Decompiler {
         input: &'a DecompilerInput,
         control: &'a dyn r2ssa::SsaWorkControl,
     ) -> Result<String, DecompileExecutionStop> {
+        self.decompile_input_with_binding_audit_and_control(input, control)
+            .map(DecompileBindingAudit::into_output)
+    }
+
+    /// Decompile and expose the non-consuming binding-shadow audit.
+    ///
+    /// The audit is constructed only after the final production poll. Its
+    /// outcome therefore cannot change the C output or a cancellation/deadline
+    /// decision made by the rendering path.
+    pub fn decompile_input_with_binding_audit(
+        &self,
+        input: &DecompilerInput,
+    ) -> DecompileBindingAudit {
+        let control = r2ssa::SsaExecutionControl::default();
+        self.decompile_input_with_binding_audit_and_control(input, &control)
+            .expect("default decompiler control never stops")
+    }
+
+    fn prepare_decompile_with_control<'a>(
+        &self,
+        input: &'a DecompilerInput,
+        control: &'a dyn r2ssa::SsaWorkControl,
+    ) -> Result<PreparedDecompile, DecompileExecutionStop> {
         let work = DecompileWorkControl::new(control, DecompileWorkPhase::Normalization);
         work.poll()?;
         let func = input.prepared_ssa().function();
@@ -2224,44 +3743,184 @@ impl Decompiler {
             .unwrap_or_else(|| format!("sub_{:x}", func.entry));
         let block_count = func.blocks().count();
         if block_count > self.config.max_blocks {
-            return Ok(block_guard_fallback_comment(
-                &func_name,
-                block_count,
-                self.config.max_blocks,
+            return Ok(PreparedDecompile::Immediate(
+                DecompileBindingAudit::not_run(block_guard_fallback_comment(
+                    &func_name,
+                    block_count,
+                    self.config.max_blocks,
+                )),
             ));
         }
         let function_facts = input.function_facts();
         let Some(semantic_route) = function_facts.decompile_route() else {
-            return Ok(missing_decompile_route_residual_comment(&func_name));
+            return Ok(PreparedDecompile::Immediate(
+                DecompileBindingAudit::not_run(missing_decompile_route_residual_comment(
+                    &func_name,
+                )),
+            ));
         };
         if let Some(reason) = route_fallback_reason(semantic_route) {
-            return Ok(artifact_guard_fallback_comment(&func_name, reason));
+            return Ok(PreparedDecompile::Immediate(
+                DecompileBindingAudit::not_run(artifact_guard_fallback_comment(&func_name, reason)),
+            ));
         }
         if let Some(reason) = summary_only_semantics_standard_render_residual_reason(
             function_facts.decompile_route(),
             function_facts.semantic_report(),
         ) {
-            return Ok(artifact_guard_fallback_comment(&func_name, &reason));
+            return Ok(PreparedDecompile::Immediate(
+                DecompileBindingAudit::not_run(artifact_guard_fallback_comment(
+                    &func_name, &reason,
+                )),
+            ));
         }
         if let Some(output) =
             self.vm_summary_output_for_route(&func_name, function_facts, semantic_route)
         {
-            return Ok(output);
+            return Ok(PreparedDecompile::Immediate(
+                DecompileBindingAudit::not_run(output),
+            ));
         }
         if let Some(output) = self.semantic_worker_summary_output_for_route(
             &func_name,
             function_facts,
             semantic_route,
         ) {
-            return Ok(output);
+            return Ok(PreparedDecompile::Immediate(
+                DecompileBindingAudit::not_run(output),
+            ));
         }
-        let c_func = self.build_function_from_input_with_control(input, control)?;
-        let render_work = work.with_phase(DecompileWorkPhase::Rendering);
+        self.build_product_from_input_with_control(input, control)
+            .map(PreparedDecompile::NativeOrResidual)
+    }
+
+    /// Controlled form of [`Self::decompile_input_with_binding_audit`].
+    pub fn decompile_input_with_binding_audit_and_control<'a>(
+        &self,
+        input: &'a DecompilerInput,
+        control: &'a dyn r2ssa::SsaWorkControl,
+    ) -> Result<DecompileBindingAudit, DecompileExecutionStop> {
+        let product = match self.prepare_decompile_with_control(input, control)? {
+            PreparedDecompile::Immediate(audit) => return Ok(audit),
+            PreparedDecompile::NativeOrResidual(product) => product,
+        };
+        let render_work = DecompileWorkControl::new(control, DecompileWorkPhase::Rendering);
         render_work.poll()?;
-        let mut codegen = CodeGenerator::new(self.config.codegen.clone());
-        let output = codegen.generate_function(&c_func);
+        let output =
+            CodeGenerator::new(self.config.codegen.clone()).generate_function(product.emission());
+        // This is deliberately the last production work-control decision.
+        // Everything below classifies the already sealed observation journal.
         render_work.poll()?;
-        Ok(output)
+        let binding_shadow = product.binding_shadow(input.source_owned_facts());
+        let effect_obligations = product.effect_obligations();
+        let placement_audit = product.placement_audit();
+        Ok(DecompileBindingAudit {
+            output,
+            binding_shadow,
+            effect_obligations,
+            placement_audit,
+            render_refusal: product.render_refusal(),
+        })
+    }
+
+    /// Render, keeping whatever was produced when a phase stopped.
+    ///
+    /// `decompile_input_with_control` returns only the stop, so a caller has to
+    /// discard the rendering to report that a budget ran out. That is why
+    /// `RefusalReason::BudgetExhausted` has never been constructed: the ledger
+    /// that would record it lives in the rendering being thrown away, and a
+    /// function that ran out of time reports as one that produced nothing.
+    ///
+    /// A stop while building the C function has no partial to keep. A stop
+    /// during rendering does -- the function is built by then, and generating it
+    /// is what the caller wanted.
+    pub fn decompile_input_keeping_partial<'a>(
+        &self,
+        input: &'a DecompilerInput,
+        control: &'a dyn r2ssa::SsaWorkControl,
+    ) -> Result<String, (DecompileExecutionStop, Option<String>)> {
+        self.decompile_input_keeping_partial_with_pending_binding_audit(input, control)
+            .map(PendingDecompileBindingAudit::into_output)
+            .map_err(|(stop, partial)| {
+                (stop, partial.map(PendingDecompileBindingAudit::into_output))
+            })
+    }
+
+    /// Render with a same-run binding audit, retaining both after a rendering stop.
+    ///
+    /// A product-bound partial is classified from the exact product that was
+    /// rendered. The audit is never rebuilt, and its construction performs no
+    /// work-control poll. Stops before a product exists therefore retain no
+    /// partial; either rendering poll retains the already sealed product's C and
+    /// audit together.
+    #[expect(
+        clippy::result_large_err,
+        reason = "a stopped request retains its exact same-run binding audit rather than a lossy or reconstructed diagnostic"
+    )]
+    pub fn decompile_input_keeping_partial_with_binding_audit<'a>(
+        &self,
+        input: &'a DecompilerInput,
+        control: &'a dyn r2ssa::SsaWorkControl,
+    ) -> Result<DecompileBindingAudit, (DecompileExecutionStop, Option<DecompileBindingAudit>)>
+    {
+        self.decompile_input_keeping_partial_with_pending_binding_audit(input, control)
+            .map(PendingDecompileBindingAudit::finalize)
+            .map_err(|(stop, partial)| (stop, partial.map(PendingDecompileBindingAudit::finalize)))
+    }
+
+    /// Render while deferring non-consuming binding classification until the
+    /// caller has made every production control decision.
+    #[expect(
+        clippy::result_large_err,
+        reason = "a stopped request retains the sealed request-local product so classification cannot be rebuilt from different facts"
+    )]
+    pub fn decompile_input_keeping_partial_with_pending_binding_audit<'a>(
+        &self,
+        input: &'a DecompilerInput,
+        control: &'a dyn r2ssa::SsaWorkControl,
+    ) -> Result<
+        PendingDecompileBindingAudit,
+        (DecompileExecutionStop, Option<PendingDecompileBindingAudit>),
+    > {
+        let product = match self.prepare_decompile_with_control(input, control) {
+            Ok(PreparedDecompile::Immediate(audit)) => {
+                return Ok(PendingDecompileBindingAudit::from_audit(audit));
+            }
+            Ok(PreparedDecompile::NativeOrResidual(product)) => product,
+            Err(stop) => return Err((stop, None)),
+        };
+        let render_work = DecompileWorkControl::new(control, DecompileWorkPhase::Rendering);
+        if let Err(stop) = render_work.poll() {
+            let output = CodeGenerator::new(self.config.codegen.clone())
+                .generate_function(product.emission());
+            return Err((
+                stop,
+                Some(PendingDecompileBindingAudit::from_product(
+                    output,
+                    product,
+                    input.source_owned_facts().clone(),
+                )),
+            ));
+        }
+        let output =
+            CodeGenerator::new(self.config.codegen.clone()).generate_function(product.emission());
+        crate::stage_timing::mark("codegen");
+        crate::stage_timing::report(&product.emission().function().name);
+        if let Err(stop) = render_work.poll() {
+            return Err((
+                stop,
+                Some(PendingDecompileBindingAudit::from_product(
+                    output,
+                    product,
+                    input.source_owned_facts().clone(),
+                )),
+            ));
+        }
+        Ok(PendingDecompileBindingAudit::from_product(
+            output,
+            product,
+            input.source_owned_facts().clone(),
+        ))
     }
 
     /// Build a C function from a prepared function + typed context payload.
@@ -2277,6 +3936,15 @@ impl Decompiler {
         input: &'a DecompilerInput,
         control: &'a dyn r2ssa::SsaWorkControl,
     ) -> Result<CFunction, DecompileExecutionStop> {
+        self.build_product_from_input_with_control(input, control)
+            .map(InternalBuildProduct::into_function)
+    }
+
+    fn build_product_from_input_with_control<'a>(
+        &self,
+        input: &'a DecompilerInput,
+        control: &'a dyn r2ssa::SsaWorkControl,
+    ) -> Result<InternalBuildProduct, DecompileExecutionStop> {
         let work = DecompileWorkControl::new(control, DecompileWorkPhase::Normalization);
         work.poll()?;
         let func = input.prepared_ssa().function();
@@ -2286,45 +3954,56 @@ impl Decompiler {
             .unwrap_or_else(|| format!("sub_{:x}", func.entry));
         let block_count = func.blocks().count();
         if block_count > self.config.max_blocks {
-            return Ok(residual_function_for_render_boundary(
-                &func_name,
-                &block_guard_fallback_comment(&func_name, block_count, self.config.max_blocks),
+            return Ok(InternalBuildProduct::residual(
+                residual_function_for_render_boundary(
+                    &func_name,
+                    &block_guard_fallback_comment(&func_name, block_count, self.config.max_blocks),
+                ),
             ));
         }
         let decompiler = Self::new(self.config.clone()).with_context(input.context_projection());
         let Some(semantic_route) = decompiler.context.function_facts.decompile_route() else {
-            return Ok(residual_function_for_render_boundary(
-                &func_name,
-                &missing_decompile_route_residual_comment(&func_name),
+            return Ok(InternalBuildProduct::residual(
+                residual_function_for_render_boundary(
+                    &func_name,
+                    &missing_decompile_route_residual_comment(&func_name),
+                ),
             ));
         };
         if let Some(reason) = route_fallback_reason(semantic_route) {
-            return Ok(residual_function_for_render_boundary(&func_name, reason));
+            return Ok(InternalBuildProduct::residual(
+                residual_function_for_render_boundary(&func_name, reason),
+            ));
         }
         if let Some(reason) = summary_only_semantics_standard_render_residual_reason(
             decompiler.context.function_facts.decompile_route(),
             decompiler.context.function_facts.semantic_report(),
         ) {
-            return Ok(residual_function_for_render_boundary(&func_name, &reason));
+            return Ok(InternalBuildProduct::residual(
+                residual_function_for_render_boundary(&func_name, &reason),
+            ));
         }
         if route_is_summary_boundary(semantic_route) {
-            return Ok(residual_function_for_summary_route_boundary(
-                &func_name,
-                semantic_route,
+            return Ok(InternalBuildProduct::residual(
+                residual_function_for_summary_route_boundary(&func_name, semantic_route),
             ));
         }
         decompiler.build_function_internal_with_control(input, semantic_route, work)
     }
 
     pub(crate) fn prepend_comment(stmt: CStmt, text: String) -> CStmt {
+        let (semantic, observations) = stmt.into_semantic_with_observations();
         let comment = CStmt::comment(text);
-        match stmt {
+        match semantic {
             CStmt::Empty => CStmt::Block(vec![comment]),
             CStmt::Block(mut stmts) => {
+                // Inserting a new sibling splits the observed block position;
+                // no existing child is an exact owner for its outer markers.
+                // Nested child observations remain intact.
                 stmts.insert(0, comment);
                 CStmt::Block(stmts)
             }
-            other => CStmt::Block(vec![comment, other]),
+            other => CStmt::Block(vec![comment, observations.reapply(other)]),
         }
     }
 
@@ -2570,27 +4249,125 @@ impl Decompiler {
         &self,
         func: &SSAFunction,
         fold_ctx: &FoldingContext<'_>,
-    ) -> Vec<CStmt> {
+    ) -> structure::ControlFlowStructureResult<Vec<CStmt>> {
         let blocks: Vec<_> = func.blocks().cloned().collect();
-        let mut stmts = Vec::new();
+        // A multi-way dispatch cannot be linearized. The terminator arm below
+        // described one -- `/* case 0: goto loc_...; */` -- and a comment is not
+        // a transfer: the block fell through to whichever arm the linearizer
+        // placed next, and the function compiled cleanly and computed the wrong
+        // answer. Refusing is the honest answer, and it is what the structured
+        // path already does when it cannot express the switch.
+        if blocks.iter().any(|block| {
+            func.cfg().get_block(block.addr).is_some_and(|cfg_block| {
+                matches!(cfg_block.terminator, BlockTerminator::Switch { .. })
+            })
+        }) {
+            return Err(
+                crate::fold::op_lower::OpLoweringRefusal::unrepresentable_operation().into(),
+            );
+        }
+        // An unclassified transfer whose target is not a block of this function
+        // cannot be linearized. The terminator arm below spells it as
+        // `goto loc_<addr>`, but an outside target has no block to carry that
+        // label. A source-proven tail jump is different: its callsite fact
+        // renders a terminal return in the folded body, so the absent target is
+        // no longer a label the linear form owes. Every other outside branch
+        // stays behind this refusal; a target that is not a function entry is
+        // still a jump, and inventing a call for it would be a wrong answer.
+        let own_blocks: std::collections::BTreeSet<u64> =
+            blocks.iter().map(|block| block.addr).collect();
+        if blocks.iter().any(|block| {
+            let terminal_call = block.ops.iter().enumerate().any(|(op_idx, _)| {
+                fold_ctx
+                    .certified_call_render_fact_for_op(block.addr, op_idx)
+                    .is_some_and(|fact| fact.disposition.is_terminal_return())
+            });
+            func.cfg().get_block(block.addr).is_some_and(|cfg_block| {
+                !terminal_call
+                    && Self::linearized_transfer_targets(&cfg_block.terminator)
+                        .iter()
+                        .any(|target| !own_blocks.contains(target))
+            })
+        }) {
+            return Err(
+                crate::fold::op_lower::OpLoweringRefusal::unrepresentable_operation().into(),
+            );
+        }
+        let mut labelled = Vec::new();
 
         for block in &blocks {
-            stmts.push(CStmt::Label(Self::linear_block_label(block.addr)));
-            for stmt in fold_ctx.fold_block(block, block.addr) {
+            let mut body = Vec::new();
+            for stmt in fold_ctx.fold_block(block, block.addr)? {
                 if !matches!(stmt, CStmt::Empty) {
-                    stmts.push(stmt);
+                    body.push(stmt);
                 }
             }
             if let Some(terminator_stmt) = Self::linearized_terminator_stmt(func, fold_ctx, block) {
-                stmts.push(terminator_stmt);
+                body.push(terminator_stmt);
+            }
+            labelled.push((Self::linear_block_label(block.addr), body));
+        }
+
+        // A block gets a label only if something jumps to it. Labelling every
+        // block is how the linear form used to be written, and it emits names
+        // no `goto` mentions, which a strict compile rejects. The set has to be
+        // collected across the whole body first, because a jump backwards is
+        // the normal case here.
+        let mut targets = std::collections::BTreeSet::new();
+        for (_, body) in &labelled {
+            for stmt in body {
+                collect_goto_targets(stmt, &mut targets);
             }
         }
 
-        stmts
+        let mut stmts = Vec::new();
+        for (label, body) in labelled {
+            if targets.contains(&label) {
+                stmts.push(CStmt::Label(label));
+            }
+            stmts.extend(body);
+        }
+
+        Ok(stmts)
     }
 
     fn linear_block_label(addr: u64) -> String {
         format!("loc_{addr:x}")
+    }
+
+    /// Every address the linear form would spell as a `goto` for this
+    /// terminator. Kept beside `linearized_terminator_stmt` so the two cannot
+    /// drift: a target that arm turns into a label has to be listed here, or
+    /// the containment check above stops seeing it.
+    fn linearized_transfer_targets(terminator: &BlockTerminator) -> Vec<u64> {
+        match terminator {
+            BlockTerminator::ConditionalBranch {
+                true_target,
+                false_target,
+            } => vec![*true_target, *false_target],
+            BlockTerminator::Branch { target } | BlockTerminator::Fallthrough { next: target } => {
+                vec![*target]
+            }
+            BlockTerminator::Call {
+                fallthrough: Some(target),
+                ..
+            }
+            | BlockTerminator::IndirectCall {
+                fallthrough: Some(target),
+            } => vec![*target],
+            BlockTerminator::Switch { cases, default } => cases
+                .iter()
+                .map(|(_, target)| *target)
+                .chain(default.iter().copied())
+                .collect(),
+            BlockTerminator::IndirectBranch
+            | BlockTerminator::Call {
+                fallthrough: None, ..
+            }
+            | BlockTerminator::IndirectCall { fallthrough: None }
+            | BlockTerminator::Return
+            | BlockTerminator::None => Vec::new(),
+        }
     }
 
     fn linearized_terminator_stmt(
@@ -2599,6 +4376,15 @@ impl Decompiler {
         block: &r2ssa::FunctionSSABlock,
     ) -> Option<CStmt> {
         let terminator = &func.cfg().get_block(block.addr)?.terminator;
+        if matches!(terminator, BlockTerminator::Branch { .. })
+            && block.ops.iter().enumerate().any(|(op_idx, _)| {
+                fold_ctx
+                    .certified_call_render_fact_for_op(block.addr, op_idx)
+                    .is_some_and(|fact| fact.disposition.is_terminal_return())
+            })
+        {
+            return None;
+        }
         match terminator {
             BlockTerminator::ConditionalBranch {
                 true_target,
@@ -2606,11 +4392,12 @@ impl Decompiler {
             } => fold_ctx
                 .extract_condition_from_block(block)
                 .map(|cond| {
-                    CStmt::if_stmt(
+                    let stmt = CStmt::if_stmt(
                         cond,
                         CStmt::Goto(Self::linear_block_label(*true_target)),
                         Some(CStmt::Goto(Self::linear_block_label(*false_target))),
-                    )
+                    );
+                    Self::observe_linearized_control_terminator(fold_ctx, block, stmt)
                 })
                 .or_else(|| {
                     Some(CStmt::comment(format!(
@@ -2620,7 +4407,11 @@ impl Decompiler {
                     )))
                 }),
             BlockTerminator::Branch { target } | BlockTerminator::Fallthrough { next: target } => {
-                Some(CStmt::Goto(Self::linear_block_label(*target)))
+                Some(Self::observe_linearized_control_terminator(
+                    fold_ctx,
+                    block,
+                    CStmt::Goto(Self::linear_block_label(*target)),
+                ))
             }
             BlockTerminator::Call {
                 fallthrough: Some(target),
@@ -2657,16 +4448,21 @@ impl Decompiler {
         }
     }
 
-    #[cfg(test)]
-    fn build_function_internal(
-        &self,
-        input: &DecompilerInput,
-        semantic_route: &DecompileRouteFacts,
-    ) -> CFunction {
-        let control = r2ssa::SsaExecutionControl::default();
-        let work = DecompileWorkControl::new(&control, DecompileWorkPhase::Normalization);
-        self.build_function_internal_with_control(input, semantic_route, work)
-            .expect("default decompiler control never stops")
+    fn observe_linearized_control_terminator(
+        fold_ctx: &FoldingContext<'_>,
+        block: &r2ssa::FunctionSSABlock,
+        stmt: CStmt,
+    ) -> CStmt {
+        let Some(op_idx) = block.ops.len().checked_sub(1) else {
+            return stmt;
+        };
+        let obligations = fold_ctx.exact_effect_obligations_for_normalized_value(
+            crate::fold::context::EffectOccurrenceKind::Expression,
+            block.addr,
+            op_idx,
+            None,
+        );
+        fold_ctx.observe_effect_stmt(&obligations, stmt)
     }
 
     fn build_function_internal_with_control<'a>(
@@ -2674,244 +4470,563 @@ impl Decompiler {
         input: &'a DecompilerInput,
         semantic_route: &DecompileRouteFacts,
         work: DecompileWorkControl<'a>,
-    ) -> Result<CFunction, DecompileExecutionStop> {
+    ) -> Result<InternalBuildProduct, DecompileExecutionStop> {
+        crate::stage_timing::begin();
+        // The names this rendering declares, from the first pass that mints one.
+        let symbol_table =
+            std::rc::Rc::new(std::cell::RefCell::new(crate::symbol::SymbolTable::new()));
+        let symbols = &*symbol_table;
+
         work.poll()?;
         let prepared = input.prepared_ssa();
         let func = prepared.function();
-        let mut normalized_func = if let Some(render_facts) = self.context.function_facts.render() {
-            normalize::materialize_certified_loop_carriers_with_control(
-                func,
-                prepared,
-                render_facts,
-                work,
-            )?
-        } else {
-            func.clone()
-        };
-        if let Some(render_facts) = self.context.function_facts.render() {
-            normalize::materialize_certified_loop_carrier_initializers_with_control(
-                &mut normalized_func,
-                prepared,
-                render_facts,
-                work,
-            )?;
+        if std::env::var_os("R2SLEIGH_DEBUG_MERGES").is_some() {
+            let graph = prepared.graph();
+            let live = prepared.live_out();
+            let dead = prepared.unobserved_merges();
+            let total: usize = func.blocks().map(|b| b.phis.len()).sum();
+            eprintln!(
+                "MERGES fn={:#x} phis={} unobserved={} live_out={} unresolved={}",
+                func.entry,
+                total,
+                dead.len(),
+                live.len(),
+                live.unresolved_blocks().count()
+            );
+            // Which merges the carrier gate admits, and which it turns away. The
+            // gate is one question asked per phi, so printing its answer beside the
+            // merge names the value that is lost rather than the layer that lost it.
+            let render_facts = self.context.function_facts.render();
+            for block in func.blocks() {
+                for phi in &block.phis {
+                    let value = graph.value_id_for_var(&phi.dst);
+                    let carrier = value.is_some_and(|value| {
+                        render_facts
+                            .is_some_and(|facts| facts.loop_carrier_for_value(value).is_some())
+                    });
+                    eprintln!(
+                        "MERGEPHI block={:#x} dst={} size={} value={:?} carrier={}",
+                        block.addr,
+                        phi.dst.display_name(),
+                        phi.dst.size,
+                        value,
+                        carrier
+                    );
+                }
+            }
+            // What each carrier member is spelled as, so a member that some other
+            // table also answers for shows up as a name the body never uses.
+            if let Some(facts) = render_facts {
+                // A carrier the alias map drops is spelled by whatever else answers
+                // for its name, so the two filters that drop one are printed by name.
+                let mirrored = prepared.memory_mirrored_carriers();
+                let reused = prepared.carriers_spanning_a_reuse();
+                let spans = prepared.storage_spans();
+                for carrier in facts.loop_carriers() {
+                    if let r2types::CertifiedEntity::LoopCarrier {
+                        id,
+                        phi,
+                        identity_values,
+                        entries,
+                        updates,
+                        ..
+                    } = carrier
+                    {
+                        eprintln!(
+                            "CARRIERFILTER id={:?} phi={:?} var={} mirrored={} reused={}",
+                            id,
+                            phi,
+                            graph
+                                .value(*phi)
+                                .map(|value| value.var.display_name())
+                                .unwrap_or_default(),
+                            mirrored.contains(id),
+                            reused.contains(id)
+                        );
+                        // A member in a second span is what makes a carrier span a
+                        // reuse, so each member prints with the span it landed in.
+                        let members = identity_values
+                            .iter()
+                            .copied()
+                            .chain(entries.iter().map(|edge| edge.value))
+                            .chain(updates.iter().flat_map(|update| {
+                                std::iter::once(update.value)
+                                    .chain(update.identity_values.iter().copied())
+                            }))
+                            .collect::<std::collections::BTreeSet<_>>();
+                        for member in members {
+                            eprintln!(
+                                "  MEMBER value={:?} var={} storage={:?} span={:?}",
+                                member,
+                                graph
+                                    .value(member)
+                                    .map(|value| value.var.display_name())
+                                    .unwrap_or_default(),
+                                graph
+                                    .value(member)
+                                    .and_then(|value| value.canonical_storage),
+                                spans.span_of(member)
+                            );
+                        }
+                    }
+                }
+            }
         }
-        work.poll()?;
+        let normalization_refusal = |error: normalize::NormalizationOriginError| {
+            let func_name = func
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("sub_{:x}", func.entry));
+            residual_function_for_render_boundary(
+                &func_name,
+                &format!("normalization origin refusal: {error}"),
+            )
+        };
+        let (mut normalized_func, mut normalization_origins) =
+            if let Some(render_facts) = self.context.function_facts.render() {
+                match normalize::materialize_certified_loop_carriers_with_control(
+                    func,
+                    prepared,
+                    render_facts,
+                    work,
+                ) {
+                    Ok(result) => result,
+                    Err(normalize::NormalizationFailure::Execution(error)) => return Err(error),
+                    Err(normalize::NormalizationFailure::Origins(error)) => {
+                        return Ok(InternalBuildProduct::refused(
+                            normalization_refusal(error),
+                            DecompileRenderRefusal::NormalizationOriginUnavailable,
+                        ));
+                    }
+                }
+            } else {
+                (
+                    func.clone(),
+                    normalize::NormalizationOrigins::for_unchanged(func, prepared),
+                )
+            };
+        if let Some(render_facts) = self.context.function_facts.render()
+            && let Err(error) =
+                normalize::materialize_certified_loop_carrier_initializers_with_control(
+                    &mut normalized_func,
+                    &mut normalization_origins,
+                    prepared,
+                    render_facts,
+                    work,
+                )
+        {
+            match error {
+                normalize::NormalizationFailure::Execution(error) => return Err(error),
+                normalize::NormalizationFailure::Origins(error) => {
+                    return Ok(InternalBuildProduct::refused(
+                        normalization_refusal(error),
+                        DecompileRenderRefusal::NormalizationOriginUnavailable,
+                    ));
+                }
+            }
+        }
+        // The graph and the normalized function, verbatim, so a rendered
+        // statement can be read back to the instruction that produced it.
+        // Every other probe answers one question; this one is for the
+        // question nobody has asked yet.
+        if std::env::var_os("R2SLEIGH_DUMP_SSA").is_some() {
+            let graph = prepared.graph();
+            eprintln!("SSADUMP prepared\n{}", func.dump());
+            eprintln!("SSADUMP normalized\n{}", normalized_func.dump());
+            for value in &graph.values {
+                eprintln!(
+                    "SSAVALUE {:?} {} storage={:?} def={:?} uses={:?}",
+                    value.id,
+                    value.var,
+                    value.canonical_storage.map(|storage| (
+                        storage.space,
+                        storage.offset,
+                        storage.size
+                    )),
+                    graph.def_inst(value.id),
+                    graph.use_sites(value.id)
+                );
+            }
+            for inst in &graph.insts {
+                eprintln!(
+                    "SSAINST {:?} block={:?} ordinal={} out={:?} in={:?} {}",
+                    inst.id,
+                    inst.block,
+                    inst.ordinal,
+                    inst.output,
+                    inst.inputs,
+                    format!("{:?}", inst.payload)
+                        .chars()
+                        .take(160)
+                        .collect::<String>()
+                );
+            }
+        }
+        if let Err(error) = normalization_origins.validate(
+            &normalized_func,
+            prepared,
+            self.context.function_facts.render(),
+        ) {
+            let func_name = func
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("sub_{:x}", func.entry));
+            return Ok(InternalBuildProduct::refused(
+                residual_function_for_render_boundary(
+                    &func_name,
+                    &format!("normalization origin refusal: {error:?}"),
+                ),
+                DecompileRenderRefusal::NormalizationOriginUnavailable,
+            ));
+        }
+        crate::stage_timing::mark("prepare");
+        let binding_plan =
+            match crate::binding_plan::BindingPlan::build_shadow(input.source_owned_facts()) {
+                Ok(plan) => std::rc::Rc::new(plan),
+                Err(error) => {
+                    debug_log_render_contract_error(prepared, "binding-plan", &error);
+                    let refusal = match error {
+                        crate::binding_plan::BindingPlanBuildError::MachineProjection(_)
+                        | crate::binding_plan::BindingPlanBuildError::Seal(
+                            crate::binding_plan::BindingPlanSourceMismatch::MachineProjection(_),
+                        ) => DecompileRenderRefusal::MissingMachineProjectionAuthorization(
+                            MachineProjectionRefusalOrigin::BindingPlanBuild,
+                        ),
+                        _ => DecompileRenderRefusal::MissingProgramVariableAuthorization,
+                    };
+                    return Ok(InternalBuildProduct::refused(
+                        residual_function_for_render_boundary(
+                            &func
+                                .name
+                                .clone()
+                                .unwrap_or_else(|| format!("sub_{:x}", func.entry)),
+                            &format!("native render refusal: {}", refusal.kind()),
+                        ),
+                        refusal,
+                    ));
+                }
+            };
+        if let Err(error) = crate::fold::op_lower::PlannedLoweringInput::try_new(
+            input.source_owned_facts(),
+            &binding_plan,
+        ) {
+            debug_log_render_contract_error(prepared, "planned-lowering-input", &error);
+            let refusal = match error {
+                crate::binding_plan::BindingPlanSourceMismatch::MachineProjection(_) => {
+                    DecompileRenderRefusal::MissingMachineProjectionAuthorization(
+                        MachineProjectionRefusalOrigin::PlannedLoweringInput,
+                    )
+                }
+                _ => DecompileRenderRefusal::MissingProgramVariableAuthorization,
+            };
+            return Ok(InternalBuildProduct::refused(
+                residual_function_for_render_boundary(
+                    &func
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| format!("sub_{:x}", func.entry)),
+                    &format!("native render refusal: {}", refusal.kind()),
+                ),
+                refusal,
+            ));
+        }
+        let binding_names = match crate::binding_plan::BindingNameResolution::build(
+            input.source_owned_facts(),
+            std::rc::Rc::clone(&binding_plan),
+            std::rc::Rc::clone(&symbol_table),
+        ) {
+            Ok(names) => std::rc::Rc::new(names),
+            Err(error) => {
+                debug_log_render_contract_error(prepared, "binding-name-resolution", &error);
+                let refusal = match error {
+                    crate::binding_plan::BindingNameResolutionError::Source(
+                        crate::binding_plan::BindingPlanSourceMismatch::MachineProjection(_),
+                    ) => DecompileRenderRefusal::MissingMachineProjectionAuthorization(
+                        MachineProjectionRefusalOrigin::PlannedLoweringInput,
+                    ),
+                    crate::binding_plan::BindingNameResolutionError::Source(_)
+                    | crate::binding_plan::BindingNameResolutionError::ConflictingCertifiedRoles(
+                        _,
+                    ) => DecompileRenderRefusal::MissingProgramVariableAuthorization,
+                };
+                return Ok(InternalBuildProduct::refused(
+                    residual_function_for_render_boundary(
+                        &func
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| format!("sub_{:x}", func.entry)),
+                        &format!("native render refusal: {}", refusal.kind()),
+                    ),
+                    refusal,
+                ));
+            }
+        };
         let func = &normalized_func;
         let func_name = func
             .name
             .clone()
             .unwrap_or_else(|| format!("sub_{:x}", func.entry));
-        if route_is_standard(semantic_route) {
-            let reason = "r2dec residual: Standard executable rendering is unavailable; r2cert typed-region authorization is required";
-            return Ok(residual_function_for_render_boundary(&func_name, reason));
+        let observation_journal = match LegacyObservationJournal::new(
+            input.source_owned_facts(),
+            &normalized_func,
+            &normalization_origins,
+            Rc::clone(&binding_names),
+            Rc::clone(&symbol_table),
+        ) {
+            Ok(journal) => std::cell::RefCell::new(journal),
+            Err(error) => {
+                let refusal = DecompileRenderRefusal::ObservationJournal(
+                    BindingObservationJournalFailure::from(&error),
+                );
+                return Ok(InternalBuildProduct::refused(
+                    residual_function_for_render_boundary(
+                        &func_name,
+                        &format!("native render refusal: {}", refusal.kind()),
+                    ),
+                    refusal,
+                ));
+            }
+        };
+        work.poll()?;
+        if std::env::var_os("R2SLEIGH_DEBUG_MERGES").is_some() {
+            eprintln!(
+                "SOURCE_INTERFACE {:?}",
+                prepared.machine_context().function_interface()
+            );
+            // What materialisation left behind, so a carrier update that renders
+            // more than once shows which ops the fold was handed.
+            for block in normalized_func.blocks() {
+                for (index, op) in block.ops.iter().enumerate() {
+                    let op: &r2ssa::SSAOp = op;
+                    let kind = format!("{op:?}");
+                    let kind = kind.split([' ', '{']).next().unwrap_or("?");
+                    let origin = prepared
+                        .graph()
+                        .block_id_for_addr(block.addr)
+                        .and_then(|block| {
+                            normalization_origins.origin(crate::normalize::NormalizedOpSite {
+                                block,
+                                op_idx: index,
+                            })
+                        })
+                        .map(|origin| match origin {
+                            crate::normalize::NormalizedOpOrigin::Original(inst) => {
+                                format!("original:{}", inst.0)
+                            }
+                            crate::normalize::NormalizedOpOrigin::PhiEdgeCopy(_) => {
+                                "phi-edge-copy".to_string()
+                            }
+                            crate::normalize::NormalizedOpOrigin::RelocatedInitializer(_) => {
+                                "relocated-initializer".to_string()
+                            }
+                        })
+                        .unwrap_or_else(|| "missing".to_string());
+                    eprintln!(
+                        "NORMOP block={:#x} idx={index} origin={origin} kind={kind} dst={:?} srcs={:?}",
+                        block.addr,
+                        op.dst().map(|var| var.display_name()),
+                        op.sources()
+                            .iter()
+                            .map(|var| var.display_name())
+                            .collect::<Vec<_>>()
+                    );
+                }
+            }
         }
         let render_signature = self.context.type_facts().render_authorized_signature();
-        // Recover variables
-        let mut var_recovery = VariableRecovery::new_with_abi(
-            &self.config.sp_name,
-            &self.config.fp_name,
-            self.config.ptr_size,
-            self.config.arg_regs.clone(),
-            self.config.ret_regs.clone(),
-        );
-        var_recovery.recover_input(input);
-        let skip_runtime_type_inference = self.context.skip_runtime_type_inference(prepared);
-        let type_inference = (!skip_runtime_type_inference).then(|| {
-            let mut type_inference = TypeInference::new_with_abi(
-                self.config.ptr_size,
-                self.config.arg_regs.clone(),
-                self.config.ret_regs.clone(),
-            );
-            type_inference.set_external_signature(
-                self.context
-                    .type_facts()
-                    .render_authorized_signature()
-                    .cloned(),
-            );
-            for (name, signature) in &self.context.type_facts().known_function_signatures {
-                type_inference.add_function_type(name, signature.clone());
-            }
-            type_inference.set_external_stack_slots(self.context.type_facts().stack_slots.clone());
-            if !self
-                .context
-                .type_facts()
-                .external_type_db
-                .structs
-                .is_empty()
-                || !self.context.type_facts().external_type_db.unions.is_empty()
-                || !self.context.type_facts().external_type_db.enums.is_empty()
-            {
-                type_inference
-                    .set_external_type_db(self.context.type_facts().external_type_db.clone());
-            }
-            type_inference.set_prepared_ssa(prepared);
-            type_inference.infer_function(func);
-            type_inference
-        });
-        let mut type_hints = if let Some(type_inference) = type_inference.as_ref() {
-            type_inference
-                .var_type_hints()
-                .into_iter()
-                .map(|(name, ty)| (name, type_like_to_ctype(&ty)))
-                .collect::<std::collections::HashMap<_, _>>()
-        } else {
-            seed_runtime_type_hints_from_facts_and_recovery(
-                self.context.type_facts(),
-                &var_recovery,
-            )
-        };
-        merge_runtime_type_hints(
-            &mut type_hints,
-            seed_runtime_type_hints_from_facts_and_recovery(
-                self.context.type_facts(),
-                &var_recovery,
-            ),
-        );
-        let combined_type_oracle = type_inference
-            .as_ref()
-            .and_then(TypeInference::combined_type_oracle);
-        let type_oracle = combined_type_oracle
-            .as_ref()
-            .map(|oracle| oracle as &dyn TypeOracle);
-        let recovered_param_infos: Vec<_> = var_recovery
+        let params = match binding_names
             .parameters()
-            .iter()
-            .map(|v| {
-                (
-                    v.ssa_var.clone(),
-                    ast::CParam {
-                        ty: type_inference
-                            .as_ref()
-                            .map(|type_inference| {
-                                type_like_to_ctype(&type_inference.get_type(&v.ssa_var))
-                            })
-                            .unwrap_or_else(|| v.ty.clone()),
-                        name: v.name.clone(),
-                    },
-                )
+            .map(|resolved| {
+                let resolved = resolved?;
+                // The render-authorized signature is the canonical declaration
+                // fact and is already the type authority used while lowering
+                // this parameter's uses. Admit that same fact at the header
+                // boundary only when it describes the certified carrier width;
+                // otherwise this value alone keeps its sealed machine type.
+                let ty = render_signature
+                    .and_then(|signature| {
+                        usize::try_from(resolved.slot)
+                            .ok()
+                            .and_then(|slot| signature.params.get(slot))
+                    })
+                    .and_then(|parameter| parameter.ty.clone())
+                    .map(|ty| {
+                        crate::binding_plan::admit_declaration(
+                            ty,
+                            resolved.width_bits,
+                            self.config.ptr_size,
+                        )
+                    })
+                    .unwrap_or(resolved.declaration_type);
+                Ok(ast::CParam {
+                    ty,
+                    name: resolved.symbol,
+                })
             })
-            .collect();
-        let params = merge_params_with_external_signature(
-            recovered_param_infos
-                .iter()
-                .map(|(_, param)| param.clone())
-                .collect(),
-            render_signature,
-        );
-        let param_register_aliases = build_param_register_aliases(
-            &params,
-            &recovered_param_infos,
-            &self.context.type_facts().register_params,
-            &self.config.arg_regs,
-            true,
-        );
-        for (idx, (_ssa_var, _)) in recovered_param_infos.iter().enumerate() {
-            let Some(param) = params.get(idx) else {
-                continue;
-            };
-            let param_ty = param.ty.clone();
-            type_hints.insert(param.name.clone(), param_ty.clone());
-            type_hints.insert(param.name.to_ascii_lowercase(), param_ty);
-        }
-        for (reg_alias, param_name) in &param_register_aliases {
-            let Some(param) = params.iter().find(|param| param.name == *param_name) else {
-                continue;
-            };
-            type_hints
-                .entry(reg_alias.clone())
-                .or_insert_with(|| param.ty.clone());
-            type_hints
-                .entry(reg_alias.to_ascii_lowercase())
-                .or_insert_with(|| param.ty.clone());
-        }
-        let inferred_ret_type = type_inference
-            .as_ref()
-            .map(|type_inference| self.infer_return_type(func, type_inference))
-            .or_else(|| {
-                render_signature.and_then(|sig| sig.ret_type.as_ref().map(type_like_to_ctype))
-            })
-            .unwrap_or(CType::Unknown);
-        let signature_ret_type =
-            render_signature.and_then(|sig| sig.ret_type.as_ref().map(type_like_to_ctype));
+            .collect::<Result<Vec<_>, crate::binding_plan::RenderedIdentityRefusal>>()
+        {
+            Ok(params) => params,
+            Err(error) => {
+                let refusal = rendered_identity_refusal_category(error);
+                return Ok(InternalBuildProduct::refused(
+                    residual_function_for_render_boundary(
+                        &func_name,
+                        &format!("native render refusal: {}", refusal.kind()),
+                    ),
+                    refusal,
+                ));
+            }
+        };
+        let inferred_ret_type = r2types::exact_source_return_type(prepared).unwrap_or_else(|| {
+            evidence_return_type(prepared, input.source_owned_facts().evidence_types())
+        });
+        let signature_ret_type = render_signature.and_then(|sig| sig.ret_type.clone());
         let fold_function_return_type = signature_ret_type.as_ref().or(Some(&inferred_ret_type));
         let fold_arch = FoldArchConfig {
             ptr_size: self.config.ptr_size,
-            sp_name: self.config.sp_name.clone(),
-            fp_name: self.config.fp_name.clone(),
-            ret_reg_name: self
-                .config
-                .ret_regs
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "rax".to_string()),
             arg_regs: self.config.arg_regs.clone(),
-            caller_saved_regs: self.config.caller_saved_regs.clone(),
         };
-        let use_prepared_semantic_view = self.context.use_prepared_semantic_view(prepared);
-        let prepared_semantic_view = use_prepared_semantic_view.then(|| {
-            analysis::PreparedSemanticView::build(analysis::PreparedSemanticViewInputs {
+        let prepared_semantic_view = match analysis::PreparedSemanticView::build_with_bindings(
+            symbols,
+            analysis::PreparedSemanticViewInputs {
                 prepared,
-                abi_arg_regs: &self.config.arg_regs,
+                #[cfg(test)]
                 stack_slots: &self.context.type_facts().stack_slots,
+                #[cfg(test)]
                 visible_bindings: &self.context.type_facts().visible_bindings,
-                param_register_aliases: &param_register_aliases,
                 function_facts: &self.context.function_facts,
                 #[cfg(test)]
                 certified_rendering_required: false,
-            })
-        });
+            },
+            Rc::clone(&binding_names),
+        ) {
+            Ok(view) => view,
+            Err(error) => {
+                debug_log_render_contract_error(prepared, "prepared-semantic-view", &error);
+                let refusal = match error {
+                    analysis::prepared_semantic::PreparedSemanticViewBuildError::RenderedIdentity(
+                        refusal,
+                    ) => {
+                        rendered_identity_refusal_category(refusal)
+                    }
+                    analysis::prepared_semantic::PreparedSemanticViewBuildError::SourceAuthorityMismatch
+                    | analysis::prepared_semantic::PreparedSemanticViewBuildError::SymbolTableMismatch => {
+                        DecompileRenderRefusal::MissingProgramVariableAuthorization
+                    }
+                };
+                return Ok(InternalBuildProduct::refused(
+                    residual_function_for_render_boundary(
+                        &func
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| format!("sub_{:x}", func.entry)),
+                        &format!("native render refusal: {}", refusal.kind()),
+                    ),
+                    refusal,
+                ));
+            }
+        };
         let fold_inputs = FoldInputs {
+            normalization_origins: Some(&normalization_origins),
+            observation_journal: Some(&observation_journal),
             arch: &fold_arch,
             #[cfg(test)]
             function_names: &self.context.function_names,
             #[cfg(test)]
-            strings: &self.context.strings,
-            #[cfg(test)]
-            symbols: &self.context.symbols,
+            binary_symbols: &self.context.symbols,
             function_facts: &self.context.function_facts,
             #[cfg(test)]
-            certified_rendering_required: false,
             stack_slots: &self.context.type_facts().stack_slots,
-            field_access_certificates: &self.context.type_facts().field_access_certificates,
             #[cfg(test)]
-            external_stack_vars: &self.context.type_facts().external_stack_vars,
             visible_bindings: &self.context.type_facts().visible_bindings,
-            external_type_db: &self.context.type_facts().external_type_db,
-            param_register_aliases: &param_register_aliases,
-            type_hints: &type_hints,
-            type_oracle,
             function_return_type: fold_function_return_type,
             prepared_ssa: Some(prepared),
-            prepared_semantic_view: prepared_semantic_view.as_ref(),
-            prepared_objects: Some(prepared.objects()),
-            prepared_memory: Some(prepared.memory()),
+            binding_names: Some(&binding_names),
+            prepared_semantic_view: Some(&prepared_semantic_view),
         };
+        crate::stage_timing::mark("binding_plan");
         let mut fold_ctx = FoldingContext::from_inputs(fold_inputs);
+        // One rendered function has one table, and this is the one the passes
+        // before now declared into.
+        fold_ctx.symbols = std::rc::Rc::clone(&symbol_table);
         let fold_blocks: Vec<_> = func.blocks().cloned().collect();
         let structuring_work = work.with_phase(DecompileWorkPhase::Structuring);
-        fold_ctx.analyze_blocks_with_control(&fold_blocks, structuring_work)?;
-        structuring_work.poll()?;
-        fold_ctx.analyze_function_structure(func);
+        if let Err(error) = fold_ctx.analyze_blocks_with_control(&fold_blocks, structuring_work) {
+            debug_log_render_contract_error(prepared, "fold-analysis", &error);
+            match error {
+                analysis::PreparedRuntimeFactsError::ExecutionStop(stop) => return Err(stop),
+                analysis::PreparedRuntimeFactsError::Lowering(refusal) => {
+                    return Ok(InternalBuildProduct::refused(
+                        residual_function_for_render_boundary(
+                            &func_name,
+                            &format!("operation lowering refusal: {refusal:?}"),
+                        ),
+                        refusal.into(),
+                    ));
+                }
+            }
+        }
+        crate::stage_timing::mark("fold");
         structuring_work.poll()?;
         // Structure control flow (primary path: folded)
         let mut structurer =
             ControlFlowStructurer::new_with_control(func, &fold_ctx, structuring_work)?;
+        let tentative_observation_checkpoint = observation_journal.borrow().checkpoint();
+        let tentative_observation_error = fold_ctx.observation_error.borrow().clone();
 
-        // Get set of variables that survive folding before structuring.
-        let emitted_vars = structurer.emitted_var_names();
-        let routed_body = consumer_structured::primary_body_for_semantic_route(
+        let routed_body = match consumer_structured::primary_body_for_semantic_route(
             semantic_route,
             &mut structurer,
             || self.linearize_function_body(func, &fold_ctx),
-        );
+            || {
+                observation_journal
+                    .borrow_mut()
+                    .rollback(tentative_observation_checkpoint);
+                *fold_ctx.observation_error.borrow_mut() = tentative_observation_error.clone();
+            },
+        ) {
+            Ok(body) => body,
+            Err(structure::ControlFlowStructureError::Lowering(refusal)) => {
+                debug_log_render_contract_error(prepared, "control-structure-lowering", &refusal);
+                let function = residual_function_for_render_boundary(
+                    &func
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| format!("sub_{:x}", func.entry)),
+                    &format!("operation lowering refusal: {refusal:?}"),
+                );
+                return Ok(InternalBuildProduct::refused(function, refusal.into()));
+            }
+            Err(structure::ControlFlowStructureError::StructuredRegion(error)) => {
+                debug_log_render_contract_error(prepared, "structured-region", &error);
+                return Ok(InternalBuildProduct::refused(
+                    residual_function_for_render_boundary(
+                        &func
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| format!("sub_{:x}", func.entry)),
+                        &format!("structured-region refusal: {error:?}"),
+                    ),
+                    DecompileRenderRefusal::UnrepresentableControlFlow,
+                ));
+            }
+        };
         if let Some(stop) = structurer.execution_stop() {
             return Err(stop);
         }
         structuring_work.poll()?;
-        let use_conservative_locals = routed_body.use_conservative_locals;
-        let is_linear_fallback = routed_body.is_linear_fallback;
-        let mut body_stmt = routed_body.body_stmt;
+        if let Some(structured_body) = routed_body.structured_body()
+            && let Err(refusal) = validate_sealed_region_occurrence_coverage(structured_body)
+        {
+            return Ok(InternalBuildProduct::refused(
+                residual_function_for_render_boundary(
+                    &func_name,
+                    "structured-region occurrence coverage mismatch",
+                ),
+                refusal,
+            ));
+        }
+        let (mut body_stmt, structured_regions) = routed_body.into_marked_body();
 
         if let Some(comment) = self.semantic_vm_summary_comment() {
             body_stmt = Self::prepend_comment(body_stmt, comment);
@@ -2920,103 +5035,23 @@ impl Decompiler {
         // Build the C function
         // Convert body to statements
         let body = self.stmt_to_vec(body_stmt);
-        let body_visible_names = collect_stmt_var_names(&body);
-        let param_name_set = params
-            .iter()
-            .map(|param| param.name.to_ascii_lowercase())
-            .collect::<HashSet<_>>();
-        let param_home_offsets = fold_ctx
-            .stack_arg_aliases_map()
-            .iter()
-            .filter_map(|(offset, alias)| {
-                param_name_set
-                    .contains(&alias.to_ascii_lowercase())
-                    .then_some(*offset)
-            })
-            .chain(
-                self.context
-                    .type_facts()
-                    .visible_bindings
-                    .iter()
-                    .filter_map(|binding| {
-                        matches!(binding.kind, VisibleBindingKind::HiddenHome)
-                            .then(|| binding.stack_slot.as_ref().map(|slot| slot.offset))
-                            .flatten()
-                    }),
-            )
-            .collect::<HashSet<_>>();
-        let body_visible_stack_offsets = collect_visible_stack_offsets(
-            &body_visible_names,
-            &self.context.type_facts().visible_bindings,
-            &self.context.type_facts().stack_slots,
-            &param_name_set,
-        );
-
-        // Collect locals -- on fallback keep locals conservatively.
-        let locals: Vec<ast::CLocal> = if use_conservative_locals {
-            var_recovery
-                .locals()
-                .iter()
-                .filter(|v| {
-                    !v.stack_offset
-                        .is_some_and(|offset| param_home_offsets.contains(&offset))
-                })
-                .map(|v| ast::CLocal {
-                    ty: choose_more_specific_runtime_type(
-                        type_inference
-                            .as_ref()
-                            .map(|type_inference| {
-                                type_like_to_ctype(&type_inference.get_type(&v.ssa_var))
-                            })
-                            .unwrap_or_else(|| v.ty.clone()),
-                        runtime_type_hint_for_name(&type_hints, &v.name),
-                    ),
-                    name: v.name.clone(),
-                    stack_offset: v.stack_offset,
-                })
-                .collect()
-        } else {
-            let mut selected = var_recovery
-                .locals()
-                .iter()
-                .filter(|v| {
-                    let not_param_home = !v
-                        .stack_offset
-                        .is_some_and(|offset| param_home_offsets.contains(&offset));
-                    not_param_home
-                        && (emitted_vars.contains(&v.name)
-                            || body_visible_names.contains(&v.name)
-                            || v.stack_offset
-                                .is_some_and(|offset| body_visible_stack_offsets.contains(&offset)))
-                })
-                .map(|v| ast::CLocal {
-                    ty: choose_more_specific_runtime_type(
-                        type_inference
-                            .as_ref()
-                            .map(|type_inference| {
-                                type_like_to_ctype(&type_inference.get_type(&v.ssa_var))
-                            })
-                            .unwrap_or_else(|| v.ty.clone()),
-                        runtime_type_hint_for_name(&type_hints, &v.name),
-                    ),
-                    name: v.name.clone(),
-                    stack_offset: v.stack_offset,
-                })
-                .collect::<Vec<_>>();
-            let mut seen_offsets = HashSet::new();
-            selected.retain(|local| match local.stack_offset {
-                Some(offset) => seen_offsets.insert(offset),
-                None => true,
-            });
-            selected
-        };
         let mut c_function = CFunction {
-            name: func_name,
+            symbols: std::rc::Rc::clone(&symbol_table),
+            name: crate::ast::c_identifier(&func_name),
+            extern_objects: Vec::new(),
+            externs: fold_ctx
+                .callee_declarations
+                .borrow()
+                .values()
+                .cloned()
+                .collect(),
             ret_type: render_signature
-                .and_then(|sig| sig.ret_type.as_ref().map(type_like_to_ctype))
+                .and_then(|sig| sig.ret_type.clone())
                 .unwrap_or_else(|| inferred_ret_type.clone()),
             params,
-            locals,
+            // Program locals are introduced only by the final placement pass
+            // from surviving, observed BindingId occurrences.
+            locals: Vec::new(),
             body,
             // Parameters here come from the render signature, so an empty list
             // is a recovered empty list rather than an unknown one.
@@ -3028,88 +5063,248 @@ impl Decompiler {
             self.context.function_facts.semantic_report(),
         );
 
-        // Apply post-structuring suffix cleanup for folded/unfolded paths.
-        // Linear fallback intentionally keeps its raw expression-builder output.
-        if !is_linear_fallback {
-            let mut known_function_names = HashSet::new();
-            for name in self.context.type_facts().known_function_signatures.keys() {
-                known_function_names.insert(name.to_ascii_lowercase());
-            }
-            post_rename::rewrite_function_identifiers(&mut c_function, &known_function_names);
+        let display = self.context.function_facts.display_names();
+        let strings = display.strings();
+        let data_symbols = display.symbols();
+        let data_object_types = &self
+            .context
+            .function_facts
+            .type_facts()
+            .program_data_objects;
+        let used_objects: std::cell::RefCell<
+            std::collections::BTreeMap<u64, crate::ast::CExternObject>,
+        > = std::cell::RefCell::new(std::collections::BTreeMap::new());
+        crate::stage_timing::mark("structure");
+        fold_constant_arithmetic_in_function(
+            &mut c_function,
+            strings,
+            data_symbols,
+            data_object_types,
+            &used_objects,
+            self.config.ptr_size,
+        );
+        c_function.extern_objects = used_objects.into_inner().into_values().collect();
+
+        if let Err(error) = single_evaluation::bind_each_call_site_once(
+            &mut c_function,
+            &binding_names,
+            structured_regions.as_ref(),
+        ) {
+            debug_log_render_contract_error(prepared, "single-evaluation", &error);
+            let refusal = DecompileRenderRefusal::MissingProgramVariableAuthorization;
+            return Ok(InternalBuildProduct::refused(
+                residual_function_for_render_boundary(
+                    &c_function.name,
+                    &format!("native render refusal: {}", refusal.kind()),
+                ),
+                refusal,
+            ));
         }
-        rewrite_stack_synonym_uses_to_declared_locals(&mut c_function, &fold_ctx);
-        prune_dead_temp_assignments_in_function_body(&mut c_function, &fold_ctx);
-        prune_unused_pure_locals(&mut c_function);
-        prune_unreferenced_local_declarations(&mut c_function);
-        normalize_redundant_return_carrier_casts(&mut c_function);
-        normalize_declared_assignment_literals(&mut c_function);
-        work.with_phase(DecompileWorkPhase::Rendering).poll()?;
-        Ok(c_function)
+        crate::stage_timing::mark("normalize");
+        unrendered::prune_unreferenced_labels(&mut c_function);
+        if void_function_has_value_return(&c_function) {
+            let refusal = DecompileRenderRefusal::UnrepresentableOperation;
+            return Ok(InternalBuildProduct::refused(
+                residual_function_for_render_boundary(
+                    &c_function.name,
+                    "native render refusal: value-bearing return in void function",
+                ),
+                refusal,
+            ));
+        }
+        // The refusal gate above proves this is a no-op. Do not discard a
+        // value-bearing return here: its expression may carry source effects.
+        unrendered::drop_values_from_void_returns(&mut c_function);
+        // Executable C is admitted only when the source obligation inventory is
+        // complete. The inventory is what says which effects the source has, so a
+        // function whose inventory did not close has no account of what the output
+        // owes, and rendering it says the effects were all handled when nothing
+        // ever enumerated them.
+        if let Some(reason) = incomplete_source_obligations_reason(prepared) {
+            return Ok(InternalBuildProduct::refused(
+                residual_function_for_render_boundary(&c_function.name, &reason),
+                DecompileRenderRefusal::IncompleteEffectInventory,
+            ));
+        }
+        let observation_error = fold_ctx.observation_error.borrow().clone();
+        drop(fold_ctx);
+        let draft = MarkedNativeDraft::new_with_placement(
+            c_function,
+            observation_journal.into_inner(),
+            structured_regions,
+            Rc::clone(&binding_names),
+        );
+        let mut native = match draft.finish_enforcing(input.source_owned_facts(), observation_error)
+        {
+            Ok(native) => native,
+            Err(failure) => {
+                let refusal = DecompileRenderRefusal::from(failure);
+                return Ok(InternalBuildProduct::refused_after_native_admission(
+                    residual_function_for_render_boundary(
+                        &func_name,
+                        &format!("native render refusal: {}", refusal.kind()),
+                    ),
+                    failure,
+                ));
+            }
+        };
+        crate::stage_timing::mark("seal");
+        let ledger = effect_ledger::build_obligation_ledger(
+            prepared,
+            &normalization_origins,
+            native.effect_observations(),
+        );
+        debug_log_ledger(prepared, &ledger);
+        let radare2_variadic_format_counts = self
+            .context
+            .function_facts
+            .callsites()
+            .into_iter()
+            .flat_map(|facts| facts.by_callsite.values())
+            .filter(|fact| {
+                fact.variadic_argument_count_evidence
+                    .is_some_and(|evidence| {
+                        evidence.source
+                            == r2ssa::VariadicCallsiteArgumentCountSource::Radare2FormatString
+                    })
+            })
+            .count();
+        native.finalize_effect_ledger(&ledger, radare2_variadic_format_counts);
+        Ok(InternalBuildProduct::Native(native))
     }
 
     /// Convert a CStmt to a Vec<CStmt>.
     fn stmt_to_vec(&self, stmt: CStmt) -> Vec<CStmt> {
-        match stmt {
-            CStmt::Block(stmts) => stmts,
-            CStmt::Empty => vec![],
-            other => vec![other],
-        }
-    }
-
-    fn infer_return_type(&self, func: &SSAFunction, type_inference: &TypeInference) -> CType {
-        let mut candidates = Vec::new();
-
-        for block in func.blocks() {
-            for op in &block.ops {
-                let SSAOp::Return { target } = op else {
-                    continue;
-                };
-
-                let target_name = target.name.to_ascii_lowercase();
-                if target_name.starts_with("xmm0") || target_name.starts_with("st0") {
-                    let bits = if target.size.saturating_mul(8) <= 32 {
-                        32
-                    } else {
-                        64
-                    };
-                    candidates.push(CType::Float(bits));
-                    continue;
-                }
-
-                candidates.push(type_like_to_ctype(&type_inference.get_type(target)));
+        let (semantic, observations) = stmt.into_semantic_with_observations();
+        match semantic {
+            CStmt::Block(mut stmts) => {
+                observations.reapply_to_unique(&mut stmts);
+                stmts
             }
+            CStmt::Empty => vec![],
+            other => vec![observations.reapply(other)],
         }
-
-        if candidates.is_empty() {
-            return CType::Void;
-        }
-
-        let mut meaningful: Vec<CType> = candidates
-            .into_iter()
-            .filter(|ty| !matches!(ty, CType::Unknown))
-            .collect();
-        if meaningful.is_empty() {
-            return CType::Int(32);
-        }
-        if meaningful.iter().all(|ty| ty == &meaningful[0]) {
-            return meaningful.remove(0);
-        }
-        if let Some(float_ty) = meaningful
-            .iter()
-            .find(|ty| matches!(ty, CType::Float(_)))
-            .cloned()
-        {
-            return float_ty;
-        }
-        meaningful.remove(0)
     }
 }
 
-fn collect_expr_var_names(expr: &CExpr, out: &mut HashSet<String>) {
-    match expr {
-        CExpr::Var(name) => {
-            out.insert(name.clone());
+fn evidence_return_type(source: &r2ssa::SsaArtifact, evidence: &r2types::EvidenceTypes) -> CType {
+    let mut candidate: Option<CType> = None;
+    let mut saw_return = false;
+    for certificate in &source.certificates().returns {
+        saw_return = true;
+        let Some(ty) = evidence.value_type(certificate.value) else {
+            return CType::Unknown;
+        };
+        let ty = ty.clone();
+        match &candidate {
+            None => candidate = Some(ty),
+            Some(existing) if existing == &ty => {}
+            Some(_) => return CType::Unknown,
         }
+    }
+    if saw_return {
+        r2il::refusal_evidence!(
+            "return-evidence",
+            "return certificates present; agreed={:?}",
+            candidate
+        );
+        return candidate.unwrap_or(CType::Unknown);
+    }
+    // A function with no `Return` of its own may still return: a tail call
+    // returns its callee's result on this function's behalf, and the exact
+    // boundary at that site says what the callee returns. Reading only the
+    // `Return` certificates scored every tail-only function `void`, and a
+    // thunk's `return fileno(stream);` then had no type to be declared with.
+    let mut tail_candidate: Option<CType> = None;
+    let mut saw_tail = false;
+    for certificate in source.certificates().callsites.values() {
+        if certificate.transfer != r2ssa::CallSiteTransfer::TailCall {
+            continue;
+        }
+        let Some(interface) = source
+            .machine_context()
+            .call_site_interface(certificate.call_site)
+        else {
+            return CType::Unknown;
+        };
+        saw_tail = true;
+        let ty = match interface.result() {
+            r2ssa::SourceCallResult::Void => CType::Void,
+            r2ssa::SourceCallResult::Register { storage } => CType::uint(storage.size * 8),
+        };
+        match &tail_candidate {
+            None => tail_candidate = Some(ty),
+            Some(existing) if existing == &ty => {}
+            Some(_) => return CType::Unknown,
+        }
+    }
+    r2il::refusal_evidence!(
+        "return-evidence",
+        "no return certificate; tail boundaries={} agreed={:?}",
+        saw_tail,
+        tail_candidate
+    );
+    if saw_tail {
+        return tail_candidate.unwrap_or(CType::Unknown);
+    }
+    CType::Void
+}
+
+fn void_function_has_value_return(func: &CFunction) -> bool {
+    if !matches!(func.ret_type, CType::Void) {
+        return false;
+    }
+
+    fn stmt_has_value_return(stmt: &CStmt) -> bool {
+        match stmt {
+            CStmt::StructuredRegion { stmt, .. } | CStmt::Observed { stmt, .. } => {
+                stmt_has_value_return(stmt)
+            }
+            CStmt::Return(Some(_)) => true,
+            CStmt::Block(stmts) => stmts.iter().any(stmt_has_value_return),
+            CStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                stmt_has_value_return(then_body)
+                    || else_body.as_deref().is_some_and(stmt_has_value_return)
+            }
+            CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => stmt_has_value_return(body),
+            CStmt::For { init, body, .. } => {
+                init.as_deref().is_some_and(stmt_has_value_return) || stmt_has_value_return(body)
+            }
+            CStmt::Switch { cases, default, .. } => {
+                cases
+                    .iter()
+                    .any(|case| case.body.iter().any(stmt_has_value_return))
+                    || default
+                        .as_ref()
+                        .is_some_and(|stmts| stmts.iter().any(stmt_has_value_return))
+            }
+            CStmt::Empty
+            | CStmt::Expr(_)
+            | CStmt::Decl { .. }
+            | CStmt::Break
+            | CStmt::Continue
+            | CStmt::Goto(_)
+            | CStmt::Label(_)
+            | CStmt::Return(None)
+            | CStmt::Comment(_) => false,
+        }
+    }
+
+    func.body.iter().any(stmt_has_value_return)
+}
+
+pub(crate) fn collect_expr_var_names(expr: &CExpr, out: &mut HashSet<crate::symbol::SymbolId>) {
+    match expr {
+        CExpr::Observed { expr, .. } => collect_expr_var_names(expr, out),
+        CExpr::Var(name) => {
+            out.insert(*name);
+        }
+        // Not a name this function declares, so not one it has to.
+        CExpr::External { .. } | CExpr::DataObject { .. } => {}
         CExpr::Unary { operand, .. }
         | CExpr::Cast { expr: operand, .. }
         | CExpr::Paren(operand)
@@ -3133,7 +5328,7 @@ fn collect_expr_var_names(expr: &CExpr, out: &mut HashSet<String>) {
             collect_expr_var_names(then_expr, out);
             collect_expr_var_names(else_expr, out);
         }
-        CExpr::Call { func, args } => {
+        CExpr::Call { func, args, .. } => {
             collect_expr_var_names(func, out);
             for arg in args {
                 collect_expr_var_names(arg, out);
@@ -3156,9 +5351,12 @@ fn collect_expr_var_names(expr: &CExpr, out: &mut HashSet<String>) {
     }
 }
 
-fn collect_stmt_var_names(stmts: &[CStmt]) -> HashSet<String> {
-    fn visit_stmt(stmt: &CStmt, out: &mut HashSet<String>) {
+/// Names a statement introduces, wherever it sits in the body.
+pub(crate) fn collect_stmt_var_names(stmts: &[CStmt]) -> HashSet<crate::symbol::SymbolId> {
+    fn visit_stmt(stmt: &CStmt, out: &mut HashSet<crate::symbol::SymbolId>) {
         match stmt {
+            CStmt::StructuredRegion { stmt, .. } => visit_stmt(stmt, out),
+            CStmt::Observed { stmt, .. } => visit_stmt(stmt, out),
             CStmt::Empty
             | CStmt::Break
             | CStmt::Continue
@@ -3245,80 +5443,444 @@ fn collect_stmt_var_names(stmts: &[CStmt]) -> HashSet<String> {
     names
 }
 
-fn parse_visible_stack_offset(
-    name: &str,
-    visible_bindings: &[VisibleBinding],
-    stack_slots: &std::collections::BTreeMap<StackSlotKey, r2types::ExternalStackSlotSpec>,
-    param_names: &HashSet<String>,
-) -> Option<i64> {
-    let lower = name.trim().to_ascii_lowercase();
-    if param_names.contains(&lower) {
-        return None;
+/// Which locals the body still assigns, printed between passes.
+///
+/// A statement the fold built and the page does not show was removed by one of
+/// the passes that run after structuring, and there are a dozen of them. Naming
+/// Fold arithmetic between integer literals, and name the result when it names
+/// a string.
+///
+/// A PIC address arrives as two constants: `adrp` puts a page in a register and
+/// `add` puts the offset on top, so the renderer had `0x100002000U + 0xbbc`
+/// where the program has one address. The sum is strictly more readable folded,
+/// and folding it is also what lets the string table answer: the table is keyed
+/// by address, and until the two halves are one number there is no address to
+/// look up.
+fn fold_constant_arithmetic_in_function(
+    func: &mut CFunction,
+    strings: &std::collections::BTreeMap<u64, String>,
+    symbols: &std::collections::BTreeMap<u64, String>,
+    object_types: &r2types::ProgramDataObjectTypeFacts,
+    used: &std::cell::RefCell<std::collections::BTreeMap<u64, crate::ast::CExternObject>>,
+    pointer_bits: u32,
+) {
+    let symbol_table = std::rc::Rc::clone(&func.symbols);
+    for stmt in &mut func.body {
+        fold_constant_arithmetic_in_stmt(
+            stmt,
+            strings,
+            symbols,
+            object_types,
+            used,
+            pointer_bits,
+            Some(&symbol_table),
+        );
     }
-    if lower == "saved_fp" {
-        return Some(0);
+}
+
+/// Restate the conversions around a constant that turned out to be a string.
+///
+/// The conversions above a constant address are decided while it is an
+/// integer, because that is what it is until the string table is consulted.
+/// Substituting the string changes the expression's type -- a string literal
+/// is a `char *`, not a number -- so every conversion that was spelled for
+/// the integer is a statement about a type the expression no longer has, and
+/// `(char *)(uint64_t)"a string"` is what survives.
+///
+/// The chain is therefore not patched but restated: the net conversion, from
+/// what the string is to what the outermost conversion required, spelled by
+/// the one emitter. Where the two are the same the chain disappears, which is
+/// the common case -- a string reaches a `char *` parameter as itself.
+/// The type of a `char` in C, which is its own type.
+///
+/// Not `int8_t`. C has three character types and `char` is distinct from both
+/// `signed char` and `unsigned char`, so a `char *` and an `int8_t *` are
+/// different pointers and converting between them is a cast the compiler
+/// asks for. A string literal is an array of `char`, and saying so is what
+/// lets it reach a `char *` with nothing spelled.
+fn plain_char_type() -> CType {
+    CType::Typedef("char".to_string())
+}
+
+/// The address a chain of conversions is wrapped around, and what it is.
+///
+/// Two substitutions put an address where a number was. A string literal is
+/// an array of `char` that decays to a `char *` wherever a value is wanted.
+/// The address of a named object is a pointer to the object, and the object
+/// is declared `extern char name[]`, so `&name` is a pointer to an array of
+/// `char` -- not a `char *`, which is why converting it to one is a cast
+/// that C requires rather than noise.
+fn substituted_address_under_conversions<'a>(
+    expr: &'a CExpr,
+    used: &std::cell::RefCell<std::collections::BTreeMap<u64, crate::ast::CExternObject>>,
+) -> Option<(&'a CExpr, CType)> {
+    match expr {
+        CExpr::StringLit(_) => Some((expr, CType::ptr(plain_char_type()))),
+        CExpr::AddrOf(inner) => match inner.unobserved() {
+            CExpr::DataObject { address, .. } => {
+                let object_type = used
+                    .borrow()
+                    .get(address)
+                    .and_then(|object| object.type_fact.as_ref())
+                    .map(|fact| fact.ty.clone())
+                    .unwrap_or_else(|| CType::Array(Box::new(plain_char_type()), None));
+                Some((expr, CType::ptr(object_type)))
+            }
+            _ => None,
+        },
+        CExpr::Observed { expr, .. } | CExpr::Paren(expr) | CExpr::Cast { expr, .. } => {
+            substituted_address_under_conversions(expr, used)
+        }
+        _ => None,
     }
-    if let Some(rest) = lower.strip_prefix("stack_") {
-        return i64::from_str_radix(rest, 16).ok();
+}
+
+/// Restate the conversions around a substituted address.
+///
+/// `required` is what the place this expression sits in asks of it, for the
+/// places that ask without spelling a cast -- a declaration's initialiser
+/// asks for the declared type, an assignment's right-hand side for the type
+/// of what it is assigned to. Inside an expression the enclosing conversion
+/// is the ask, and the outermost one is what the whole chain amounted to.
+///
+/// The distinction matters because the conversion around a constant address
+/// is often *nothing*: a `uint64_t` constant initialising a `uint64_t` needs
+/// no cast, so after `&progName` is substituted there is no chain to notice
+/// and the rendering assigns a pointer to an integer. That is not noise but
+/// a type error, and `-Wint-conversion` in the corpus's own compile is what
+/// found it.
+fn restate_string_conversions_in_expr(
+    expr: &mut CExpr,
+    pointer_bits: u32,
+    required: Option<&CType>,
+    symbols: Option<&std::rc::Rc<std::cell::RefCell<crate::symbol::SymbolTable>>>,
+    used: &std::cell::RefCell<std::collections::BTreeMap<u64, crate::ast::CExternObject>>,
+) {
+    if let Some((address, from)) = substituted_address_under_conversions(expr, used) {
+        let required = match expr.unobserved() {
+            CExpr::Cast { ty, .. } => Some(ty.clone()),
+            _ => required.cloned(),
+        };
+        let Some(required) = required else {
+            return;
+        };
+        let restated = crate::fold::op_lower::convert::convert(
+            address.clone(),
+            &r2rewrite::CValue::Typed(from),
+            &required,
+            pointer_bits,
+        );
+        let source = std::mem::replace(expr, CExpr::IntLit(0));
+        *expr = crate::ast::carry_all_expr_observations(&source, restated);
+        return;
     }
-    if let Some(rest) = lower.strip_prefix("local_") {
-        return i64::from_str_radix(rest, 16).ok().map(|v| -v);
+    // A literal that the fold above rewrote, or that the renderer will spell
+    // as the negative it stands for, carries no type of its own. `-0x4` is an
+    // `int` whatever value it denotes, so reading it as a `uint64_t` is a
+    // signedness-changing conversion; the constant fold produces exactly that
+    // when it collapses a mask, after every conversion has been decided.
+    if let Some(required) = required
+        && crate::fold::op_lower::convert::literal_renders_as_signed(expr)
+        && crate::fold::op_lower::convert::is_unsigned_integer(required, pointer_bits)
+    {
+        // The cast is built around the literal as it stands, markers and
+        // all, so every occurrence it records is still in the tree exactly
+        // once. Carrying them again would put each one in twice.
+        let source = std::mem::replace(expr, CExpr::IntLit(0));
+        *expr = CExpr::cast(required.clone(), source);
+        return;
     }
-    if let Some(rest) = lower.strip_prefix("arg_") {
-        return i64::from_str_radix(rest, 16).ok().map(|v| -v);
+    // A render marker and a bracket are metadata: what the place asks of the
+    // expression it asks of the expression under them. Falling through to the
+    // generic descent instead dropped the requirement, and every statement
+    // whose right-hand side carries an occurrence marker -- which is most of
+    // them -- was walked as though nothing had been asked of it.
+    if let CExpr::Observed { expr, .. } | CExpr::Paren(expr) = expr {
+        restate_string_conversions_in_expr(expr, pointer_bits, required, symbols, used);
+        return;
     }
-    if let Some(rest) = lower.strip_prefix("var_") {
-        let trimmed = rest.strip_suffix('h').unwrap_or(rest);
-        if !trimmed.is_empty() && trimmed.chars().all(|ch| ch.is_ascii_hexdigit()) {
-            return i64::from_str_radix(trimmed, 16).ok().map(|v| -v);
+    // An assignment tells its right-hand side what is wanted: the type of
+    // the object being written. A compound assignment says the same thing:
+    // `x &= m` converts `m` to x's type exactly as `x = x & m` would.
+    if let CExpr::Binary {
+        op:
+            BinaryOp::Assign
+            | BinaryOp::AddAssign
+            | BinaryOp::SubAssign
+            | BinaryOp::MulAssign
+            | BinaryOp::DivAssign
+            | BinaryOp::ModAssign
+            | BinaryOp::BitAndAssign
+            | BinaryOp::BitOrAssign
+            | BinaryOp::BitXorAssign
+            | BinaryOp::ShlAssign
+            | BinaryOp::ShrAssign,
+        left,
+        right,
+    } = expr
+    {
+        let target = match left.unobserved() {
+            CExpr::Var(symbol) => symbols.map(|table| table.borrow().get(*symbol).ty.clone()),
+            _ => None,
+        };
+        restate_string_conversions_in_expr(left, pointer_bits, None, symbols, used);
+        restate_string_conversions_in_expr(right, pointer_bits, target.as_ref(), symbols, used);
+        return;
+    }
+    // Arithmetic on an address is arithmetic on a number. C has one operator
+    // that means anything by a pointer operand, and it counts elements rather
+    // than bytes -- and `&name` is a pointer to an incomplete array, which C
+    // will not do arithmetic on at all. So an address that reaches an
+    // arithmetic operator crosses into the address integer first, and the
+    // conversion back to a pointer is whatever the surrounding place asks
+    // for.
+    if let CExpr::Binary { op, left, right } = expr
+        && matches!(
+            op,
+            BinaryOp::Add
+                | BinaryOp::Sub
+                | BinaryOp::Mul
+                | BinaryOp::Shl
+                | BinaryOp::Shr
+                | BinaryOp::BitAnd
+                | BinaryOp::BitOr
+                | BinaryOp::BitXor
+                | BinaryOp::Eq
+                | BinaryOp::Ne
+                | BinaryOp::Lt
+                | BinaryOp::Le
+                | BinaryOp::Gt
+                | BinaryOp::Ge
+        )
+    {
+        // An address takes the address integer, because arithmetic on an
+        // address is arithmetic on a number. The operator's own operand rule
+        // is otherwise left alone: restating it from this pass, which knows
+        // the address width and nothing else, would widen a narrow
+        // computation and change what it computes.
+        //
+        // A literal is the exception, and only for the operators whose
+        // operands C converts to the result's type. There the type the whole
+        // expression is read at is the type the operand is read at, so a
+        // literal the renderer spells as a negative -- an `int` to the
+        // compiler whatever value it denotes -- can be given that type. A
+        // shift's count is not such an operand: it keeps its own type, and
+        // saying otherwise would be a claim about a different thing.
+        let address = CType::uint(pointer_bits);
+        let converted_together = !matches!(op, BinaryOp::Shl | BinaryOp::Shr);
+        // A comparison's operands are converted to each other rather than to
+        // the type the comparison is read at, which is a truth value. So the
+        // type a literal takes there is the other operand's, and the only
+        // other operand this pass can ask about is a name.
+        let comparison = matches!(
+            op,
+            BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge
+        );
+        let peer = |other: &CExpr| match other.unobserved() {
+            CExpr::Var(symbol) => symbols.map(|table| table.borrow().get(*symbol).ty.clone()),
+            _ => None,
+        };
+        let peers = comparison.then(|| (peer(right), peer(left)));
+        for (index, operand) in [&mut *left, &mut *right].into_iter().enumerate() {
+            let peer_type = peers.as_ref().and_then(|(for_left, for_right)| {
+                if index == 0 { for_left } else { for_right }.clone()
+            });
+            let wanted = if substituted_address_under_conversions(operand, used).is_some() {
+                Some(address.clone())
+            } else if !crate::fold::op_lower::convert::literal_renders_as_signed(operand) {
+                None
+            } else if comparison {
+                peer_type
+            } else if index == 0 || converted_together {
+                required.cloned()
+            } else {
+                None
+            };
+            restate_string_conversions_in_expr(
+                operand,
+                pointer_bits,
+                wanted.as_ref(),
+                symbols,
+                used,
+            );
+        }
+        return;
+    }
+    let taken = std::mem::replace(expr, CExpr::IntLit(0));
+    *expr = taken.map_children(&mut |mut child| {
+        restate_string_conversions_in_expr(&mut child, pointer_bits, None, symbols, used);
+        child
+    });
+}
+
+/// Replace a machine-width load through a substituted global address with the
+/// source-typed object itself.
+///
+/// The rewrite is authorized only when radare2 supplied the object's type and
+/// the machine load clears that type's storage width. The address and load are
+/// already proven by the ordinary memory path; this removes the byte-pointer
+/// cast that was needed only while the object had no type.
+fn simplify_typed_data_object_loads(
+    expr: &mut CExpr,
+    pointer_bits: u32,
+    used: &std::cell::RefCell<std::collections::BTreeMap<u64, crate::ast::CExternObject>>,
+) {
+    let taken = std::mem::replace(expr, CExpr::IntLit(0));
+    *expr = taken.map_children(&mut |mut child| {
+        simplify_typed_data_object_loads(&mut child, pointer_bits, used);
+        child
+    });
+
+    let CExpr::Deref(address) = expr.unobserved() else {
+        return;
+    };
+    let Some((object_address, name)) = data_object_under_conversions(address) else {
+        return;
+    };
+    let name = name.to_string();
+    let Some(object_type) = used
+        .borrow()
+        .get(&object_address)
+        .and_then(|object| object.type_fact.as_ref())
+        .map(|fact| fact.ty.clone())
+    else {
+        return;
+    };
+    let access_type =
+        pointer_target_under_conversions(address).unwrap_or_else(|| object_type.clone());
+    if access_type != object_type {
+        let Some(access_bits) = c_object_storage_bits(&access_type, pointer_bits) else {
+            return;
+        };
+        let Some(object_bits) = c_object_storage_bits(&object_type, pointer_bits) else {
+            return;
+        };
+        if access_bits != object_bits {
+            return;
         }
     }
-    visible_bindings
-        .iter()
-        .find(|binding| binding.name.eq_ignore_ascii_case(name))
-        .and_then(|binding| binding.stack_slot.as_ref().map(|slot| slot.offset))
-        .or_else(|| {
-            stack_slots
-                .iter()
-                .find(|(_, slot_spec)| slot_spec.name.eq_ignore_ascii_case(name))
-                .map(|(slot_key, _)| slot_key.offset)
-        })
+    let source = std::mem::replace(expr, CExpr::IntLit(0));
+    *expr = crate::ast::carry_all_expr_observations(
+        &source,
+        CExpr::DataObject {
+            address: object_address,
+            name,
+        },
+    );
 }
 
-fn collect_visible_stack_offsets(
-    names: &HashSet<String>,
-    visible_bindings: &[VisibleBinding],
-    stack_slots: &std::collections::BTreeMap<StackSlotKey, r2types::ExternalStackSlotSpec>,
-    param_names: &HashSet<String>,
-) -> HashSet<i64> {
-    names
-        .iter()
-        .filter_map(|name| {
-            parse_visible_stack_offset(name, visible_bindings, stack_slots, param_names)
-        })
-        .collect()
+fn data_object_under_conversions(expr: &CExpr) -> Option<(u64, &str)> {
+    match expr.unobserved() {
+        CExpr::AddrOf(inner) => match inner.unobserved() {
+            CExpr::DataObject { address, name } => Some((*address, name)),
+            _ => None,
+        },
+        CExpr::Cast { expr, .. } | CExpr::Paren(expr) => data_object_under_conversions(expr),
+        _ => None,
+    }
 }
 
-fn rewrite_stmt_var_aliases(
+fn pointer_target_under_conversions(expr: &CExpr) -> Option<CType> {
+    match expr.unobserved() {
+        CExpr::Cast {
+            ty: CType::Pointer(inner),
+            ..
+        } => Some(inner.as_ref().clone()),
+        CExpr::Cast { expr, .. } | CExpr::Paren(expr) => pointer_target_under_conversions(expr),
+        _ => None,
+    }
+}
+
+fn c_object_storage_bits(ty: &CType, pointer_bits: u32) -> Option<u32> {
+    match ty {
+        CType::Bool => Some(8),
+        CType::Int { bits, .. } | CType::Float(bits) | CType::BitVector(bits) => Some(*bits),
+        CType::Pointer(_) | CType::Function { .. } => Some(pointer_bits),
+        CType::Array(element, Some(len)) => {
+            c_object_storage_bits(element, pointer_bits)?.checked_mul(u32::try_from(*len).ok()?)
+        }
+        CType::Void
+        | CType::Array(_, None)
+        | CType::Struct(_)
+        | CType::Union(_)
+        | CType::Enum(_)
+        | CType::Typedef(_)
+        | CType::Unknown => None,
+    }
+}
+
+fn fold_constant_arithmetic_in_stmt(
     stmt: &mut CStmt,
-    rename_map: &std::collections::HashMap<String, String>,
+    strings: &std::collections::BTreeMap<u64, String>,
+    symbols: &std::collections::BTreeMap<u64, String>,
+    object_types: &r2types::ProgramDataObjectTypeFacts,
+    used: &std::cell::RefCell<std::collections::BTreeMap<u64, crate::ast::CExternObject>>,
+    pointer_bits: u32,
+    symbol_table: Option<&std::rc::Rc<std::cell::RefCell<crate::symbol::SymbolTable>>>,
 ) {
+    // The substitution and the restatement of what it changed are one visit
+    // of one expression: a conversion can only be restated once the string
+    // it converts is there to be seen.
+    let fold_expr = |expr: &mut CExpr| {
+        fold_constant_arithmetic_in_expr(expr, strings, symbols, object_types, used);
+        restate_string_conversions_in_expr(expr, pointer_bits, None, symbol_table, used);
+        simplify_typed_data_object_loads(expr, pointer_bits, used);
+    };
     match stmt {
+        CStmt::StructuredRegion { stmt, .. } => fold_constant_arithmetic_in_stmt(
+            stmt,
+            strings,
+            symbols,
+            object_types,
+            used,
+            pointer_bits,
+            symbol_table,
+        ),
+        CStmt::Observed { stmt, .. } => fold_constant_arithmetic_in_stmt(
+            stmt,
+            strings,
+            symbols,
+            object_types,
+            used,
+            pointer_bits,
+            symbol_table,
+        ),
         CStmt::Empty
         | CStmt::Break
         | CStmt::Continue
         | CStmt::Goto(_)
         | CStmt::Label(_)
         | CStmt::Comment(_) => {}
-        CStmt::Expr(expr) => rewrite_expr_var_aliases(expr, rename_map, true),
-        CStmt::Decl { init, .. } => {
+        CStmt::Expr(expr) => fold_expr(expr),
+        CStmt::Decl { ty, init, .. } => {
             if let Some(init) = init {
-                rewrite_expr_var_aliases(init, rename_map, true);
+                fold_constant_arithmetic_in_expr(init, strings, symbols, object_types, used);
+                restate_string_conversions_in_expr(
+                    init,
+                    pointer_bits,
+                    Some(ty),
+                    symbol_table,
+                    used,
+                );
+                simplify_typed_data_object_loads(init, pointer_bits, used);
+            }
+        }
+        CStmt::Return(expr) => {
+            if let Some(expr) = expr {
+                fold_expr(expr);
             }
         }
         CStmt::Block(stmts) => {
             for stmt in stmts {
-                rewrite_stmt_var_aliases(stmt, rename_map);
+                fold_constant_arithmetic_in_stmt(
+                    stmt,
+                    strings,
+                    symbols,
+                    object_types,
+                    used,
+                    pointer_bits,
+                    symbol_table,
+                );
             }
         }
         CStmt::If {
@@ -3326,19 +5888,39 @@ fn rewrite_stmt_var_aliases(
             then_body,
             else_body,
         } => {
-            rewrite_expr_var_aliases(cond, rename_map, true);
-            rewrite_stmt_var_aliases(then_body, rename_map);
+            fold_expr(cond);
+            fold_constant_arithmetic_in_stmt(
+                then_body,
+                strings,
+                symbols,
+                object_types,
+                used,
+                pointer_bits,
+                symbol_table,
+            );
             if let Some(else_body) = else_body {
-                rewrite_stmt_var_aliases(else_body, rename_map);
+                fold_constant_arithmetic_in_stmt(
+                    else_body,
+                    strings,
+                    symbols,
+                    object_types,
+                    used,
+                    pointer_bits,
+                    symbol_table,
+                );
             }
         }
-        CStmt::While { cond, body } => {
-            rewrite_expr_var_aliases(cond, rename_map, true);
-            rewrite_stmt_var_aliases(body, rename_map);
-        }
-        CStmt::DoWhile { body, cond } => {
-            rewrite_stmt_var_aliases(body, rename_map);
-            rewrite_expr_var_aliases(cond, rename_map, true);
+        CStmt::While { cond, body } | CStmt::DoWhile { body, cond } => {
+            fold_expr(cond);
+            fold_constant_arithmetic_in_stmt(
+                body,
+                strings,
+                symbols,
+                object_types,
+                used,
+                pointer_bits,
+                symbol_table,
+            );
         }
         CStmt::For {
             init,
@@ -3347,259 +5929,223 @@ fn rewrite_stmt_var_aliases(
             body,
         } => {
             if let Some(init) = init {
-                rewrite_stmt_var_aliases(init, rename_map);
+                fold_constant_arithmetic_in_stmt(
+                    init,
+                    strings,
+                    symbols,
+                    object_types,
+                    used,
+                    pointer_bits,
+                    symbol_table,
+                );
             }
             if let Some(cond) = cond {
-                rewrite_expr_var_aliases(cond, rename_map, true);
+                fold_expr(cond);
             }
             if let Some(update) = update {
-                rewrite_expr_var_aliases(update, rename_map, true);
+                fold_expr(update);
             }
-            rewrite_stmt_var_aliases(body, rename_map);
+            fold_constant_arithmetic_in_stmt(
+                body,
+                strings,
+                symbols,
+                object_types,
+                used,
+                pointer_bits,
+                symbol_table,
+            );
         }
         CStmt::Switch {
             expr,
             cases,
             default,
         } => {
-            rewrite_expr_var_aliases(expr, rename_map, true);
+            fold_expr(expr);
             for case in cases {
-                rewrite_expr_var_aliases(&mut case.value, rename_map, true);
                 for stmt in &mut case.body {
-                    rewrite_stmt_var_aliases(stmt, rename_map);
+                    fold_constant_arithmetic_in_stmt(
+                        stmt,
+                        strings,
+                        symbols,
+                        object_types,
+                        used,
+                        pointer_bits,
+                        symbol_table,
+                    );
                 }
             }
             if let Some(default) = default {
                 for stmt in default {
-                    rewrite_stmt_var_aliases(stmt, rename_map);
+                    fold_constant_arithmetic_in_stmt(
+                        stmt,
+                        strings,
+                        symbols,
+                        object_types,
+                        used,
+                        pointer_bits,
+                        symbol_table,
+                    );
                 }
-            }
-        }
-        CStmt::Return(expr) => {
-            if let Some(expr) = expr {
-                rewrite_expr_var_aliases(expr, rename_map, true);
             }
         }
     }
 }
 
-fn rewrite_expr_var_aliases(
-    expr: &mut CExpr,
-    rename_map: &std::collections::HashMap<String, String>,
-    allow_plain_var_rewrite: bool,
-) {
+/// The unsigned value of an integer literal, ignoring any cast around it.
+fn literal_value(expr: &CExpr) -> Option<u64> {
     match expr {
-        CExpr::Var(name) if allow_plain_var_rewrite => {
-            if let Some(target) = rename_map.get(&name.to_ascii_lowercase()) {
-                *name = target.clone();
-            }
-        }
+        CExpr::Observed { expr, .. } => literal_value(expr),
+        CExpr::UIntLit(value) => Some(*value),
+        CExpr::IntLit(value) => u64::try_from(*value).ok(),
+        CExpr::Paren(inner) | CExpr::Cast { expr: inner, .. } => literal_value(inner),
+        _ => None,
+    }
+}
+
+fn fold_constant_arithmetic_in_expr(
+    expr: &mut CExpr,
+    strings: &std::collections::BTreeMap<u64, String>,
+    symbols: &std::collections::BTreeMap<u64, String>,
+    object_types: &r2types::ProgramDataObjectTypeFacts,
+    used: &std::cell::RefCell<std::collections::BTreeMap<u64, crate::ast::CExternObject>>,
+) {
+    if let CExpr::Observed { expr, .. } = expr {
+        fold_constant_arithmetic_in_expr(expr, strings, symbols, object_types, used);
+        return;
+    }
+    let mut replacement = None;
+    match expr {
         CExpr::Unary { operand, .. }
         | CExpr::Cast { expr: operand, .. }
-        | CExpr::Paren(operand)
-        | CExpr::Sizeof(operand) => {
-            rewrite_expr_var_aliases(operand, rename_map, allow_plain_var_rewrite);
+        | CExpr::Sizeof(operand)
+        | CExpr::AddrOf(operand)
+        | CExpr::Deref(operand)
+        | CExpr::Paren(operand) => {
+            fold_constant_arithmetic_in_expr(operand, strings, symbols, object_types, used)
         }
-        CExpr::AddrOf(operand) => {
-            rewrite_expr_var_aliases(operand, rename_map, false);
-        }
-        CExpr::Deref(operand) => {
-            rewrite_expr_var_aliases(operand, rename_map, false);
-        }
-        CExpr::Binary { left, right, .. } => {
-            rewrite_expr_var_aliases(left, rename_map, allow_plain_var_rewrite);
-            rewrite_expr_var_aliases(right, rename_map, allow_plain_var_rewrite);
+        CExpr::Binary { op, left, right } => {
+            fold_constant_arithmetic_in_expr(left, strings, symbols, object_types, used);
+            fold_constant_arithmetic_in_expr(right, strings, symbols, object_types, used);
+            if let (Some(lhs), Some(rhs)) = (literal_value(left), literal_value(right)) {
+                // Wrapping, because the program's arithmetic wraps; a fold that
+                // disagreed with the machine would be worse than no fold.
+                let folded = match op {
+                    BinaryOp::Add => Some(lhs.wrapping_add(rhs)),
+                    BinaryOp::Sub => Some(lhs.wrapping_sub(rhs)),
+                    _ => None,
+                };
+                if let Some(folded) = folded {
+                    replacement = Some(CExpr::UIntLit(folded));
+                }
+            }
         }
         CExpr::Ternary {
             cond,
             then_expr,
             else_expr,
         } => {
-            rewrite_expr_var_aliases(cond, rename_map, allow_plain_var_rewrite);
-            rewrite_expr_var_aliases(then_expr, rename_map, allow_plain_var_rewrite);
-            rewrite_expr_var_aliases(else_expr, rename_map, allow_plain_var_rewrite);
+            fold_constant_arithmetic_in_expr(cond, strings, symbols, object_types, used);
+            fold_constant_arithmetic_in_expr(then_expr, strings, symbols, object_types, used);
+            fold_constant_arithmetic_in_expr(else_expr, strings, symbols, object_types, used);
         }
-        CExpr::Call { func, args } => {
-            rewrite_expr_var_aliases(func, rename_map, allow_plain_var_rewrite);
+        CExpr::Call { func, args, .. } => {
+            fold_constant_arithmetic_in_expr(func, strings, symbols, object_types, used);
             for arg in args {
-                rewrite_expr_var_aliases(arg, rename_map, allow_plain_var_rewrite);
+                fold_constant_arithmetic_in_expr(arg, strings, symbols, object_types, used);
             }
         }
         CExpr::Subscript { base, index } => {
-            rewrite_expr_var_aliases(base, rename_map, allow_plain_var_rewrite);
-            rewrite_expr_var_aliases(index, rename_map, allow_plain_var_rewrite);
+            fold_constant_arithmetic_in_expr(base, strings, symbols, object_types, used);
+            fold_constant_arithmetic_in_expr(index, strings, symbols, object_types, used);
         }
         CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
-            rewrite_expr_var_aliases(base, rename_map, allow_plain_var_rewrite);
+            fold_constant_arithmetic_in_expr(base, strings, symbols, object_types, used)
         }
         CExpr::Comma(items) => {
             for item in items {
-                rewrite_expr_var_aliases(item, rename_map, allow_plain_var_rewrite);
+                fold_constant_arithmetic_in_expr(item, strings, symbols, object_types, used);
             }
         }
-        CExpr::IntLit(_)
-        | CExpr::UIntLit(_)
-        | CExpr::FloatLit(_)
-        | CExpr::StringLit(_)
-        | CExpr::CharLit(_)
-        | CExpr::SizeofType(_)
-        | CExpr::Var(_) => {}
+        _ => {}
+    }
+    if let Some(replacement) = replacement {
+        let source = std::mem::replace(expr, CExpr::IntLit(0));
+        // Every marker in the collapsed subtree, not only the outermost:
+        // folding a cast chain down to one literal deletes the nodes the inner
+        // markers sat on, and the one literal is what renders them now.
+        *expr = crate::ast::carry_all_expr_observations(&source, replacement);
+    }
+    // Once the address is one number the string table can answer for it.
+    if let Some(value) = literal_value(expr)
+        && let Some(text) = strings.get(&value)
+    {
+        let source = std::mem::replace(expr, CExpr::IntLit(0));
+        *expr = crate::ast::carry_all_expr_observations(&source, CExpr::StringLit(text.clone()));
+        return;
+    }
+    // And so can the object table, for an address radare2 has a name for.
+    //
+    // The address is taken rather than the object's value: `lea` puts the
+    // address of the object in the register, so `&progName` is what the
+    // constant is. Rendering the number instead loses a name the analysis
+    // already had and that a reader cannot recover from it.
+    if let Some(value) = literal_value(expr)
+        && let Some(name) = symbols.get(&value)
+    {
+        let source = std::mem::replace(expr, CExpr::IntLit(0));
+        let rendered = c_identifier_for_data_symbol(name);
+        let type_fact = object_types.get(value).cloned();
+        let type_refusal = object_types.refused().get(&value).cloned();
+        used.borrow_mut().insert(
+            value,
+            crate::ast::CExternObject {
+                name: rendered.clone(),
+                address: value,
+                type_fact,
+                type_refusal,
+            },
+        );
+        *expr = crate::ast::carry_all_expr_observations(
+            &source,
+            CExpr::addr_of(CExpr::DataObject {
+                address: value,
+                name: rendered,
+            }),
+        );
     }
 }
 
-fn rewrite_stack_synonym_uses_to_declared_locals(
-    func: &mut CFunction,
-    fold_ctx: &FoldingContext<'_>,
-) {
-    let declared_names = func
-        .params
-        .iter()
-        .map(|param| param.name.to_ascii_lowercase())
-        .chain(
-            func.locals
-                .iter()
-                .map(|local| local.name.to_ascii_lowercase()),
-        )
-        .collect::<HashSet<_>>();
-    let local_by_offset = func
-        .locals
-        .iter()
-        .filter_map(|local| {
-            local
-                .stack_offset
-                .map(|offset| (offset, local.name.clone()))
+/// The C name for a radare2 data flag.
+///
+/// The fact is kept as radare2 stated it -- `obj.progName`, `reloc.stderr` --
+/// because that is what the analysis said and what the proof line answers for.
+/// What C can take is the name without the flag space that qualifies it, and
+/// with anything left that is not an identifier character replaced, so the
+/// rendered program declares `progName` rather than a dotted spelling no
+/// compiler accepts.
+fn c_identifier_for_data_symbol(flag: &str) -> String {
+    const SPACES: [&str; 6] = ["obj.", "reloc.", "segment.", "section.", "str.", "sym."];
+    let mut name = flag;
+    loop {
+        let Some(stripped) = SPACES.iter().find_map(|space| name.strip_prefix(space)) else {
+            break;
+        };
+        name = stripped;
+    }
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
         })
-        .collect::<std::collections::HashMap<_, _>>();
-    let mut pointer_locals = func
-        .locals
-        .iter()
-        .filter(|local| matches!(local.ty, CType::Pointer(_)))
-        .map(|local| local.name.clone())
-        .collect::<Vec<_>>();
-    pointer_locals.sort();
-    pointer_locals.dedup_by(|lhs, rhs| lhs.eq_ignore_ascii_case(rhs));
-    let unique_pointer_local = (pointer_locals.len() == 1).then(|| pointer_locals[0].clone());
-    if local_by_offset.is_empty() && unique_pointer_local.is_none() {
-        return;
-    }
-
-    let mut rename_map = std::collections::HashMap::new();
-    for name in collect_stmt_var_names(&func.body) {
-        if declared_names.contains(&name.to_ascii_lowercase()) {
-            continue;
-        }
-        let target = if let Some(offset) = fold_ctx.stack_offset_for_visible_storage_name(&name) {
-            local_by_offset.get(&offset).cloned()
-        } else if name.eq_ignore_ascii_case("slot") {
-            unique_pointer_local.clone()
-        } else {
-            None
-        };
-        let Some(target) = target else {
-            continue;
-        };
-        if !target.eq_ignore_ascii_case(&name) {
-            rename_map.insert(name.to_ascii_lowercase(), target);
-        }
-    }
-    if rename_map.is_empty() {
-        return;
-    }
-
-    for stmt in &mut func.body {
-        rewrite_stmt_var_aliases(stmt, &rename_map);
-    }
-}
-
-fn prune_dead_temp_assignments_in_function_body(
-    func: &mut CFunction,
-    fold_ctx: &FoldingContext<'_>,
-) {
-    let body = CStmt::Block(std::mem::take(&mut func.body));
-    func.body = match fold_ctx.prune_dead_temp_assignments_in_stmt(body) {
-        CStmt::Block(stmts) => stmts,
-        CStmt::Empty => Vec::new(),
-        stmt => vec![stmt],
-    };
-}
-
-fn normalize_redundant_return_carrier_casts(func: &mut CFunction) {
-    fn visit(stmt: &mut CStmt, ret_type: &CType, declared_types: &HashMap<String, CType>) {
-        match stmt {
-            CStmt::Return(Some(expr)) => {
-                let CExpr::Cast { expr: inner, .. } = expr else {
-                    return;
-                };
-                let CExpr::Var(name) = inner.as_ref() else {
-                    return;
-                };
-                if declared_types
-                    .get(&name.to_ascii_lowercase())
-                    .is_some_and(|ty| ty == ret_type)
-                {
-                    *expr = *inner.clone();
-                }
-            }
-            CStmt::Block(stmts) => {
-                for stmt in stmts {
-                    visit(stmt, ret_type, declared_types);
-                }
-            }
-            CStmt::If {
-                then_body,
-                else_body,
-                ..
-            } => {
-                visit(then_body, ret_type, declared_types);
-                if let Some(else_body) = else_body {
-                    visit(else_body, ret_type, declared_types);
-                }
-            }
-            CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => {
-                visit(body, ret_type, declared_types);
-            }
-            CStmt::For { init, body, .. } => {
-                if let Some(init) = init {
-                    visit(init, ret_type, declared_types);
-                }
-                visit(body, ret_type, declared_types);
-            }
-            CStmt::Switch { cases, default, .. } => {
-                for case in cases {
-                    for stmt in &mut case.body {
-                        visit(stmt, ret_type, declared_types);
-                    }
-                }
-                if let Some(default) = default {
-                    for stmt in default {
-                        visit(stmt, ret_type, declared_types);
-                    }
-                }
-            }
-            CStmt::Empty
-            | CStmt::Expr(_)
-            | CStmt::Decl { .. }
-            | CStmt::Return(None)
-            | CStmt::Break
-            | CStmt::Continue
-            | CStmt::Goto(_)
-            | CStmt::Label(_)
-            | CStmt::Comment(_) => {}
-        }
-    }
-
-    let declared_types = func
-        .params
-        .iter()
-        .map(|param| (param.name.to_ascii_lowercase(), param.ty.clone()))
-        .chain(
-            func.locals
-                .iter()
-                .map(|local| (local.name.to_ascii_lowercase(), local.ty.clone())),
-        )
-        .collect::<HashMap<_, _>>();
-    for stmt in &mut func.body {
-        visit(stmt, &func.ret_type, &declared_types);
+        .collect();
+    if cleaned.is_empty() || cleaned.starts_with(|c: char| c.is_ascii_digit()) {
+        format!("g_{cleaned}")
+    } else {
+        cleaned
     }
 }
 
@@ -3622,537 +6168,6 @@ fn typed_integer_literal_expr(value: u64, is_signed: bool, bits: u32) -> CExpr {
     } else {
         CExpr::IntLit(truncated as i64)
     }
-}
-
-fn normalize_literal_for_declared_type(expr: &mut CExpr, ty: &CType) {
-    let (is_signed, bits) = match ty {
-        CType::Int(bits) => (true, *bits),
-        CType::UInt(bits) => (false, *bits),
-        CType::Bool => (false, 1),
-        _ => return,
-    };
-    if bits == 0 || bits > 64 {
-        return;
-    }
-    match expr {
-        CExpr::UIntLit(value) => {
-            *expr = typed_integer_literal_expr(*value, is_signed, bits);
-        }
-        CExpr::IntLit(value) if *value >= 0 => {
-            *expr = typed_integer_literal_expr(*value as u64, is_signed, bits);
-        }
-        CExpr::Paren(inner) => normalize_literal_for_declared_type(inner, ty),
-        _ => {}
-    }
-}
-
-fn normalize_declared_assignment_literals(func: &mut CFunction) {
-    fn visit_expr(expr: &mut CExpr, declared_types: &HashMap<String, CType>) {
-        match expr {
-            CExpr::Unary { operand, .. }
-            | CExpr::Cast { expr: operand, .. }
-            | CExpr::Sizeof(operand)
-            | CExpr::AddrOf(operand)
-            | CExpr::Deref(operand)
-            | CExpr::Paren(operand) => visit_expr(operand, declared_types),
-            CExpr::Binary { left, right, .. } => {
-                visit_expr(left, declared_types);
-                visit_expr(right, declared_types);
-            }
-            CExpr::Ternary {
-                cond,
-                then_expr,
-                else_expr,
-            } => {
-                visit_expr(cond, declared_types);
-                visit_expr(then_expr, declared_types);
-                visit_expr(else_expr, declared_types);
-            }
-            CExpr::Call { func, args } => {
-                visit_expr(func, declared_types);
-                for arg in args {
-                    visit_expr(arg, declared_types);
-                }
-            }
-            CExpr::Subscript { base, index } => {
-                visit_expr(base, declared_types);
-                visit_expr(index, declared_types);
-            }
-            CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
-                visit_expr(base, declared_types);
-            }
-            CExpr::Comma(exprs) => {
-                for expr in exprs {
-                    visit_expr(expr, declared_types);
-                }
-            }
-            CExpr::IntLit(_)
-            | CExpr::UIntLit(_)
-            | CExpr::FloatLit(_)
-            | CExpr::StringLit(_)
-            | CExpr::CharLit(_)
-            | CExpr::Var(_)
-            | CExpr::SizeofType(_) => {}
-        }
-
-        let CExpr::Binary {
-            op: BinaryOp::Assign,
-            left,
-            right,
-        } = expr
-        else {
-            return;
-        };
-        let CExpr::Var(name) = left.as_ref() else {
-            return;
-        };
-        if let Some(ty) = declared_types.get(&name.to_ascii_lowercase()) {
-            normalize_literal_for_declared_type(right, ty);
-        }
-    }
-
-    fn visit_stmt(stmt: &mut CStmt, declared_types: &HashMap<String, CType>) {
-        match stmt {
-            CStmt::Expr(expr) => visit_expr(expr, declared_types),
-            CStmt::Decl { ty, init, .. } => {
-                if let Some(init) = init {
-                    visit_expr(init, declared_types);
-                    normalize_literal_for_declared_type(init, ty);
-                }
-            }
-            CStmt::Block(stmts) => {
-                for stmt in stmts {
-                    visit_stmt(stmt, declared_types);
-                }
-            }
-            CStmt::If {
-                cond,
-                then_body,
-                else_body,
-            } => {
-                visit_expr(cond, declared_types);
-                visit_stmt(then_body, declared_types);
-                if let Some(else_body) = else_body {
-                    visit_stmt(else_body, declared_types);
-                }
-            }
-            CStmt::While { cond, body } | CStmt::DoWhile { body, cond } => {
-                visit_expr(cond, declared_types);
-                visit_stmt(body, declared_types);
-            }
-            CStmt::For {
-                init,
-                cond,
-                update,
-                body,
-            } => {
-                if let Some(init) = init {
-                    visit_stmt(init, declared_types);
-                }
-                if let Some(cond) = cond {
-                    visit_expr(cond, declared_types);
-                }
-                if let Some(update) = update {
-                    visit_expr(update, declared_types);
-                }
-                visit_stmt(body, declared_types);
-            }
-            CStmt::Switch {
-                expr,
-                cases,
-                default,
-            } => {
-                visit_expr(expr, declared_types);
-                for case in cases {
-                    visit_expr(&mut case.value, declared_types);
-                    for stmt in &mut case.body {
-                        visit_stmt(stmt, declared_types);
-                    }
-                }
-                if let Some(default) = default {
-                    for stmt in default {
-                        visit_stmt(stmt, declared_types);
-                    }
-                }
-            }
-            CStmt::Return(Some(expr)) => visit_expr(expr, declared_types),
-            CStmt::Empty
-            | CStmt::Return(None)
-            | CStmt::Break
-            | CStmt::Continue
-            | CStmt::Goto(_)
-            | CStmt::Label(_)
-            | CStmt::Comment(_) => {}
-        }
-    }
-
-    let declared_types = func
-        .params
-        .iter()
-        .map(|param| (param.name.to_ascii_lowercase(), param.ty.clone()))
-        .chain(
-            func.locals
-                .iter()
-                .map(|local| (local.name.to_ascii_lowercase(), local.ty.clone())),
-        )
-        .collect::<HashMap<_, _>>();
-    for stmt in &mut func.body {
-        visit_stmt(stmt, &declared_types);
-    }
-}
-
-fn prune_unused_pure_locals(func: &mut CFunction) {
-    loop {
-        let live_reads = collect_function_local_reads(func);
-        let dead_locals = func
-            .locals
-            .iter()
-            .map(|local| local.name.to_ascii_lowercase())
-            .filter(|name| !live_reads.contains(name))
-            .collect::<HashSet<_>>();
-
-        if dead_locals.is_empty() {
-            break;
-        }
-
-        func.locals
-            .retain(|local| !dead_locals.contains(&local.name.to_ascii_lowercase()));
-        prune_unused_pure_local_stmts(&mut func.body, &dead_locals);
-    }
-}
-
-fn prune_unreferenced_local_declarations(func: &mut CFunction) {
-    let referenced = collect_stmt_var_names(&func.body)
-        .into_iter()
-        .map(|name| name.to_ascii_lowercase())
-        .collect::<HashSet<_>>();
-    func.locals
-        .retain(|local| referenced.contains(&local.name.to_ascii_lowercase()));
-}
-
-fn collect_function_local_reads(func: &CFunction) -> HashSet<String> {
-    let mut reads = HashSet::new();
-    for stmt in &func.body {
-        collect_stmt_local_reads(stmt, &mut reads);
-    }
-    reads
-}
-
-fn collect_stmt_local_reads(stmt: &CStmt, reads: &mut HashSet<String>) {
-    match stmt {
-        CStmt::Empty
-        | CStmt::Break
-        | CStmt::Continue
-        | CStmt::Goto(_)
-        | CStmt::Label(_)
-        | CStmt::Comment(_) => {}
-        CStmt::Expr(CExpr::Binary {
-            op: BinaryOp::Assign,
-            left,
-            right,
-        }) => {
-            if !matches!(left.as_ref(), CExpr::Var(_)) {
-                collect_expr_local_reads(left, reads);
-            }
-            collect_expr_local_reads(right, reads);
-        }
-        CStmt::Expr(expr) => collect_expr_local_reads(expr, reads),
-        CStmt::Decl { init, .. } => {
-            if let Some(init) = init {
-                collect_expr_local_reads(init, reads);
-            }
-        }
-        CStmt::Block(stmts) => {
-            for stmt in stmts {
-                collect_stmt_local_reads(stmt, reads);
-            }
-        }
-        CStmt::If {
-            cond,
-            then_body,
-            else_body,
-        } => {
-            collect_expr_local_reads(cond, reads);
-            collect_stmt_local_reads(then_body, reads);
-            if let Some(else_body) = else_body {
-                collect_stmt_local_reads(else_body, reads);
-            }
-        }
-        CStmt::While { cond, body } => {
-            collect_expr_local_reads(cond, reads);
-            collect_stmt_local_reads(body, reads);
-        }
-        CStmt::DoWhile { body, cond } => {
-            collect_stmt_local_reads(body, reads);
-            collect_expr_local_reads(cond, reads);
-        }
-        CStmt::For {
-            init,
-            cond,
-            update,
-            body,
-        } => {
-            if let Some(init) = init {
-                collect_stmt_local_reads(init, reads);
-            }
-            if let Some(cond) = cond {
-                collect_expr_local_reads(cond, reads);
-            }
-            if let Some(update) = update {
-                collect_expr_local_reads(update, reads);
-            }
-            collect_stmt_local_reads(body, reads);
-        }
-        CStmt::Switch {
-            expr,
-            cases,
-            default,
-        } => {
-            collect_expr_local_reads(expr, reads);
-            for case in cases {
-                collect_expr_local_reads(&case.value, reads);
-                for stmt in &case.body {
-                    collect_stmt_local_reads(stmt, reads);
-                }
-            }
-            if let Some(default) = default {
-                for stmt in default {
-                    collect_stmt_local_reads(stmt, reads);
-                }
-            }
-        }
-        CStmt::Return(Some(expr)) => collect_expr_local_reads(expr, reads),
-        CStmt::Return(None) => {}
-    }
-}
-
-fn collect_expr_local_reads(expr: &CExpr, reads: &mut HashSet<String>) {
-    match expr {
-        CExpr::Var(name) => {
-            reads.insert(name.to_ascii_lowercase());
-        }
-        CExpr::Paren(inner)
-        | CExpr::AddrOf(inner)
-        | CExpr::Deref(inner)
-        | CExpr::Cast { expr: inner, .. }
-        | CExpr::Unary { operand: inner, .. }
-        | CExpr::Sizeof(inner) => collect_expr_local_reads(inner, reads),
-        CExpr::Binary { left, right, .. } => {
-            collect_expr_local_reads(left, reads);
-            collect_expr_local_reads(right, reads);
-        }
-        CExpr::Subscript { base, index } => {
-            collect_expr_local_reads(base, reads);
-            collect_expr_local_reads(index, reads);
-        }
-        CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
-            collect_expr_local_reads(base, reads);
-        }
-        CExpr::Call { func, args } => {
-            collect_expr_local_reads(func, reads);
-            for arg in args {
-                collect_expr_local_reads(arg, reads);
-            }
-        }
-        CExpr::Ternary {
-            cond,
-            then_expr,
-            else_expr,
-        } => {
-            collect_expr_local_reads(cond, reads);
-            collect_expr_local_reads(then_expr, reads);
-            collect_expr_local_reads(else_expr, reads);
-        }
-        CExpr::Comma(items) => {
-            for item in items {
-                collect_expr_local_reads(item, reads);
-            }
-        }
-        CExpr::IntLit(_)
-        | CExpr::UIntLit(_)
-        | CExpr::FloatLit(_)
-        | CExpr::StringLit(_)
-        | CExpr::CharLit(_)
-        | CExpr::SizeofType(_) => {}
-    }
-}
-
-fn prune_unused_pure_local_stmts(stmts: &mut Vec<CStmt>, dead_locals: &HashSet<String>) {
-    for stmt in stmts.iter_mut() {
-        prune_unused_pure_local_stmt(stmt, dead_locals);
-    }
-    stmts.retain(|stmt| !matches!(stmt, CStmt::Empty));
-}
-
-fn prune_unused_pure_local_stmt(stmt: &mut CStmt, dead_locals: &HashSet<String>) {
-    match stmt {
-        CStmt::Expr(CExpr::Binary {
-            op: BinaryOp::Assign,
-            left,
-            right,
-        }) => {
-            if let CExpr::Var(name) = left.as_ref()
-                && dead_locals.contains(&name.to_ascii_lowercase())
-                && expr_is_pure_for_dead_local_prune(right)
-            {
-                *stmt = CStmt::Empty;
-            }
-        }
-        CStmt::Decl { name, init, .. } => {
-            if dead_locals.contains(&name.to_ascii_lowercase()) {
-                match init.take() {
-                    Some(expr) if !expr_is_pure_for_dead_local_prune(&expr) => {
-                        *stmt = CStmt::Expr(expr);
-                    }
-                    _ => {
-                        *stmt = CStmt::Empty;
-                    }
-                }
-            }
-        }
-        CStmt::Block(stmts) => prune_unused_pure_local_stmts(stmts, dead_locals),
-        CStmt::If {
-            then_body,
-            else_body,
-            ..
-        } => {
-            prune_unused_pure_local_stmt(then_body, dead_locals);
-            if let Some(else_body) = else_body {
-                prune_unused_pure_local_stmt(else_body, dead_locals);
-            }
-        }
-        CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => {
-            prune_unused_pure_local_stmt(body, dead_locals);
-        }
-        CStmt::For { init, body, .. } => {
-            if let Some(init) = init {
-                prune_unused_pure_local_stmt(init, dead_locals);
-            }
-            prune_unused_pure_local_stmt(body, dead_locals);
-        }
-        CStmt::Switch { cases, default, .. } => {
-            for case in cases {
-                prune_unused_pure_local_stmts(&mut case.body, dead_locals);
-            }
-            if let Some(default) = default {
-                prune_unused_pure_local_stmts(default, dead_locals);
-            }
-        }
-        CStmt::Empty
-        | CStmt::Expr(_)
-        | CStmt::Return(_)
-        | CStmt::Break
-        | CStmt::Continue
-        | CStmt::Goto(_)
-        | CStmt::Label(_)
-        | CStmt::Comment(_) => {}
-    }
-}
-
-fn expr_is_pure_for_dead_local_prune(expr: &CExpr) -> bool {
-    match expr {
-        CExpr::IntLit(_)
-        | CExpr::UIntLit(_)
-        | CExpr::FloatLit(_)
-        | CExpr::StringLit(_)
-        | CExpr::CharLit(_)
-        | CExpr::SizeofType(_)
-        | CExpr::Var(_) => true,
-        CExpr::Paren(inner)
-        | CExpr::AddrOf(inner)
-        | CExpr::Deref(inner)
-        | CExpr::Cast { expr: inner, .. }
-        | CExpr::Unary { operand: inner, .. }
-        | CExpr::Sizeof(inner) => expr_is_pure_for_dead_local_prune(inner),
-        CExpr::Binary { left, right, .. } => {
-            expr_is_pure_for_dead_local_prune(left) && expr_is_pure_for_dead_local_prune(right)
-        }
-        CExpr::Subscript { base, index } => {
-            expr_is_pure_for_dead_local_prune(base) && expr_is_pure_for_dead_local_prune(index)
-        }
-        CExpr::Member { base, .. } | CExpr::PtrMember { base, .. } => {
-            expr_is_pure_for_dead_local_prune(base)
-        }
-        CExpr::Ternary {
-            cond,
-            then_expr,
-            else_expr,
-        } => {
-            expr_is_pure_for_dead_local_prune(cond)
-                && expr_is_pure_for_dead_local_prune(then_expr)
-                && expr_is_pure_for_dead_local_prune(else_expr)
-        }
-        CExpr::Comma(items) => items.iter().all(expr_is_pure_for_dead_local_prune),
-        CExpr::Call { .. } => false,
-    }
-}
-
-#[cfg(test)]
-fn infer_local_struct_field_accesses(
-    func: &SSAFunction,
-    config: &DecompilerConfig,
-) -> Vec<LocalStructFieldAccess> {
-    let cfg_summary = func.cfg_risk_summary();
-    if cfg_summary.block_count >= 96
-        && cfg_summary.switch_block_count > 0
-        && cfg_summary.max_switch_cases >= 32
-    {
-        return Vec::new();
-    }
-
-    let type_hints = std::collections::HashMap::new();
-    let function_names = std::collections::HashMap::new();
-    let strings = std::collections::HashMap::new();
-    let symbols = std::collections::HashMap::new();
-    let mut param_register_aliases = std::collections::HashMap::new();
-    let mut arg_slot_map = std::collections::HashMap::new();
-
-    for (idx, reg_name) in config.arg_regs.iter().enumerate() {
-        let arg_name = format!("arg{idx}");
-        for alias in register_alias_names(reg_name) {
-            let lower = alias.to_ascii_lowercase();
-            param_register_aliases.insert(lower.clone(), arg_name.clone());
-            arg_slot_map.insert(lower, idx);
-        }
-    }
-
-    let env = analysis::PassEnv {
-        ptr_size: config.ptr_size,
-        sp_name: &config.sp_name,
-        fp_name: &config.fp_name,
-        ret_reg_name: config.ret_regs.first().map(String::as_str).unwrap_or("rax"),
-        #[cfg(test)]
-        function_names: &function_names,
-        #[cfg(test)]
-        strings: &strings,
-        #[cfg(test)]
-        symbols: &symbols,
-        callee_facts: analysis::empty_callee_facts(),
-        callee_resolution: None,
-        summary_view: None,
-        arg_regs: &config.arg_regs,
-        param_register_aliases: &param_register_aliases,
-        caller_saved_regs: &config.caller_saved_regs,
-        type_hints: &type_hints,
-        type_oracle: None,
-    };
-
-    let blocks: Vec<_> = func.blocks().cloned().collect();
-    let use_info = analysis::UseInfo::analyze_for_local_struct_accesses(&blocks, &env);
-    analysis::use_info::collect_local_struct_field_access_profiles(
-        &use_info,
-        func,
-        &env,
-        &arg_slot_map,
-    )
-    .into_iter()
-    .map(|profile| LocalStructFieldAccess {
-        arg_index: profile.arg_index,
-        field_offset: profile.field_offset,
-        access_size: profile.access_size,
-        is_write: profile.is_write,
-    })
-    .collect()
 }
 
 #[cfg(test)]
@@ -4210,8 +6225,6 @@ pub(crate) fn test_native_semantic_report(
                 role_identity: None,
                 closure_functions: 0,
                 helper_functions: 0,
-                derived_summaries: 0,
-                derived_diagnostics: Default::default(),
                 region_summaries: Vec::new(),
                 worker_summaries: Vec::new(),
             },
@@ -4230,17 +6243,218 @@ pub(crate) fn test_native_semantic_report(
     }
 }
 
+/// Every label a `goto` in this statement names.
+fn collect_goto_targets(statement: &CStmt, into: &mut std::collections::BTreeSet<String>) {
+    match statement {
+        CStmt::Goto(label) => {
+            into.insert(label.clone());
+        }
+        CStmt::Observed { stmt, .. } | CStmt::StructuredRegion { stmt, .. } => {
+            collect_goto_targets(stmt, into);
+        }
+        CStmt::Block(statements) => {
+            for statement in statements {
+                collect_goto_targets(statement, into);
+            }
+        }
+        CStmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            collect_goto_targets(then_body, into);
+            if let Some(else_body) = else_body {
+                collect_goto_targets(else_body, into);
+            }
+        }
+        CStmt::While { body, .. } | CStmt::DoWhile { body, .. } => {
+            collect_goto_targets(body, into);
+        }
+        CStmt::For { init, body, .. } => {
+            if let Some(init) = init {
+                collect_goto_targets(init, into);
+            }
+            collect_goto_targets(body, into);
+        }
+        CStmt::Switch { cases, default, .. } => {
+            for case in cases {
+                for statement in &case.body {
+                    collect_goto_targets(statement, into);
+                }
+            }
+            if let Some(default) = default {
+                for statement in default {
+                    collect_goto_targets(statement, into);
+                }
+            }
+        }
+        CStmt::Empty
+        | CStmt::Expr(_)
+        | CStmt::Decl { .. }
+        | CStmt::Return(_)
+        | CStmt::Break
+        | CStmt::Continue
+        | CStmt::Label(_)
+        | CStmt::Comment(_) => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
+
+    fn no_extern_objects()
+    -> std::cell::RefCell<std::collections::BTreeMap<u64, crate::ast::CExternObject>> {
+        std::cell::RefCell::new(std::collections::BTreeMap::new())
+    }
+
+    #[test]
+    fn a_compared_mask_takes_the_type_of_what_it_is_compared_with() {
+        // `tmp < -0x4` where `tmp` is a `uint64_t`. The comparison is read as
+        // a truth value, so the type the mask needs is not the statement's --
+        // it is the other operand's, and `-0x4` is an `int` until something
+        // says otherwise.
+        let mut symbols = crate::symbol::SymbolTable::new();
+        let name = symbols.reserve_binding(
+            "tmp_3ea80_2".to_string(),
+            CType::u64(),
+            crate::symbol::SymbolRole::Carrier,
+        );
+        let table = std::rc::Rc::new(std::cell::RefCell::new(symbols));
+        let mut owner = crate::ast::RenderObservationOwner::new();
+        let (_, marked) = owner
+            .observe_expr(CExpr::binary(
+                BinaryOp::Lt,
+                CExpr::Var(name),
+                CExpr::UIntLit(0xffff_ffff_ffff_fffc),
+            ))
+            .expect("the statement's own occurrence marker");
+        let mut expr = marked;
+        restate_string_conversions_in_expr(
+            &mut expr,
+            64,
+            Some(&CType::u8()),
+            Some(&table),
+            &no_extern_objects(),
+        );
+        let CExpr::Observed { expr: inner, .. } = &expr else {
+            panic!("the marker must survive: {expr:?}");
+        };
+        let CExpr::Binary { right, .. } = inner.as_ref() else {
+            panic!("expected the comparison, got {inner:?}");
+        };
+        assert!(
+            matches!(right.as_ref(), CExpr::Cast { ty, .. } if *ty == CType::u64()),
+            "the mask takes the compared operand's type, not the flag's: {right:?}"
+        );
+    }
+
+    #[test]
+    fn a_mask_under_a_render_marker_still_takes_the_type_that_reads_it() {
+        // The shape every statement has in production: the right-hand side
+        // carries an occurrence marker. `X1_0 & -0x4` on a `uint64_t` is a
+        // signedness-changing conversion, because `-0x4` is an `int`
+        // whatever value it denotes, and the marker must not hide the ask.
+        let mut symbols = crate::symbol::SymbolTable::new();
+        let name = symbols.reserve_binding(
+            "X1_0".to_string(),
+            CType::u64(),
+            crate::symbol::SymbolRole::Carrier,
+        );
+        let table = std::rc::Rc::new(std::cell::RefCell::new(symbols));
+        let mask = CExpr::UIntLit(0xffff_ffff_ffff_fffc);
+        let mut owner = crate::ast::RenderObservationOwner::new();
+        let (_, marked) = owner
+            .observe_expr(CExpr::binary(BinaryOp::BitAnd, CExpr::Var(name), mask))
+            .expect("the statement's own occurrence marker");
+        let mut expr = marked;
+        restate_string_conversions_in_expr(
+            &mut expr,
+            64,
+            Some(&CType::u64()),
+            Some(&table),
+            &no_extern_objects(),
+        );
+        let CExpr::Observed { expr: inner, .. } = &expr else {
+            panic!("the marker must survive: {expr:?}");
+        };
+        let CExpr::Binary { right, .. } = inner.as_ref() else {
+            panic!("expected the masking, got {inner:?}");
+        };
+        assert!(
+            matches!(right.as_ref(), CExpr::Cast { ty, .. } if *ty == CType::u64()),
+            "the mask must say it is a uint64_t, got {right:?}"
+        );
+    }
+
+    #[test]
+    fn a_string_address_drops_the_conversions_spelled_for_its_number() {
+        // A string reaches a `char *` as itself: the conversions above the
+        // constant were spelled while it was a number, and substituting the
+        // string makes every one of them a statement about a type the
+        // expression no longer has.
+        let text = CExpr::StringLit("usage: %s\n".to_string());
+        let char_ptr = CType::ptr(plain_char_type());
+        let mut expr = CExpr::cast(
+            char_ptr.clone(),
+            CExpr::cast(
+                CType::Int {
+                    bits: 64,
+                    signedness: r2types::Signedness::Unsigned,
+                },
+                text.clone(),
+            ),
+        );
+        restate_string_conversions_in_expr(&mut expr, 64, None, None, &no_extern_objects());
+        assert_eq!(expr, text, "got {expr:?}");
+
+        // Converted to a number, the string is still an address, so the
+        // conversion that is C's own is the one that survives -- and it is
+        // recorded as the address-width step, so a round trip collapses.
+        let mut as_number = CExpr::cast(
+            CType::Int {
+                bits: 64,
+                signedness: r2types::Signedness::Unsigned,
+            },
+            text.clone(),
+        );
+        restate_string_conversions_in_expr(&mut as_number, 64, None, None, &no_extern_objects());
+        assert!(
+            matches!(
+                &as_number,
+                CExpr::Cast {
+                    ty: CType::Int { bits: 64, .. },
+                    role: crate::ast::CastRole::PointerWidthStep,
+                    ..
+                }
+            ),
+            "got {as_number:?}"
+        );
+        let _ = char_ptr;
+    }
+
+    /// What the two type models lose when a type crosses between them.
+    ///
+    /// `r2dec` and `r2types` each have a type enum and a renderer, and the two
+    /// renderers already disagreed once -- about how to spell a 128-bit integer
+    /// -- with nothing to catch it. Before the two are folded into one model,
+    /// this records exactly which types do not survive the trip, so the fold is
+    /// closing a measured gap rather than an assumed one.
+    use r2il::{
+        ArchSpec, R2ILBlock, R2ILOp, RegisterBitSlice, RegisterDef, RegisterProjection,
+        RegisterProjectionDisposition, RegisterStorage, SpaceId, Varnode,
+    };
     use r2ssa::SSAFunction;
     use r2types::{
-        ExternalField, ExternalRegisterParamSpec, ExternalStruct, ExternalTypeDb, FunctionFacts,
-        FunctionParamSpec, FunctionSignatureSpec, FunctionTypeFacts, SignatureCertificate,
-        SignatureCertificateSource,
+        ExternalRegisterParamSpec, ExternalStruct, ExternalTypeDb, FunctionFacts,
+        FunctionParamSpec, FunctionSignatureSpec, FunctionTypeFacts,
     };
     use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+    /// The names a fixture in this module declares.
+    fn test_table() -> std::cell::RefCell<crate::symbol::SymbolTable> {
+        std::cell::RefCell::new(crate::symbol::SymbolTable::new())
+    }
 
     #[test]
     fn semantic_memory_address_format_preserves_identity_kind() {
@@ -4272,9 +6486,6 @@ mod tests {
     fn empty_fold_context_for_linearization<'a>() -> FoldingContext<'a> {
         let arch = Box::leak(Box::new(FoldArchConfig {
             ptr_size: 8,
-            sp_name: "rsp".to_string(),
-            fp_name: "rbp".to_string(),
-            ret_reg_name: "rax".to_string(),
             arg_regs: vec![
                 "rdi".to_string(),
                 "rsi".to_string(),
@@ -4283,160 +6494,21 @@ mod tests {
                 "r8".to_string(),
                 "r9".to_string(),
             ],
-            caller_saved_regs: HashSet::new(),
         }));
         FoldingContext::from_inputs(FoldInputs {
+            normalization_origins: None,
+            observation_journal: None,
             arch,
             function_names: Box::leak(Box::new(HashMap::new())),
-            strings: Box::leak(Box::new(HashMap::new())),
-            symbols: Box::leak(Box::new(HashMap::new())),
+            binary_symbols: Box::leak(Box::new(HashMap::new())),
             function_facts: crate::fold::context::empty_function_facts(),
-            #[cfg(test)]
-            certified_rendering_required: false,
             stack_slots: Box::leak(Box::new(BTreeMap::new())),
-            field_access_certificates: &[],
-            external_stack_vars: Box::leak(Box::new(HashMap::new())),
             visible_bindings: Box::leak(Box::new(Vec::new())),
-            external_type_db: Box::leak(Box::new(ExternalTypeDb::default())),
-            param_register_aliases: Box::leak(Box::new(HashMap::new())),
-            type_hints: Box::leak(Box::new(HashMap::new())),
-            type_oracle: None,
             function_return_type: None,
             prepared_ssa: None,
+            binding_names: None,
             prepared_semantic_view: None,
-            prepared_objects: None,
-            prepared_memory: None,
         })
-    }
-
-    #[test]
-    fn certified_source_aliases_normalize_strength_reduced_array_member_address() {
-        let arch = FoldArchConfig {
-            ptr_size: 64,
-            sp_name: "rsp".to_string(),
-            fp_name: "rbp".to_string(),
-            ret_reg_name: "rax".to_string(),
-            arg_regs: vec![
-                "rdi".to_string(),
-                "rsi".to_string(),
-                "rdx".to_string(),
-                "rcx".to_string(),
-                "r8".to_string(),
-                "r9".to_string(),
-            ],
-            caller_saved_regs: HashSet::new(),
-        };
-        let signature = FunctionSignatureSpec {
-            ret_type: Some(ctype_to_type_like(&CType::i32())),
-            params: vec![
-                FunctionParamSpec {
-                    name: "arr".to_string(),
-                    ty: Some(ctype_to_type_like(&CType::ptr(CType::Struct(
-                        "DemoStruct".to_string(),
-                    )))),
-                },
-                FunctionParamSpec {
-                    name: "idx".to_string(),
-                    ty: Some(ctype_to_type_like(&CType::i32())),
-                },
-                FunctionParamSpec {
-                    name: "v".to_string(),
-                    ty: Some(ctype_to_type_like(&CType::i32())),
-                },
-            ],
-        };
-        let type_facts = FunctionTypeFacts {
-            merged_signature: Some(signature.clone()),
-            register_params: vec![ExternalRegisterParamSpec {
-                name: "arr".to_string(),
-                ty: Some(ctype_to_type_like(&CType::ptr(CType::Struct(
-                    "DemoStruct".to_string(),
-                )))),
-                reg: "rdi".to_string(),
-            }],
-            signature_certificate: SignatureCertificate::from_signature(
-                &signature,
-                [SignatureCertificateSource::ExternalContext],
-            ),
-            ..Default::default()
-        };
-        let function_facts =
-            FunctionFacts::new(type_facts, None).with_decompile_route(test_decompile_route(
-                r2types::DecompileRouteKind::Standard,
-                "certified source alias normalization",
-                None,
-            ));
-        let mut param_register_aliases = HashMap::new();
-        param_register_aliases.insert("rdi".to_string(), "arr".to_string());
-        param_register_aliases.insert("edi".to_string(), "arr".to_string());
-        let type_hints = HashMap::new();
-        let function_names = HashMap::new();
-        let strings = HashMap::new();
-        let symbols = HashMap::new();
-        let stack_slots = BTreeMap::new();
-        let external_stack_vars = HashMap::new();
-        let visible_bindings = Vec::new();
-        let external_type_db = ExternalTypeDb::default();
-        let mut ctx = FoldingContext::from_inputs(FoldInputs {
-            arch: &arch,
-            function_names: &function_names,
-            strings: &strings,
-            symbols: &symbols,
-            function_facts: &function_facts,
-            certified_rendering_required: true,
-            stack_slots: &stack_slots,
-            field_access_certificates: &[],
-            external_stack_vars: &external_stack_vars,
-            visible_bindings: &visible_bindings,
-            external_type_db: &external_type_db,
-            param_register_aliases: &param_register_aliases,
-            type_hints: &type_hints,
-            type_oracle: None,
-            function_return_type: None,
-            prepared_ssa: None,
-            prepared_semantic_view: None,
-            prepared_objects: None,
-            prepared_memory: None,
-        });
-        ctx.set_type_hints(type_hints.clone());
-        let idx_times_56 = CExpr::binary(
-            BinaryOp::Shl,
-            CExpr::binary(
-                BinaryOp::Sub,
-                CExpr::binary(BinaryOp::Shl, CExpr::var("idx"), CExpr::int(3)),
-                CExpr::var("idx"),
-            ),
-            CExpr::int(3),
-        );
-        let expr = CExpr::binary(
-            BinaryOp::Add,
-            CExpr::binary(BinaryOp::Add, idx_times_56, CExpr::var("arr")),
-            CExpr::int(8),
-        );
-
-        assert_eq!(
-            ctx.debug_ssa_var_for_visible_name("arr"),
-            Some(r2ssa::SSAVar::new("rdi", 0, 64))
-        );
-        assert_eq!(
-            ctx.debug_ssa_var_for_visible_name("idx"),
-            Some(r2ssa::SSAVar::new("rsi", 0, 64))
-        );
-        let canonical = ctx.debug_canonicalize_visible_address_expr(&expr);
-        let addr = ctx
-            .debug_normalized_addr_from_visible_expr(&canonical)
-            .expect("strength-reduced array member address should normalize");
-
-        match addr.base {
-            analysis::BaseRef::Value(base) => {
-                assert_eq!(base.var, r2ssa::SSAVar::new("rdi", 0, 64));
-            }
-            other => panic!("expected arr base, got {other:?}"),
-        }
-        let index = addr.index.expect("array index");
-        assert_eq!(index.var, r2ssa::SSAVar::new("rsi", 0, 64));
-        assert_eq!(addr.scale_bytes, 56);
-        assert_eq!(addr.offset_bytes, 8);
     }
 
     fn test_decompile_route(
@@ -4448,7 +6520,6 @@ mod tests {
             kind,
             reason: Some(reason.to_string()),
             fallback_comment,
-            skip_runtime_type_inference: !matches!(kind, r2types::DecompileRouteKind::Standard),
             use_prepared_semantic_view: matches!(kind, r2types::DecompileRouteKind::Standard),
         }
     }
@@ -4524,51 +6595,6 @@ mod tests {
         assert!(comment.contains("false_target=loc_1004"));
     }
 
-    #[test]
-    fn runtime_type_hints_prefer_canonical_typed_pointer_over_inferred_void_pointer() {
-        let mut hints = HashMap::from([("buf".to_string(), CType::Pointer(Box::new(CType::Void)))]);
-        merge_runtime_type_hints(
-            &mut hints,
-            HashMap::from([("buf".to_string(), CType::Pointer(Box::new(CType::Int(8))))]),
-        );
-
-        assert_eq!(
-            hints.get("buf"),
-            Some(&CType::Pointer(Box::new(CType::Int(8))))
-        );
-        assert_eq!(
-            choose_more_specific_runtime_type(
-                CType::Pointer(Box::new(CType::Void)),
-                hints.get("buf")
-            ),
-            CType::Pointer(Box::new(CType::Int(8)))
-        );
-    }
-
-    #[test]
-    fn runtime_type_hints_preserve_same_width_canonical_signedness() {
-        assert_eq!(
-            choose_more_specific_runtime_type(CType::Int(8), Some(&CType::UInt(8))),
-            CType::UInt(8)
-        );
-        assert_eq!(
-            choose_more_specific_runtime_type(CType::UInt(8), Some(&CType::Int(8))),
-            CType::Int(8)
-        );
-    }
-
-    #[test]
-    fn runtime_type_hints_prefer_canonical_narrow_integer_over_carrier_width() {
-        assert_eq!(
-            choose_more_specific_runtime_type(CType::Int(64), Some(&CType::UInt(8))),
-            CType::UInt(8)
-        );
-        assert_eq!(
-            choose_more_specific_runtime_type(CType::UInt(64), Some(&CType::Int(16))),
-            CType::Int(16)
-        );
-    }
-
     fn prepared_from_ops(ops: Vec<R2ILOp>, arch: &ArchSpec) -> r2ssa::SsaArtifact {
         let mut block = R2ILBlock::new(0x1000, 4);
         for op in ops {
@@ -4628,54 +6654,438 @@ mod tests {
         DecompilerInput::new(source_owned_facts)
     }
 
-    fn test_arch_for_decompile() -> ArchSpec {
-        let mut arch = ArchSpec::new("x86-64");
-        arch.add_register(RegisterDef::new("RAX", 0x00, 8));
-        arch.add_register(RegisterDef::new("RDI", 0x10, 8));
-        arch.add_register(RegisterDef::new("RSI", 0x18, 8));
-        arch.add_register(RegisterDef::new("RBP", 0x20, 8));
-        arch.add_register(RegisterDef::new("RSP", 0x28, 8));
-        arch.add_register(RegisterDef::new("RIP", 0x30, 8));
-        arch
-    }
-
+    /// A comparison written directly into the logical low byte of the ABI
+    /// result carrier, rendered through the complete source-owned pipeline.
     #[test]
-    fn param_register_aliases_keep_abi_order_over_misaligned_external_regs() {
-        let params = vec![
-            ast::CParam {
-                ty: CType::Pointer(Box::new(CType::Int(32))),
-                name: "arr".to_string(),
+    fn a_logical_low_byte_return_renders() {
+        let mut arch = test_arch_for_decompile();
+        arch.add_register(RegisterDef::sub("AL", 0, 1, "RAX"));
+        arch.register_projections.push(RegisterProjection {
+            written: RegisterStorage { offset: 0, size: 1 },
+            disposition: RegisterProjectionDisposition::Bound {
+                carrier: RegisterStorage { offset: 0, size: 8 },
+                slice: RegisterBitSlice {
+                    lsb_bit_offset: 0,
+                    size_bits: 8,
+                },
             },
-            ast::CParam {
-                ty: CType::Int(32),
-                name: "len".to_string(),
+        });
+        arch.register_projections
+            .sort_by_key(|projection| projection.written);
+
+        let storage = |offset, size| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size,
+        };
+        let logical_u64 = r2ssa::SourceLogicalValue::new(
+            0,
+            r2ssa::SourceCarrierProjection::new(r2ssa::SourceCarrierKind::Full, 0, 64),
+        );
+        let logical_u8 = r2ssa::SourceLogicalValue::new(
+            1,
+            r2ssa::SourceCarrierProjection::new(r2ssa::SourceCarrierKind::LowBits, 0, 8),
+        );
+        let type_graph = r2ssa::SourceTypeGraph::new(
+            [
+                r2ssa::SourceType::new(0, r2ssa::SourceTypeKind::UnsignedInteger, 64, 64),
+                r2ssa::SourceType::new(1, r2ssa::SourceTypeKind::UnsignedInteger, 8, 8),
+            ],
+            [],
+        )
+        .expect("exact boolean-return type graph");
+        let interface = r2ssa::SourceFunctionInterface::new_exact_with_logical_types(
+            b"logical-low-byte-return".to_vec(),
+            "sysv64",
+            [r2ssa::SourceAbiParameterSpec::new(0, storage(0x10, 8))],
+            r2ssa::SourceFunctionReturn::Register {
+                storage: storage(0, 8),
             },
-        ];
-        let register_params = vec![
-            ExternalRegisterParamSpec {
-                name: "al".to_string(),
-                ty: Some(CTypeLike::Typedef("int32_t".to_string())),
-                reg: "AL".to_string(),
-            },
-            ExternalRegisterParamSpec {
-                name: "rdi".to_string(),
-                ty: Some(CTypeLike::Pointer(Box::new(CTypeLike::Typedef(
-                    "int32_t".to_string(),
-                )))),
-                reg: "rdi".to_string(),
-            },
-        ];
-        let aliases = build_param_register_aliases(
-            &params,
-            &[],
-            &register_params,
-            &["rdi".to_string(), "rsi".to_string()],
-            true,
+            [],
+            [logical_u64],
+            Some(logical_u8),
+            Some(type_graph),
+        )
+        .and_then(|interface| interface.with_return_address_storage(storage(0x30, 8)))
+        .and_then(|interface| interface.with_stack_pointer_storage(storage(0x28, 8)))
+        .expect("exact boolean-return interface");
+
+        let mut block = R2ILBlock::new(0x1000, 4);
+        block.push(R2ILOp::IntLess {
+            dst: Varnode::register(0, 1),
+            a: Varnode::constant(7, 8),
+            b: Varnode::register(0x10, 8),
+        });
+        block.push(R2ILOp::Return {
+            target: Varnode::register(0x30, 8),
+        });
+        let prepared =
+            r2ssa::SsaArtifact::for_decompile_with_interface(&[block], Some(&arch), interface)
+                .expect("prepared boolean return")
+                .with_name("shape_bool_probe");
+        let boundary = prepared
+            .facts()
+            .boundaries
+            .returns
+            .values()
+            .next()
+            .expect("boolean return boundary");
+        assert!(boundary.complete);
+        let [boundary_value] = boundary.values.as_slice() else {
+            panic!("logical low-byte return must carry one value")
+        };
+        assert!(
+            prepared
+                .graph()
+                .value(boundary_value.value)
+                .is_some_and(|value| {
+                    value.var.size == 1 && value.canonical_storage == Some(storage(0, 1))
+                })
         );
 
-        assert_eq!(aliases.get("rdi").map(String::as_str), Some("arr"));
-        assert_eq!(aliases.get("edi").map(String::as_str), Some("arr"));
-        assert_eq!(aliases.get("rsi").map(String::as_str), Some("len"));
+        let input = source_owned_decompiler_input(
+            prepared,
+            (
+                r2types::DecompileRouteKind::Standard,
+                "logical low-byte return route",
+                None,
+            ),
+        );
+        let output = Decompiler::new(DecompilerConfig::x86_64()).decompile_input(&input);
+        assert!(
+            !output.contains("fallback") && !output.contains("native rendering refused"),
+            "an exact logical low-byte result must render: {output}"
+        );
+        assert!(output.contains("uint8_t shape_bool_probe("), "{output}");
+        assert!(
+            output.contains("return ") && output.contains(" < "),
+            "{output}"
+        );
+    }
+
+    /// A call whose stack pointer the convention restores, rendered end to end.
+    #[test]
+    fn a_restored_stack_pointer_renders() {
+        let arch = test_arch_for_decompile();
+        let storage = |offset| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let rsp = Varnode::register(0x28, 8);
+        let rip = Varnode::register(0x30, 8);
+
+        // One arm calls and one does not, so their restored stack pointers
+        // meet in a phi that is also the same machine object.
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::IntNotEqual {
+            dst: Varnode::unique(0x80, 1),
+            a: Varnode::register(0x10, 8),
+            b: Varnode::constant(0, 8),
+        });
+        entry.push(R2ILOp::CBranch {
+            target: Varnode::constant(0x1008, 8),
+            cond: Varnode::unique(0x80, 1),
+        });
+        let mut no_call = R2ILBlock::new(0x1004, 4);
+        no_call.push(R2ILOp::Branch {
+            target: Varnode::constant(0x1010, 8),
+        });
+
+        let mut call_ops = vec![R2ILOp::IntSub {
+            dst: rsp.clone(),
+            a: rsp.clone(),
+            b: Varnode::constant(8, 8),
+        }];
+        call_ops.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: rsp.clone(),
+            val: Varnode::constant(0x100d, 8),
+        });
+        call_ops.push(R2ILOp::Call {
+            target: Varnode::constant(0x2000, 8),
+        });
+        let mut call_meta = std::collections::BTreeMap::new();
+        for i in 0..call_ops.len() {
+            call_meta.insert(
+                i,
+                r2il::OpMetadata {
+                    instruction_addr: Some(0x1008),
+                    ..Default::default()
+                },
+            );
+        }
+        call_ops.push(R2ILOp::Branch {
+            target: Varnode::constant(0x1010, 8),
+        });
+        let called = R2ILBlock {
+            addr: 0x1008,
+            size: 8,
+            ops: call_ops,
+            switch_info: None,
+            op_metadata: call_meta,
+        };
+
+        let mut exit_ops = vec![R2ILOp::Load {
+            dst: rip.clone(),
+            space: SpaceId::Ram,
+            addr: rsp.clone(),
+        }];
+        exit_ops.push(R2ILOp::IntAdd {
+            dst: rsp.clone(),
+            a: rsp.clone(),
+            b: Varnode::constant(8, 8),
+        });
+        exit_ops.push(R2ILOp::Return {
+            target: rip.clone(),
+        });
+        let mut exit_meta = std::collections::BTreeMap::new();
+        for i in 0..exit_ops.len() {
+            exit_meta.insert(
+                i,
+                r2il::OpMetadata {
+                    instruction_addr: Some(0x1010),
+                    ..Default::default()
+                },
+            );
+        }
+        let exit = R2ILBlock {
+            addr: 0x1010,
+            size: 4,
+            ops: exit_ops,
+            switch_info: None,
+            op_metadata: exit_meta,
+        };
+        let blocks = [entry, no_call, called, exit];
+
+        let interface = r2ssa::SourceFunctionInterface::new_exact(
+            b"restore-fixture".to_vec(),
+            "sysv64",
+            [r2ssa::SourceAbiParameterSpec::new(0, storage(0x10))],
+            r2ssa::SourceFunctionReturn::Void,
+            std::iter::empty::<r2ssa::SourceStackSlotSpec>(),
+        )
+        .and_then(|i| i.with_return_address_storage(storage(0x30)))
+        .and_then(|i| i.with_stack_pointer_storage(storage(0x28)))
+        .expect("interface")
+        .with_preserved_call_carriers(true, true);
+        let prepared =
+            r2ssa::SsaArtifact::for_decompile_with_interface(&blocks, Some(&arch), interface)
+                .expect("prepared")
+                .with_name("restore_demo");
+        let restores = prepared
+            .function()
+            .get_block(0x1008)
+            .expect("call arm")
+            .ops
+            .iter()
+            .filter(|op| matches!(op, r2ssa::SSAOp::CallRestore { .. }))
+            .count();
+        assert_eq!(restores, 1, "the call moved the carrier, so it is restored");
+        assert!(
+            prepared
+                .function()
+                .get_block(0x1010)
+                .expect("join")
+                .phis
+                .iter()
+                .any(|phi| phi.canonical_storage == Some(storage(0x28))),
+            "the called and uncalled paths must merge their stack carriers"
+        );
+        let input = source_owned_decompiler_input(
+            prepared,
+            (r2types::DecompileRouteKind::Standard, "restore route", None),
+        );
+        let decompiler = Decompiler::new(DecompilerConfig::x86_64());
+        let output = decompiler.decompile_input(&input);
+        // The restore performs nothing and says so: its two sides are one
+        // object, licensed by the convention, so both its read and its write
+        // are accounted as a coalesced copy rather than left for the seal to
+        // find. Before that licence existed this refused outright, first for
+        // an unaccounted read of the entry carrier and then for a write with
+        // no rendered occurrence.
+        assert!(
+            !output.contains("native render refusal"),
+            "a restored carrier must not refuse the function: {output}"
+        );
+        assert!(
+            output.contains("0 unaccounted"),
+            "the restore accounts for both of its sides: {output}"
+        );
+    }
+
+    /// A restore whose certified output is dead still has no C occurrence.
+    #[test]
+    fn an_unused_restored_stack_pointer_renders() {
+        let arch = test_arch_for_decompile();
+        let storage = |offset| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let rsp = Varnode::register(0x28, 8);
+        let mut entry = R2ILBlock::new(0x1000, 4);
+        entry.push(R2ILOp::IntNotEqual {
+            dst: Varnode::unique(0x80, 1),
+            a: Varnode::register(0x10, 8),
+            b: Varnode::constant(0, 8),
+        });
+        entry.push(R2ILOp::CBranch {
+            target: Varnode::constant(0x1008, 8),
+            cond: Varnode::unique(0x80, 1),
+        });
+        let mut no_call = R2ILBlock::new(0x1004, 4);
+        no_call.push(R2ILOp::Branch {
+            target: Varnode::constant(0x1010, 8),
+        });
+        let mut called = R2ILBlock::new(0x1008, 8);
+        called.push(R2ILOp::IntSub {
+            dst: rsp.clone(),
+            a: rsp.clone(),
+            b: Varnode::constant(8, 8),
+        });
+        called.push(R2ILOp::Store {
+            space: SpaceId::Ram,
+            addr: rsp,
+            val: Varnode::constant(0x100d, 8),
+        });
+        called.push(R2ILOp::Call {
+            target: Varnode::constant(0x2000, 8),
+        });
+        for i in 0..called.ops.len() {
+            called.op_metadata.insert(
+                i,
+                r2il::OpMetadata {
+                    instruction_addr: Some(0x1008),
+                    ..Default::default()
+                },
+            );
+        }
+        called.push(R2ILOp::Branch {
+            target: Varnode::constant(0x1010, 8),
+        });
+        let mut exit = R2ILBlock::new(0x1010, 4);
+        exit.push(R2ILOp::Breakpoint);
+        let interface = r2ssa::SourceFunctionInterface::new_exact(
+            b"unused-restore-fixture".to_vec(),
+            "sysv64",
+            std::iter::empty::<r2ssa::SourceAbiParameterSpec>(),
+            r2ssa::SourceFunctionReturn::Void,
+            std::iter::empty::<r2ssa::SourceStackSlotSpec>(),
+        )
+        .and_then(|i| i.with_return_address_storage(storage(0x30)))
+        .and_then(|i| i.with_stack_pointer_storage(storage(0x28)))
+        .expect("interface")
+        .with_preserved_call_carriers(true, true);
+        let prepared = r2ssa::SsaArtifact::for_decompile_with_interface(
+            &[entry, no_call, called, exit],
+            Some(&arch),
+            interface,
+        )
+        .expect("prepared")
+        .with_name("unused_restore_demo");
+        let restore_outputs = prepared
+            .graph()
+            .insts
+            .iter()
+            .filter(|inst| {
+                matches!(
+                    inst.payload,
+                    r2ssa::InstPayload::Op(r2ssa::SSAOp::CallRestore { .. })
+                )
+            })
+            .filter_map(|inst| inst.output)
+            .collect::<Vec<_>>();
+        assert_eq!(restore_outputs.len(), 1, "one stack carrier is restored");
+        let structural_unused = prepared
+            .obligations()
+            .structural_unused_values(
+                prepared.graph(),
+                prepared.unobserved_merges().unobserved_uses(),
+            )
+            .expect("complete structural-value inventory");
+        assert!(
+            restore_outputs
+                .iter()
+                .all(|value| structural_unused.contains(value)),
+            "the regression requires an unused restore output"
+        );
+
+        let input = source_owned_decompiler_input(
+            prepared,
+            (r2types::DecompileRouteKind::Standard, "restore route", None),
+        );
+        let output = Decompiler::new(DecompilerConfig::x86_64()).decompile_input(&input);
+        assert!(
+            !output.contains("native render refusal"),
+            "an unused restored carrier must not refuse the function: {output}"
+        );
+        assert!(
+            output.contains("0 unaccounted"),
+            "the structural elision accounts for the restore operand: {output}"
+        );
+    }
+
+    fn test_arch_for_decompile() -> ArchSpec {
+        let mut arch = ArchSpec::new("x86-64");
+        let registers = [
+            (
+                "RAX",
+                RegisterStorage {
+                    offset: 0x00,
+                    size: 8,
+                },
+            ),
+            (
+                "RDI",
+                RegisterStorage {
+                    offset: 0x10,
+                    size: 8,
+                },
+            ),
+            (
+                "RSI",
+                RegisterStorage {
+                    offset: 0x18,
+                    size: 8,
+                },
+            ),
+            (
+                "RBP",
+                RegisterStorage {
+                    offset: 0x20,
+                    size: 8,
+                },
+            ),
+            (
+                "RSP",
+                RegisterStorage {
+                    offset: 0x28,
+                    size: 8,
+                },
+            ),
+            (
+                "RIP",
+                RegisterStorage {
+                    offset: 0x30,
+                    size: 8,
+                },
+            ),
+        ];
+        for (name, storage) in registers {
+            arch.add_register(RegisterDef::new(name, storage.offset, storage.size));
+            arch.register_projections.push(RegisterProjection {
+                written: storage,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier: storage,
+                    slice: RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits: u64::from(storage.size) * 8,
+                    },
+                },
+            });
+        }
+        arch
     }
 
     fn signature_spec(
@@ -4683,12 +7093,12 @@ mod tests {
         params: Vec<(&str, Option<CType>)>,
     ) -> FunctionSignatureSpec {
         FunctionSignatureSpec {
-            ret_type: ret_type.as_ref().map(super::ctype_to_type_like),
+            ret_type: ret_type.as_ref().cloned(),
             params: params
                 .into_iter()
                 .map(|(name, ty)| FunctionParamSpec {
                     name: name.to_string(),
-                    ty: ty.as_ref().map(super::ctype_to_type_like),
+                    ty: ty.as_ref().cloned(),
                 })
                 .collect(),
         }
@@ -4770,254 +7180,249 @@ mod tests {
     }
 
     #[test]
-    fn test_final_function_body_prune_removes_late_dead_sleigh_temps() {
-        let mut func = CFunction {
-            name: "late_prune".to_string(),
-            ret_type: CType::i64(),
-            params: Vec::new(),
-            params_known: true,
-            locals: Vec::new(),
-            body: vec![
-                CStmt::Expr(CExpr::assign(
-                    CExpr::Var("tmp_ldwn_1".to_string()),
-                    CExpr::deref(CExpr::binary(
-                        BinaryOp::Add,
-                        CExpr::Var("base".to_string()),
-                        CExpr::IntLit(50),
-                    )),
-                )),
-                CStmt::Expr(CExpr::assign(
-                    CExpr::Var("tmp_stwn_1".to_string()),
-                    CExpr::binary(
-                        BinaryOp::Add,
-                        CExpr::deref(CExpr::binary(
-                            BinaryOp::Add,
-                            CExpr::Var("base".to_string()),
-                            CExpr::IntLit(50),
-                        )),
-                        CExpr::Var("arg1".to_string()),
-                    ),
-                )),
-                CStmt::Expr(CExpr::assign(
-                    CExpr::deref(CExpr::binary(
-                        BinaryOp::Add,
-                        CExpr::Var("x0_5".to_string()),
-                        CExpr::IntLit(50),
-                    )),
-                    CExpr::binary(
-                        BinaryOp::Add,
-                        CExpr::Var("arg1".to_string()),
-                        CExpr::deref(CExpr::binary(
-                            BinaryOp::Add,
-                            CExpr::Var("base".to_string()),
-                            CExpr::IntLit(50),
-                        )),
-                    ),
-                )),
-                CStmt::Return(Some(CExpr::Var("x0_5".to_string()))),
-            ],
-        };
-        let ctx = FoldingContext::new(64);
+    fn folded_constant_keeps_every_observation_it_collapsed() {
+        let mut observations = crate::ast::RenderObservationOwner::new();
+        let (left_id, left) = observations
+            .observe_expr(CExpr::UIntLit(0x1000))
+            .expect("left operand observation");
+        let (right_id, right) = observations
+            .observe_expr(CExpr::UIntLit(4))
+            .expect("right operand observation");
+        let (root_id, mut expr) = observations
+            .observe_expr(CExpr::binary(BinaryOp::Add, left, right))
+            .expect("root observation");
+        let strings = BTreeMap::from([(0x1004, "text".to_string())]);
 
-        prune_dead_temp_assignments_in_function_body(&mut func, &ctx);
+        let no_symbols = BTreeMap::new();
+        let no_object_types = r2types::ProgramDataObjectTypeFacts::default();
+        let unused_objects = std::cell::RefCell::new(std::collections::BTreeMap::new());
+        fold_constant_arithmetic_in_expr(
+            &mut expr,
+            &strings,
+            &no_symbols,
+            &no_object_types,
+            &unused_objects,
+        );
+        let mut function = CFunction::new(
+            "folded",
+            CType::Pointer(Box::new(CType::Int {
+                bits: 8,
+                signedness: r2types::Signedness::Signed,
+            })),
+        )
+        .with_body(vec![CStmt::Return(Some(expr))]);
+        let reachable =
+            crate::ast::strip_render_observations(&mut function, observations.expected_count())
+                .expect("constant folding preserves a valid marker domain");
 
-        assert_eq!(func.body.len(), 2, "{func:?}");
+        // The one rendered node stands for everything the fold collapsed, so
+        // it owns every occurrence those nodes owned. Keeping only the root
+        // silently discarded the operands' occurrences, and an obligation
+        // whose only rendered occurrence sat on a folded operand was then
+        // scored refused for an effect the program does render.
+        assert!(reachable.contains(root_id));
+        assert!(reachable.contains(left_id));
+        assert!(reachable.contains(right_id));
+        assert_eq!(
+            function.body,
+            vec![CStmt::Return(Some(CExpr::StringLit("text".to_string())))]
+        );
+    }
+
+    #[test]
+    fn radare_typed_global_renders_as_its_type_and_direct_value() {
+        let mut function =
+            CFunction::new("read_counter", CType::i32()).with_body(vec![CStmt::Return(Some(
+                CExpr::deref(CExpr::cast(
+                    CType::ptr(CType::u32()),
+                    CExpr::UIntLit(0x7000),
+                )),
+            ))]);
+        let strings = BTreeMap::new();
+        let symbols = BTreeMap::from([(0x7000, "obj.global_counter".to_string())]);
+        let object_types = r2types::ProgramDataObjectTypeFacts::from_radare2(
+            [(0x7000, Some("int32_t"))],
+            64,
+            &r2types::ExternalTypeDb::default(),
+        );
+        let used = std::cell::RefCell::new(std::collections::BTreeMap::new());
+
+        fold_constant_arithmetic_in_function(
+            &mut function,
+            &strings,
+            &symbols,
+            &object_types,
+            &used,
+            64,
+        );
+        function.extern_objects = used.into_inner().into_values().collect();
+        note_unproven_constructs(&mut function, None, 0);
+        let ready = crate::codegen::prepare_function_for_emission(&function);
+        let rendered =
+            crate::codegen::CodeGenerator::new(Default::default()).generate_function(&ready);
+
         assert!(
-            !format!("{:?}", func.body).contains("tmp_"),
-            "Sleigh load/store temps should be gone from final function body: {:?}",
-            func.body
+            rendered.contains("extern int32_t global_counter;"),
+            "{rendered}"
         );
-        assert!(matches!(
-            func.body[0],
-            CStmt::Expr(CExpr::Binary {
-                op: BinaryOp::Assign,
-                ..
-            })
-        ));
-        assert_eq!(
-            func.body[1],
-            CStmt::Return(Some(CExpr::Var("x0_5".to_string())))
-        );
-    }
-
-    #[test]
-    fn authoritative_external_signature_can_shrink_recovered_header_params() {
-        let recovered = vec![
-            ast::CParam {
-                ty: CType::Int(32),
-                name: "arg1".to_string(),
-            },
-            ast::CParam {
-                ty: CType::Int(32),
-                name: "arg2".to_string(),
-            },
-            ast::CParam {
-                ty: CType::Int(32),
-                name: "arg3".to_string(),
-            },
-        ];
-        let signature = signature_spec(
-            Some(CType::Pointer(Box::new(CType::Int(8)))),
-            vec![
-                ("src", Some(CType::Pointer(Box::new(CType::Int(8))))),
-                ("len", Some(CType::UInt(64))),
-            ],
-        );
-
-        let params = merge_params_with_external_signature(recovered, Some(&signature));
-        assert_eq!(
-            params.len(),
-            2,
-            "typed/named external signature should be authoritative for the visible header"
-        );
-        assert_eq!(params[0].name, "src");
-        assert_eq!(params[1].name, "len");
-        assert!(matches!(params[1].ty, CType::UInt(64)));
-    }
-
-    #[test]
-    fn generic_external_signature_still_owns_header_arity() {
-        let recovered = vec![
-            ast::CParam {
-                ty: CType::Int(32),
-                name: "arg1".to_string(),
-            },
-            ast::CParam {
-                ty: CType::Int(32),
-                name: "arg2".to_string(),
-            },
-            ast::CParam {
-                ty: CType::Int(32),
-                name: "arg3".to_string(),
-            },
-        ];
-        let signature = signature_spec(None, vec![("arg1", None), ("arg2", None)]);
-
-        let params = merge_params_with_external_signature(recovered, Some(&signature));
-        assert_eq!(
-            params.len(),
-            2,
-            "certified signature arity must be the visible header authority even when generic"
+        assert!(rendered.contains("return global_counter;"), "{rendered}");
+        assert!(
+            rendered.contains("1 data object type supplied by radare2"),
+            "{rendered}"
         );
         assert!(
-            params.iter().all(|param| param.name != "arg3"),
-            "local recovery must not append surplus header params beyond FunctionFacts signature"
+            !rendered.contains("extern char global_counter[]"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("*(uint32_t*)&global_counter"),
+            "{rendered}"
         );
     }
 
     #[test]
-    fn external_signature_can_extend_empty_recovered_header_params() {
-        let signature = signature_spec(
-            None,
+    fn unplaceable_global_type_keeps_the_honest_byte_declaration() {
+        let mut function = CFunction::new("read_counter", CType::u32())
+            .with_body(vec![CStmt::Return(Some(CExpr::UIntLit(0x7000)))]);
+        let symbols = BTreeMap::from([(0x7000, "obj.global_counter".to_string())]);
+        let object_types = r2types::ProgramDataObjectTypeFacts::from_radare2(
+            [(0x7000, Some("looks_specific_t"))],
+            64,
+            &r2types::ExternalTypeDb::default(),
+        );
+        let used = std::cell::RefCell::new(std::collections::BTreeMap::new());
+        fold_constant_arithmetic_in_function(
+            &mut function,
+            &BTreeMap::new(),
+            &symbols,
+            &object_types,
+            &used,
+            64,
+        );
+        function.extern_objects = used.into_inner().into_values().collect();
+        note_unproven_constructs(&mut function, None, 0);
+        let ready = crate::codegen::prepare_function_for_emission(&function);
+        let rendered =
+            crate::codegen::CodeGenerator::new(Default::default()).generate_function(&ready);
+
+        assert!(
+            rendered.contains("extern char global_counter[];"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("1 data object type refused"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("looks_specific_t"), "{rendered}");
+    }
+
+    #[test]
+    fn prepended_comment_keeps_only_the_exact_original_statement_observation() {
+        let mut observations = crate::ast::RenderObservationOwner::new();
+        let (stmt_id, stmt) = observations
+            .observe_stmt(CStmt::Return(Some(CExpr::IntLit(7))))
+            .expect("return observation");
+        let commented = Decompiler::prepend_comment(stmt, "summary".to_string());
+        assert_eq!(
+            commented,
+            CStmt::Block(vec![
+                CStmt::comment("summary"),
+                CStmt::observed(stmt_id, CStmt::Return(Some(CExpr::IntLit(7)))),
+            ])
+        );
+
+        let mut function = CFunction::new(
+            "commented",
+            CType::Int {
+                bits: 32,
+                signedness: r2types::Signedness::Signed,
+            },
+        )
+        .with_body(vec![commented]);
+        let reachable =
+            crate::ast::strip_render_observations(&mut function, observations.expected_count())
+                .expect("comment insertion preserves a valid marker domain");
+        assert!(reachable.contains(stmt_id));
+    }
+
+    #[test]
+    fn prepended_comment_does_not_move_a_split_block_observation() {
+        let mut observations = crate::ast::RenderObservationOwner::new();
+        let (child_id, child) = observations
+            .observe_stmt(CStmt::Return(Some(CExpr::IntLit(1))))
+            .expect("child observation");
+        let (block_id, block) = observations
+            .observe_stmt(CStmt::Block(vec![
+                child,
+                CStmt::Return(Some(CExpr::IntLit(2))),
+            ]))
+            .expect("block observation");
+        let commented = Decompiler::prepend_comment(block, "summary".to_string());
+        let mut function = CFunction::new(
+            "commented_block",
+            CType::Int {
+                bits: 32,
+                signedness: r2types::Signedness::Signed,
+            },
+        )
+        .with_body(vec![commented]);
+
+        let reachable =
+            crate::ast::strip_render_observations(&mut function, observations.expected_count())
+                .expect("comment insertion preserves a valid marker domain");
+        assert!(reachable.contains(child_id));
+        assert!(
+            !reachable.contains(block_id),
+            "a new comment sibling leaves no exact owner for the old block marker"
+        );
+        assert_eq!(
+            function.body,
+            vec![CStmt::Block(vec![
+                CStmt::comment("summary"),
+                CStmt::Return(Some(CExpr::IntLit(1))),
+                CStmt::Return(Some(CExpr::IntLit(2))),
+            ])]
+        );
+    }
+
+    #[test]
+    fn split_block_observation_is_not_assigned_to_its_first_child() {
+        let mut observations = crate::ast::RenderObservationOwner::new();
+        let (first_id, first) = observations
+            .observe_stmt(CStmt::Return(Some(CExpr::IntLit(1))))
+            .expect("first statement observation");
+        let (block_id, block) = observations
+            .observe_stmt(CStmt::Block(vec![
+                first,
+                CStmt::Return(Some(CExpr::IntLit(2))),
+            ]))
+            .expect("block observation");
+        let decompiler = Decompiler::new(DecompilerConfig::x86_64());
+        let body = decompiler.stmt_to_vec(block);
+        let mut function = CFunction::new(
+            "split",
+            CType::Int {
+                bits: 32,
+                signedness: r2types::Signedness::Signed,
+            },
+        )
+        .with_body(body);
+
+        let reachable =
+            crate::ast::strip_render_observations(&mut function, observations.expected_count())
+                .expect("block decomposition preserves a valid marker domain");
+        assert!(reachable.contains(first_id));
+        assert!(
+            !reachable.contains(block_id),
+            "a multi-statement block has no exact first-child projection"
+        );
+        assert_eq!(
+            function.body,
             vec![
-                ("buf", Some(CType::Pointer(Box::new(CType::Int(8))))),
-                ("count", Some(CType::UInt(64))),
-            ],
+                CStmt::Return(Some(CExpr::IntLit(1))),
+                CStmt::Return(Some(CExpr::IntLit(2))),
+            ]
         );
-
-        let params = merge_params_with_external_signature(Vec::new(), Some(&signature));
-        assert_eq!(params.len(), 2);
-        assert_eq!(params[0].name, "buf");
-        assert_eq!(params[1].name, "count");
-    }
-
-    #[test]
-    fn redundant_return_carrier_cast_yields_to_declared_c_type() {
-        let mut func = CFunction::new("carrier", CType::Int(32)).with_body(vec![CStmt::if_stmt(
-            CExpr::IntLit(1),
-            CStmt::Return(Some(CExpr::cast(CType::Int(64), CExpr::var("result")))),
-            None,
-        )]);
-        func.locals.push(ast::CLocal {
-            ty: CType::Int(32),
-            name: "result".to_string(),
-            stack_offset: Some(-4),
-        });
-
-        normalize_redundant_return_carrier_casts(&mut func);
-
-        assert!(matches!(
-            &func.body[0],
-            CStmt::If { then_body, .. }
-                if matches!(then_body.as_ref(), CStmt::Return(Some(CExpr::Var(name))) if name == "result")
-        ));
-    }
-
-    #[test]
-    fn declared_assignment_type_normalizes_only_root_integer_literals() {
-        let mut func = CFunction::new("typed_assignments", CType::Int(32)).with_body(vec![
-            CStmt::Expr(CExpr::binary(
-                BinaryOp::Assign,
-                CExpr::var("signed_value"),
-                CExpr::UIntLit(0xffff_ffff),
-            )),
-            CStmt::Expr(CExpr::binary(
-                BinaryOp::Assign,
-                CExpr::var("unsigned_value"),
-                CExpr::UIntLit(0xffff_ffff),
-            )),
-            CStmt::Expr(CExpr::binary(
-                BinaryOp::Assign,
-                CExpr::var("signed_value"),
-                CExpr::binary(BinaryOp::Add, CExpr::UIntLit(0xffff_ffff), CExpr::IntLit(1)),
-            )),
-        ]);
-        func.locals = vec![
-            ast::CLocal {
-                ty: CType::Int(32),
-                name: "signed_value".to_string(),
-                stack_offset: Some(-4),
-            },
-            ast::CLocal {
-                ty: CType::UInt(32),
-                name: "unsigned_value".to_string(),
-                stack_offset: Some(-8),
-            },
-        ];
-
-        normalize_declared_assignment_literals(&mut func);
-
-        let CStmt::Expr(CExpr::Binary { right, .. }) = &func.body[0] else {
-            panic!("expected signed assignment");
-        };
-        assert_eq!(right.as_ref(), &CExpr::IntLit(-1));
-        let CStmt::Expr(CExpr::Binary { right, .. }) = &func.body[1] else {
-            panic!("expected unsigned assignment");
-        };
-        assert_eq!(right.as_ref(), &CExpr::UIntLit(0xffff_ffff));
-        let CStmt::Expr(CExpr::Binary { right, .. }) = &func.body[2] else {
-            panic!("expected compound rhs assignment");
-        };
-        assert!(matches!(
-            right.as_ref(),
-            CExpr::Binary {
-                op: BinaryOp::Add,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn unreferenced_local_declaration_is_removed_without_touching_live_locals() {
-        let mut func = CFunction::new("locals", CType::Int(32))
-            .with_body(vec![CStmt::Return(Some(CExpr::var("live")))]);
-        func.locals = vec![
-            ast::CLocal {
-                ty: CType::Int(32),
-                name: "dead_return_slot".to_string(),
-                stack_offset: Some(-4),
-            },
-            ast::CLocal {
-                ty: CType::Int(32),
-                name: "live".to_string(),
-                stack_offset: Some(-8),
-            },
-        ];
-
-        prune_unreferenced_local_declarations(&mut func);
-
-        assert_eq!(func.locals.len(), 1);
-        assert_eq!(func.locals[0].name, "live");
     }
 
     #[test]
@@ -5056,75 +7461,6 @@ mod tests {
                 |stmt| matches!(stmt, CStmt::Comment(text) if text.contains("2 blocks > limit 1"))
             ),
             "direct AST construction must enforce the same block budget: {function:?}"
-        );
-    }
-
-    #[test]
-    fn decompile_input_with_standard_route_residualizes() {
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_from_ops(
-            vec![
-                R2ILOp::Load {
-                    dst: Varnode::unique(0x10, 4),
-                    space: SpaceId::Ram,
-                    addr: Varnode::register(0x10, 8),
-                },
-                R2ILOp::Return {
-                    target: Varnode::unique(0x10, 4),
-                },
-            ],
-            &arch,
-        );
-        let input = source_owned_decompiler_input(
-            prepared,
-            (
-                r2types::DecompileRouteKind::Standard,
-                "standard residual route",
-                None,
-            ),
-        );
-
-        let output = Decompiler::new(DecompilerConfig::x86_64()).decompile_input(&input);
-
-        assert!(
-            output.contains("Standard executable rendering is unavailable"),
-            "{output}"
-        );
-        assert!(
-            !output.contains("return 0;"),
-            "Standard residual route must not render executable C, got:\n{output}"
-        );
-    }
-
-    #[test]
-    fn build_function_from_input_with_standard_route_residualizes_ast() {
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_from_ops(
-            vec![R2ILOp::Return {
-                target: Varnode::constant(0, 8),
-            }],
-            &arch,
-        );
-        let input = source_owned_decompiler_input(
-            prepared,
-            (
-                r2types::DecompileRouteKind::Standard,
-                "standard residual route",
-                None,
-            ),
-        );
-
-        let func = Decompiler::new(DecompilerConfig::x86_64()).build_function_from_input(&input);
-
-        assert!(
-            func.body
-                .iter()
-                .any(|stmt| matches!(stmt, CStmt::Comment(text) if text.contains("Standard executable rendering is unavailable"))),
-            "Standard route must produce an explicit residual AST, got {func:?}"
-        );
-        assert!(
-            !func.body.iter().any(summary_stmt_contains_return),
-            "Standard residual route must not render executable return AST, got {func:?}"
         );
     }
 
@@ -5203,11 +7539,8 @@ mod tests {
         }];
         let requested = Arc::new(prepared_from_ops(ops.clone(), &arch));
         let foreign = Arc::new(prepared_from_ops(ops, &arch));
-        let artifact = r2sym::compile_semantic_artifact_default_with_scope(
-            &z3::Context::thread_local(),
-            &foreign,
-            None,
-        );
+        let artifact =
+            r2sym::compile_semantic_artifact_default(&z3::Context::thread_local(), &foreign);
         let request = r2types::TypeWritebackAnalysisRequest::new(
             Arc::clone(&requested),
             r2types::ParsedExternalContext::default(),
@@ -5261,8 +7594,7 @@ mod tests {
 
     #[test]
     fn foreign_interproc_summary_never_reaches_decompiler_input() {
-        let mut arch = test_arch_for_decompile();
-        arch.add_register(RegisterDef::new("RIP", 0x30, 8));
+        let arch = test_arch_for_decompile();
         let mut block = R2ILBlock::new(0x1000, 4);
         block.push(R2ILOp::Return {
             target: Varnode::constant(0, 8),
@@ -5501,68 +7833,6 @@ mod tests {
     }
 
     #[test]
-    fn build_function_from_input_standard_route_cannot_authorize_executable_ast() {
-        let arch = test_arch_for_decompile();
-        let prepared = prepared_from_ops(
-            vec![R2ILOp::Return {
-                target: Varnode::constant(0, 8),
-            }],
-            &arch,
-        );
-        let input = source_owned_decompiler_input(
-            prepared,
-            (
-                r2types::DecompileRouteKind::Standard,
-                "standard route request",
-                None,
-            ),
-        );
-
-        let built = Decompiler::new(DecompilerConfig::x86_64()).build_function_from_input(&input);
-
-        assert!(
-            format!("{:?}", built.body).contains("Standard executable rendering is unavailable"),
-            "source-owned Standard route should explain the residual: {:?}",
-            built.body
-        );
-        assert!(
-            !built
-                .body
-                .iter()
-                .any(|stmt| matches!(stmt, CStmt::Return(_))),
-            "source-owned Standard route must not produce executable returns: {:?}",
-            built.body
-        );
-        assert!(
-            built.locals.is_empty(),
-            "source-owned Standard route must fail closed before local recovery: {:?}",
-            built.locals
-        );
-
-        let decompiler =
-            Decompiler::new(DecompilerConfig::x86_64()).with_context(input.context_projection());
-        let route = decompiler
-            .context
-            .function_facts
-            .decompile_route()
-            .expect("test route");
-        let direct_built = decompiler.build_function_internal(&input, route);
-        assert!(
-            direct_built
-                .body
-                .iter()
-                .all(|stmt| matches!(stmt, CStmt::Comment(_))),
-            "internal Standard path must fail closed before structuring executable C: {:?}",
-            direct_built.body
-        );
-        assert!(
-            direct_built.locals.is_empty(),
-            "internal Standard path must fail closed before local recovery: {:?}",
-            direct_built.locals
-        );
-    }
-
-    #[test]
     fn report_only_standard_summary_semantics_residualizes() {
         let semantic_report = test_native_semantic_report(
             r2sym::RefinementStage::Compiled,
@@ -5590,8 +7860,10 @@ mod tests {
         );
     }
 
+    /// A malformed source return boundary is refused before the effect ledger
+    /// can classify any native C as surviving.
     #[test]
-    fn decompile_input_honors_source_owned_standard_residual() {
+    fn malformed_return_boundary_refuses_before_effect_audit() {
         let arch = test_arch_for_decompile();
         let prepared = prepared_from_ops(
             vec![R2ILOp::Return {
@@ -5608,13 +7880,593 @@ mod tests {
             ),
         );
 
-        let output = Decompiler::new(DecompilerConfig::x86_64()).decompile_input(&input);
-
-        assert!(output.contains("r2dec residual"), "{output}");
-        assert!(
-            output.contains("Standard executable rendering is unavailable"),
-            "{output}"
+        let decompiler = Decompiler::new(DecompilerConfig::x86_64());
+        let audited = decompiler.decompile_input_with_binding_audit(&input);
+        assert_eq!(
+            audited.render_refusal(),
+            Some(
+                DecompileRenderRefusal::MissingMachineProjectionAuthorization(
+                    crate::MachineProjectionRefusalOrigin::op_lowering(),
+                )
+            )
         );
+        assert_eq!(audited.effect_obligations(), EffectObligationAudit::NOT_RUN);
+        assert!(!audited.output().contains("return"), "{}", audited.output());
+    }
+
+    #[test]
+    fn native_standard_path_builds_a_sound_non_consuming_binding_shadow() {
+        let arch = test_arch_for_decompile();
+        let prepared = prepared_from_ops(
+            vec![
+                R2ILOp::Copy {
+                    dst: Varnode::register(0, 8),
+                    src: Varnode::constant(0, 8),
+                },
+                R2ILOp::Return {
+                    target: Varnode::register(0x30, 8),
+                },
+            ],
+            &arch,
+        );
+        let block = prepared.function().get_block(0x1000).expect("entry block");
+        let copy_source = block
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                SSAOp::Copy { src, .. } => Some(src),
+                _ => None,
+            })
+            .expect("copy source");
+        let copy_source_value = prepared
+            .graph()
+            .value_id_for_var(copy_source)
+            .expect("copy source must retain exact ValueId");
+        let return_op = block
+            .ops
+            .iter()
+            .position(|op| matches!(op, SSAOp::Return { .. }))
+            .expect("return op");
+        let return_certificate = prepared
+            .return_certificate_for_op(0x1000, return_op)
+            .expect("scalar audit fixture must retain an exact return certificate");
+        assert_eq!(return_certificate.block_addr, 0x1000);
+        assert_eq!(return_certificate.op_index, return_op);
+        let return_value = return_certificate.value;
+        let input = source_owned_decompiler_input(
+            prepared,
+            (
+                r2types::DecompileRouteKind::Standard,
+                "binding shadow production path",
+                None,
+            ),
+        );
+        let plan = crate::binding_plan::BindingPlan::build_shadow(input.source_owned_facts())
+            .expect("scalar audit fixture binding plan");
+        assert!(matches!(
+            plan.disposition(return_value),
+            Some(crate::binding_plan::ValueDisposition::Bound { .. })
+        ));
+        assert!(matches!(
+            plan.disposition(copy_source_value),
+            Some(crate::binding_plan::ValueDisposition::Inline { .. })
+        ));
+        assert_eq!(
+            input
+                .function_facts()
+                .render()
+                .and_then(|render| render.return_for_op(0x1000, return_op))
+                .map(|fact| fact.value),
+            Some(return_value)
+        );
+        let config = DecompilerConfig::x86_64();
+        let public_decompiler = Decompiler::new(config.clone());
+        let internal_decompiler =
+            Decompiler::new(config.clone()).with_context(input.context_projection());
+        let semantic_route = input
+            .function_facts()
+            .decompile_route()
+            .expect("sealed standard route");
+        let execution = r2ssa::SsaExecutionControl::default();
+        let work = DecompileWorkControl::new(&execution, DecompileWorkPhase::Normalization);
+        let built = internal_decompiler
+            .build_function_internal_with_control(&input, semantic_route, work)
+            .expect("native production build");
+
+        let internal_output =
+            CodeGenerator::new(config.codegen).generate_function(built.emission());
+        let public_output = public_decompiler.decompile_input(&input);
+        assert_eq!(internal_output, public_output);
+        let audited = public_decompiler.decompile_input_with_binding_audit(&input);
+        assert_eq!(audited.output(), public_output);
+        let BindingShadowAuditOutcome::Complete {
+            ledger,
+            observations,
+        } = audited.binding_shadow()
+        else {
+            panic!("public native path did not expose its complete shadow audit");
+        };
+        assert!(ledger.equations_hold());
+        assert!(ledger.passes_quality());
+        assert!(observations.equations_hold());
+        assert!(observations.passes_quality());
+        let mut corrupted_public_ledger = ledger;
+        corrupted_public_ledger.values.observed =
+            corrupted_public_ledger.values.observed.saturating_sub(1);
+        assert!(!corrupted_public_ledger.equations_hold());
+        assert!(!corrupted_public_ledger.passes_quality());
+    }
+
+    #[test]
+    fn shuffled_block_schedule_keeps_spans_bindings_placement_and_bytes_identical() {
+        fn exact_diamond_input(
+            blocks: &[R2ILBlock],
+        ) -> (r2ssa::span::StorageSpans, DecompilerInput) {
+            let arch = test_arch_for_decompile();
+            let storage = |offset| r2ssa::CanonicalStorageId {
+                space: r2ssa::CanonicalStorageSpace::Register,
+                offset,
+                size: 8,
+            };
+            let logical_u64 = r2ssa::SourceLogicalValue::new(
+                0,
+                r2ssa::SourceCarrierProjection::new(r2ssa::SourceCarrierKind::Full, 0, 64),
+            );
+            let type_graph = r2ssa::SourceTypeGraph::new(
+                [r2ssa::SourceType::new(
+                    0,
+                    r2ssa::SourceTypeKind::UnsignedInteger,
+                    64,
+                    64,
+                )],
+                [],
+            )
+            .expect("exact diamond type graph");
+            let interface = r2ssa::SourceFunctionInterface::new_exact_with_logical_types(
+                b"r2dec-shuffled-diamond".to_vec(),
+                "sysv64",
+                [r2ssa::SourceAbiParameterSpec::new(0, storage(0x10))],
+                r2ssa::SourceFunctionReturn::Register {
+                    storage: storage(0),
+                },
+                [],
+                [logical_u64],
+                Some(logical_u64),
+                Some(type_graph),
+            )
+            .and_then(|interface| interface.with_return_address_storage(storage(0x30)))
+            .and_then(|interface| interface.with_stack_pointer_storage(storage(0x28)))
+            .expect("exact diamond interface");
+            let prepared = Arc::new(
+                r2ssa::SsaArtifact::for_decompile_with_interface(blocks, Some(&arch), interface)
+                    .expect("prepared shuffled diamond")
+                    .with_name("stable_diamond"),
+            );
+            let spans = prepared.storage_spans().clone();
+            let signature = signature_spec(
+                Some(CType::Int {
+                    bits: 64,
+                    signedness: r2types::Signedness::Unsigned,
+                }),
+                vec![(
+                    "condition",
+                    Some(CType::Int {
+                        bits: 64,
+                        signedness: r2types::Signedness::Unsigned,
+                    }),
+                )],
+            );
+            let parsed_context = r2types::ParsedExternalContext {
+                current_signature: Some(signature.clone()),
+                merged_signature: Some(signature),
+                ..r2types::ParsedExternalContext::default()
+            };
+            let request = r2types::TypeWritebackAnalysisRequest::new(prepared, parsed_context)
+                .expect("source-owned shuffled diamond request");
+            let source_owned_facts = r2types::build_source_owned_type_writeback_analysis(request)
+                .expect("source-owned shuffled diamond analysis")
+                .finalize_for_decompile(r2types::DecompileFinalization {
+                    kind: r2types::DecompileRouteKind::Standard,
+                    reason: "shuffled determinism proof".to_string(),
+                    fallback_comment: None,
+                })
+                .expect("source-owned shuffled diamond finalization");
+            let input = DecompilerInput::new(source_owned_facts);
+            (spans, input)
+        }
+
+        fn binding_signature(input: &DecompilerInput) -> (Vec<String>, Vec<String>) {
+            let plan = crate::binding_plan::BindingPlan::build_shadow(input.source_owned_facts())
+                .expect("sealed deterministic plan");
+            let bindings = plan
+                .bindings()
+                .map(|(id, binding)| {
+                    format!(
+                        "{}:{:?}:{:?}:{:?}",
+                        id.index(),
+                        binding.declaration_type(),
+                        binding.presentation_name_hint(),
+                        plan.binding_role(id)
+                    )
+                })
+                .collect();
+            let dispositions = (0..input.prepared_ssa().graph().values.len())
+                .map(|index| {
+                    let value = r2ssa::ValueId(index as u32);
+                    match plan
+                        .disposition(value)
+                        .expect("one disposition per dense value")
+                    {
+                        crate::binding_plan::ValueDisposition::Bound { binding } => {
+                            format!("bound:{}", binding.index())
+                        }
+                        crate::binding_plan::ValueDisposition::Inline { term, .. } => {
+                            format!("inline:{}", term.index())
+                        }
+                        crate::binding_plan::ValueDisposition::Elided { reason, .. } => {
+                            format!("elided:{reason:?}")
+                        }
+                        crate::binding_plan::ValueDisposition::Refused { reason } => {
+                            format!("refused:{reason:?}")
+                        }
+                    }
+                })
+                .collect();
+            (bindings, dispositions)
+        }
+
+        let mut entry = R2ILBlock::new(0x1000, 0x10);
+        entry.push(R2ILOp::CBranch {
+            target: Varnode::constant(0x1020, 8),
+            cond: Varnode::register(0x10, 8),
+        });
+        let mut false_arm = R2ILBlock::new(0x1010, 0x10);
+        false_arm.push(R2ILOp::Copy {
+            dst: Varnode::register(0, 8),
+            src: Varnode::constant(1, 8),
+        });
+        false_arm.push(R2ILOp::Branch {
+            target: Varnode::constant(0x1030, 8),
+        });
+        let mut true_arm = R2ILBlock::new(0x1020, 0x10);
+        true_arm.push(R2ILOp::Copy {
+            dst: Varnode::register(0, 8),
+            src: Varnode::constant(2, 8),
+        });
+        true_arm.push(R2ILOp::Branch {
+            target: Varnode::constant(0x1030, 8),
+        });
+        let mut merge = R2ILBlock::new(0x1030, 4);
+        merge.push(R2ILOp::Return {
+            target: Varnode::register(0x30, 8),
+        });
+
+        let peers = [false_arm, true_arm, merge];
+        let baseline_blocks = vec![
+            entry.clone(),
+            peers[0].clone(),
+            peers[1].clone(),
+            peers[2].clone(),
+        ];
+        let (baseline_spans, baseline_input) = exact_diamond_input(&baseline_blocks);
+        let decompiler = Decompiler::new(DecompilerConfig::x86_64());
+        let baseline = decompiler.decompile_input_with_binding_audit(&baseline_input);
+        let baseline_binding_signature = binding_signature(&baseline_input);
+        let baseline_values = baseline_input
+            .prepared_ssa()
+            .graph()
+            .values
+            .iter()
+            .map(|value| {
+                format!(
+                    "{:?}:{}:{:?}",
+                    value.id,
+                    value.var.display_name(),
+                    value.canonical_storage
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            baseline.placement_audit(),
+            PlacementAudit::Applied,
+            "baseline must reach placement: output={} refusal={:?} binding={:?} effects={:?} signature={baseline_binding_signature:?} values={baseline_values:?} type_facts={:?}",
+            baseline.output(),
+            baseline.render_refusal(),
+            baseline.binding_shadow(),
+            baseline.effect_obligations(),
+            baseline_input.function_facts().type_facts(),
+        );
+
+        // Exhaust the complete schedule domain of the non-entry blocks. Entry
+        // identity is semantic input; node/edge insertion order is not.
+        for schedule in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let mut shuffled_blocks = vec![entry.clone()];
+            shuffled_blocks.extend(schedule.map(|index| peers[index].clone()));
+            let (shuffled_spans, shuffled_input) = exact_diamond_input(&shuffled_blocks);
+            let shuffled = decompiler.decompile_input_with_binding_audit(&shuffled_input);
+
+            assert_eq!(baseline_spans, shuffled_spans, "schedule={schedule:?}");
+            assert_eq!(
+                baseline_binding_signature,
+                binding_signature(&shuffled_input),
+                "schedule={schedule:?}"
+            );
+            assert_eq!(
+                baseline.placement_audit(),
+                shuffled.placement_audit(),
+                "schedule={schedule:?}"
+            );
+            assert_eq!(
+                baseline.binding_shadow(),
+                shuffled.binding_shadow(),
+                "schedule={schedule:?}"
+            );
+            assert_eq!(
+                baseline.effect_obligations(),
+                shuffled.effect_obligations(),
+                "schedule={schedule:?}"
+            );
+            assert_eq!(
+                baseline.render_refusal(),
+                shuffled.render_refusal(),
+                "schedule={schedule:?}"
+            );
+            assert_eq!(
+                baseline.output().as_bytes(),
+                shuffled.output().as_bytes(),
+                "schedule={schedule:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn binding_shadow_adds_no_post_render_work_control_decision() {
+        struct CountingControl {
+            polls: std::cell::Cell<usize>,
+            stop_at: Option<usize>,
+        }
+
+        impl r2ssa::SsaWorkControl for CountingControl {
+            fn poll(&self) -> Result<(), r2ssa::SsaExecutionStopReason> {
+                let poll = self.polls.get() + 1;
+                self.polls.set(poll);
+                if self.stop_at == Some(poll) {
+                    Err(r2ssa::SsaExecutionStopReason::Cancelled)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        let arch = test_arch_for_decompile();
+        let prepared = prepared_from_ops(
+            vec![R2ILOp::Return {
+                target: Varnode::constant(0, 8),
+            }],
+            &arch,
+        );
+        let input = source_owned_decompiler_input(
+            prepared,
+            (
+                r2types::DecompileRouteKind::Standard,
+                "binding shadow work-control path",
+                None,
+            ),
+        );
+        let decompiler = Decompiler::new(DecompilerConfig::x86_64());
+        let baseline = CountingControl {
+            polls: std::cell::Cell::new(0),
+            stop_at: None,
+        };
+        decompiler
+            .decompile_input_with_binding_audit_and_control(&input, &baseline)
+            .expect("unbounded audit");
+        let final_production_poll = baseline.polls.get();
+
+        let stop_at_final = CountingControl {
+            polls: std::cell::Cell::new(0),
+            stop_at: Some(final_production_poll),
+        };
+        let stop = decompiler
+            .decompile_input_with_binding_audit_and_control(&input, &stop_at_final)
+            .expect_err("the final production poll must remain observable");
+        assert_eq!(stop.phase(), DecompileWorkPhase::Rendering);
+        assert_eq!(stop.reason(), r2ssa::SsaExecutionStopReason::Cancelled);
+
+        let no_later_poll = CountingControl {
+            polls: std::cell::Cell::new(0),
+            stop_at: Some(final_production_poll + 1),
+        };
+        decompiler
+            .decompile_input_with_binding_audit_and_control(&input, &no_later_poll)
+            .expect("shadow capture and classification must not poll work control");
+        assert_eq!(no_later_poll.polls.get(), final_production_poll);
+    }
+
+    #[test]
+    fn audited_partial_retains_the_same_product_without_extra_polls() {
+        struct CountingControl {
+            polls: std::cell::Cell<usize>,
+            stop_at: Option<usize>,
+        }
+
+        impl r2ssa::SsaWorkControl for CountingControl {
+            fn poll(&self) -> Result<(), r2ssa::SsaExecutionStopReason> {
+                let poll = self.polls.get() + 1;
+                self.polls.set(poll);
+                if self.stop_at == Some(poll) {
+                    Err(r2ssa::SsaExecutionStopReason::Cancelled)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        let arch = test_arch_for_decompile();
+        let prepared = prepared_from_ops(
+            vec![R2ILOp::Return {
+                target: Varnode::constant(0, 8),
+            }],
+            &arch,
+        );
+        let input = source_owned_decompiler_input(
+            prepared,
+            (
+                r2types::DecompileRouteKind::Standard,
+                "same-run audited partial",
+                None,
+            ),
+        );
+        let decompiler = Decompiler::new(DecompilerConfig::x86_64());
+
+        let baseline_control = CountingControl {
+            polls: std::cell::Cell::new(0),
+            stop_at: None,
+        };
+        let baseline = decompiler
+            .decompile_input_keeping_partial_with_binding_audit(&input, &baseline_control)
+            .expect("unbounded audited rendering");
+        let final_poll = baseline_control.polls.get();
+        let first_render_poll = final_poll
+            .checked_sub(1)
+            .expect("successful product rendering has two rendering polls");
+
+        for stop_at in [first_render_poll, final_poll] {
+            let stopped_control = CountingControl {
+                polls: std::cell::Cell::new(0),
+                stop_at: Some(stop_at),
+            };
+            let (stop, partial) = decompiler
+                .decompile_input_keeping_partial_with_binding_audit(&input, &stopped_control)
+                .expect_err("selected rendering poll must stop");
+            assert_eq!(stop.phase(), DecompileWorkPhase::Rendering);
+            assert_eq!(stop.reason(), r2ssa::SsaExecutionStopReason::Cancelled);
+            assert_eq!(
+                stopped_control.polls.get(),
+                stop_at,
+                "retaining output and audit must neither rebuild nor poll again"
+            );
+            assert_eq!(
+                partial.as_ref(),
+                Some(&baseline),
+                "the partial must classify the exact retained product"
+            );
+        }
+
+        let pre_product_control = CountingControl {
+            polls: std::cell::Cell::new(0),
+            stop_at: Some(1),
+        };
+        let (stop, partial) = decompiler
+            .decompile_input_keeping_partial_with_binding_audit(&input, &pre_product_control)
+            .expect_err("initial preparation poll must stop");
+        assert_eq!(stop.phase(), DecompileWorkPhase::Normalization);
+        assert_eq!(partial, None);
+        assert_eq!(pre_product_control.polls.get(), 1);
+
+        let compatibility_control = CountingControl {
+            polls: std::cell::Cell::new(0),
+            stop_at: None,
+        };
+        let compatibility_output = decompiler
+            .decompile_input_keeping_partial(&input, &compatibility_control)
+            .expect("compatibility rendering");
+        assert_eq!(compatibility_output, baseline.output());
+        assert_eq!(
+            compatibility_control.polls.get(),
+            final_poll,
+            "the string compatibility mapper must add no work-control decision"
+        );
+    }
+
+    /// The marks the structurer leaves are counted wherever they sit, including
+    /// inside a loop or a switch arm, and the function says how many it carries.
+    #[test]
+    fn unproven_constructs_are_counted_through_nested_bodies() {
+        let mut func = CFunction::new("partly_proven".to_string(), CType::Unknown);
+        func.body = vec![
+            CStmt::comment("r2dec residual: unresolved branch condition at 0x1000"),
+            CStmt::While {
+                cond: CExpr::IntLit(1),
+                body: Box::new(CStmt::Block(vec![CStmt::comment(
+                    "r2dec residual: uncertified loop structure at 0x1010",
+                )])),
+            },
+            CStmt::Return(Some(CExpr::IntLit(0))),
+        ];
+        assert_eq!(count_residual_markers(&func.body), 2);
+
+        note_unproven_constructs(&mut func, None, 0);
+        let note = match func.body.first() {
+            Some(CStmt::Comment(text)) => text.clone(),
+            other => panic!("expected a leading proof note, got {other:?}"),
+        };
+        assert!(note.contains("r2dec proof:"), "{note}");
+        assert!(note.contains("2 constructs are marked below"), "{note}");
+        assert!(
+            func.body
+                .iter()
+                .any(|stmt| matches!(stmt, CStmt::Return(_))),
+            "the proven return survives beside the marks: {:?}",
+            func.body
+        );
+    }
+
+    /// An uncertified route says so even when the structurer marked nothing,
+    /// because "nothing was marked" is not the same claim as "everything was
+    /// proven". Without this the near-miss aggregate fixture rendered a bare
+    /// `return` with no indication the kernel never claimed it.
+    #[test]
+    fn a_rendering_says_so_even_with_nothing_marked() {
+        let mut func = CFunction::new("unclaimed".to_string(), CType::Unknown);
+        func.body = vec![CStmt::Return(Some(CExpr::IntLit(0)))];
+        note_unproven_constructs(&mut func, None, 0);
+        let note = match func.body.first() {
+            Some(CStmt::Comment(text)) => text.clone(),
+            other => panic!("expected a leading proof note, got {other:?}"),
+        };
+        assert!(note.contains("r2dec proof:"), "{note}");
+        assert!(note.contains("no individual construct is marked"), "{note}");
+    }
+
+    #[test]
+    fn proof_line_attributes_variadic_format_counts_to_radare2() {
+        let mut func = CFunction::new("formatted".to_string(), CType::Unknown);
+        func.body = vec![CStmt::Return(None)];
+        note_unproven_constructs(&mut func, None, 2);
+        let note = match func.body.first() {
+            Some(CStmt::Comment(text)) => text,
+            other => panic!("expected a leading proof note, got {other:?}"),
+        };
+        assert!(
+            note.contains(
+                "2 variadic callsite argument counts supplied by radare2 format literals"
+            ),
+            "{note}"
+        );
+    }
+
+    /// Rendering nothing is not the same as proving the function does nothing.
+    /// An empty body reads as "this function has no effects", so a render that
+    /// produced no statements says that instead of implying it.
+    #[test]
+    fn a_body_that_rendered_nothing_says_so_rather_than_reading_as_empty() {
+        let mut func = CFunction::new("nothing_rendered".to_string(), CType::Unknown);
+        func.body = Vec::new();
+        note_unproven_constructs(&mut func, None, 0);
+        let text = format!("{:?}", func.body);
+        assert!(
+            text.contains("r2dec proof: rendering produced no statements"),
+            "{text}"
+        );
+        assert_eq!(func.body.len(), 1, "one statement says it, not two: {text}");
     }
 
     #[test]
@@ -5654,1174 +8506,6 @@ mod tests {
                 && comment.contains("stack slot")
                 && comment.contains("temporary"),
             "sanitized comment should preserve actionable categories, got {comment}"
-        );
-    }
-
-    #[test]
-    fn infer_local_struct_field_accesses_recovers_observed_arm64_struct_array_offsets() {
-        let block = r2ssa::SSABlock {
-            addr: 0x100000e40,
-            size: 96,
-            ops: vec![
-                SSAOp::IntSub {
-                    dst: r2ssa::SSAVar::new("SP", 1, 8),
-                    a: r2ssa::SSAVar::new("SP", 0, 8),
-                    b: r2ssa::SSAVar::new("const:10", 0, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:6500", 1, 8),
-                    a: r2ssa::SSAVar::new("SP", 1, 8),
-                    b: r2ssa::SSAVar::new("const:8", 0, 8),
-                },
-                SSAOp::Store {
-                    space: r2il::SpaceId::Ram,
-                    addr: r2ssa::SSAVar::new("tmp:6500", 1, 8),
-                    val: r2ssa::SSAVar::new("X0", 0, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:6400", 1, 8),
-                    a: r2ssa::SSAVar::new("SP", 1, 8),
-                    b: r2ssa::SSAVar::new("const:4", 0, 8),
-                },
-                SSAOp::Store {
-                    space: r2il::SpaceId::Ram,
-                    addr: r2ssa::SSAVar::new("tmp:6400", 1, 8),
-                    val: r2ssa::SSAVar::new("W1", 0, 4),
-                },
-                SSAOp::Copy {
-                    dst: r2ssa::SSAVar::new("tmp:6780", 1, 8),
-                    src: r2ssa::SSAVar::new("SP", 1, 8),
-                },
-                SSAOp::Store {
-                    space: r2il::SpaceId::Ram,
-                    addr: r2ssa::SSAVar::new("tmp:6780", 1, 8),
-                    val: r2ssa::SSAVar::new("W2", 0, 4),
-                },
-                SSAOp::Copy {
-                    dst: r2ssa::SSAVar::new("tmp:6780", 2, 8),
-                    src: r2ssa::SSAVar::new("SP", 1, 8),
-                },
-                SSAOp::Load {
-                    dst: r2ssa::SSAVar::new("tmp:24c00", 1, 4),
-                    space: r2il::SpaceId::Ram,
-                    addr: r2ssa::SSAVar::new("tmp:6780", 2, 8),
-                },
-                SSAOp::IntZExt {
-                    dst: r2ssa::SSAVar::new("X8", 1, 8),
-                    src: r2ssa::SSAVar::new("tmp:24c00", 1, 4),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:6500", 2, 8),
-                    a: r2ssa::SSAVar::new("SP", 1, 8),
-                    b: r2ssa::SSAVar::new("const:8", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: r2ssa::SSAVar::new("X9", 1, 8),
-                    space: r2il::SpaceId::Ram,
-                    addr: r2ssa::SSAVar::new("tmp:6500", 2, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:6400", 2, 8),
-                    a: r2ssa::SSAVar::new("SP", 1, 8),
-                    b: r2ssa::SSAVar::new("const:4", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: r2ssa::SSAVar::new("tmp:26b00", 1, 4),
-                    space: r2il::SpaceId::Ram,
-                    addr: r2ssa::SSAVar::new("tmp:6400", 2, 8),
-                },
-                SSAOp::IntSExt {
-                    dst: r2ssa::SSAVar::new("X10", 1, 8),
-                    src: r2ssa::SSAVar::new("tmp:26b00", 1, 4),
-                },
-                SSAOp::Copy {
-                    dst: r2ssa::SSAVar::new("X11", 1, 8),
-                    src: r2ssa::SSAVar::new("const:38", 0, 8),
-                },
-                SSAOp::IntMult {
-                    dst: r2ssa::SSAVar::new("X10", 2, 8),
-                    a: r2ssa::SSAVar::new("X10", 1, 8),
-                    b: r2ssa::SSAVar::new("const:38", 0, 8),
-                },
-                SSAOp::Copy {
-                    dst: r2ssa::SSAVar::new("tmp:12380", 1, 8),
-                    src: r2ssa::SSAVar::new("X10", 2, 8),
-                },
-                SSAOp::IntCarry {
-                    dst: r2ssa::SSAVar::new("TMPCY", 1, 1),
-                    a: r2ssa::SSAVar::new("X9", 1, 8),
-                    b: r2ssa::SSAVar::new("tmp:12380", 1, 8),
-                },
-                SSAOp::IntSCarry {
-                    dst: r2ssa::SSAVar::new("TMPOV", 1, 1),
-                    a: r2ssa::SSAVar::new("X9", 1, 8),
-                    b: r2ssa::SSAVar::new("tmp:12380", 1, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:12480", 1, 8),
-                    a: r2ssa::SSAVar::new("X9", 1, 8),
-                    b: r2ssa::SSAVar::new("tmp:12380", 1, 8),
-                },
-                SSAOp::IntSLess {
-                    dst: r2ssa::SSAVar::new("TMPNG", 1, 1),
-                    a: r2ssa::SSAVar::new("tmp:12480", 1, 8),
-                    b: r2ssa::SSAVar::new("const:0", 0, 8),
-                },
-                SSAOp::IntEqual {
-                    dst: r2ssa::SSAVar::new("TMPZR", 1, 1),
-                    a: r2ssa::SSAVar::new("tmp:12480", 1, 8),
-                    b: r2ssa::SSAVar::new("const:0", 0, 8),
-                },
-                SSAOp::Copy {
-                    dst: r2ssa::SSAVar::new("X9", 2, 8),
-                    src: r2ssa::SSAVar::new("tmp:12480", 1, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:6400", 3, 8),
-                    a: r2ssa::SSAVar::new("X9", 2, 8),
-                    b: r2ssa::SSAVar::new("const:8", 0, 8),
-                },
-                SSAOp::Store {
-                    space: r2il::SpaceId::Ram,
-                    addr: r2ssa::SSAVar::new("tmp:6400", 3, 8),
-                    val: r2ssa::SSAVar::new("W8", 0, 4),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:6500", 3, 8),
-                    a: r2ssa::SSAVar::new("SP", 1, 8),
-                    b: r2ssa::SSAVar::new("const:8", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: r2ssa::SSAVar::new("X8", 2, 8),
-                    space: r2il::SpaceId::Ram,
-                    addr: r2ssa::SSAVar::new("tmp:6500", 3, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:6400", 4, 8),
-                    a: r2ssa::SSAVar::new("SP", 1, 8),
-                    b: r2ssa::SSAVar::new("const:4", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: r2ssa::SSAVar::new("tmp:26b00", 2, 4),
-                    space: r2il::SpaceId::Ram,
-                    addr: r2ssa::SSAVar::new("tmp:6400", 4, 8),
-                },
-                SSAOp::IntSExt {
-                    dst: r2ssa::SSAVar::new("X9", 3, 8),
-                    src: r2ssa::SSAVar::new("tmp:26b00", 2, 4),
-                },
-                SSAOp::IntMult {
-                    dst: r2ssa::SSAVar::new("X9", 4, 8),
-                    a: r2ssa::SSAVar::new("X9", 3, 8),
-                    b: r2ssa::SSAVar::new("const:38", 0, 8),
-                },
-                SSAOp::Copy {
-                    dst: r2ssa::SSAVar::new("tmp:12380", 2, 8),
-                    src: r2ssa::SSAVar::new("X9", 4, 8),
-                },
-                SSAOp::IntCarry {
-                    dst: r2ssa::SSAVar::new("TMPCY", 2, 1),
-                    a: r2ssa::SSAVar::new("X8", 2, 8),
-                    b: r2ssa::SSAVar::new("tmp:12380", 2, 8),
-                },
-                SSAOp::IntSCarry {
-                    dst: r2ssa::SSAVar::new("TMPOV", 2, 1),
-                    a: r2ssa::SSAVar::new("X8", 2, 8),
-                    b: r2ssa::SSAVar::new("tmp:12380", 2, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:12480", 2, 8),
-                    a: r2ssa::SSAVar::new("X8", 2, 8),
-                    b: r2ssa::SSAVar::new("tmp:12380", 2, 8),
-                },
-                SSAOp::IntSLess {
-                    dst: r2ssa::SSAVar::new("TMPNG", 2, 1),
-                    a: r2ssa::SSAVar::new("tmp:12480", 2, 8),
-                    b: r2ssa::SSAVar::new("const:0", 0, 8),
-                },
-                SSAOp::IntEqual {
-                    dst: r2ssa::SSAVar::new("TMPZR", 2, 1),
-                    a: r2ssa::SSAVar::new("tmp:12480", 2, 8),
-                    b: r2ssa::SSAVar::new("const:0", 0, 8),
-                },
-                SSAOp::Copy {
-                    dst: r2ssa::SSAVar::new("X8", 3, 8),
-                    src: r2ssa::SSAVar::new("tmp:12480", 2, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:6400", 5, 8),
-                    a: r2ssa::SSAVar::new("X8", 3, 8),
-                    b: r2ssa::SSAVar::new("const:8", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: r2ssa::SSAVar::new("tmp:24c00", 2, 4),
-                    space: r2il::SpaceId::Ram,
-                    addr: r2ssa::SSAVar::new("tmp:6400", 5, 8),
-                },
-                SSAOp::IntZExt {
-                    dst: r2ssa::SSAVar::new("X8", 4, 8),
-                    src: r2ssa::SSAVar::new("tmp:24c00", 2, 4),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:6500", 4, 8),
-                    a: r2ssa::SSAVar::new("SP", 1, 8),
-                    b: r2ssa::SSAVar::new("const:8", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: r2ssa::SSAVar::new("X9", 5, 8),
-                    space: r2il::SpaceId::Ram,
-                    addr: r2ssa::SSAVar::new("tmp:6500", 4, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:6400", 6, 8),
-                    a: r2ssa::SSAVar::new("SP", 1, 8),
-                    b: r2ssa::SSAVar::new("const:4", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: r2ssa::SSAVar::new("tmp:26b00", 3, 4),
-                    space: r2il::SpaceId::Ram,
-                    addr: r2ssa::SSAVar::new("tmp:6400", 6, 8),
-                },
-                SSAOp::IntSExt {
-                    dst: r2ssa::SSAVar::new("X10", 3, 8),
-                    src: r2ssa::SSAVar::new("tmp:26b00", 3, 4),
-                },
-                SSAOp::IntMult {
-                    dst: r2ssa::SSAVar::new("X10", 4, 8),
-                    a: r2ssa::SSAVar::new("X10", 3, 8),
-                    b: r2ssa::SSAVar::new("const:38", 0, 8),
-                },
-                SSAOp::Copy {
-                    dst: r2ssa::SSAVar::new("tmp:12380", 3, 8),
-                    src: r2ssa::SSAVar::new("X10", 4, 8),
-                },
-                SSAOp::IntCarry {
-                    dst: r2ssa::SSAVar::new("TMPCY", 3, 1),
-                    a: r2ssa::SSAVar::new("X9", 5, 8),
-                    b: r2ssa::SSAVar::new("tmp:12380", 3, 8),
-                },
-                SSAOp::IntSCarry {
-                    dst: r2ssa::SSAVar::new("TMPOV", 3, 1),
-                    a: r2ssa::SSAVar::new("X9", 5, 8),
-                    b: r2ssa::SSAVar::new("tmp:12380", 3, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:12480", 3, 8),
-                    a: r2ssa::SSAVar::new("X9", 5, 8),
-                    b: r2ssa::SSAVar::new("tmp:12380", 3, 8),
-                },
-                SSAOp::IntSLess {
-                    dst: r2ssa::SSAVar::new("TMPNG", 3, 1),
-                    a: r2ssa::SSAVar::new("tmp:12480", 3, 8),
-                    b: r2ssa::SSAVar::new("const:0", 0, 8),
-                },
-                SSAOp::IntEqual {
-                    dst: r2ssa::SSAVar::new("TMPZR", 3, 1),
-                    a: r2ssa::SSAVar::new("tmp:12480", 3, 8),
-                    b: r2ssa::SSAVar::new("const:0", 0, 8),
-                },
-                SSAOp::Copy {
-                    dst: r2ssa::SSAVar::new("X9", 6, 8),
-                    src: r2ssa::SSAVar::new("tmp:12480", 3, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:6400", 7, 8),
-                    a: r2ssa::SSAVar::new("X9", 6, 8),
-                    b: r2ssa::SSAVar::new("const:34", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: r2ssa::SSAVar::new("tmp:24c00", 3, 4),
-                    space: r2il::SpaceId::Ram,
-                    addr: r2ssa::SSAVar::new("tmp:6400", 7, 8),
-                },
-                SSAOp::IntZExt {
-                    dst: r2ssa::SSAVar::new("X9", 7, 8),
-                    src: r2ssa::SSAVar::new("tmp:24c00", 3, 4),
-                },
-                SSAOp::Return {
-                    target: r2ssa::SSAVar::new("X0", 0, 8),
-                },
-            ],
-        };
-
-        let raw = R2ILBlock {
-            addr: block.addr,
-            size: block.size,
-            ops: vec![R2ILOp::Return {
-                target: Varnode::constant(0, 8),
-            }],
-            switch_info: None,
-            op_metadata: Default::default(),
-        };
-        let mut func = SSAFunction::from_blocks_raw_no_arch(&[raw]).expect("ssa function");
-        func.get_block_mut(block.addr).expect("entry block").ops = block.ops;
-        func = func.with_name("sym._test_struct_array_index");
-
-        let config = DecompilerConfig::aarch64();
-        let function_names = std::collections::HashMap::new();
-        let strings = std::collections::HashMap::new();
-        let symbols = std::collections::HashMap::new();
-        let type_hints = std::collections::HashMap::new();
-        let mut param_register_aliases = std::collections::HashMap::new();
-        let mut arg_slot_map = std::collections::HashMap::new();
-        for (idx, reg_name) in config.arg_regs.iter().enumerate() {
-            let arg_name = format!("arg{}", idx + 1);
-            for alias in register_alias_names(reg_name) {
-                let lower = alias.to_ascii_lowercase();
-                param_register_aliases.insert(lower.clone(), arg_name.clone());
-                arg_slot_map.insert(lower, idx);
-            }
-        }
-        let env = analysis::PassEnv {
-            ptr_size: config.ptr_size,
-            sp_name: &config.sp_name,
-            fp_name: &config.fp_name,
-            ret_reg_name: config.ret_regs.first().map(String::as_str).unwrap_or("x0"),
-            function_names: &function_names,
-            strings: &strings,
-            symbols: &symbols,
-            callee_facts: analysis::empty_callee_facts(),
-            callee_resolution: None,
-            summary_view: None,
-            arg_regs: &config.arg_regs,
-            param_register_aliases: &param_register_aliases,
-            caller_saved_regs: &config.caller_saved_regs,
-            type_hints: &type_hints,
-            type_oracle: None,
-        };
-        let blocks: Vec<_> = func.blocks().cloned().collect();
-        let use_info = analysis::UseInfo::analyze(&blocks, &env);
-        let profiles = analysis::use_info::collect_local_struct_field_access_profiles(
-            &use_info,
-            &func,
-            &env,
-            &arg_slot_map,
-        );
-        let accesses = infer_local_struct_field_accesses(&func, &config);
-        assert!(
-            accesses.iter().any(|access| access.arg_index == 0
-                && access.field_offset == 0x8
-                && access.is_write),
-            "expected store to arg0+0x8 in semantic field accesses, got {accesses:?}; semantic_values={:?}; forwarded={:?}; profiles={profiles:?}",
-            use_info.semantic_values,
-            use_info.forwarded_values
-        );
-        assert!(
-            accesses.iter().any(|access| access.arg_index == 0
-                && access.field_offset == 0x34
-                && !access.is_write),
-            "expected load from arg0+0x34 in semantic field accesses, got {accesses:?}; semantic_values={:?}; forwarded={:?}; profiles={profiles:?}",
-            use_info.semantic_values,
-            use_info.forwarded_values
-        );
-    }
-
-    #[test]
-    fn infer_local_struct_field_accesses_recovers_observed_x86_struct_field_offsets() {
-        let block = r2ssa::SSABlock {
-            addr: 0x401667,
-            size: 42,
-            ops: vec![
-                SSAOp::IntSub {
-                    dst: r2ssa::SSAVar::new("RSP", 1, 8),
-                    a: r2ssa::SSAVar::new("RSP", 0, 8),
-                    b: r2ssa::SSAVar::new("const:8", 0, 8),
-                },
-                SSAOp::Store {
-                    space: r2il::SpaceId::Ram,
-                    addr: r2ssa::SSAVar::new("RSP", 1, 8),
-                    val: r2ssa::SSAVar::new("RBP", 0, 8),
-                },
-                SSAOp::Copy {
-                    dst: r2ssa::SSAVar::new("RBP", 1, 8),
-                    src: r2ssa::SSAVar::new("RSP", 1, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:4700", 1, 8),
-                    a: r2ssa::SSAVar::new("RBP", 1, 8),
-                    b: r2ssa::SSAVar::new("const:fffffffffffffff8", 0, 8),
-                },
-                SSAOp::Store {
-                    space: r2il::SpaceId::Ram,
-                    addr: r2ssa::SSAVar::new("tmp:4700", 1, 8),
-                    val: r2ssa::SSAVar::new("RDI", 0, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:4700", 2, 8),
-                    a: r2ssa::SSAVar::new("RBP", 1, 8),
-                    b: r2ssa::SSAVar::new("const:fffffffffffffff4", 0, 8),
-                },
-                SSAOp::Store {
-                    space: r2il::SpaceId::Ram,
-                    addr: r2ssa::SSAVar::new("tmp:4700", 2, 8),
-                    val: r2ssa::SSAVar::new("ESI", 0, 4),
-                },
-                SSAOp::Load {
-                    dst: r2ssa::SSAVar::new("tmp:11f80", 1, 8),
-                    space: r2il::SpaceId::Ram,
-                    addr: r2ssa::SSAVar::new("tmp:4700", 1, 8),
-                },
-                SSAOp::Copy {
-                    dst: r2ssa::SSAVar::new("RAX", 1, 8),
-                    src: r2ssa::SSAVar::new("tmp:11f80", 1, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:4700", 3, 8),
-                    a: r2ssa::SSAVar::new("RAX", 1, 8),
-                    b: r2ssa::SSAVar::new("const:30", 0, 8),
-                },
-                SSAOp::Store {
-                    space: r2il::SpaceId::Ram,
-                    addr: r2ssa::SSAVar::new("tmp:4700", 3, 8),
-                    val: r2ssa::SSAVar::new("ESI", 0, 4),
-                },
-                SSAOp::Load {
-                    dst: r2ssa::SSAVar::new("tmp:11f80", 2, 8),
-                    space: r2il::SpaceId::Ram,
-                    addr: r2ssa::SSAVar::new("tmp:4700", 1, 8),
-                },
-                SSAOp::Copy {
-                    dst: r2ssa::SSAVar::new("RAX", 2, 8),
-                    src: r2ssa::SSAVar::new("tmp:11f80", 2, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:4700", 4, 8),
-                    a: r2ssa::SSAVar::new("RAX", 2, 8),
-                    b: r2ssa::SSAVar::new("const:30", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: r2ssa::SSAVar::new("tmp:11f00", 1, 4),
-                    space: r2il::SpaceId::Ram,
-                    addr: r2ssa::SSAVar::new("tmp:4700", 4, 8),
-                },
-                SSAOp::Load {
-                    dst: r2ssa::SSAVar::new("tmp:11f00", 2, 4),
-                    space: r2il::SpaceId::Ram,
-                    addr: r2ssa::SSAVar::new("RAX", 2, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("EAX", 1, 4),
-                    a: r2ssa::SSAVar::new("tmp:11f00", 1, 4),
-                    b: r2ssa::SSAVar::new("tmp:11f00", 2, 4),
-                },
-                SSAOp::Return {
-                    target: r2ssa::SSAVar::new("RIP", 0, 8),
-                },
-            ],
-        };
-
-        let raw = R2ILBlock {
-            addr: block.addr,
-            size: block.size,
-            ops: vec![R2ILOp::Return {
-                target: Varnode::constant(0, 8),
-            }],
-            switch_info: None,
-            op_metadata: Default::default(),
-        };
-        let mut func = SSAFunction::from_blocks_raw_no_arch(&[raw]).expect("ssa function");
-        func.get_block_mut(block.addr).expect("entry block").ops = block.ops;
-        func = func.with_name("sym.test_struct_field");
-
-        let config = DecompilerConfig::x86_64();
-        let function_names = std::collections::HashMap::new();
-        let strings = std::collections::HashMap::new();
-        let symbols = std::collections::HashMap::new();
-        let type_hints = std::collections::HashMap::new();
-        let mut param_register_aliases = std::collections::HashMap::new();
-        let mut arg_slot_map = std::collections::HashMap::new();
-        for (idx, reg_name) in config.arg_regs.iter().enumerate() {
-            let arg_name = format!("arg{}", idx + 1);
-            for alias in register_alias_names(reg_name) {
-                let lower = alias.to_ascii_lowercase();
-                param_register_aliases.insert(lower.clone(), arg_name.clone());
-                arg_slot_map.insert(lower, idx);
-            }
-        }
-        let env = analysis::PassEnv {
-            ptr_size: config.ptr_size,
-            sp_name: &config.sp_name,
-            fp_name: &config.fp_name,
-            ret_reg_name: config.ret_regs.first().map(String::as_str).unwrap_or("rax"),
-            function_names: &function_names,
-            strings: &strings,
-            symbols: &symbols,
-            callee_facts: analysis::empty_callee_facts(),
-            callee_resolution: None,
-            summary_view: None,
-            arg_regs: &config.arg_regs,
-            param_register_aliases: &param_register_aliases,
-            caller_saved_regs: &config.caller_saved_regs,
-            type_hints: &type_hints,
-            type_oracle: None,
-        };
-        let blocks: Vec<_> = func.blocks().cloned().collect();
-        let use_info = analysis::UseInfo::analyze_for_local_struct_accesses(&blocks, &env);
-        let profiles = analysis::use_info::collect_local_struct_field_access_profiles(
-            &use_info,
-            &func,
-            &env,
-            &arg_slot_map,
-        );
-        let accesses = infer_local_struct_field_accesses(&func, &config);
-        assert!(
-            accesses.iter().any(|access| access.arg_index == 0
-                && access.field_offset == 0
-                && !access.is_write),
-            "expected load from arg0+0x0, got {accesses:?}; semantic_values={:?}; forwarded={:?}; profiles={profiles:?}",
-            use_info.semantic_values,
-            use_info.forwarded_values
-        );
-        assert!(
-            accesses.iter().any(|access| access.arg_index == 0
-                && access.field_offset == 0x30
-                && access.is_write),
-            "expected store to arg0+0x30, got {accesses:?}; semantic_values={:?}; forwarded={:?}; profiles={profiles:?}",
-            use_info.semantic_values,
-            use_info.forwarded_values
-        );
-        assert!(
-            accesses.iter().any(|access| access.arg_index == 0
-                && access.field_offset == 0x30
-                && !access.is_write),
-            "expected load from arg0+0x30, got {accesses:?}; semantic_values={:?}; forwarded={:?}; profiles={profiles:?}",
-            use_info.semantic_values,
-            use_info.forwarded_values
-        );
-    }
-
-    #[test]
-    fn infer_local_struct_field_accesses_recovers_observed_x86_struct_array_offsets() {
-        let block = r2ssa::SSABlock {
-            addr: 0x40182f,
-            size: 124,
-            ops: vec![
-                SSAOp::IntSub {
-                    dst: r2ssa::SSAVar::new("RSP", 1, 8),
-                    a: r2ssa::SSAVar::new("RSP", 0, 8),
-                    b: r2ssa::SSAVar::new("const:8", 0, 8),
-                },
-                SSAOp::Store {
-                    space: r2il::SpaceId::Ram,
-                    addr: r2ssa::SSAVar::new("RSP", 1, 8),
-                    val: r2ssa::SSAVar::new("RBP", 0, 8),
-                },
-                SSAOp::Copy {
-                    dst: r2ssa::SSAVar::new("RBP", 1, 8),
-                    src: r2ssa::SSAVar::new("RSP", 1, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:4700", 1, 8),
-                    a: r2ssa::SSAVar::new("RBP", 1, 8),
-                    b: r2ssa::SSAVar::new("const:fffffffffffffff8", 0, 8),
-                },
-                SSAOp::Store {
-                    space: r2il::SpaceId::Ram,
-                    addr: r2ssa::SSAVar::new("tmp:4700", 1, 8),
-                    val: r2ssa::SSAVar::new("RDI", 0, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:4700", 2, 8),
-                    a: r2ssa::SSAVar::new("RBP", 1, 8),
-                    b: r2ssa::SSAVar::new("const:fffffffffffffff4", 0, 8),
-                },
-                SSAOp::Store {
-                    space: r2il::SpaceId::Ram,
-                    addr: r2ssa::SSAVar::new("tmp:4700", 2, 8),
-                    val: r2ssa::SSAVar::new("ESI", 0, 4),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:4700", 3, 8),
-                    a: r2ssa::SSAVar::new("RBP", 1, 8),
-                    b: r2ssa::SSAVar::new("const:fffffffffffffff0", 0, 8),
-                },
-                SSAOp::Store {
-                    space: r2il::SpaceId::Ram,
-                    addr: r2ssa::SSAVar::new("tmp:4700", 3, 8),
-                    val: r2ssa::SSAVar::new("EDX", 0, 4),
-                },
-                SSAOp::Load {
-                    dst: r2ssa::SSAVar::new("tmp:11f00", 1, 4),
-                    space: r2il::SpaceId::Ram,
-                    addr: r2ssa::SSAVar::new("tmp:4700", 2, 8),
-                },
-                SSAOp::Copy {
-                    dst: r2ssa::SSAVar::new("EAX", 1, 4),
-                    src: r2ssa::SSAVar::new("tmp:11f00", 1, 4),
-                },
-                SSAOp::IntSExt {
-                    dst: r2ssa::SSAVar::new("RDX", 1, 8),
-                    src: r2ssa::SSAVar::new("EAX", 1, 4),
-                },
-                SSAOp::Copy {
-                    dst: r2ssa::SSAVar::new("RAX", 1, 8),
-                    src: r2ssa::SSAVar::new("RDX", 1, 8),
-                },
-                SSAOp::IntLeft {
-                    dst: r2ssa::SSAVar::new("RAX", 2, 8),
-                    a: r2ssa::SSAVar::new("RAX", 1, 8),
-                    b: r2ssa::SSAVar::new("const:3", 0, 8),
-                },
-                SSAOp::IntSub {
-                    dst: r2ssa::SSAVar::new("RAX", 3, 8),
-                    a: r2ssa::SSAVar::new("RAX", 2, 8),
-                    b: r2ssa::SSAVar::new("RDX", 1, 8),
-                },
-                SSAOp::IntLeft {
-                    dst: r2ssa::SSAVar::new("RAX", 4, 8),
-                    a: r2ssa::SSAVar::new("RAX", 3, 8),
-                    b: r2ssa::SSAVar::new("const:3", 0, 8),
-                },
-                SSAOp::Copy {
-                    dst: r2ssa::SSAVar::new("RDX", 2, 8),
-                    src: r2ssa::SSAVar::new("RAX", 4, 8),
-                },
-                SSAOp::Load {
-                    dst: r2ssa::SSAVar::new("tmp:11f80", 1, 8),
-                    space: r2il::SpaceId::Ram,
-                    addr: r2ssa::SSAVar::new("tmp:4700", 1, 8),
-                },
-                SSAOp::Copy {
-                    dst: r2ssa::SSAVar::new("RAX", 5, 8),
-                    src: r2ssa::SSAVar::new("tmp:11f80", 1, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("RDX", 3, 8),
-                    a: r2ssa::SSAVar::new("RDX", 2, 8),
-                    b: r2ssa::SSAVar::new("RAX", 5, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:4700", 4, 8),
-                    a: r2ssa::SSAVar::new("RDX", 3, 8),
-                    b: r2ssa::SSAVar::new("const:8", 0, 8),
-                },
-                SSAOp::Store {
-                    space: r2il::SpaceId::Ram,
-                    addr: r2ssa::SSAVar::new("tmp:4700", 4, 8),
-                    val: r2ssa::SSAVar::new("EDX", 0, 4),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:4700", 5, 8),
-                    a: r2ssa::SSAVar::new("RDX", 3, 8),
-                    b: r2ssa::SSAVar::new("const:8", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: r2ssa::SSAVar::new("ECX", 1, 4),
-                    space: r2il::SpaceId::Ram,
-                    addr: r2ssa::SSAVar::new("tmp:4700", 5, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:4700", 6, 8),
-                    a: r2ssa::SSAVar::new("RDX", 3, 8),
-                    b: r2ssa::SSAVar::new("const:34", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: r2ssa::SSAVar::new("EAX", 2, 4),
-                    space: r2il::SpaceId::Ram,
-                    addr: r2ssa::SSAVar::new("tmp:4700", 6, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("EAX", 3, 4),
-                    a: r2ssa::SSAVar::new("EAX", 2, 4),
-                    b: r2ssa::SSAVar::new("ECX", 1, 4),
-                },
-                SSAOp::Return {
-                    target: r2ssa::SSAVar::new("RIP", 0, 8),
-                },
-            ],
-        };
-
-        let raw = R2ILBlock {
-            addr: block.addr,
-            size: block.size,
-            ops: vec![R2ILOp::Return {
-                target: Varnode::constant(0, 8),
-            }],
-            switch_info: None,
-            op_metadata: Default::default(),
-        };
-        let mut func = SSAFunction::from_blocks_raw_no_arch(&[raw]).expect("ssa function");
-        func.get_block_mut(block.addr).expect("entry block").ops = block.ops;
-        func = func.with_name("sym.test_struct_array_index");
-
-        let config = DecompilerConfig::x86_64();
-        let function_names = std::collections::HashMap::new();
-        let strings = std::collections::HashMap::new();
-        let symbols = std::collections::HashMap::new();
-        let type_hints = std::collections::HashMap::new();
-        let mut param_register_aliases = std::collections::HashMap::new();
-        let mut arg_slot_map = std::collections::HashMap::new();
-        for (idx, reg_name) in config.arg_regs.iter().enumerate() {
-            let arg_name = format!("arg{}", idx + 1);
-            for alias in register_alias_names(reg_name) {
-                let lower = alias.to_ascii_lowercase();
-                param_register_aliases.insert(lower.clone(), arg_name.clone());
-                arg_slot_map.insert(lower, idx);
-            }
-        }
-        let env = analysis::PassEnv {
-            ptr_size: config.ptr_size,
-            sp_name: &config.sp_name,
-            fp_name: &config.fp_name,
-            ret_reg_name: config.ret_regs.first().map(String::as_str).unwrap_or("rax"),
-            function_names: &function_names,
-            strings: &strings,
-            symbols: &symbols,
-            callee_facts: analysis::empty_callee_facts(),
-            callee_resolution: None,
-            summary_view: None,
-            arg_regs: &config.arg_regs,
-            param_register_aliases: &param_register_aliases,
-            caller_saved_regs: &config.caller_saved_regs,
-            type_hints: &type_hints,
-            type_oracle: None,
-        };
-        let blocks: Vec<_> = func.blocks().cloned().collect();
-        let use_info = analysis::UseInfo::analyze_for_local_struct_accesses(&blocks, &env);
-        let profiles = analysis::use_info::collect_local_struct_field_access_profiles(
-            &use_info,
-            &func,
-            &env,
-            &arg_slot_map,
-        );
-        let accesses = infer_local_struct_field_accesses(&func, &config);
-        assert!(
-            accesses.iter().any(|access| access.arg_index == 0
-                && access.field_offset == 0x8
-                && access.is_write),
-            "expected store to arg0+0x8, got {accesses:?}; semantic_values={:?}; forwarded={:?}; profiles={profiles:?}",
-            use_info.semantic_values,
-            use_info.forwarded_values
-        );
-        assert!(
-            accesses.iter().any(|access| access.arg_index == 0
-                && access.field_offset == 0x8
-                && !access.is_write),
-            "expected load from arg0+0x8, got {accesses:?}; semantic_values={:?}; forwarded={:?}; profiles={profiles:?}",
-            use_info.semantic_values,
-            use_info.forwarded_values
-        );
-        assert!(
-            accesses.iter().any(|access| access.arg_index == 0
-                && access.field_offset == 0x34
-                && !access.is_write),
-            "expected load from arg0+0x34, got {accesses:?}; semantic_values={:?}; forwarded={:?}; profiles={profiles:?}",
-            use_info.semantic_values,
-            use_info.forwarded_values
-        );
-    }
-
-    #[test]
-    fn infer_local_struct_field_accesses_skips_large_dense_switch_cfgs() {
-        let mut blocks = Vec::new();
-
-        let mut switch_block = R2ILBlock::new(0x1000, 1);
-        switch_block.set_switch_info(r2il::SwitchInfo {
-            switch_addr: 0x1000,
-            min_val: 0,
-            max_val: 39,
-            default_target: Some(0x3000),
-            cases: (0..40u64)
-                .map(|idx| r2il::SwitchCase {
-                    value: idx,
-                    target: 0x2000 + idx * 0x10,
-                })
-                .collect(),
-        });
-        blocks.push(switch_block);
-
-        for idx in 0..110u64 {
-            let addr = if idx < 40 {
-                0x2000 + idx * 0x10
-            } else if idx == 40 {
-                0x3000
-            } else {
-                0x4000 + (idx - 41) * 0x10
-            };
-            let mut block = R2ILBlock::new(addr, 1);
-            block.push(R2ILOp::Return {
-                target: Varnode::constant(0, 8),
-            });
-            blocks.push(block);
-        }
-
-        let func = SSAFunction::from_blocks_raw_no_arch(&blocks).expect("ssa function");
-        let accesses = infer_local_struct_field_accesses(&func, &DecompilerConfig::x86_64());
-        assert!(
-            accesses.is_empty(),
-            "large dense switch CFGs should skip semantic local-struct inference, got {accesses:?}"
-        );
-    }
-
-    #[test]
-    fn hand_authored_struct_array_fixture_refuses_typed_rendering() {
-        use std::collections::HashMap;
-
-        let block = r2ssa::SSABlock {
-            addr: 0x40182f,
-            size: 124,
-            ops: vec![
-                SSAOp::IntSub {
-                    dst: r2ssa::SSAVar::new("RSP", 1, 8),
-                    a: r2ssa::SSAVar::new("RSP", 0, 8),
-                    b: r2ssa::SSAVar::new("const:8", 0, 8),
-                },
-                SSAOp::Store {
-                    space: r2il::SpaceId::Ram,
-                    addr: r2ssa::SSAVar::new("RSP", 1, 8),
-                    val: r2ssa::SSAVar::new("RBP", 0, 8),
-                },
-                SSAOp::Copy {
-                    dst: r2ssa::SSAVar::new("RBP", 1, 8),
-                    src: r2ssa::SSAVar::new("RSP", 1, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:4700", 1, 8),
-                    a: r2ssa::SSAVar::new("RBP", 1, 8),
-                    b: r2ssa::SSAVar::new("const:fffffffffffffff8", 0, 8),
-                },
-                SSAOp::Store {
-                    space: r2il::SpaceId::Ram,
-                    addr: r2ssa::SSAVar::new("tmp:4700", 1, 8),
-                    val: r2ssa::SSAVar::new("RDI", 0, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:4700", 2, 8),
-                    a: r2ssa::SSAVar::new("RBP", 1, 8),
-                    b: r2ssa::SSAVar::new("const:fffffffffffffff4", 0, 8),
-                },
-                SSAOp::Store {
-                    space: r2il::SpaceId::Ram,
-                    addr: r2ssa::SSAVar::new("tmp:4700", 2, 8),
-                    val: r2ssa::SSAVar::new("ESI", 0, 4),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:4700", 3, 8),
-                    a: r2ssa::SSAVar::new("RBP", 1, 8),
-                    b: r2ssa::SSAVar::new("const:fffffffffffffff0", 0, 8),
-                },
-                SSAOp::Store {
-                    space: r2il::SpaceId::Ram,
-                    addr: r2ssa::SSAVar::new("tmp:4700", 3, 8),
-                    val: r2ssa::SSAVar::new("EDX", 0, 4),
-                },
-                SSAOp::Load {
-                    dst: r2ssa::SSAVar::new("tmp:11f00", 1, 4),
-                    space: r2il::SpaceId::Ram,
-                    addr: r2ssa::SSAVar::new("tmp:4700", 2, 8),
-                },
-                SSAOp::Copy {
-                    dst: r2ssa::SSAVar::new("EAX", 1, 4),
-                    src: r2ssa::SSAVar::new("tmp:11f00", 1, 4),
-                },
-                SSAOp::IntSExt {
-                    dst: r2ssa::SSAVar::new("RDX", 1, 8),
-                    src: r2ssa::SSAVar::new("EAX", 1, 4),
-                },
-                SSAOp::Copy {
-                    dst: r2ssa::SSAVar::new("RAX", 1, 8),
-                    src: r2ssa::SSAVar::new("RDX", 1, 8),
-                },
-                SSAOp::IntLeft {
-                    dst: r2ssa::SSAVar::new("RAX", 2, 8),
-                    a: r2ssa::SSAVar::new("RAX", 1, 8),
-                    b: r2ssa::SSAVar::new("const:3", 0, 8),
-                },
-                SSAOp::IntSub {
-                    dst: r2ssa::SSAVar::new("RAX", 3, 8),
-                    a: r2ssa::SSAVar::new("RAX", 2, 8),
-                    b: r2ssa::SSAVar::new("RDX", 1, 8),
-                },
-                SSAOp::IntLeft {
-                    dst: r2ssa::SSAVar::new("RAX", 4, 8),
-                    a: r2ssa::SSAVar::new("RAX", 3, 8),
-                    b: r2ssa::SSAVar::new("const:3", 0, 8),
-                },
-                SSAOp::Copy {
-                    dst: r2ssa::SSAVar::new("RDX", 2, 8),
-                    src: r2ssa::SSAVar::new("RAX", 4, 8),
-                },
-                SSAOp::Load {
-                    dst: r2ssa::SSAVar::new("tmp:11f80", 1, 8),
-                    space: r2il::SpaceId::Ram,
-                    addr: r2ssa::SSAVar::new("tmp:4700", 1, 8),
-                },
-                SSAOp::Copy {
-                    dst: r2ssa::SSAVar::new("RAX", 5, 8),
-                    src: r2ssa::SSAVar::new("tmp:11f80", 1, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("RDX", 3, 8),
-                    a: r2ssa::SSAVar::new("RDX", 2, 8),
-                    b: r2ssa::SSAVar::new("RAX", 5, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:4700", 4, 8),
-                    a: r2ssa::SSAVar::new("RDX", 3, 8),
-                    b: r2ssa::SSAVar::new("const:8", 0, 8),
-                },
-                SSAOp::Store {
-                    space: r2il::SpaceId::Ram,
-                    addr: r2ssa::SSAVar::new("tmp:4700", 4, 8),
-                    val: r2ssa::SSAVar::new("EDX", 0, 4),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:4700", 5, 8),
-                    a: r2ssa::SSAVar::new("RDX", 3, 8),
-                    b: r2ssa::SSAVar::new("const:8", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: r2ssa::SSAVar::new("ECX", 1, 4),
-                    space: r2il::SpaceId::Ram,
-                    addr: r2ssa::SSAVar::new("tmp:4700", 5, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("tmp:4700", 6, 8),
-                    a: r2ssa::SSAVar::new("RDX", 3, 8),
-                    b: r2ssa::SSAVar::new("const:34", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: r2ssa::SSAVar::new("EAX", 2, 4),
-                    space: r2il::SpaceId::Ram,
-                    addr: r2ssa::SSAVar::new("tmp:4700", 6, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: r2ssa::SSAVar::new("EAX", 3, 4),
-                    a: r2ssa::SSAVar::new("EAX", 2, 4),
-                    b: r2ssa::SSAVar::new("ECX", 1, 4),
-                },
-                SSAOp::Return {
-                    target: r2ssa::SSAVar::new("RIP", 0, 8),
-                },
-            ],
-        };
-
-        let raw = R2ILBlock {
-            addr: block.addr,
-            size: block.size,
-            ops: vec![R2ILOp::Return {
-                target: Varnode::constant(0, 8),
-            }],
-            switch_info: None,
-            op_metadata: Default::default(),
-        };
-        let mut func = SSAFunction::from_blocks_raw_no_arch(&[raw]).expect("ssa function");
-        func.get_block_mut(block.addr).expect("entry block").ops = block.ops.clone();
-        func = func.with_name("dbg.test_struct_array_index");
-
-        let config = DecompilerConfig::x86_64();
-        let mut decompiler = Decompiler::new(config.clone());
-        let signature = signature_spec(
-            Some(CType::Int(32)),
-            vec![
-                (
-                    "arr",
-                    Some(CType::Pointer(Box::new(CType::Struct(
-                        "sla_struct_420703e08f70f00e".to_string(),
-                    )))),
-                ),
-                ("idx", Some(CType::Int(32))),
-                ("v", Some(CType::Int(32))),
-            ],
-        );
-        decompiler.set_type_facts(FunctionTypeFacts {
-            signature_certificate: external_signature_certificate(&signature),
-            merged_signature: Some(signature),
-            external_type_db: ExternalTypeDb {
-                structs: HashMap::from([(
-                    "sla_struct_420703e08f70f00e".to_string(),
-                    ExternalStruct {
-                        name: "sla_struct_420703e08f70f00e".to_string(),
-                        fields: HashMap::from([
-                            (
-                                8,
-                                ExternalField {
-                                    name: "f_8".to_string(),
-                                    offset: 8,
-                                    ty: Some("int32_t".to_string()),
-                                },
-                            ),
-                            (
-                                0x34,
-                                ExternalField {
-                                    name: "f_34".to_string(),
-                                    offset: 0x34,
-                                    ty: Some("int32_t".to_string()),
-                                },
-                            ),
-                        ])
-                        .into_iter()
-                        .collect(),
-                    },
-                )]),
-                ..ExternalTypeDb::default()
-            },
-            ..FunctionTypeFacts::default()
-        });
-        let type_facts = decompiler.context.type_facts().clone();
-        let mut route = test_decompile_route(
-            r2types::DecompileRouteKind::Standard,
-            "x86 struct-array pipeline test route",
-            None,
-        );
-        route.use_prepared_semantic_view = false;
-        decompiler.context.function_facts =
-            FunctionFacts::new(type_facts, None).with_decompile_route(route);
-
-        let normalized_func = func.clone();
-        let func = &normalized_func;
-
-        let mut var_recovery = VariableRecovery::new_with_abi(
-            &config.sp_name,
-            &config.fp_name,
-            config.ptr_size,
-            config.arg_regs.clone(),
-            config.ret_regs.clone(),
-        );
-        var_recovery.set_type_facts(decompiler.context.type_facts().clone());
-        var_recovery.recover(func);
-
-        let mut type_inference = TypeInference::new_with_abi(
-            config.ptr_size,
-            config.arg_regs.clone(),
-            config.ret_regs.clone(),
-        );
-        type_inference.set_external_signature(
-            decompiler
-                .context
-                .type_facts()
-                .render_authorized_signature()
-                .cloned(),
-        );
-        type_inference
-            .set_external_stack_slots(decompiler.context.type_facts().stack_slots.clone());
-        type_inference
-            .set_external_type_db(decompiler.context.type_facts().external_type_db.clone());
-        type_inference.set_decompile_prep_facts(func.decompile_prep_facts());
-        type_inference.infer_function(func);
-        let mut type_hints = type_inference
-            .var_type_hints()
-            .into_iter()
-            .map(|(name, ty)| (name, type_like_to_ctype(&ty)))
-            .collect::<HashMap<_, _>>();
-        let recovered_param_infos: Vec<_> = var_recovery
-            .parameters()
-            .iter()
-            .map(|v| {
-                (
-                    v.ssa_var.clone(),
-                    ast::CParam {
-                        ty: type_like_to_ctype(&type_inference.get_type(&v.ssa_var)),
-                        name: v.name.clone(),
-                    },
-                )
-            })
-            .collect();
-        let params = merge_params_with_external_signature(
-            recovered_param_infos
-                .iter()
-                .map(|(_, param)| param.clone())
-                .collect(),
-            decompiler
-                .context
-                .type_facts()
-                .render_authorized_signature(),
-        );
-        let param_register_aliases = build_param_register_aliases(
-            &params,
-            &recovered_param_infos,
-            &decompiler.context.type_facts().register_params,
-            &config.arg_regs,
-            true,
-        );
-        for (idx, (_ssa_var, _)) in recovered_param_infos.iter().enumerate() {
-            let Some(param) = params.get(idx) else {
-                continue;
-            };
-            let param_ty = param.ty.clone();
-            type_hints.insert(param.name.clone(), param_ty.clone());
-            type_hints.insert(param.name.to_ascii_lowercase(), param_ty);
-        }
-        for (reg_alias, param_name) in &param_register_aliases {
-            let Some(param) = params.iter().find(|param| param.name == *param_name) else {
-                continue;
-            };
-            type_hints
-                .entry(reg_alias.clone())
-                .or_insert_with(|| param.ty.clone());
-            type_hints
-                .entry(reg_alias.to_ascii_lowercase())
-                .or_insert_with(|| param.ty.clone());
-        }
-
-        let fold_arch = FoldArchConfig {
-            ptr_size: config.ptr_size,
-            sp_name: config.sp_name.clone(),
-            fp_name: config.fp_name.clone(),
-            ret_reg_name: config
-                .ret_regs
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "rax".to_string()),
-            arg_regs: config.arg_regs.clone(),
-            caller_saved_regs: config.caller_saved_regs.clone(),
-        };
-        let combined_type_oracle = type_inference.combined_type_oracle();
-        let inferred_ret_type = decompiler.infer_return_type(func, &type_inference);
-        let signature_ret_type = decompiler
-            .context
-            .type_facts()
-            .render_authorized_signature()
-            .and_then(|sig| sig.ret_type.as_ref().map(type_like_to_ctype));
-        let fold_inputs = FoldInputs {
-            arch: &fold_arch,
-            function_names: &decompiler.context.function_names,
-            strings: &decompiler.context.strings,
-            symbols: &decompiler.context.symbols,
-            function_facts: &decompiler.context.function_facts,
-            certified_rendering_required: true,
-            stack_slots: &decompiler.context.type_facts().stack_slots,
-            field_access_certificates: &decompiler.context.type_facts().field_access_certificates,
-            #[cfg(test)]
-            external_stack_vars: &decompiler.context.type_facts().external_stack_vars,
-            visible_bindings: &decompiler.context.type_facts().visible_bindings,
-            external_type_db: &decompiler.context.type_facts().external_type_db,
-            param_register_aliases: &param_register_aliases,
-            type_hints: &type_hints,
-            type_oracle: combined_type_oracle
-                .as_ref()
-                .map(|oracle| oracle as &dyn TypeOracle),
-            function_return_type: signature_ret_type.as_ref().or(Some(&inferred_ret_type)),
-            prepared_ssa: None,
-            prepared_semantic_view: None,
-            prepared_objects: None,
-            prepared_memory: None,
-        };
-        let mut fold_ctx = FoldingContext::from_inputs(fold_inputs);
-        let fold_blocks: Vec<_> = func.blocks().cloned().collect();
-        fold_ctx.analyze_blocks(&fold_blocks);
-        fold_ctx.analyze_function_structure(func);
-
-        let eax2 = fold_ctx.get_expr(&r2ssa::SSAVar::new("EAX", 2, 4));
-        let ecx1 = fold_ctx.get_expr(&r2ssa::SSAVar::new("ECX", 1, 4));
-        let stmts = fold_ctx.fold_block(&fold_blocks[0], fold_blocks[0].addr);
-        let mut structurer = ControlFlowStructurer::new(func, &fold_ctx);
-        let body_stmt = structurer.structure();
-
-        assert!(
-            !matches!(eax2, CExpr::Member { .. } | CExpr::PtrMember { .. })
-                && !matches!(ecx1, CExpr::Member { .. } | CExpr::PtrMember { .. }),
-            "typed rendering must not invent member loads without exact owners, eax2={eax2:?}, ecx1={ecx1:?}; params={params:?}; param_aliases={param_register_aliases:?}; type_hints={type_hints:?}"
-        );
-        assert!(
-            stmts.iter().all(|stmt| !matches!(stmt, CStmt::Return(_)))
-                && format!("{stmts:?}").contains("uncertified memory store")
-                && format!("{stmts:?}").contains("missing certified value return"),
-            "incomplete FunctionFacts must residualize this block instead of fabricating a return, got {stmts:?}"
-        );
-        assert!(
-            !format!("{body_stmt:?}").contains("f_34") && !format!("{body_stmt:?}").contains("f_8"),
-            "uncertified structuring must not preserve fake member loads, body={body_stmt:?}"
         );
     }
 
@@ -6976,6 +8660,7 @@ mod tests {
                 interpreter: None,
                 step_summary: Some(vm_step),
                 transfer_summary: None,
+                native: None,
             })),
             diagnostics: r2sym::SemanticArtifactDiagnostics {
                 branches_evaluated: 0,
@@ -6989,11 +8674,32 @@ mod tests {
             },
         };
         let signature = signature_spec(
-            Some(CType::Int(32)),
+            Some(CType::Int {
+                bits: 32,
+                signedness: r2types::Signedness::Signed,
+            }),
             vec![
-                ("code", Some(CType::Pointer(Box::new(CType::UInt(8))))),
-                ("len", Some(CType::Int(32))),
-                ("arg3", Some(CType::Int(64))),
+                (
+                    "code",
+                    Some(CType::Pointer(Box::new(CType::Int {
+                        bits: 8,
+                        signedness: r2types::Signedness::Unsigned,
+                    }))),
+                ),
+                (
+                    "len",
+                    Some(CType::Int {
+                        bits: 32,
+                        signedness: r2types::Signedness::Signed,
+                    }),
+                ),
+                (
+                    "arg3",
+                    Some(CType::Int {
+                        bits: 64,
+                        signedness: r2types::Signedness::Signed,
+                    }),
+                ),
             ],
         );
         let function_facts = FunctionFacts::new(
@@ -7074,7 +8780,16 @@ mod tests {
                 ),
             ],
         );
-        let signature = signature_spec(Some(CType::Void), vec![("status", Some(CType::Int(32)))]);
+        let signature = signature_spec(
+            Some(CType::Void),
+            vec![(
+                "status",
+                Some(CType::Int {
+                    bits: 32,
+                    signedness: r2types::Signedness::Signed,
+                }),
+            )],
+        );
         let function_facts = FunctionFacts::new(
             FunctionTypeFacts {
                 signature_certificate: external_signature_certificate(&signature),
@@ -7157,7 +8872,13 @@ mod tests {
             vec![
                 ("dst", Some(CType::Pointer(Box::new(CType::Void)))),
                 ("src", Some(CType::Pointer(Box::new(CType::Void)))),
-                ("len", Some(CType::Int(64))),
+                (
+                    "len",
+                    Some(CType::Int {
+                        bits: 64,
+                        signedness: r2types::Signedness::Signed,
+                    }),
+                ),
             ],
         );
         let function_facts = FunctionFacts::new(
@@ -7267,7 +8988,13 @@ mod tests {
     fn semantic_worker_summary_handles_structured_worker_comment_only() {
         let semantic_artifact =
             large_cfg_worker_report(r2sym::RefinementStage::Compiled, Vec::new(), Vec::new());
-        let signature = signature_spec(Some(CType::Int(32)), Vec::new());
+        let signature = signature_spec(
+            Some(CType::Int {
+                bits: 32,
+                signedness: r2types::Signedness::Signed,
+            }),
+            Vec::new(),
+        );
         let function_facts = FunctionFacts::new(
             FunctionTypeFacts {
                 signature_certificate: external_signature_certificate(&signature),
@@ -7488,12 +9215,12 @@ mod tests {
                 register_params: vec![
                     ExternalRegisterParamSpec {
                         name: "arg1".to_string(),
-                        ty: Some(CTypeLike::Typedef("int64_t".to_string())),
+                        ty: Some(CType::Typedef("int64_t".to_string())),
                         reg: "rdx".to_string(),
                     },
                     ExternalRegisterParamSpec {
                         name: "arg2".to_string(),
-                        ty: Some(CTypeLike::Typedef("int64_t".to_string())),
+                        ty: Some(CType::Typedef("int64_t".to_string())),
                         reg: "r8".to_string(),
                     },
                 ],
@@ -7561,7 +9288,7 @@ mod tests {
                 merged_signature: Some(signature_spec(Some(CType::Bool), Vec::new())),
                 register_params: vec![ExternalRegisterParamSpec {
                     name: "arg1".to_string(),
-                    ty: Some(CTypeLike::Typedef("int64_t".to_string())),
+                    ty: Some(CType::Typedef("int64_t".to_string())),
                     reg: "rdi".to_string(),
                 }],
                 ..FunctionTypeFacts::default()
@@ -7629,12 +9356,12 @@ mod tests {
                 register_params: vec![
                     ExternalRegisterParamSpec {
                         name: "arg1".to_string(),
-                        ty: Some(CTypeLike::Typedef("int64_t".to_string())),
+                        ty: Some(CType::Typedef("int64_t".to_string())),
                         reg: "rdi".to_string(),
                     },
                     ExternalRegisterParamSpec {
                         name: "arg2".to_string(),
-                        ty: Some(CTypeLike::Typedef("int64_t".to_string())),
+                        ty: Some(CType::Typedef("int64_t".to_string())),
                         reg: "rsi".to_string(),
                     },
                 ],
@@ -7757,11 +9484,32 @@ mod tests {
                 });
         }
         let signature = signature_spec(
-            Some(CType::Int(32)),
+            Some(CType::Int {
+                bits: 32,
+                signedness: r2types::Signedness::Signed,
+            }),
             vec![
-                ("src_fd", Some(CType::Int(32))),
-                ("dest_fd", Some(CType::Int(32))),
-                ("len", Some(CType::Int(64))),
+                (
+                    "src_fd",
+                    Some(CType::Int {
+                        bits: 32,
+                        signedness: r2types::Signedness::Signed,
+                    }),
+                ),
+                (
+                    "dest_fd",
+                    Some(CType::Int {
+                        bits: 32,
+                        signedness: r2types::Signedness::Signed,
+                    }),
+                ),
+                (
+                    "len",
+                    Some(CType::Int {
+                        bits: 64,
+                        signedness: r2types::Signedness::Signed,
+                    }),
+                ),
                 ("sp", Some(CType::Pointer(Box::new(CType::Void)))),
                 ("stream", Some(CType::Pointer(Box::new(CType::Void)))),
                 ("fields", Some(CType::Pointer(Box::new(CType::Void)))),
@@ -7839,13 +9587,19 @@ mod tests {
                 (
                     "argv",
                     Some(CType::Pointer(Box::new(CType::Pointer(Box::new(
-                        CType::Int(8),
+                        CType::Int {
+                            bits: 8,
+                            signedness: r2types::Signedness::Signed,
+                        },
                     ))))),
                 ),
                 (
                     "envp",
                     Some(CType::Pointer(Box::new(CType::Pointer(Box::new(
-                        CType::Int(8),
+                        CType::Int {
+                            bits: 8,
+                            signedness: r2types::Signedness::Signed,
+                        },
                     ))))),
                 ),
             ],
@@ -8077,8 +9831,17 @@ mod tests {
         let function_facts = FunctionFacts::new(
             FunctionTypeFacts {
                 merged_signature: Some(signature_spec(
-                    Some(CType::Int(32)),
-                    vec![("str", Some(CType::Pointer(Box::new(CType::Int(8)))))],
+                    Some(CType::Int {
+                        bits: 32,
+                        signedness: r2types::Signedness::Signed,
+                    }),
+                    vec![(
+                        "str",
+                        Some(CType::Pointer(Box::new(CType::Int {
+                            bits: 8,
+                            signedness: r2types::Signedness::Signed,
+                        }))),
+                    )],
                 )),
                 ..FunctionTypeFacts::default()
             },
@@ -8100,7 +9863,10 @@ mod tests {
         assert!(!output.contains("summary locals are synthetic"));
         assert!(!output.contains("while ("));
         assert!(!output.contains("return summary_value;"));
-        assert!(output.contains("worker loop: parse base10 numeric stream from arg0"));
+        // `str`, not `arg0`. The parameter was named all along; this summary
+        // path simply never ran the text scan that substituted names, so it
+        // printed the slot index instead of the name the facts already held.
+        assert!(output.contains("worker loop: parse base10 numeric stream from str"));
         assert!(output.contains("worker summary: parser"));
     }
 
@@ -8236,7 +10002,16 @@ mod tests {
                     r2sym::SemanticEvidenceReason::SummaryBudget,
                 ),
             });
-        let signature = signature_spec(Some(CType::Void), vec![("size", Some(CType::UInt(64)))]);
+        let signature = signature_spec(
+            Some(CType::Void),
+            vec![(
+                "size",
+                Some(CType::Int {
+                    bits: 64,
+                    signedness: r2types::Signedness::Unsigned,
+                }),
+            )],
+        );
         let function_facts = FunctionFacts::new(
             FunctionTypeFacts {
                 signature_certificate: external_signature_certificate(&signature),
@@ -8410,10 +10185,28 @@ mod tests {
         let signature = signature_spec(
             Some(CType::Typedef("size_t".to_string())),
             vec![
-                ("buf", Some(CType::Pointer(Box::new(CType::UInt(8))))),
+                (
+                    "buf",
+                    Some(CType::Pointer(Box::new(CType::Int {
+                        bits: 8,
+                        signedness: r2types::Signedness::Unsigned,
+                    }))),
+                ),
                 ("n", Some(CType::Typedef("size_t".to_string()))),
-                ("a", Some(CType::UInt(8))),
-                ("b", Some(CType::UInt(8))),
+                (
+                    "a",
+                    Some(CType::Int {
+                        bits: 8,
+                        signedness: r2types::Signedness::Unsigned,
+                    }),
+                ),
+                (
+                    "b",
+                    Some(CType::Int {
+                        bits: 8,
+                        signedness: r2types::Signedness::Unsigned,
+                    }),
+                ),
             ],
         );
         let function_facts = FunctionFacts::new(
@@ -9227,8 +11020,17 @@ mod tests {
                 .with_coverage(r2sym::SemanticEvidenceCoverage::Bounded),
         }));
         let signature = signature_spec(
-            Some(CType::Int(32)),
-            vec![("table", Some(CType::Pointer(Box::new(CType::Int(8)))))],
+            Some(CType::Int {
+                bits: 32,
+                signedness: r2types::Signedness::Signed,
+            }),
+            vec![(
+                "table",
+                Some(CType::Pointer(Box::new(CType::Int {
+                    bits: 8,
+                    signedness: r2types::Signedness::Signed,
+                }))),
+            )],
         );
         let function_facts = FunctionFacts::new(
             FunctionTypeFacts {
@@ -9334,6 +11136,7 @@ mod tests {
 
     #[test]
     fn semantic_summary_return_guard_fills_nonvoid_body_without_return() {
+        let symbols = test_table();
         let mut semantic_artifact = test_native_semantic_report(
             r2sym::RefinementStage::Compiled,
             r2sym::ArtifactGranularity::Regioned,
@@ -9371,21 +11174,33 @@ mod tests {
             });
         let function_facts = FunctionFacts::new(
             FunctionTypeFacts {
-                merged_signature: Some(signature_spec(Some(CType::ptr(CType::Int(8))), Vec::new())),
+                merged_signature: Some(signature_spec(
+                    Some(CType::ptr(CType::Int {
+                        bits: 8,
+                        signedness: r2types::Signedness::Signed,
+                    })),
+                    Vec::new(),
+                )),
                 ..FunctionTypeFacts::default()
             },
             None,
         );
         let mut func = CFunction {
+            externs: Vec::new(),
+            extern_objects: Vec::new(),
             name: "dbg.gettext_quote".to_string(),
-            ret_type: CType::ptr(CType::Int(8)),
+            ret_type: CType::ptr(CType::Int {
+                bits: 8,
+                signedness: r2types::Signedness::Signed,
+            }),
             params: Vec::new(),
             params_known: true,
             locals: Vec::new(),
             body: vec![CStmt::Expr(CExpr::call(
-                CExpr::var("sym.rpl_mbrtoc32"),
+                CExpr::var(crate::symbol::declare(&symbols, "sym.rpl_mbrtoc32")),
                 Vec::new(),
             ))],
+            symbols: std::rc::Rc::new(symbols),
         };
 
         append_semantic_summary_return_to_function_if_needed(
@@ -9408,6 +11223,7 @@ mod tests {
 
     #[test]
     fn raw_summary_report_does_not_invent_executable_return() {
+        let symbols = test_table();
         let semantic_artifact = test_native_semantic_report(
             r2sym::RefinementStage::Compiled,
             r2sym::ArtifactGranularity::WholeFunction,
@@ -9419,23 +11235,38 @@ mod tests {
         let function_facts = FunctionFacts::new(
             FunctionTypeFacts {
                 merged_signature: Some(signature_spec(
-                    Some(CType::ptr(CType::Int(8))),
-                    vec![("buf", Some(CType::ptr(CType::Int(8))))],
+                    Some(CType::ptr(CType::Int {
+                        bits: 8,
+                        signedness: r2types::Signedness::Signed,
+                    })),
+                    vec![(
+                        "buf",
+                        Some(CType::ptr(CType::Int {
+                            bits: 8,
+                            signedness: r2types::Signedness::Signed,
+                        })),
+                    )],
                 )),
                 ..FunctionTypeFacts::default()
             },
             None,
         );
         let mut func = CFunction {
+            externs: Vec::new(),
+            extern_objects: Vec::new(),
             name: "dbg.return_arg_summary".to_string(),
-            ret_type: CType::ptr(CType::Int(8)),
+            ret_type: CType::ptr(CType::Int {
+                bits: 8,
+                signedness: r2types::Signedness::Signed,
+            }),
             params: Vec::new(),
             params_known: true,
             locals: Vec::new(),
             body: vec![CStmt::Expr(CExpr::call(
-                CExpr::var("summary_worker"),
+                CExpr::var(crate::symbol::declare(&symbols, "summary_worker")),
                 Vec::new(),
             ))],
+            symbols: std::rc::Rc::new(symbols),
         };
 
         append_semantic_summary_return_to_function_if_needed(
@@ -9458,6 +11289,7 @@ mod tests {
 
     #[test]
     fn certified_standard_summary_return_guard_does_not_invent_executable_return() {
+        let symbols = test_table();
         let semantic_artifact = test_native_semantic_report(
             r2sym::RefinementStage::Compiled,
             r2sym::ArtifactGranularity::WholeFunction,
@@ -9469,23 +11301,33 @@ mod tests {
         let function_facts = FunctionFacts::new(
             FunctionTypeFacts {
                 merged_signature: Some(signature_spec(
-                    Some(CType::ptr(CType::Int(8))),
+                    Some(CType::ptr(CType::Int {
+                        bits: 8,
+                        signedness: r2types::Signedness::Signed,
+                    })),
                     vec![("n", Some(CType::Typedef("size_t".to_string())))],
                 )),
                 ..FunctionTypeFacts::default()
             },
             None,
         );
+        let body = vec![CStmt::Expr(CExpr::call(
+            crate::symbol::var_ref(&symbols, "sym.imp.malloc"),
+            vec![crate::symbol::var_ref(&symbols, "n")],
+        ))];
         let mut func = CFunction {
+            externs: Vec::new(),
+            extern_objects: Vec::new(),
             name: "dbg.alloc_wrapper2".to_string(),
-            ret_type: CType::ptr(CType::Int(8)),
+            ret_type: CType::ptr(CType::Int {
+                bits: 8,
+                signedness: r2types::Signedness::Signed,
+            }),
             params: Vec::new(),
             params_known: true,
             locals: Vec::new(),
-            body: vec![CStmt::Expr(CExpr::call(
-                CExpr::var("sym.imp.malloc"),
-                vec![CExpr::var("n")],
-            ))],
+            body,
+            symbols: std::rc::Rc::new(symbols),
         };
 
         append_semantic_summary_return_comment_to_function_if_needed(
@@ -9511,5 +11353,15 @@ mod tests {
         assert!(is_autogenerated_function_name("_140010138"));
         assert!(is_autogenerated_function_name("_401000"));
         assert!(!is_autogenerated_function_name("_named_worker"));
+    }
+
+    #[test]
+    fn sealed_region_occurrence_mismatch_is_a_render_refusal() {
+        assert_eq!(validate_sealed_region_occurrence_counts(3, 3), Ok(()));
+        assert_eq!(
+            validate_sealed_region_occurrence_counts(2, 3),
+            Err(DecompileRenderRefusal::UnrepresentableControlFlow),
+            "release builds must not admit a partially represented region domain"
+        );
     }
 }

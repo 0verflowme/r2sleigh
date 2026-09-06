@@ -14,7 +14,7 @@ use z3::Context;
 use z3::ast::{BV, Bool};
 
 use crate::memory::{MemoryRegionId, MemoryRegionKind, SymMemory};
-use crate::value::SymValue;
+use crate::value::{SymValue, SymbolicKey};
 
 fn debug_runtime_continuation_log(message: &str) {
     if std::env::var_os("R2SLEIGH_DEBUG_RUNTIME_CONTINUATION").is_none() {
@@ -223,7 +223,7 @@ pub struct SymState<'ctx> {
     /// The Z3 context.
     ctx: &'ctx Context,
     /// Register values (register name -> value).
-    registers: Rc<HashMap<String, SymValue<'ctx>>>,
+    registers: Rc<BTreeMap<String, SymValue<'ctx>>>,
     /// Memory state.
     pub memory: SymMemory<'ctx>,
     /// Path constraints (conditions that must be true for this path).
@@ -231,8 +231,8 @@ pub struct SymState<'ctx> {
     /// Materialized constraint list, populated lazily from the shared cursor chain.
     materialized_constraints: OnceCell<Vec<Bool>>,
     /// Syntactic value facts derived while adding constraints.
-    known_zero_values: Rc<BTreeSet<String>>,
-    known_nonzero_values: Rc<BTreeSet<String>>,
+    known_zero_values: Rc<HashSet<SymbolicKey>>,
+    known_nonzero_values: Rc<HashSet<SymbolicKey>>,
     /// Current program counter.
     pc: u64,
     /// Address domain for the current program counter.
@@ -248,7 +248,7 @@ pub struct SymState<'ctx> {
     /// Execution depth (number of steps taken).
     pub depth: usize,
     /// Named symbolic inputs (registers or buffers).
-    symbolic_inputs: Rc<HashMap<String, SymValue<'ctx>>>,
+    symbolic_inputs: Rc<BTreeMap<String, SymValue<'ctx>>>,
     /// Tracked symbolic memory regions.
     symbolic_memory: Rc<Vec<SymbolicMemoryRegion<'ctx>>>,
     /// Symbolic external input streams keyed by file descriptor.
@@ -311,12 +311,12 @@ impl<'ctx> SymState<'ctx> {
     pub fn new(ctx: &'ctx Context, entry_pc: u64) -> Self {
         Self {
             ctx,
-            registers: Rc::new(HashMap::new()),
+            registers: Rc::new(BTreeMap::new()),
             memory: SymMemory::new(ctx),
             constraints: ConstraintCursor::default(),
             materialized_constraints: OnceCell::new(),
-            known_zero_values: Rc::new(BTreeSet::new()),
-            known_nonzero_values: Rc::new(BTreeSet::new()),
+            known_zero_values: Rc::new(HashSet::new()),
+            known_nonzero_values: Rc::new(HashSet::new()),
             pc: entry_pc,
             execution_pc: ExecutionPc::Static,
             predecessor: None,
@@ -324,7 +324,7 @@ impl<'ctx> SymState<'ctx> {
             active: true,
             exit_status: None,
             depth: 0,
-            symbolic_inputs: Rc::new(HashMap::new()),
+            symbolic_inputs: Rc::new(BTreeMap::new()),
             symbolic_memory: Rc::new(Vec::new()),
             symbolic_fd_inputs: Rc::new(HashMap::new()),
             runtime: RuntimeState::default(),
@@ -335,12 +335,12 @@ impl<'ctx> SymState<'ctx> {
     pub fn new_symbolic(ctx: &'ctx Context, entry_pc: u64) -> Self {
         Self {
             ctx,
-            registers: Rc::new(HashMap::new()),
+            registers: Rc::new(BTreeMap::new()),
             memory: SymMemory::new_symbolic(ctx),
             constraints: ConstraintCursor::default(),
             materialized_constraints: OnceCell::new(),
-            known_zero_values: Rc::new(BTreeSet::new()),
-            known_nonzero_values: Rc::new(BTreeSet::new()),
+            known_zero_values: Rc::new(HashSet::new()),
+            known_nonzero_values: Rc::new(HashSet::new()),
             pc: entry_pc,
             execution_pc: ExecutionPc::Static,
             predecessor: None,
@@ -348,7 +348,7 @@ impl<'ctx> SymState<'ctx> {
             active: true,
             exit_status: None,
             depth: 0,
-            symbolic_inputs: Rc::new(HashMap::new()),
+            symbolic_inputs: Rc::new(BTreeMap::new()),
             symbolic_memory: Rc::new(Vec::new()),
             symbolic_fd_inputs: Rc::new(HashMap::new()),
             runtime: RuntimeState::default(),
@@ -546,12 +546,12 @@ impl<'ctx> SymState<'ctx> {
     }
 
     /// Get all registers.
-    pub fn registers(&self) -> &HashMap<String, SymValue<'ctx>> {
+    pub fn registers(&self) -> &BTreeMap<String, SymValue<'ctx>> {
         self.registers.as_ref()
     }
 
     /// Get tracked symbolic inputs.
-    pub fn symbolic_inputs(&self) -> &HashMap<String, SymValue<'ctx>> {
+    pub fn symbolic_inputs(&self) -> &BTreeMap<String, SymValue<'ctx>> {
         self.symbolic_inputs.as_ref()
     }
 
@@ -1002,8 +1002,8 @@ impl<'ctx> SymState<'ctx> {
             hash_sym_value(self.ctx, &self.registers[name], &mut hasher);
         }
 
-        self.known_zero_values.hash(&mut hasher);
-        self.known_nonzero_values.hash(&mut hasher);
+        hash_unordered(&self.known_zero_values, &mut hasher);
+        hash_unordered(&self.known_nonzero_values, &mut hasher);
 
         let mut symbolic_input_names: Vec<_> = self.symbolic_inputs.keys().collect();
         symbolic_input_names.sort_unstable();
@@ -1091,11 +1091,15 @@ impl<'ctx> SymState<'ctx> {
                 .collect(),
         );
 
-        let mut keys = HashSet::new();
+        // Ordered: merging builds a solver term per key, so a hashed iteration
+        // order handed Z3 the same merge in a different order on every run, and
+        // the model it chose for an under-constrained value moved with it. One
+        // statement in `list_reverse` appeared in roughly one run in ten.
+        let mut keys = BTreeSet::new();
         keys.extend(self.registers.keys().cloned());
         keys.extend(other.registers.keys().cloned());
 
-        let mut registers = HashMap::with_capacity(keys.len());
+        let mut registers = BTreeMap::new();
         for key in keys {
             let val_self = self
                 .registers
@@ -1762,6 +1766,22 @@ impl<'ctx> std::fmt::Debug for SymState<'ctx> {
             .field("active", &self.active)
             .finish()
     }
+}
+
+/// Hash a set whose iteration order is not part of its meaning.
+///
+/// `BTreeSet` hashed in order and a `HashSet` cannot, so combining the members'
+/// hashes has to be commutative. Exclusive-or is, and it keeps the state's
+/// identity a function of which facts are present rather than of the order the
+/// table happens to store them in.
+fn hash_unordered(values: &HashSet<SymbolicKey>, hasher: &mut impl Hasher) {
+    let mut combined = 0u64;
+    for value in values {
+        let mut member = DefaultHasher::new();
+        value.hash(&mut member);
+        combined ^= member.finish();
+    }
+    combined.hash(hasher);
 }
 
 #[cfg(test)]

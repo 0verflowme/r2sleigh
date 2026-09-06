@@ -1,0 +1,185 @@
+diff --git a/crates/r2dec/src/fold/op_lower/calls.rs b/crates/r2dec/src/fold/op_lower/calls.rs
+index 6ff5959..29d2794 100644
+--- a/crates/r2dec/src/fold/op_lower/calls.rs
++++ b/crates/r2dec/src/fold/op_lower/calls.rs
+@@ -96,9 +96,17 @@ impl<'a> FoldingContext<'a> {
+         // which does not parse at all.
+         let declaration = crate::ast::CExternDecl {
+             name: name.clone(),
++            // The result is declared at the width the caller reads, not the
++            // width of the register it arrives in. The callee's own rendering
++            // declares the width it produced, by following the returned value
++            // back through the zero-extension into the ABI carrier, and the
++            // two have to agree: decompiling caller and callee into one
++            // translation unit is a hard `conflicting types` error otherwise.
++            // Both measure the same thing -- how much of the carrier holds the
++            // value -- from the side each of them can see.
+             ret_type: self
+                 .certified_call_result_value((block_addr, op_idx))
+-                .and_then(|value| self.machine_value_width_bits(value))
++                .and_then(|value| self.call_result_width_bits(value))
+                 .map_or(CType::Void, CType::uint),
+             params: args
+                 .values
+@@ -113,6 +121,35 @@ impl<'a> FoldingContext<'a> {
+     }
+ 
+     /// The width a value occupies in machine storage, in bits.
++    /// The width of a call result, as the caller reads it.
++    ///
++    /// Every use of the result projects some slice of the carrier. Where all of
++    /// them read the same narrower slice at offset zero, that is how wide the
++    /// result is; a caller that reads the whole register gets the whole
++    /// register.
++    fn call_result_width_bits(&self, value: r2ssa::ValueId) -> Option<u32> {
++        let carrier = self.machine_value_width_bits(value)?;
++        let Some(prepared) = self.inputs.prepared_ssa else {
++            return Some(carrier);
++        };
++        let plan = self.inputs.binding_names?.plan();
++        let mut widest = 0_u32;
++        for site in prepared.graph().use_sites(value) {
++            let Some(r2ssa::MachineUseDisposition::Exact(slice)) = plan.use_disposition(*site)
++            else {
++                return Some(carrier);
++            };
++            if slice.bit_offset() != 0 {
++                return Some(carrier);
++            }
++            widest = widest.max(slice.width_bits());
++        }
++        if widest == 0 || !matches!(widest, 8 | 16 | 32 | 64) {
++            return Some(carrier);
++        }
++        Some(widest.min(carrier))
++    }
++
+     fn machine_value_width_bits(&self, value: r2ssa::ValueId) -> Option<u32> {
+         let graph = self.inputs.prepared_ssa?.graph();
+         let size = graph.value(value)?.canonical_storage?.size;
+diff --git a/crates/r2dec/src/lib.rs b/crates/r2dec/src/lib.rs
+index c5c3f60..0423cd9 100644
+--- a/crates/r2dec/src/lib.rs
++++ b/crates/r2dec/src/lib.rs
+@@ -4856,9 +4856,17 @@ impl Decompiler {
+                 .values()
+                 .cloned()
+                 .collect(),
+-            ret_type: render_signature
+-                .and_then(|sig| sig.ret_type.clone())
+-                .unwrap_or_else(|| inferred_ret_type.clone()),
++            // Narrowed by what the function produced, whichever answer names
++            // the type. A signature recovered from the ABI names the carrier
++            // register, so it says `uint64_t` for every function on x86-64;
++            // the returned value's own definition says how much of that
++            // register the function filled.
++            ret_type: narrowed_return_type(
++                &render_signature
++                    .and_then(|sig| sig.ret_type.clone())
++                    .unwrap_or_else(|| inferred_ret_type.clone()),
++                certified_return_bits(prepared),
++            ),
+             params,
+             // Program locals are introduced only by the final placement pass
+             // from surviving, observed BindingId occurrences.
+@@ -4982,7 +4990,15 @@ fn evidence_return_type(source: &r2ssa::SsaArtifact, evidence: &r2types::Evidenc
+         let Some(ty) = evidence.value_type(certificate.value) else {
+             return CType::Unknown;
+         };
+-        let ty = ty.clone();
++        // The certificate says how wide the returned value is; the evidence
++        // says what it means. Both are facts about the same return, and where
++        // they disagree about width the certificate is the one that measured
++        // the machine: the value sits in a 64-bit carrier because that is the
++        // register the ABI returns in, while `certificate.width` records the
++        // bits the function actually produced. Declaring the carrier made
++        // every corpus function return `uint64_t` when forty-eight of the
++        // fifty-four return something narrower.
++        let ty = narrowed_return_type(ty, semantic_return_bits(source, certificate.value));
+         match &candidate {
+             None => candidate = Some(ty),
+             Some(existing) if existing == &ty => {}
+@@ -4996,6 +5012,83 @@ fn evidence_return_type(source: &r2ssa::SsaArtifact, evidence: &r2types::Evidenc
+     })
+ }
+ 
++/// How many bits of the returned value the function actually produced.
++///
++/// A function returning `uint32_t` on x86-64 leaves its result in `eax`, and
++/// the lift models that as a zero-extension into the 64-bit `rax` the ABI
++/// returns in. The carrier's width is therefore the register's, not the
++/// function's, and reading the declaration off it made every corpus function
++/// return `uint64_t` while forty-eight of the fifty-four return something
++/// narrower.
++///
++/// Following the definition through zero-extensions and whole-width copies
++/// finds the value the extension was applied to, which is the one the function
++/// computed. A sign extension is deliberately not followed: it says the value
++/// is signed, and its high bits are part of the value rather than padding.
++fn semantic_return_bits(source: &r2ssa::SsaArtifact, value: r2ssa::ValueId) -> u32 {
++    let graph = source.graph();
++    let mut value = value;
++    let mut bits = source.value_var(value).map_or(0, |var| var.size * 8);
++    // Bounded: each step moves to the operand of an extension or copy, and the
++    // graph is acyclic in that direction, but a bound keeps a malformed source
++    // from spinning.
++    for _ in 0..16 {
++        let Some(inst) = graph.def_inst(value).and_then(|inst| graph.inst(inst)) else {
++            return bits;
++        };
++        let r2ssa::InstPayload::Op(op) = &inst.payload else {
++            return bits;
++        };
++        let source_var = match op {
++            r2ssa::SSAOp::IntZExt { src, .. } => src,
++            r2ssa::SSAOp::Copy { dst, src } if dst.size == src.size => src,
++            _ => return bits,
++        };
++        let Some(next) = graph.value_id_for_var(source_var) else {
++            return bits;
++        };
++        bits = source_var.size * 8;
++        value = next;
++    }
++    bits
++}
++
++/// The widest return the function produces, across all of its returns.
++///
++/// Every `return` in one function shares one declared type, so the type has to
++/// hold the widest of them. A function with no certified return produces
++/// nothing to narrow and reports the full width.
++fn certified_return_bits(source: &r2ssa::SsaArtifact) -> u32 {
++    source
++        .certificates()
++        .returns
++        .iter()
++        .map(|certificate| semantic_return_bits(source, certificate.value))
++        .max()
++        .unwrap_or(u32::MAX)
++}
++
++/// The return type at the width the returned value actually occupies.
++///
++/// Only an unsigned integer is narrowed, and only downwards. A pointer, a
++/// float or a signed value is left alone: the width is how many bits the
++/// machine produced, which is a statement about occupancy rather than about
++/// what the bits mean, and narrowing anything whose meaning is not "an
++/// unsigned integer" would read more into it than it says.
++fn narrowed_return_type(ty: &r2types::CTypeLike, width_bits: u32) -> CType {
++    let r2types::CTypeLike::Int {
++        bits,
++        signedness: r2types::Signedness::Unsigned,
++    } = ty
++    else {
++        return ty.clone();
++    };
++    if width_bits >= *bits || !matches!(width_bits, 8 | 16 | 32 | 64) {
++        return ty.clone();
++    }
++    CType::uint(width_bits)
++}
++
+ fn void_function_has_value_return(func: &CFunction) -> bool {
+     if !matches!(func.ret_type, CType::Void) {
+         return false;

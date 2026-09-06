@@ -1,0 +1,164 @@
+#define R_ANAL_DYNCC_NAME_SIZE 32
+
+#define R_ANAL_DYNCC_GROUP_SIZE 256
+
+#define R_ANAL_DYNCC_REGSET_SIZE 256
+
+#define R_ANAL_DYNCC_MAX_HOMES 8
+
+#define R_ANAL_DYNCC_MAX_ROLES 16
+
+#define R_ANAL_DYNCC_STACK_PREFIX '\1'
+
+#define R_ANAL_DYNCC_REVSTACK_PREFIX '\2'
+
+typedef struct r_anal_dyn_cc_slice_t {
+	const char *p;
+	ut16 len;
+} RAnalDynCCSlice;
+
+typedef struct r_anal_dyn_cc_loc_t {
+	RAnalDynCCSlice text;
+	bool indexed;
+	char prefix;
+	int index;
+} RAnalDynCCLoc;
+
+typedef struct r_anal_dyn_cc_seq_t {
+	RAnalDynCCLoc locs[R_ANAL_CC_MAXARG];
+	int count;
+} RAnalDynCCSeq;
+
+typedef struct r_anal_dyn_cc_homes_t {
+	RAnalDynCCLoc homes[R_ANAL_DYNCC_MAX_HOMES];
+	int home_count;
+} RAnalDynCCHomes;
+
+typedef struct r_anal_dyn_cc_role_t {
+	char tag;
+	int arg;
+	RAnalDynCCLoc loc;
+} RAnalDynCCRole;
+
+typedef struct r_anal_dyn_cc_t {
+	RAnalDynCCHomes args[R_ANAL_CC_MAXARG];
+	int arg_count;
+	bool arg_tail;
+	RAnalDynCCLoc arg_tail_loc;
+	RAnalDynCCSlice arg_ref;
+	RAnalDynCCHomes fpargs[R_ANAL_CC_MAXARG];
+	int fparg_count;
+	RAnalDynCCSlice fparg_ref;
+	RAnalDynCCHomes rets[R_ANAL_CC_MAXARG];
+	int ret_count;
+	RAnalDynCCSlice ret_ref;
+	int stack_pop;
+	RAnalDynCCSlice clobbers;
+	RAnalDynCCSlice preserves;
+	RAnalDynCCRole roles[R_ANAL_DYNCC_MAX_ROLES];
+	int role_count;
+} RAnalDynCC;
+
+typedef struct {
+	RAnalVar *var;
+	int order;
+} FunctionArgOrder;
+
+typedef struct {
+	Sdb *type_db;
+	RList *base_types;
+	const RAnalFunctionSnapshotLimits *limits;
+	size_t base_type_count;
+	size_t string_bytes;
+	bool valid;
+} SnapshotTypeResolverCapture;
+
+typedef enum {
+	BASE_TYPE_APPEND_OK,
+	BASE_TYPE_APPEND_SKIPPED,
+	BASE_TYPE_APPEND_ERROR,
+} BaseTypeAppendResult;
+
+typedef struct {
+	RAnal *anal;
+	Sdb *seen;
+	RAnalTypeSnapshotBudget budget;
+	const RAnalFunctionSnapshotLimits *limits;
+} TypeSnapshotPreflightContext;
+
+typedef struct {
+	RAnal *anal;
+	RList *types;
+	Sdb *seen;
+	bool fail_closed;
+	bool valid;
+} TypeSnapshotCloneContext;
+
+typedef struct {
+	ut64 xor_hash;
+	ut64 sum_hash;
+	ut64 count;
+} TypeContextLinkHash;
+
+typedef struct r_anal_exact_formal_proof_t {
+	RAnalFunction *fcn;
+	ut64 function_addr;
+	int ordinal;
+	RAnalVarKind kind;
+	int delta;
+	st64 source_offset;
+	st64 bp_off;
+	int maxstack;
+	char *type;
+} RAnalExactFormalProof;
+
+typedef enum {
+	R_ANAL_DWARF_FUNCTION_LINK_POISONED = 0,
+	R_ANAL_DWARF_FUNCTION_LINK_OWNED,
+} RAnalDwarfFunctionLinkState;
+
+typedef struct r_anal_dwarf_function_link_authority_t {
+	char *type_name;
+	ut64 generation;
+	RAnalDwarfFunctionLinkState state;
+} RAnalDwarfFunctionLinkAuthority;
+
+typedef struct r_anal_dwarf_frame_pointer_proof_t {
+	char *type_name;
+	char *arch;
+	char *reg_name;
+	ut64 generation;
+	ut64 offset;
+	ut32 size;
+	int dwarf_reg_num;
+	int bits;
+} RAnalDwarfFramePointerProof;
+
+typedef enum {
+	R_ANAL_CC_RETURN_MECHANISM_NONE = 0,
+	R_ANAL_CC_RETURN_MECHANISM_STACK,
+} RAnalCCReturnMechanismKind;
+
+typedef struct r_anal_cc_return_mechanism_t {
+	RAnalCCReturnMechanismKind kind;
+	st64 entry_sp_offset;
+	ut32 slot_size;
+	st64 exit_sp_delta;
+} RAnalCCReturnMechanism;
+
+typedef enum {
+	R_ANAL_CC_STACK_GROWTH_NONE = 0,
+	R_ANAL_CC_STACK_GROWTH_LOWER,
+	R_ANAL_CC_STACK_GROWTH_HIGHER,
+} RAnalCCStackGrowth;
+
+typedef struct r_anal_cc_stack_allocation_contract_t {
+	// A full-width SP move in this direction grants the callee exclusive use
+	// of the half-open interval between the entry and moved SP until exact
+	// restoration. The red zone is the exact convention-owned interval that is
+	// available without moving SP.
+	RAnalCCStackGrowth growth;
+	ut32 red_zone_bytes;
+} RAnalCCStackAllocationContract;
+
+#define R_ANAL_CC_STACK_POP_UNKNOWN (-1)

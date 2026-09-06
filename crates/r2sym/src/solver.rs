@@ -6,7 +6,6 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::time::Duration;
 
 use z3::ast::{Ast, BV, Bool, Dynamic};
 use z3::{AstKind, Context, DeclKind, Model, Params, Solver};
@@ -65,8 +64,14 @@ pub struct SymSolver<'ctx> {
     selection_solver: Solver,
     /// Scratch solver for sliced one-shot queries.
     scratch_solver: Solver,
-    /// Timeout in milliseconds (0 = no timeout).
-    timeout_ms: u32,
+    /// Deterministic solver resource limit (0 = unbounded).
+    ///
+    /// Z3's `timeout` parameter is wall clock, so the same query decides or
+    /// returns unknown depending on how loaded the machine is, and the rendered
+    /// C changed between runs of one binary. `rlimit` counts solver work
+    /// instead, so a query that is cut off is cut off at the same point every
+    /// time.
+    rlimit: u32,
     /// Memoized satisfiability results for state queries.
     sat_cache: RefCell<HashMap<ConstraintCursorKey, SatResult>>,
     /// Cached dependency and partition analysis for cursor-based states.
@@ -301,46 +306,43 @@ impl AbstractFacts {
 }
 
 impl<'ctx> SymSolver<'ctx> {
-    fn configured_solver(timeout_ms: u32) -> Solver {
+    fn configured_solver(rlimit: u32) -> Solver {
         let solver = Solver::new();
-        if timeout_ms != 0 {
-            let mut params = Params::new();
-            params.set_u32("timeout", timeout_ms);
-            solver.set_params(&params);
+        let mut params = Params::new();
+        // Pin the search seeds. Z3 randomises parts of its search per process,
+        // so the same query could come back decided or undecided between runs
+        // and the rendered C moved with it.
+        params.set_u32("random_seed", 0);
+        if rlimit != 0 {
+            params.set_u32("rlimit", rlimit);
         }
+        solver.set_params(&params);
         solver
     }
 
     /// Create a new solver.
     pub fn new(ctx: &'ctx Context) -> Self {
-        Self::with_timeout_and_execution_control(ctx, None, SymExecutionControl::default())
+        Self::with_rlimit_and_execution_control(ctx, None, SymExecutionControl::default())
     }
 
     /// Create a solver with cooperative cancellation and deadline control.
     pub fn with_execution_control(ctx: &'ctx Context, execution: SymExecutionControl) -> Self {
-        Self::with_timeout_and_execution_control(ctx, None, execution)
+        Self::with_rlimit_and_execution_control(ctx, None, execution)
     }
 
-    fn with_timeout_and_execution_control(
+    fn with_rlimit_and_execution_control(
         ctx: &'ctx Context,
-        timeout: Option<Duration>,
+        rlimit: Option<u32>,
         execution: SymExecutionControl,
     ) -> Self {
-        let configured_timeout_ms = timeout
-            .map(|timeout| timeout.as_millis().min(u32::MAX as u128) as u32)
-            .unwrap_or(0);
-        let timeout_ms = match (configured_timeout_ms, execution.remaining_timeout_ms()) {
-            (0, Some(deadline_ms)) => deadline_ms,
-            (configured, Some(deadline_ms)) => configured.min(deadline_ms),
-            (configured, None) => configured,
-        };
+        let rlimit = rlimit.unwrap_or(0);
         Self {
             ctx,
-            solver: Self::configured_solver(timeout_ms),
-            state_solver: Self::configured_solver(timeout_ms),
-            selection_solver: Self::configured_solver(timeout_ms),
-            scratch_solver: Self::configured_solver(timeout_ms),
-            timeout_ms,
+            solver: Self::configured_solver(rlimit),
+            state_solver: Self::configured_solver(rlimit),
+            selection_solver: Self::configured_solver(rlimit),
+            scratch_solver: Self::configured_solver(rlimit),
+            rlimit,
             sat_cache: RefCell::new(HashMap::new()),
             analysis_cache: RefCell::new(ConstraintAnalysisCache::default()),
             state_session: RefCell::new(SolverCursorSession::default()),
@@ -350,18 +352,18 @@ impl<'ctx> SymSolver<'ctx> {
         }
     }
 
-    /// Create a solver with a timeout.
-    pub fn with_timeout(ctx: &'ctx Context, timeout: Duration) -> Self {
-        Self::with_timeout_and_execution_control(ctx, Some(timeout), SymExecutionControl::default())
+    /// Create a solver bounded by a deterministic resource limit.
+    pub fn with_rlimit(ctx: &'ctx Context, rlimit: u32) -> Self {
+        Self::with_rlimit_and_execution_control(ctx, Some(rlimit), SymExecutionControl::default())
     }
 
-    /// Create a timed solver with additional cooperative request control.
-    pub fn with_timeout_and_control(
+    /// Create a bounded solver with additional cooperative request control.
+    pub fn with_rlimit_and_control(
         ctx: &'ctx Context,
-        timeout: Duration,
+        rlimit: u32,
         execution: SymExecutionControl,
     ) -> Self {
-        Self::with_timeout_and_execution_control(ctx, Some(timeout), execution)
+        Self::with_rlimit_and_execution_control(ctx, Some(rlimit), execution)
     }
 
     /// Get the Z3 context.
@@ -409,22 +411,13 @@ impl<'ctx> SymSolver<'ctx> {
     }
 
     fn refresh_solver_timeout(&self, solver: &Solver) {
-        // Recompute this at every check: a construction-time minimum would let
-        // later checks run past the absolute request deadline.
-        let timeout_ms = self
-            .execution
-            .remaining_timeout_ms()
-            .map(|deadline_ms| {
-                if self.timeout_ms == 0 {
-                    deadline_ms
-                } else {
-                    self.timeout_ms.min(deadline_ms)
-                }
-            })
-            .unwrap_or(self.timeout_ms);
-        if timeout_ms != 0 {
+        // The limit counts solver work rather than elapsed time, so it does not
+        // shrink as the request runs and does not need recomputing against a
+        // deadline. Reapplying it keeps a solver reused across queries bounded.
+        let rlimit = self.rlimit;
+        if rlimit != 0 {
             let mut params = Params::new();
-            params.set_u32("timeout", timeout_ms);
+            params.set_u32("rlimit", rlimit);
             solver.set_params(&params);
         }
     }
@@ -436,9 +429,9 @@ impl<'ctx> SymSolver<'ctx> {
 
     fn reset_state_solver(&self) {
         self.state_solver.reset();
-        if self.timeout_ms != 0 {
+        if self.rlimit != 0 {
             let mut params = Params::new();
-            params.set_u32("timeout", self.timeout_ms);
+            params.set_u32("rlimit", self.rlimit);
             self.state_solver.set_params(&params);
         }
         *self.state_session.borrow_mut() = SolverCursorSession::default();
@@ -446,18 +439,18 @@ impl<'ctx> SymSolver<'ctx> {
 
     fn reset_scratch_solver(&self) {
         self.scratch_solver.reset();
-        if self.timeout_ms != 0 {
+        if self.rlimit != 0 {
             let mut params = Params::new();
-            params.set_u32("timeout", self.timeout_ms);
+            params.set_u32("rlimit", self.rlimit);
             self.scratch_solver.set_params(&params);
         }
     }
 
     fn reset_selection_solver(&self) {
         self.selection_solver.reset();
-        if self.timeout_ms != 0 {
+        if self.rlimit != 0 {
             let mut params = Params::new();
-            params.set_u32("timeout", self.timeout_ms);
+            params.set_u32("rlimit", self.rlimit);
             self.selection_solver.set_params(&params);
         }
         *self.selection_session.borrow_mut() = SelectionSolverSession::default();
@@ -906,18 +899,24 @@ impl<'ctx> SymSolver<'ctx> {
     fn state_constraint_pairs_with_facts(
         &self,
         state: &SymState<'ctx>,
-    ) -> Vec<(
-        ConstraintCursorKey,
-        ConstraintCursorKey,
-        Bool,
-        CursorConstraintFacts,
-    )> {
-        self.state_constraint_pairs(state)
+    ) -> Option<
+        Vec<(
+            ConstraintCursorKey,
+            ConstraintCursorKey,
+            Bool,
+            CursorConstraintFacts,
+        )>,
+    > {
+        let constraints = self.state_constraint_pairs(state);
+        let facts = self.ensure_cursor_facts(state);
+        if constraints.len() != facts.len() {
+            return None;
+        }
+        constraints
             .into_iter()
-            .zip(self.ensure_cursor_facts(state))
+            .zip(facts)
             .map(|((key, constraint), (fact_key, parent, facts))| {
-                debug_assert_eq!(key, fact_key);
-                (key, parent, constraint, facts)
+                (key == fact_key).then_some((key, parent, constraint, facts))
             })
             .collect()
     }
@@ -933,20 +932,23 @@ impl<'ctx> SymSolver<'ctx> {
         atoms.len()
     }
 
-    fn state_constraint_analysis(&self, state: &SymState<'ctx>) -> Rc<StateConstraintAnalysis> {
+    fn state_constraint_analysis(
+        &self,
+        state: &SymState<'ctx>,
+    ) -> Option<Rc<StateConstraintAnalysis>> {
         let cache_key = state.constraint_cursor_key();
         if let Some(cached) = self.analysis_cache.borrow().state_cache.get(&cache_key) {
-            return cached.clone();
+            return Some(cached.clone());
         }
 
-        let pairs = self.state_constraint_pairs_with_facts(state);
+        let pairs = self.state_constraint_pairs_with_facts(state)?;
         if pairs.is_empty() {
             let empty = Rc::new(StateConstraintAnalysis::default());
             self.analysis_cache
                 .borrow_mut()
                 .state_cache
                 .insert(cache_key, empty.clone());
-            return empty;
+            return Some(empty);
         }
 
         let mut cached_prefix = StateConstraintAnalysis::default();
@@ -972,12 +974,14 @@ impl<'ctx> SymSolver<'ctx> {
                 .insert(*key, cached);
         }
 
-        self.analysis_cache
-            .borrow()
-            .state_cache
-            .get(&cache_key)
-            .cloned()
-            .unwrap_or_else(|| Rc::new(current))
+        Some(
+            self.analysis_cache
+                .borrow()
+                .state_cache
+                .get(&cache_key)
+                .cloned()
+                .unwrap_or_else(|| Rc::new(current)),
+        )
     }
 
     fn cached_state_constraint_analysis(
@@ -1016,7 +1020,7 @@ impl<'ctx> SymSolver<'ctx> {
         match mode {
             SolverMode::ExploreFast => self.cached_state_constraint_analysis(state),
             SolverMode::QueryDeep if self.should_build_partition_analysis(state, kind) => {
-                Some(self.state_constraint_analysis(state))
+                self.state_constraint_analysis(state)
             }
             SolverMode::QueryDeep => None,
         }
@@ -2110,7 +2114,9 @@ mod tests {
         state.add_true_constraint(&y.eq(&ctx, &SymValue::concrete(42, 32)));
 
         let solver = SymSolver::new(&ctx);
-        let analysis = solver.state_constraint_analysis(&state);
+        let analysis = solver
+            .state_constraint_analysis(&state)
+            .expect("coherent cursor facts");
         assert_eq!(analysis.ground_constraints.len(), 0);
         assert_eq!(analysis.partitions.len(), 2);
     }

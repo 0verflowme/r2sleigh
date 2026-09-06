@@ -135,6 +135,91 @@
       "return": "i32",
       "params": ["char*"],
       "variadic": false
+    },
+    "__memcpy_chk": {
+      "return": "void*",
+      "params": ["void*", "void*", "size_t", "size_t"],
+      "variadic": false
+    },
+    "__memmove_chk": {
+      "return": "void*",
+      "params": ["void*", "void*", "size_t", "size_t"],
+      "variadic": false
+    },
+    "__memset_chk": {
+      "return": "void*",
+      "params": ["void*", "i32", "size_t", "size_t"],
+      "variadic": false
+    },
+    "__memccpy_chk": {
+      "return": "void*",
+      "params": ["void*", "void*", "i32", "size_t", "size_t"],
+      "variadic": false
+    },
+    "__strcpy_chk": {
+      "return": "char*",
+      "params": ["char*", "char*", "size_t"],
+      "variadic": false
+    },
+    "__strncpy_chk": {
+      "return": "char*",
+      "params": ["char*", "char*", "size_t", "size_t"],
+      "variadic": false
+    },
+    "__strcat_chk": {
+      "return": "char*",
+      "params": ["char*", "char*", "size_t"],
+      "variadic": false
+    },
+    "__strncat_chk": {
+      "return": "char*",
+      "params": ["char*", "char*", "size_t", "size_t"],
+      "variadic": false
+    },
+    "__stpcpy_chk": {
+      "return": "char*",
+      "params": ["char*", "char*", "size_t"],
+      "variadic": false
+    },
+    "__stpncpy_chk": {
+      "return": "char*",
+      "params": ["char*", "char*", "size_t", "size_t"],
+      "variadic": false
+    },
+    "__strlcpy_chk": {
+      "return": "size_t",
+      "params": ["char*", "char*", "size_t", "size_t"],
+      "variadic": false
+    },
+    "__strlcat_chk": {
+      "return": "size_t",
+      "params": ["char*", "char*", "size_t", "size_t"],
+      "variadic": false
+    },
+    "__sprintf_chk": {
+      "return": "i32",
+      "params": ["char*", "i32", "size_t", "char*"],
+      "variadic": true
+    },
+    "__snprintf_chk": {
+      "return": "i32",
+      "params": ["char*", "size_t", "i32", "size_t", "char*"],
+      "variadic": true
+    },
+    "__vsprintf_chk": {
+      "return": "i32",
+      "params": ["char*", "i32", "size_t", "char*", "va_list"],
+      "variadic": false
+    },
+    "__vsnprintf_chk": {
+      "return": "i32",
+      "params": ["char*", "size_t", "i32", "size_t", "char*", "va_list"],
+      "variadic": false
+    },
+    "__printf_chk": {
+      "return": "i32",
+      "params": ["i32", "char*"],
+      "variadic": true
     }
   }
 }

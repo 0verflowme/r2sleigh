@@ -28,6 +28,9 @@ pub enum CallHookResult {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+// The shared prefix is the point: these name Windows API entry points, and
+// dropping it would leave variants like `RaiseException` that read as ours.
+#[allow(clippy::enum_variant_names)]
 pub enum CallHookTag {
     WindowsAddVectoredExceptionHandler,
     WindowsRaiseException,
@@ -234,6 +237,17 @@ impl<'ctx> SymExecutor<'ctx> {
                     dst.size * 8,
                 );
                 self.write_var(state, dst, value);
+                Ok(vec![])
+            }
+
+            // The callee handed this carrier back unchanged, so the value is
+            // the one the caller had. That is a copy, and it carries the
+            // provenance with it: the whole point of the operation is that the
+            // stack pointer after a call still addresses the caller's frame.
+            CallRestore { dst, src } => {
+                let carrier = self.read_var_carrier(state, src);
+                self.write_var(state, dst, carrier.value);
+                self.propagate_var_provenance(state, dst, carrier.provenance);
                 Ok(vec![])
             }
 
@@ -1349,7 +1363,11 @@ impl<'ctx> SymExecutor<'ctx> {
         for tail_op in tail {
             self.execution.poll()?;
             let forked = self.step(state, tail_op)?;
-            debug_assert!(forked.is_empty());
+            if !forked.is_empty() {
+                return Err(crate::SymError::UnsupportedOp(
+                    "local branch copy tail unexpectedly forked execution".to_string(),
+                ));
+            }
             state.step();
         }
         state.set_static_execution_pc(target_addr);
@@ -1533,6 +1551,7 @@ fn op_def(op: &SSAOp) -> Option<&SSAVar> {
         | SSAOp::PopCount { dst, .. }
         | SSAOp::Lzcount { dst, .. }
         | SSAOp::CallDefine { dst }
+        | SSAOp::CallRestore { dst, .. }
         | SSAOp::FloatAdd { dst, .. }
         | SSAOp::FloatSub { dst, .. }
         | SSAOp::FloatMult { dst, .. }

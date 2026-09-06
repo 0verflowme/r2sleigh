@@ -1,5 +1,5 @@
 use crate::blocks::BlockSlice;
-use crate::{R2ILBlock, R2ILContext, SSA_JSON_SCHEMA_VERSION, SSAOpInfo, ssa_op_to_info};
+use crate::{R2ILBlock, R2ILContext, SSAOpInfo, ssa_op_to_info};
 use r2ssa::TaintPolicy;
 use serde::Serialize;
 use std::ffi::CString;
@@ -10,6 +10,12 @@ const R2TAINT_OP_OTHER: u32 = 0;
 const R2TAINT_OP_CALL: u32 = 1;
 const R2TAINT_OP_CALL_IND: u32 = 2;
 const R2TAINT_OP_STORE: u32 = 3;
+
+/// Exact schema for the standalone taint report document.
+///
+/// Nested SSA operations use the shared typed operation shape, but changes to
+/// the SSA document envelope do not version the taint document.
+const TAINT_JSON_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Serialize)]
 struct TaintSourceJson {
@@ -165,7 +171,10 @@ fn build_taint_summary_report(
     let ssa_func = r2ssa::SSAFunction::from_blocks_with_arch(blocks, ctx_ref.arch.as_ref())?;
     let policy = current_taint_policy();
     let sources = collect_taint_sources(&ssa_func, &policy);
-    let analysis = r2ssa::TaintAnalysis::with_arch(&ssa_func, policy, ctx_ref.arch.as_ref());
+    // This legacy block-only endpoint has no source snapshot or exact callsite
+    // interface. Calls therefore expose only their explicit SSA operands;
+    // architecture labels and register spellings are not ABI authority.
+    let analysis = r2ssa::TaintAnalysis::new(&ssa_func, policy);
     let result = analysis.analyze();
 
     Some(TaintSummaryReportJson {
@@ -325,7 +334,10 @@ pub(crate) fn r2taint_function_json(
         }
     }
 
-    let analysis = r2ssa::TaintAnalysis::with_arch(&ssa_func, policy, ctx_ref.arch.as_ref());
+    // The raw FFI shape carries no source-owned callsite certificate. Keep
+    // implicit call arguments unavailable instead of guessing them from the
+    // architecture and register names.
+    let analysis = r2ssa::TaintAnalysis::new(&ssa_func, policy);
     let result = analysis.analyze();
 
     let mut tainted_vars = Vec::new();
@@ -341,7 +353,7 @@ pub(crate) fn r2taint_function_json(
     tainted_vars.sort_by(|a, b| a.var.cmp(&b.var));
 
     let report = TaintReportJson {
-        schema_version: SSA_JSON_SCHEMA_VERSION,
+        schema_version: TAINT_JSON_SCHEMA_VERSION,
         sources,
         sinks,
         sink_hits: collect_taint_sink_hits(&result),
@@ -425,6 +437,25 @@ pub(crate) fn r2taint_function_summary_free(summary: *mut R2TaintFunctionSummary
 #[cfg(test)]
 mod tests {
     use super::*;
+    use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, SpaceId, Varnode};
+
+    fn register(offset: u64) -> Varnode {
+        Varnode {
+            space: SpaceId::Register,
+            offset,
+            size: 8,
+            meta: None,
+        }
+    }
+
+    fn constant(value: u64) -> Varnode {
+        Varnode {
+            space: SpaceId::Const,
+            offset: value,
+            size: 8,
+            meta: None,
+        }
+    }
 
     #[test]
     fn taint_document_versions_nested_ssa_operations_once() {
@@ -433,7 +464,7 @@ mod tests {
             src: r2ssa::SSAVar::new("src", 1, 8),
         };
         let value = serde_json::to_value(TaintReportJson {
-            schema_version: SSA_JSON_SCHEMA_VERSION,
+            schema_version: TAINT_JSON_SCHEMA_VERSION,
             sources: Vec::new(),
             sinks: vec![TaintSinkJson {
                 block: 0x1000,
@@ -446,7 +477,43 @@ mod tests {
         })
         .expect("taint JSON");
 
-        assert_eq!(value["schema_version"], SSA_JSON_SCHEMA_VERSION);
+        assert_eq!(value["schema_version"], TAINT_JSON_SCHEMA_VERSION);
+        assert_eq!(value["schema_version"], 1);
         assert!(value["sinks"][0]["op"].get("schema_version").is_none());
+    }
+
+    #[test]
+    fn block_only_plugin_taint_does_not_guess_implicit_call_arguments() {
+        let mut arch = ArchSpec::new("x86-64");
+        arch.addr_size = 8;
+        arch.add_register(RegisterDef::new("rax", 0, 8));
+        arch.add_register(RegisterDef::new("rdi", 56, 8));
+        let mut context = R2ILContext::new();
+        context.arch = Some(arch);
+        let blocks = vec![R2ILBlock {
+            addr: 0x2000,
+            size: 2,
+            switch_info: None,
+            op_metadata: Default::default(),
+            ops: vec![
+                R2ILOp::Copy {
+                    dst: register(56),
+                    src: register(0),
+                },
+                R2ILOp::Call {
+                    target: constant(0x402000),
+                },
+            ],
+        }];
+
+        let report = build_taint_summary_report(&context, &blocks).expect("taint report");
+        assert!(
+            !report.sources.is_empty(),
+            "fixture must contain taint sources"
+        );
+        assert!(
+            report.sink_hits.is_empty(),
+            "an x86 architecture label is not source-owned callsite authority"
+        );
     }
 }

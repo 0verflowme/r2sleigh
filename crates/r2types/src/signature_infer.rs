@@ -1,16 +1,16 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use r2ssa::{ObjectKind, SSAFunction, SSAOp, SSAVar, SsaArtifact};
 
 use crate::convert::CTypeLike;
-use crate::facts::{FunctionSignatureSpec, FunctionType, FunctionTypeFacts, signature_strength};
+use crate::facts::{FunctionSignatureSpec, signature_strength};
 use crate::inference::TypeInference;
 use crate::model::Signedness;
 use crate::prepare::{
-    SignatureTypeEvidenceContext, prepared_arch_name, recover_signature_params_from_prepared_ssa,
-    scalar_register_family_key, ssa_var_is_register_like,
+    SignatureTypeEvidenceContext, prepared_arch_display_name,
+    recover_signature_params_from_prepared_ssa, scalar_register_family_key,
+    ssa_var_is_register_like,
 };
-use crate::signature::SignatureRegistry;
 use crate::signedness::{ScalarSignednessEvidence, infer_scalar_signedness};
 use crate::writeback::{InferredSignature, InferredSignatureParam};
 
@@ -75,32 +75,27 @@ pub fn infer_signature_from_prepared_ssa(prepared: &SsaArtifact) -> InferredSign
         .machine_context()
         .memory_model()
         .default_address_bits();
-    let ssa_blocks = prepared.local_ssa_blocks();
     let recovered_params = recover_signature_params_from_prepared_ssa(prepared, ptr_bits);
-    let arch_name = prepared_arch_name(prepared).unwrap_or("");
-    let evidence_ctx = crate::prepare::collect_signature_type_evidence_context(&ssa_blocks);
-    let mut type_inference = TypeInference::new(ptr_bits);
-    type_inference.set_prepared_ssa(prepared);
-    type_inference.infer_function(prepared);
+    let arch_name = prepared_arch_display_name(prepared).unwrap_or("");
+    let evidence_types = crate::solve_evidence_types(prepared, &BTreeMap::new(), ptr_bits);
     let certified_parameter_widths = certified_parameter_memory_widths(prepared);
 
     let mut canonical_params = recovered_params
         .iter()
         .map(|param| {
-            let initial_ty = certified_parameter_pointer_type(
+            let certified_ty = certified_parameter_pointer_type(
                 param.initial_ty.clone(),
                 certified_parameter_widths.get(&param.arg_index),
             );
-            let mut evidence =
-                collect_signature_type_evidence_for_var(&evidence_ctx, &param.ssa_var, &initial_ty);
+            let initial_ty = prepared
+                .graph()
+                .value_id_for_var(&param.ssa_var)
+                .and_then(|value| evidence_types.value_type(value))
+                .cloned()
+                .unwrap_or(certified_ty);
+            let mut evidence = exact_signature_type_evidence(&initial_ty);
             if certified_parameter_widths.contains_key(&param.arg_index) {
                 evidence.pointer_proven = evidence.pointer_proven.max(1);
-            }
-            if matches!(initial_ty, CTypeLike::Void | CTypeLike::Unknown) {
-                merge_initial_signature_type_evidence(
-                    &type_inference.type_from_size(param.ssa_var.size),
-                    &mut evidence,
-                );
             }
             let ty = resolve_evidence_driven_signature_type(
                 initial_ty,
@@ -133,22 +128,25 @@ pub fn infer_signature_from_prepared_ssa(prepared: &SsaArtifact) -> InferredSign
         &mut canonical_params,
     );
 
-    let (ret_type, ret_evidence) = infer_signature_return_type_from_prepared(
-        prepared,
-        &type_inference,
-        ptr_bits,
-        &evidence_ctx,
-    );
-    let input_counts = collect_version0_input_regs(prepared);
-    build_inferred_signature(
+    let (ret_type, ret_evidence) =
+        infer_signature_return_type_from_prepared(prepared, &evidence_types, ptr_bits);
+    let mut inferred = build_inferred_signature(
         &function_name,
         arch_name,
         ptr_bits,
         &canonical_params,
         &ret_type,
         &ret_evidence,
-        &input_counts,
-    )
+        &HashMap::new(),
+    );
+    if let Some(interface) = prepared.machine_context().function_interface() {
+        inferred.callconv = interface.calling_convention().to_string();
+        inferred.callconv_confidence = 100;
+    } else {
+        inferred.callconv = "unknown".to_string();
+        inferred.callconv_confidence = 0;
+    }
+    inferred
 }
 
 fn certified_parameter_memory_widths(prepared: &SsaArtifact) -> HashMap<usize, BTreeSet<u32>> {
@@ -559,6 +557,116 @@ pub fn materialize_signature_type_like(ty: CTypeLike, ptr_bits: u32) -> CTypeLik
     }
 }
 
+/// Spell a type the way radare2's type database expects it applied.
+///
+/// This differs from `render_signature_type` in exactly one respect: radare2
+/// writes a pointer with a space before the star, `struct Foo *`, and the
+/// signature renderer writes `struct Foo*`. That difference was previously
+/// applied by byte surgery on an already-rendered string --
+/// `canonicalize_writeback_apply_type_name` searching for the first `*` and
+/// inserting a space in front of it -- which made three components normalize
+/// the same star three different ways. Rendering from the type instead means
+/// the spelling is decided once, by the code that knows which sink it is for.
+pub fn render_writeback_apply_type(ty: &CTypeLike, _ptr_bits: u32) -> String {
+    match ty {
+        CTypeLike::Pointer(inner) => {
+            format!("{} *", render_writeback_apply_type(inner, _ptr_bits))
+        }
+        // `render_c_type_like`, not `render_signature_type`: the latter
+        // materializes first, which turns a pointer to an unmaterialized
+        // aggregate into `void *`. That is the right answer for a rendered
+        // signature and the wrong one here, because radare2 needs the name it
+        // was given so the writeback can require the type be materialized and
+        // fail closed when it is not.
+        other => crate::convert::render_c_type_like(other),
+    }
+}
+
+/// Whether two signature types are the same type for writeback purposes.
+///
+/// Both operands are already `CTypeLike`. This was written at six sites as
+/// `render_signature_type(a) == render_signature_type(b)` -- two structured
+/// values compared by the text they print to. That is only correct if the
+/// renderer is injective over the types that reach it, which nothing checked,
+/// and it silently imposed one equivalence of its own: `Signedness::Unknown`
+/// prints as signed, so a width whose signedness is not yet established
+/// compared equal to the signed type of that width and unequal to the unsigned
+/// one.
+///
+/// The equivalence is kept here rather than corrected, because removing a round
+/// trip through text should not also change which types are considered the
+/// same. It is stated instead of implied, so the next reader can see it and
+/// decide it on its merits.
+pub fn signature_types_are_equivalent(left: &CTypeLike, right: &CTypeLike, ptr_bits: u32) -> bool {
+    normalized_signature_type(left, ptr_bits) == normalized_signature_type(right, ptr_bits)
+}
+
+fn normalized_signature_type(ty: &CTypeLike, ptr_bits: u32) -> CTypeLike {
+    settle_unknown_signedness(resolve_builtin_typedefs(
+        materialize_signature_type_like(ty.clone(), ptr_bits),
+        ptr_bits,
+    ))
+}
+
+/// Fold a typedef whose name is itself a C type spelling into that type.
+///
+/// `Typedef("int32_t")` and `Int { bits: 32, signedness: Signed }` are the same
+/// type -- one arrived through radare2's type database and the other through
+/// inference -- and the comparison this replaced got that right by accident,
+/// because both print `int32_t`. Parsing the name is how to get it right on
+/// purpose.
+///
+/// The fold normally applies only when the parsed type spells itself the same
+/// way again. That separates `int32_t` from `size_t`, which is also sixty-four
+/// bits unsigned on this target but is a more specific statement about the
+/// value. Plain C `int` is the exception: it is a language scalar spelling, not
+/// a typedef identity, and this model's canonical spelling for it is
+/// `int32_t`.
+pub(crate) fn resolve_builtin_typedefs(ty: CTypeLike, ptr_bits: u32) -> CTypeLike {
+    match ty {
+        CTypeLike::Typedef(name) => {
+            let Some(parsed) = crate::convert::parse_c_type_like(&name, ptr_bits) else {
+                return CTypeLike::Typedef(name);
+            };
+            let is_plain_c_int = matches!(name.trim().to_ascii_lowercase().as_str(), "int");
+            if matches!(parsed, CTypeLike::Typedef(_))
+                || (!is_plain_c_int && render_signature_type(&parsed, ptr_bits) != name)
+            {
+                CTypeLike::Typedef(name)
+            } else {
+                parsed
+            }
+        }
+        CTypeLike::Pointer(inner) => {
+            CTypeLike::Pointer(Box::new(resolve_builtin_typedefs(*inner, ptr_bits)))
+        }
+        CTypeLike::Array(inner, len) => {
+            CTypeLike::Array(Box::new(resolve_builtin_typedefs(*inner, ptr_bits)), len)
+        }
+        other => other,
+    }
+}
+
+/// Resolve the one distinction a C spelling cannot express.
+fn settle_unknown_signedness(ty: CTypeLike) -> CTypeLike {
+    match ty {
+        CTypeLike::Int {
+            bits,
+            signedness: Signedness::Unknown,
+        } => CTypeLike::Int {
+            bits,
+            signedness: Signedness::Signed,
+        },
+        CTypeLike::Pointer(inner) => {
+            CTypeLike::Pointer(Box::new(settle_unknown_signedness(*inner)))
+        }
+        CTypeLike::Array(inner, len) => {
+            CTypeLike::Array(Box::new(settle_unknown_signedness(*inner)), len)
+        }
+        other => other,
+    }
+}
+
 pub fn render_signature_type(ty: &CTypeLike, ptr_bits: u32) -> String {
     match materialize_signature_type_like(ty.clone(), ptr_bits) {
         CTypeLike::Void => "void".to_string(),
@@ -606,6 +714,7 @@ pub fn render_signature_type(ty: &CTypeLike, ptr_bits: u32) -> String {
         CTypeLike::Float(32) => "float".to_string(),
         CTypeLike::Float(64) => "double".to_string(),
         CTypeLike::Float(bits) => format!("float{bits}"),
+        CTypeLike::BitVector(bits) => format!("struct r2sleigh_bits_{bits}"),
         CTypeLike::Pointer(inner) => format!("{}*", render_signature_type(&inner, ptr_bits)),
         CTypeLike::Array(inner, Some(size)) => {
             format!("{}[{}]", render_signature_type(&inner, ptr_bits), size)
@@ -615,7 +724,7 @@ pub fn render_signature_type(ty: &CTypeLike, ptr_bits: u32) -> String {
         CTypeLike::Union(name) => format!("union {name}"),
         CTypeLike::Enum(name) => format!("enum {name}"),
         CTypeLike::Typedef(name) => name,
-        CTypeLike::Function => "void (*)()".to_string(),
+        CTypeLike::Function { .. } => "void (*)()".to_string(),
         CTypeLike::Unknown => "int64_t".to_string(),
     }
 }
@@ -728,7 +837,7 @@ pub fn collect_signature_type_evidence_for_var(
     var: &SSAVar,
     initial_ty: &CTypeLike,
 ) -> SignatureTypeEvidence {
-    let key = format!("{}_{}", var.name.to_ascii_lowercase(), var.version);
+    let key = crate::prepare::ssa_var_key(var);
     let family = scalar_register_family_key(&var.name);
     let mut evidence = SignatureTypeEvidence::default();
     if evidence_ctx.pointer_vars.contains(&key) {
@@ -803,10 +912,7 @@ fn width_hint_for_register_family(
 }
 
 fn key_matches_register_family_version(key: &str, family: &str, version: u32) -> bool {
-    let Some((name, version_str)) = key.rsplit_once('_') else {
-        return false;
-    };
-    version_str.parse::<u32>().ok() == Some(version) && scalar_register_family_key(name) == family
+    crate::prepare::ssa_var_key_matches_register_family_version(key, family, version)
 }
 
 pub fn infer_signature_return_type(
@@ -825,23 +931,6 @@ pub fn infer_signature_return_type(
                 continue;
             };
 
-            let target_name = target.name.to_ascii_lowercase();
-            if target_name.starts_with("xmm0") || target_name.starts_with("st0") {
-                let bits = if target.size.saturating_mul(8) <= 32 {
-                    32
-                } else {
-                    64
-                };
-                let ty = CTypeLike::Float(bits);
-                let mut evidence = SignatureTypeEvidence::default();
-                merge_initial_signature_type_evidence(&ty, &mut evidence);
-                evidence.width_bits = bits;
-                candidates.push(ty);
-                candidate_evidence.push(evidence);
-                candidate_constants.push(None);
-                continue;
-            }
-
             let initial_ty = type_inference.get_type(target);
             let evidence =
                 collect_signature_type_evidence_for_var(evidence_ctx, target, &initial_ty);
@@ -853,7 +942,7 @@ pub fn infer_signature_return_type(
             );
             candidates.push(ty);
             candidate_evidence.push(evidence);
-            candidate_constants.push(r2ssa::parse_const_value(&target.name));
+            candidate_constants.push(target.constant_bits());
         }
     }
 
@@ -901,100 +990,165 @@ pub fn infer_signature_return_type(
 
 fn infer_signature_return_type_from_prepared(
     prepared: &SsaArtifact,
-    type_inference: &TypeInference,
+    evidence_types: &crate::EvidenceTypes,
     ptr_bits: u32,
-    evidence_ctx: &SignatureTypeEvidenceContext,
 ) -> (CTypeLike, SignatureTypeEvidence) {
-    let mut return_vars = prepared
+    let mut return_values = prepared
         .facts()
         .certificates
         .returns
         .iter()
-        .filter_map(|certificate| {
-            transparent_return_source(prepared, certificate.value)
-                .or_else(|| prepared.value_var(certificate.value).cloned())
+        .map(|certificate| {
+            transparent_return_source_value(prepared, certificate.value)
+                .unwrap_or((certificate.value, None))
         })
         .collect::<Vec<_>>();
-    return_vars.sort_by(|left, right| {
-        left.name
-            .cmp(&right.name)
-            .then(left.version.cmp(&right.version))
-            .then(left.size.cmp(&right.size))
-    });
-    return_vars.dedup();
-    if return_vars.is_empty() {
-        return (CTypeLike::Void, SignatureTypeEvidence::default());
+    return_values.sort();
+    return_values.dedup();
+    if return_values.is_empty() {
+        return infer_signature_return_type_from_tail_boundaries(prepared, ptr_bits);
     }
 
-    infer_signature_return_type_from_vars(&return_vars, type_inference, ptr_bits, evidence_ctx)
+    infer_signature_return_type_from_values(prepared, &return_values, evidence_types, ptr_bits)
 }
 
-fn transparent_return_source(prepared: &SsaArtifact, start: r2ssa::ValueId) -> Option<SSAVar> {
+/// What a function with no `Return` of its own returns.
+///
+/// A tail call returns its callee's result on this function's behalf, and the
+/// exact boundary at that site says what the callee returns. Reading only the
+/// `Return` certificates scored every tail-only function `void`, so an import
+/// thunk -- `jmp [reloc.fileno]`, the whole of it -- was declared to return
+/// nothing while its body returned `fileno(stream)`, and the declaration
+/// refused the call. Absence of a `Return` is not a fact about the return.
+///
+/// The callee's own logical type is not known here; the boundary proves the
+/// carrier and its width, and that width takes the same default a parameter
+/// of that width takes with no evidence. Tail sites that disagree, or a site
+/// whose interface is missing, leave the type unknown rather than guessed.
+fn infer_signature_return_type_from_tail_boundaries(
+    prepared: &SsaArtifact,
+    ptr_bits: u32,
+) -> (CTypeLike, SignatureTypeEvidence) {
+    let evidence = SignatureTypeEvidence::default();
+    let context = prepared.machine_context();
+    let mut agreed: Option<CTypeLike> = None;
+    let mut saw_tail = false;
+    for certificate in prepared.facts().certificates.callsites.values() {
+        if certificate.transfer != r2ssa::CallSiteTransfer::TailCall {
+            continue;
+        }
+        let Some(interface) = context.call_site_interface(certificate.call_site) else {
+            return (CTypeLike::Unknown, evidence);
+        };
+        saw_tail = true;
+        let ty = match interface.result() {
+            r2ssa::SourceCallResult::Void => CTypeLike::Void,
+            r2ssa::SourceCallResult::Register { storage } => {
+                resolve_evidence_driven_signature_type(
+                    CTypeLike::Unknown,
+                    storage.size,
+                    ptr_bits,
+                    &evidence,
+                )
+            }
+        };
+        match &agreed {
+            None => agreed = Some(ty),
+            Some(existing) if *existing == ty => {}
+            Some(_) => return (CTypeLike::Unknown, evidence),
+        }
+    }
+    if !saw_tail {
+        return (CTypeLike::Void, evidence);
+    }
+    (agreed.unwrap_or(CTypeLike::Unknown), evidence)
+}
+
+fn transparent_return_source_value(
+    prepared: &SsaArtifact,
+    start: r2ssa::ValueId,
+) -> Option<(r2ssa::ValueId, Option<Signedness>)> {
     let mut current = start;
+    let mut signedness = None;
     let mut visited = HashSet::new();
     while visited.insert(current) {
-        let current_var = prepared.value_var(current)?.clone();
         let Some(inst) = prepared
             .graph()
             .def_inst(current)
             .and_then(|inst| prepared.graph().inst(inst))
         else {
-            return Some(current_var);
+            return Some((current, signedness));
         };
         let r2ssa::InstPayload::Op(op) = &inst.payload else {
-            return Some(current_var);
+            return Some((current, signedness));
         };
-        let source = match op {
-            SSAOp::Copy { src, .. }
-            | SSAOp::New { src, .. }
-            | SSAOp::IntZExt { src, .. }
-            | SSAOp::IntSExt { src, .. }
-            | SSAOp::Trunc { src, .. } => src,
-            SSAOp::Subpiece { src, offset, .. } if *offset == 0 => src,
-            _ => return Some(current_var),
+        match op {
+            SSAOp::IntZExt { .. } if signedness.is_none() => {
+                signedness = Some(Signedness::Unsigned);
+            }
+            SSAOp::IntSExt { .. } if signedness.is_none() => {
+                signedness = Some(Signedness::Signed);
+            }
+            SSAOp::Copy { .. }
+            | SSAOp::New { .. }
+            | SSAOp::IntZExt { .. }
+            | SSAOp::IntSExt { .. }
+            | SSAOp::Trunc { .. }
+            | SSAOp::Subpiece { offset: 0, .. } => {}
+            _ => return Some((current, signedness)),
         };
-        let Some(source_value) = prepared.graph().value_id_for_var(source) else {
-            return Some(current_var);
+        let Some(source_value) = inst.inputs.first().copied() else {
+            return Some((current, signedness));
         };
         current = source_value;
     }
     None
 }
 
-fn infer_signature_return_type_from_vars(
-    return_vars: &[SSAVar],
-    type_inference: &TypeInference,
+fn exact_signature_type_evidence(ty: &CTypeLike) -> SignatureTypeEvidence {
+    let mut evidence = SignatureTypeEvidence::default();
+    merge_initial_signature_type_evidence(ty, &mut evidence);
+    match ty {
+        CTypeLike::Pointer(_) => evidence.pointer_proven = 1,
+        CTypeLike::Bool => evidence.bool_like = 1,
+        CTypeLike::Float(bits) => {
+            evidence.scalar_proven = 1;
+            evidence.width_bits = *bits;
+        }
+        CTypeLike::Int { bits, .. } => evidence.width_bits = *bits,
+        _ => {}
+    }
+    evidence
+}
+
+fn infer_signature_return_type_from_values(
+    prepared: &SsaArtifact,
+    return_values: &[(r2ssa::ValueId, Option<Signedness>)],
+    evidence_types: &crate::EvidenceTypes,
     ptr_bits: u32,
-    evidence_ctx: &SignatureTypeEvidenceContext,
 ) -> (CTypeLike, SignatureTypeEvidence) {
     let mut candidates = Vec::new();
     let mut candidate_evidence = Vec::new();
     let mut candidate_constants = Vec::new();
-    for value in return_vars {
-        let target_name = value.name.to_ascii_lowercase();
-        if target_name.starts_with("xmm0") || target_name.starts_with("st0") {
-            let bits = if value.size.saturating_mul(8) <= 32 {
-                32
-            } else {
-                64
-            };
-            let ty = CTypeLike::Float(bits);
-            let mut evidence = SignatureTypeEvidence::default();
-            merge_initial_signature_type_evidence(&ty, &mut evidence);
-            evidence.width_bits = bits;
-            candidates.push(ty);
-            candidate_evidence.push(evidence);
-            candidate_constants.push(None);
+    for (value, signedness) in return_values {
+        let Some(var) = prepared.value_var(*value) else {
             continue;
+        };
+        let mut initial_ty = evidence_types
+            .value_type(*value)
+            .cloned()
+            .unwrap_or_else(|| fallback_scalar_type_like(var.size, &Default::default(), ptr_bits));
+        if let (CTypeLike::Int { bits, .. }, Some(signedness)) = (&initial_ty, signedness) {
+            initial_ty = CTypeLike::Int {
+                bits: *bits,
+                signedness: *signedness,
+            };
         }
-
-        let initial_ty = type_inference.get_type(value);
-        let evidence = collect_signature_type_evidence_for_var(evidence_ctx, value, &initial_ty);
-        let ty =
-            resolve_evidence_driven_signature_type(initial_ty, value.size, ptr_bits, &evidence);
+        let evidence = exact_signature_type_evidence(&initial_ty);
+        let ty = resolve_evidence_driven_signature_type(initial_ty, var.size, ptr_bits, &evidence);
         candidates.push(ty);
         candidate_evidence.push(evidence);
-        candidate_constants.push(r2ssa::parse_const_value(&value.name));
+        candidate_constants.push(var.constant_bits());
     }
     choose_signature_return_type(
         candidates,
@@ -1433,127 +1587,140 @@ pub fn build_inferred_signature(
     }
 }
 
-fn insert_known_signature_aliases(
-    known: &mut HashMap<String, FunctionType>,
-    name: &str,
-    sig: &FunctionType,
-) {
-    if name.is_empty() {
-        return;
-    }
-    known.insert(name.to_string(), sig.clone());
-
-    for prefix in ["sym.imp.", "sym.", "imp.", "dbg.", "fcn."] {
-        if let Some(stripped) = name.strip_prefix(prefix)
-            && !stripped.is_empty()
-        {
-            known.insert(stripped.to_string(), sig.clone());
-        }
-    }
-}
-
-fn normalize_signature_registry_name(name: &str) -> Option<&'static str> {
-    let normalized_owned = name.trim().to_ascii_lowercase();
-    let mut normalized = normalized_owned.as_str();
-
-    for prefix in ["sym.imp.", "sym.", "imp.", "reloc.", "dbg."] {
-        while let Some(rest) = normalized.strip_prefix(prefix) {
-            normalized = rest;
-        }
-    }
-
-    while let Some(rest) = normalized.strip_suffix("@plt") {
-        normalized = rest;
-    }
-    while let Some(rest) = normalized.strip_suffix(".plt") {
-        normalized = rest;
-    }
-    if let Some((base, _)) = normalized.split_once('@') {
-        normalized = base;
-    }
-
-    if let Some(rest) = normalized.strip_prefix("__isoc99_") {
-        normalized = rest;
-    }
-    if let Some(rest) = normalized.strip_prefix("__gi_") {
-        normalized = rest;
-    }
-
-    match normalized {
-        "strlen" | "__strlen_chk" => Some("strlen"),
-        "strcmp" => Some("strcmp"),
-        "memcmp" => Some("memcmp"),
-        "memcpy" | "__memcpy_chk" => Some("memcpy"),
-        "memset" => Some("memset"),
-        "malloc" | "__libc_malloc" | "__gi___libc_malloc" => Some("malloc"),
-        "free" => Some("free"),
-        "puts" => Some("puts"),
-        "printf" | "__printf_chk" => Some("printf"),
-        "exit" | "_exit" => Some("exit"),
-        _ => None,
-    }
-}
-
-pub fn enrich_known_function_signatures_from_names(
-    type_facts: &mut FunctionTypeFacts,
-    function_names: &HashMap<u64, String>,
-    ptr_bits: u32,
-) {
-    let registry = SignatureRegistry::from_embedded_json();
-
-    for name in function_names.values() {
-        let mut candidates = vec![name.clone()];
-        if let Some(sim_name) = normalize_signature_registry_name(name)
-            && sim_name != name
-            && !candidates.iter().any(|candidate| candidate == sim_name)
-        {
-            candidates.push(sim_name.to_string());
-        }
-
-        let resolved = candidates.into_iter().find_map(|candidate| {
-            let mut arena = crate::TypeArena::default();
-            registry
-                .resolve(&candidate, &mut arena, ptr_bits)
-                .map(|sig| {
-                    (
-                        candidate,
-                        FunctionType {
-                            return_type: crate::to_c_type_like(&arena, sig.ret),
-                            params: sig
-                                .params
-                                .into_iter()
-                                .map(|param| crate::to_c_type_like(&arena, param))
-                                .collect(),
-                            variadic: sig.variadic,
-                        },
-                    )
-                })
-        });
-
-        let Some((resolved_name, sig)) = resolved else {
-            continue;
-        };
-
-        insert_known_signature_aliases(&mut type_facts.known_function_signatures, name, &sig);
-        if resolved_name != *name {
-            insert_known_signature_aliases(
-                &mut type_facts.known_function_signatures,
-                &resolved_name,
-                &sig,
-            );
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rendered_machine_bitvectors_parse_back_to_the_same_type() {
+        for bits in [1, 24, 129, 256] {
+            let ty = CTypeLike::BitVector(bits);
+            let spelling = render_signature_type(&ty, 64);
+            assert_eq!(crate::parse_c_type_like(&spelling, 64), Some(ty));
+        }
+    }
+
+    #[test]
+    fn plain_int_and_canonical_int32_are_equivalent() {
+        let source_spelling = CTypeLike::Typedef("int".to_string());
+        let canonical = CTypeLike::Int {
+            bits: 32,
+            signedness: Signedness::Signed,
+        };
+
+        assert!(signature_types_are_equivalent(
+            &source_spelling,
+            &canonical,
+            64
+        ));
+        assert!(signature_types_are_equivalent(
+            &CTypeLike::Pointer(Box::new(source_spelling)),
+            &CTypeLike::Pointer(Box::new(canonical)),
+            64
+        ));
+    }
+
+    /// Where comparing types differs from comparing the text they print to.
+    ///
+    /// The six sites this predicate replaced compared rendered strings, so any
+    /// two types that print the same were treated as one. Comparing the types
+    /// instead is only safe where the renderer is injective, and this test says
+    /// exactly where it is not, rather than leaving it to be discovered by a
+    /// wrong decompilation.
+    #[test]
+    fn comparing_types_agrees_with_comparing_their_spellings() {
+        let mut cases = vec![
+            CTypeLike::Void,
+            CTypeLike::Bool,
+            CTypeLike::Unknown,
+            CTypeLike::Float(32),
+            CTypeLike::Float(64),
+            CTypeLike::Struct("Demo".to_string()),
+            CTypeLike::Union("Demo".to_string()),
+            CTypeLike::Typedef("demo_t".to_string()),
+            // The collision worth naming: a typedef whose spelling is exactly a
+            // built-in type's spelling.
+            CTypeLike::Typedef("int32_t".to_string()),
+            CTypeLike::Typedef("size_t".to_string()),
+        ];
+        for bits in [8u32, 16, 32, 64] {
+            for signedness in [
+                Signedness::Signed,
+                Signedness::Unsigned,
+                Signedness::Unknown,
+            ] {
+                cases.push(CTypeLike::Int { bits, signedness });
+            }
+        }
+        let scalars = cases.clone();
+        for scalar in scalars {
+            cases.push(CTypeLike::Pointer(Box::new(scalar)));
+        }
+
+        let ptr_bits = 64;
+        let mut divergences = Vec::new();
+        for left in &cases {
+            for right in &cases {
+                let by_type = signature_types_are_equivalent(left, right, ptr_bits);
+                let by_spelling =
+                    render_signature_type(left, ptr_bits) == render_signature_type(right, ptr_bits);
+                if by_type != by_spelling {
+                    divergences.push(format!(
+                        "{left:?} vs {right:?}: by type {by_type}, by spelling {by_spelling}"
+                    ));
+                }
+            }
+        }
+        assert!(
+            divergences.is_empty(),
+            "comparing types disagrees with comparing spellings:\n{}",
+            divergences.join("\n")
+        );
+    }
 
     fn x86_return_arch() -> r2il::ArchSpec {
         let mut arch = r2il::ArchSpec::new("x86-64");
         arch.add_register(r2il::RegisterDef::new("RAX", 0, 8));
         arch.add_register(r2il::RegisterDef::new("RIP", 8, 8));
+        arch.add_register(r2il::RegisterDef::new("RSP", 16, 8));
         arch
+    }
+
+    fn prepared_x86_scalar_return(
+        return_carrier_name: &str,
+        calling_convention: &str,
+    ) -> SsaArtifact {
+        let mut arch = r2il::ArchSpec::new("x86-64");
+        arch.add_register(r2il::RegisterDef::new(return_carrier_name, 0, 8));
+        arch.add_register(r2il::RegisterDef::new("RIP", 8, 8));
+        arch.add_register(r2il::RegisterDef::new("RSP", 16, 8));
+        let register = |offset| r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset,
+            size: 8,
+        };
+        let interface = r2ssa::SourceFunctionInterface::new_exact(
+            format!("signature-{return_carrier_name}").into_bytes(),
+            calling_convention,
+            [],
+            r2ssa::SourceFunctionReturn::Register {
+                storage: register(0),
+            },
+            [],
+        )
+        .and_then(|interface| interface.with_return_address_storage(register(8)))
+        .and_then(|interface| interface.with_stack_pointer_storage(register(16)))
+        .expect("exact renamed return interface");
+        let mut block = r2il::R2ILBlock::new(0x1000, 4);
+        block.push(r2il::R2ILOp::IntZExt {
+            dst: r2il::Varnode::register(0, 8),
+            src: r2il::Varnode::unique(0x20, 4),
+        });
+        block.push(r2il::R2ILOp::Return {
+            target: r2il::Varnode::register(8, 8),
+        });
+        SsaArtifact::for_decompile_with_interface(&[block], Some(&arch), interface)
+            .expect("prepared renamed return source")
     }
 
     fn aarch64_parameter_arch() -> r2il::ArchSpec {
@@ -1761,10 +1928,73 @@ mod tests {
         block.push(r2il::R2ILOp::Return {
             target: r2il::Varnode::register(8, 8),
         });
-        let prepared = SsaArtifact::for_patterns(&[block], Some(&arch)).expect("prepared SSA");
+        let return_storage = r2ssa::CanonicalStorageId {
+            space: r2ssa::CanonicalStorageSpace::Register,
+            offset: 0,
+            size: 8,
+        };
+        let interface = r2ssa::SourceFunctionInterface::new_exact(
+            b"certified-signature-return-fixture".to_vec(),
+            "sysv64",
+            [],
+            r2ssa::SourceFunctionReturn::Register {
+                storage: return_storage,
+            },
+            [],
+        )
+        .and_then(|interface| {
+            interface.with_return_address_storage(r2ssa::CanonicalStorageId {
+                space: r2ssa::CanonicalStorageSpace::Register,
+                offset: 8,
+                size: 8,
+            })
+        })
+        .and_then(|interface| {
+            interface.with_stack_pointer_storage(r2ssa::CanonicalStorageId {
+                space: r2ssa::CanonicalStorageSpace::Register,
+                offset: 16,
+                size: 8,
+            })
+        })
+        .expect("exact function return interface");
+        let prepared = SsaArtifact::for_decompile_with_interface(&[block], Some(&arch), interface)
+            .expect("prepared exact return SSA");
+        assert_eq!(
+            prepared.certificates().returns.len(),
+            1,
+            "source-owned return fixture must certify one value"
+        );
         let inferred = infer_signature_from_prepared_ssa(&prepared);
 
         assert_eq!(inferred.ret_type, "uint32_t");
+    }
+
+    #[test]
+    fn prepared_signature_callconv_is_source_owned_and_rename_invariant() {
+        let expected = "source-owned-test-cc";
+        let ordinary =
+            infer_signature_from_prepared_ssa(&prepared_x86_scalar_return("rax", expected));
+        let renamed = infer_signature_from_prepared_ssa(&prepared_x86_scalar_return(
+            "xmm0_misleading",
+            expected,
+        ));
+
+        assert_eq!(ordinary.callconv, expected);
+        assert_eq!(renamed.callconv, expected);
+        assert_eq!(ordinary.callconv_confidence, 100);
+        assert_eq!(renamed.callconv_confidence, 100);
+    }
+
+    #[test]
+    fn misleading_xmm0_spelling_does_not_manufacture_a_float_return() {
+        let inferred = infer_signature_from_prepared_ssa(&prepared_x86_scalar_return(
+            "xmm0_misleading",
+            "source-owned-test-cc",
+        ));
+
+        assert_eq!(inferred.ret_type, "uint32_t");
+        assert_ne!(inferred.ret_type, "float");
+        assert_ne!(inferred.ret_type, "double");
     }
 
     #[test]
@@ -1844,22 +2074,6 @@ mod tests {
                 signedness: Signedness::Signed,
             }
         );
-    }
-
-    #[test]
-    fn enrich_known_function_signatures_moves_registry_alias_policy_upstream() {
-        let mut facts = FunctionTypeFacts::default();
-        let names = HashMap::from([(0u64, "sym.imp.__printf_chk".to_string())]);
-
-        enrich_known_function_signatures_from_names(&mut facts, &names, 64);
-
-        assert!(
-            facts
-                .known_function_signatures
-                .contains_key("sym.imp.__printf_chk")
-        );
-        assert!(facts.known_function_signatures.contains_key("__printf_chk"));
-        assert!(facts.known_function_signatures.contains_key("printf"));
     }
 
     #[test]

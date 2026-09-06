@@ -16,23 +16,57 @@ use r2source::{
     AdvisorySuccessorKind, CanonicalStorageId, CanonicalStorageSpace, MachineProfile,
     OwnedFunctionSnapshot, SourceFunctionInterface,
 };
+use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::translate::{self, PcodeSource};
 use crate::{LiftError, Result};
 
-/// A disassembler that uses libsla to lift instructions to r2il.
-pub struct Disassembler {
-    /// The underlying Ghidra Sleigh instance
-    sleigh: GhidraSleigh,
-    /// Architecture name
-    arch_name: String,
+/// One parsed Sleigh specification: everything derived from the `.sla` and the
+/// processor spec, and nothing derived from who asked for it.
+///
+/// Parsing one is the single most expensive thing this crate does -- 58 to 91
+/// milliseconds for x86-64, against 21 to 83 *micro*seconds to lift a block --
+/// and it was being done three times over. `Disassembler::from_trusted_profile`
+/// did it on the lift path, and `create_disassembler_for_arch` in the plugin
+/// did it twice more for one `R2ILContext`: once through `build_arch_spec` for
+/// the architecture and once through `from_sla` for the disassembler. Splitting
+/// the parse from the caller's identity is what lets all three share one, and
+/// putting the split here rather than a cache at each call site is what stops
+/// there being a fourth.
+///
+/// The lift authority is minted with the specification rather than per
+/// disassembler because minting copies the whole `.sla` into an `Arc` and
+/// hashes it. Its documented meaning is unchanged: equality is the identity of
+/// a load event, and there is now one load event per specification instead of
+/// one per caller. It is handed out only to a caller holding a trusted profile.
+struct LoadedSpecification {
+    /// The thread-confined Sleigh instance. Public lift boundaries invalidate
+    /// its address-keyed decode state before admitting another byte source.
+    sleigh: RefCell<GhidraSleigh>,
     /// Canonical register names by (offset, size)
     reg_name_map: HashMap<(u64, u32), String>,
     /// Exact mapping extracted with the architecture metadata for this session.
     space_map: HashMap<AddressSpaceId, SpaceId>,
+    /// Register the processor spec names as the program counter.
+    program_counter: String,
+    /// Architecture exactly as `extract_architecture` derived it, before any
+    /// processor-spec overlay a particular consumer wants.
+    arch: Arc<r2il::ArchSpec>,
+    /// Present only for a specification loaded from embedded bytes, which are
+    /// the only ones that can certify.
+    authority: Option<GenuineLiftAuthority>,
+}
+
+/// A disassembler that uses libsla to lift instructions to r2il.
+pub struct Disassembler {
+    /// The parsed specification, shared with every other holder of it.
+    spec: Rc<LoadedSpecification>,
+    /// Architecture name
+    arch_name: String,
     /// Opaque authority present only for an embedded trusted Sleigh profile.
     genuine_authority: Option<GenuineLiftAuthority>,
     trusted_profile: Option<TrustedSleighProfile>,
@@ -70,7 +104,7 @@ pub enum TrustedSleighProfile {
 }
 
 impl TrustedSleighProfile {
-    fn specification(self) -> (&'static [u8], &'static str, &'static str) {
+    pub fn specification(self) -> (&'static [u8], &'static str, &'static str) {
         match self {
             #[cfg(feature = "x86")]
             Self::X86 => (
@@ -85,9 +119,13 @@ impl TrustedSleighProfile {
                 "x86-64",
             ),
             #[cfg(feature = "arm")]
+            // Ghidra's own ARM.ldefs pairs ARM8_le with ARMt, which leaves
+            // TMode clear. A Cortex pspec sets TMode, and Cortex-M is
+            // Thumb-only, so pairing it here would lift every A32 instruction
+            // as Thumb: wrong instruction, wrong length, wrong control flow.
             Self::ArmCortexLe => (
                 sleigh_config::processor_arm::SLA_ARM8_LE,
-                sleigh_config::processor_arm::PSPEC_ARMCORTEX,
+                sleigh_config::processor_arm::PSPEC_ARMT,
                 "ARM",
             ),
             #[cfg(feature = "arm")]
@@ -209,6 +247,76 @@ fn register_storages_are_disjoint(first: CanonicalStorageId, second: CanonicalSt
         .is_some_and(|(first_end, second_end)| {
             first_end <= second.offset || second_end <= first.offset
         })
+}
+
+/// Where the lifted architecture puts the register the source named.
+///
+/// Spelling differs between the two: radare2 writes x86 register names in lower
+/// case where the Sleigh specification writes them in upper case, and that is a
+/// difference in spelling, not in register. Case is therefore folded, and
+/// nothing else is: a name the architecture does not define resolves to
+/// nothing, because placing an unrecognised carrier by guesswork is how a
+/// carrier ends up at another register's offset.
+fn arch_register_storage(arch: &r2il::ArchSpec, name: &str) -> Option<CanonicalStorageId> {
+    let register = arch
+        .get_register(name)
+        .or_else(|| arch.get_register(&name.to_ascii_uppercase()))
+        .or_else(|| arch.get_register(&name.to_ascii_lowercase()))?;
+    Some(CanonicalStorageId {
+        space: r2source::CanonicalStorageSpace::Register,
+        offset: register.offset,
+        size: register.size,
+    })
+}
+
+/// Restate a capture's role carriers in the lifted architecture's numbering.
+///
+/// The capture states each carrier as a name plus an offset into its own
+/// register arena. Only the name crosses over, so each carrier is looked up
+/// again here and a carrier the architecture cannot place is dropped. Dropping
+/// costs the certificates that need that carrier; keeping the capture's offset
+/// would instead assert that some unrelated register is the return address,
+/// which every consumer downstream would then believe.
+fn arch_resolved_source(
+    source: OwnedFunctionSnapshot,
+    arch: &r2il::ArchSpec,
+) -> Result<OwnedFunctionSnapshot> {
+    let resolve = |name: Option<&str>| name.and_then(|name| arch_register_storage(arch, name));
+    let interface = match source.function_interface() {
+        Some(interface) => {
+            let names = interface.role_register_names();
+            Some(
+                interface
+                    .clone()
+                    .with_arch_resolved_role_carriers(
+                        resolve(names.return_address()),
+                        resolve(names.stack_pointer()),
+                        resolve(names.frame_pointer()),
+                    )
+                    .map_err(|error| {
+                        LiftError::Unsupported(format!(
+                            "captured interface carriers do not resolve against the lifted \
+                             architecture: {error:?}"
+                        ))
+                    })?,
+            )
+        }
+        None => None,
+    };
+    let role_names = source.machine_roles().role_register_names();
+    let roles = source
+        .machine_roles()
+        .with_arch_resolved_carriers(
+            resolve(role_names.return_address()),
+            resolve(role_names.stack_pointer()),
+        )
+        .map_err(|error| {
+            LiftError::Unsupported(format!(
+                "captured machine carriers do not resolve against the lifted architecture: \
+                 {error:?}"
+            ))
+        })?;
+    Ok(source.with_arch_resolved_role_carriers(interface, roles))
 }
 
 fn captured_frame_pointer_storage_matches_arch(
@@ -740,6 +848,18 @@ fn control_op_is_intra_instruction(block: &GenuineLiftedBlock, op_index: usize) 
     })
 }
 
+/// The operation that decides where this block goes, if any.
+fn block_terminator(block: &GenuineLiftedBlock) -> Option<&R2ILOp> {
+    block
+        .block
+        .ops
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(index, op)| op.is_control_flow() && !control_op_is_intra_instruction(block, *index))
+        .map(|(_, op)| op)
+}
+
 fn genuine_block_successors(block: &GenuineLiftedBlock) -> Result<Vec<u64>> {
     let fallthrough = block
         .block
@@ -771,7 +891,7 @@ fn genuine_block_successors(block: &GenuineLiftedBlock) -> Result<Vec<u64>> {
             R2ILOp::Branch { .. } | R2ILOp::CBranch { .. } => {
                 !control_op_is_intra_instruction(block, op_index)
             }
-            R2ILOp::Return { .. } => true,
+            R2ILOp::Return { .. } | R2ILOp::Breakpoint => true,
             R2ILOp::BranchInd { .. } => block.block.switch_info.is_some(),
             _ => false,
         };
@@ -787,16 +907,8 @@ fn genuine_block_successors(block: &GenuineLiftedBlock) -> Result<Vec<u64>> {
             ));
         }
     }
-    let control = block
-        .block
-        .ops
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(index, op)| op.is_control_flow() && !control_op_is_intra_instruction(block, *index))
-        .map(|(_, op)| op);
-    match control {
-        Some(R2ILOp::Return { .. }) => Ok(Vec::new()),
+    match block_terminator(block) {
+        Some(R2ILOp::Return { .. } | R2ILOp::Breakpoint) => Ok(Vec::new()),
         Some(R2ILOp::Branch { target }) => constant_control_target(target)
             .map(|target| vec![target])
             .ok_or_else(|| {
@@ -856,7 +968,8 @@ fn validate_genuine_function_cfg(
     let lands_offcut = |target: u64| {
         !starts.contains(&target)
             && layout.blocks.iter().any(|block| {
-                target > block.addr() && target < block.addr().saturating_add(u64::from(block.size()))
+                target > block.addr()
+                    && target < block.addr().saturating_add(u64::from(block.size()))
             })
     };
     let mut internal_successors = HashMap::<u64, Vec<u64>>::new();
@@ -868,14 +981,22 @@ fn validate_genuine_function_cfg(
                 "genuine function branches into the middle of one of its blocks".to_string(),
             ));
         }
-        internal_successors.insert(
-            block.block.addr,
+        // An indirect branch the lift could not resolve may land on any of this
+        // function's blocks. Recording no edge would let the reachability check
+        // below conclude that the blocks only it reaches were invented, which
+        // is the machine's ignorance stated as a finding about the program.
+        let internal = if matches!(block_terminator(block), Some(R2ILOp::BranchInd { .. }))
+            && block.block.switch_info.is_none()
+        {
+            starts.iter().copied().collect()
+        } else {
             successors
                 .iter()
                 .copied()
                 .filter(|successor| starts.contains(successor))
-                .collect(),
-        );
+                .collect()
+        };
+        internal_successors.insert(block.block.addr, internal);
         successor_manifest.push(successors);
     }
     let mut reached = HashSet::new();
@@ -905,16 +1026,8 @@ fn typed_genuine_block_successors(
         .addr
         .checked_add(u64::from(block.block.size))
         .ok_or_else(|| LiftError::Parse("trusted block fallthrough overflows".to_string()))?;
-    let control = block
-        .block
-        .ops
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(index, op)| op.is_control_flow() && !control_op_is_intra_instruction(block, *index))
-        .map(|(_, op)| op);
-    match control {
-        Some(R2ILOp::Return { .. }) => Ok(Vec::new()),
+    match block_terminator(block) {
+        Some(R2ILOp::Return { .. } | R2ILOp::Breakpoint) => Ok(Vec::new()),
         Some(R2ILOp::Branch { target }) => constant_control_target(target)
             .map(|target| vec![(AdvisorySuccessorKind::Direct, target, None)])
             .ok_or_else(|| {
@@ -930,11 +1043,39 @@ fn typed_genuine_block_successors(
             .ok_or_else(|| {
                 LiftError::Parse("trusted conditional branch target is not constant".to_string())
             }),
-        // See genuine_block_successors: an unresolved indirect branch names no
-        // edge back into this function. When the source block carries switch
-        // metadata the comparison against the advisory graph is what refuses
-        // the function, and it reports the disagreement it actually found.
-        Some(R2ILOp::BranchInd { .. }) => Ok(Vec::new()),
+        // An unresolved indirect branch names no edge back into this function:
+        // the machine does not know where it goes.
+        //
+        // A jump table is different only in that radare2 resolved it and put
+        // the result on the block. That resolution is not machine evidence and
+        // grants no authority, but it is still the flow this function has, and
+        // reporting no successors here would say the switch block goes nowhere
+        // -- leaving every block it reaches unreachable and the function
+        // refused. The edges are reported so the graphs describe the same
+        // function; what may be claimed about them is settled downstream,
+        // where an unproven construct is marked rather than rejected.
+        Some(R2ILOp::BranchInd { .. }) => Ok(match block.block.switch_info.as_ref() {
+            Some(switch) => {
+                let mut successors = switch
+                    .cases
+                    .iter()
+                    .map(|case| {
+                        (
+                            AdvisorySuccessorKind::SwitchCase,
+                            case.target,
+                            Some(case.value),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                successors.extend(
+                    switch
+                        .default_target
+                        .map(|target| (AdvisorySuccessorKind::SwitchDefault, target, None)),
+                );
+                successors
+            }
+            None => Vec::new(),
+        }),
         // A call leaves the block by falling through to the next instruction.
         // Where it goes in between is a property of the callee, not of this
         // function's control flow, so it contributes no successor of its own.
@@ -975,11 +1116,6 @@ fn validate_owned_snapshot_cfg(
                 "trusted lift block order differs from owned source".to_string(),
             ));
         }
-        if source_block.switch_instruction().is_some() {
-            return Err(LiftError::Unsupported(
-                "advisory source switches cannot create trusted switch authority".to_string(),
-            ));
-        }
         let mut machine = typed_genuine_block_successors(lifted_block)?;
         machine.sort_unstable();
         if machine.windows(2).any(|pair| pair[0] == pair[1]) {
@@ -1016,10 +1152,53 @@ fn validate_owned_snapshot_cfg(
                 .filter(|(_, target, _)| block_starts.contains(target))
                 .collect::<Vec<_>>()
         };
-        if internal(&machine) != internal(&advisory) {
-            return Err(LiftError::Parse(
-                "machine-derived CFG differs from the owned advisory source CFG".to_string(),
-            ));
+        // The two graphs answer the same question from different evidence, and
+        // each knows something the other cannot. Where they disagree, the
+        // question is whether one of them is ignorant or the two contradict
+        // each other; only a contradiction refuses the function.
+        //
+        // The machine cannot resolve a jump table, so it names no edge out of
+        // an indirect branch while radare2, having analysed the table, names
+        // every case. The machine also assumes a call returns, because whether
+        // it does is a property of the callee; radare2 knows `exit` does not
+        // and ends the block there. Neither difference is a disagreement about
+        // this function's instructions, and refusing on either rejects most
+        // real programs -- the first takes out every entry point that switches,
+        // the second every one that can fail.
+        //
+        // What certifies nothing still describes the flow, and is marked
+        // unproven where that matters rather than discarded here.
+        let terminator = block_terminator(lifted_block);
+        let machine_internal = internal(&machine);
+        let advisory_internal = internal(&advisory);
+        let machine_only = machine_internal
+            .iter()
+            .filter(|edge| !advisory_internal.contains(edge))
+            .copied()
+            .collect::<Vec<_>>();
+        let advisory_only = advisory_internal
+            .iter()
+            .filter(|edge| !machine_internal.contains(edge))
+            .copied()
+            .collect::<Vec<_>>();
+
+        let call_may_not_return = matches!(
+            terminator,
+            Some(R2ILOp::Call { .. } | R2ILOp::CallInd { .. })
+        ) && machine_only
+            .iter()
+            .all(|(kind, _, _)| *kind == AdvisorySuccessorKind::Fallthrough);
+        let table_unresolved = matches!(terminator, Some(R2ILOp::BranchInd { .. }))
+            && lifted_block.block().switch_info.is_none();
+
+        if (!machine_only.is_empty() && !call_may_not_return)
+            || (!advisory_only.is_empty() && !table_unresolved)
+        {
+            return Err(LiftError::Parse(format!(
+                "machine-derived CFG contradicts the owned advisory source CFG at {:#x}: \
+                 machine names {machine_only:?}, source names {advisory_only:?}",
+                lifted_block.block().addr,
+            )));
         }
     }
     Ok(())
@@ -1147,7 +1326,7 @@ impl<'a> PcodeSource for DisasmInstructionWrapper<'a> {
     fn space_from_index(&self, idx: u64) -> Option<SpaceId> {
         usize::try_from(idx)
             .ok()
-            .and_then(|idx| self.disasm.space_map.get(&AddressSpaceId::new(idx)))
+            .and_then(|idx| self.disasm.spec.space_map.get(&AddressSpaceId::new(idx)))
             .copied()
     }
 }
@@ -1184,13 +1363,10 @@ fn build_register_name_map(sleigh: &GhidraSleigh) -> HashMap<(u64, u32), String>
     map
 }
 
-impl Disassembler {
-    fn from_sla_parts(
-        sla_bytes: &[u8],
-        pspec: &str,
-        arch_name: &str,
-        trusted_profile: Option<TrustedSleighProfile>,
-    ) -> Result<Self> {
+impl LoadedSpecification {
+    /// Parse one specification. `certifying` says whether the bytes are
+    /// embedded, which is the only case that may mint authority.
+    fn load(sla_bytes: &[u8], pspec: &str, arch_name: &str, certifying: bool) -> Result<Self> {
         let sleigh = GhidraSleigh::builder()
             .processor_spec(pspec)
             .map_err(|e| LiftError::Parse(format!("Invalid processor spec: {}", e)))?
@@ -1200,7 +1376,7 @@ impl Disassembler {
         let reg_name_map = build_register_name_map(&sleigh);
         let extracted = crate::sleigh::extract_architecture(&sleigh, arch_name)?;
         let arch = Arc::new(extracted.arch);
-        let genuine_authority = trusted_profile.map(|_| {
+        let authority = certifying.then(|| {
             GenuineLiftAuthority::new(
                 Arc::from(sla_bytes),
                 Arc::from(pspec),
@@ -1210,28 +1386,175 @@ impl Disassembler {
         });
 
         Ok(Self {
-            sleigh,
-            arch_name: arch_name.to_string(),
+            program_counter: program_counter_from_pspec(pspec),
+            sleigh: RefCell::new(sleigh),
             reg_name_map,
             space_map: extracted.space_map,
+            arch,
+            authority,
+        })
+    }
+}
+
+/// Load an embedded specification.
+///
+/// This is the cold embedded path. Session work uses the thread-local owner in
+/// `Disassembler::shared_loaded_profile`; keeping this constructor separate
+/// provides an intentionally independent instance for controls and callers
+/// that need a distinct authority.
+fn load_embedded_specification(
+    sla_bytes: &'static [u8],
+    pspec: &'static str,
+    arch_name: &'static str,
+) -> Result<Rc<LoadedSpecification>> {
+    Ok(Rc::new(LoadedSpecification::load(
+        sla_bytes, pspec, arch_name, true,
+    )?))
+}
+
+/// One load, giving both the architecture the plugin wants and the
+/// disassembler beside it.
+///
+/// These were two hand-written parses of the same bytes -- `build_arch_spec`
+/// for the architecture and `from_sla` for the disassembler -- inside one
+/// `create_disassembler_for_arch`. Sharing them is safe where sharing an
+/// instance across callers is not: this is one load handed to one caller, so
+/// there is no second consumer to see a decode cached by the first.
+///
+/// The architecture carries the processor spec's program counter, which
+/// `extract_architecture` alone does not set and the disassembler tracks
+/// separately.
+pub fn embedded_arch_and_disassembler(
+    sla_bytes: &'static [u8],
+    pspec: &'static str,
+    arch_name: &'static str,
+) -> Result<(r2il::ArchSpec, Disassembler)> {
+    let spec = load_embedded_specification(sla_bytes, pspec, arch_name)?;
+    let mut arch = (*spec.arch).clone();
+    arch.program_counter = crate::sleigh::processor_spec_program_counter(pspec);
+    Ok((arch, Disassembler::wrap(spec, arch_name, None)))
+}
+
+impl Disassembler {
+    fn from_sla_parts(
+        sla_bytes: &[u8],
+        pspec: &str,
+        arch_name: &str,
+        trusted_profile: Option<TrustedSleighProfile>,
+    ) -> Result<Self> {
+        // Caller-supplied bytes: loaded on their own and never cached, because
+        // nothing here can promise they outlive the cache.
+        let spec = Rc::new(LoadedSpecification::load(
+            sla_bytes,
+            pspec,
+            arch_name,
+            trusted_profile.is_some(),
+        )?);
+        Ok(Self::wrap(spec, arch_name, trusted_profile))
+    }
+
+    /// Wrap a specification with one caller's identity. Everything expensive
+    /// already happened; this is an `Rc` clone and a name.
+    fn wrap(
+        spec: Rc<LoadedSpecification>,
+        arch_name: &str,
+        trusted_profile: Option<TrustedSleighProfile>,
+    ) -> Self {
+        let genuine_authority = trusted_profile.and_then(|_| spec.authority.clone());
+        Self {
+            spec,
+            arch_name: arch_name.to_string(),
             genuine_authority,
             trusted_profile,
-        })
+        }
     }
 
     /// Construct from a pinned, embedded processor specification.
     ///
-    /// This is the only constructor that can mint genuine lift authority.
+    /// This cold path mints an independent genuine lift authority. Prefer
+    /// [`Self::shared_trusted_profile`] for session work.
     pub fn from_trusted_profile(profile: TrustedSleighProfile) -> Result<Self> {
         let (sla_bytes, pspec, arch_name) = profile.specification();
-        Self::from_sla_parts(sla_bytes, pspec, arch_name, Some(profile))
+        let spec = load_embedded_specification(sla_bytes, pspec, arch_name)?;
+        Ok(Self::wrap(spec, arch_name, Some(profile)))
+    }
+
+    /// The sole owner of a loaded embedded profile on this thread.
+    ///
+    /// Parsing the compiled specification dominates lifting cost. The C++
+    /// instance cannot cross threads, so each lifting thread retains at most
+    /// one parse per trusted embedded profile. Its address-keyed decode state
+    /// is cleared once at every public byte-source boundary before reuse.
+    fn shared_loaded_profile(profile: TrustedSleighProfile) -> Result<Rc<LoadedSpecification>> {
+        thread_local! {
+            static LOADED: RefCell<HashMap<TrustedSleighProfile, Rc<LoadedSpecification>>> =
+                RefCell::new(HashMap::new());
+        }
+
+        if let Some(spec) = LOADED.with(|loaded| loaded.borrow().get(&profile).map(Rc::clone)) {
+            return Ok(spec);
+        }
+
+        // Load outside the map borrow: construction is fallible and must not
+        // leave the thread-local cache mutably borrowed while it runs.
+        let (sla_bytes, pspec, arch_name) = profile.specification();
+        let spec = load_embedded_specification(sla_bytes, pspec, arch_name)?;
+        LOADED.with(|loaded| {
+            loaded.borrow_mut().insert(profile, Rc::clone(&spec));
+        });
+        Ok(spec)
+    }
+
+    /// A certifying view of the thread-owned embedded profile.
+    pub fn shared_trusted_profile(profile: TrustedSleighProfile) -> Result<Self> {
+        let (_, _, arch_name) = profile.specification();
+        Ok(Self::wrap(
+            Self::shared_loaded_profile(profile)?,
+            arch_name,
+            Some(profile),
+        ))
+    }
+
+    /// A non-certifying view of the thread-owned embedded profile.
+    ///
+    /// This is for consumers such as the radare2 architecture context: their
+    /// input bytes are not the source-owned snapshot required for authority.
+    pub fn shared_profile_for_analysis(profile: TrustedSleighProfile) -> Result<Self> {
+        let (_, _, arch_name) = profile.specification();
+        Ok(Self::wrap(
+            Self::shared_loaded_profile(profile)?,
+            arch_name,
+            None,
+        ))
+    }
+
+    /// One shared load, giving the plugin its processor-qualified architecture
+    /// and a non-certifying disassembler view beside it.
+    pub fn shared_arch_and_disassembler(
+        profile: TrustedSleighProfile,
+    ) -> Result<(r2il::ArchSpec, Self)> {
+        let (_, pspec, _) = profile.specification();
+        let disassembler = Self::shared_profile_for_analysis(profile)?;
+        let mut arch = disassembler.arch_spec().clone();
+        arch.program_counter = crate::sleigh::processor_spec_program_counter(pspec);
+        Ok((arch, disassembler))
+    }
+
+    /// Whether two views use the exact same parsed C++ Sleigh instance.
+    pub fn shares_loaded_specification(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.spec, &other.spec)
+    }
+
+    /// Architecture metadata extracted from this loaded specification.
+    pub fn arch_spec(&self) -> &r2il::ArchSpec {
+        &self.spec.arch
     }
 
     /// Lift every byte of one opaque source capture with the one exact embedded
     /// profile selected by its owned machine tuple.
     pub fn lift_owned_function(source: OwnedFunctionSnapshot) -> Result<TrustedLiftedFunction> {
         let profile = TrustedSleighProfile::from_machine(source.machine())?;
-        let disassembler = Self::from_trusted_profile(profile)?;
+        let disassembler = Self::shared_trusted_profile(profile)?;
         if disassembler.trusted_profile != Some(profile) {
             return Err(LiftError::Unsupported(
                 "trusted profile identity was lost while loading Sleigh".to_string(),
@@ -1246,6 +1569,9 @@ impl Disassembler {
                     "trusted lift lost its exact architecture authority".to_string(),
                 )
             })?;
+        // The capture's carriers are restated in this architecture's numbering
+        // before anything reads them, including the agreement check below.
+        let source = arch_resolved_source(source, trusted_arch)?;
         // Lifting is a function of the machine tuple and the image bytes; the
         // function interface is evidence about the ABI and is never read below.
         // An absent interface is therefore a fact about the source, not a lift
@@ -1257,15 +1583,14 @@ impl Disassembler {
         // wrong rather than merely missing. Agreement between the interface and
         // the captured field flags is already an invariant established when the
         // snapshot is constructed, so it is not re-checked here.
-        if let Some(interface) = source.function_interface() {
-            if !captured_frame_pointer_storage_matches_arch(interface, trusted_arch)
-                || !captured_return_mechanism_matches_arch(interface, trusted_arch)
-            {
-                return Err(LiftError::Unsupported(
-                    "captured frame/return mechanism conflicts with the exact lifted machine"
-                        .to_string(),
-                ));
-            }
+        if let Some(interface) = source.function_interface()
+            && (!captured_frame_pointer_storage_matches_arch(interface, trusted_arch)
+                || !captured_return_mechanism_matches_arch(interface, trusted_arch))
+        {
+            return Err(LiftError::Unsupported(
+                "captured frame/return mechanism conflicts with the exact lifted machine"
+                    .to_string(),
+            ));
         }
         let mut ranges = Vec::with_capacity(source.image().blocks().len());
         let mut blocks = Vec::with_capacity(source.image().blocks().len());
@@ -1274,11 +1599,52 @@ impl Disassembler {
                 LiftError::Parse("owned source block exceeds r2il size range".to_string())
             })?;
             ranges.push(GenuineFunctionBlockRange::new(block.address(), size));
-            blocks.push(disassembler.lift_genuine_block(
+            let mut lifted_block = disassembler.lift_genuine_block(
                 block.bytes(),
                 block.address(),
                 block.bytes().len(),
-            )?);
+            )?;
+            // radare2 resolves jump tables, and the snapshot carries what it
+            // found as switch-case successors. Lifting reads only the bytes, so
+            // without this the dispatch arrives as an indirect branch with no
+            // targets and the renderer says so and drops the rest of the
+            // function: `murmur3_32` rendered four statements of thirty-five and
+            // no return at all, because its tail switch on `len & 3` was thrown
+            // away between the snapshot and the lift.
+            if let Some(switch_addr) = block.switch_instruction() {
+                let cases: Vec<r2il::SwitchCase> = block
+                    .successors()
+                    .iter()
+                    .filter(|successor| {
+                        successor.kind() == r2source::AdvisorySuccessorKind::SwitchCase
+                    })
+                    .filter_map(|successor| {
+                        successor.case_value().map(|value| r2il::SwitchCase {
+                            value,
+                            target: successor.target(),
+                        })
+                    })
+                    .collect();
+                if !cases.is_empty() {
+                    let default_target = block
+                        .successors()
+                        .iter()
+                        .find(|successor| {
+                            successor.kind() == r2source::AdvisorySuccessorKind::SwitchDefault
+                        })
+                        .map(|successor| successor.target());
+                    let min_val = cases.iter().map(|case| case.value).min().unwrap_or(0);
+                    let max_val = cases.iter().map(|case| case.value).max().unwrap_or(0);
+                    lifted_block.block.switch_info = Some(r2il::SwitchInfo {
+                        switch_addr,
+                        min_val,
+                        max_val,
+                        default_target,
+                        cases,
+                    });
+                }
+            }
+            blocks.push(lifted_block);
         }
         validate_owned_snapshot_cfg(&source, &blocks)?;
         let layout = GenuineFunctionLayout::new(
@@ -1324,19 +1690,31 @@ impl Disassembler {
         &self.arch_name
     }
 
+    /// The register this processor uses as its program counter.
+    ///
+    /// Taken from the processor spec rather than assumed, because it is `RIP`
+    /// on x86-64, `EIP` on x86 and 16-bit, and `pc` on ARM, MIPS and RISC-V.
+    /// Writing a branch target to the wrong name leaves the branch with no
+    /// effect at all.
+    pub fn program_counter(&self) -> &str {
+        &self.spec.program_counter
+    }
+
     /// Get the default code address space.
     pub fn default_code_space(&self) -> AddressSpace {
-        self.sleigh.default_code_space()
+        self.spec.sleigh.borrow().default_code_space()
     }
 
     /// List all address spaces.
     pub fn address_spaces(&self) -> Vec<AddressSpace> {
-        self.sleigh.address_spaces()
+        self.spec.sleigh.borrow().address_spaces()
     }
 
     /// Get a register's varnode data by name.
     pub fn register(&self, name: &str) -> Result<VarnodeData> {
-        self.sleigh
+        self.spec
+            .sleigh
+            .borrow()
             .register_from_name(name)
             .map_err(|e| LiftError::Parse(format!("Unknown register '{}': {}", name, e)))
     }
@@ -1358,17 +1736,18 @@ impl Disassembler {
             return None;
         }
 
-        if let Some(name) = self.reg_name_map.get(&(vn.offset, vn.size)) {
+        if let Some(name) = self.spec.reg_name_map.get(&(vn.offset, vn.size)) {
             return Some(name.clone());
         }
 
         // Get the register address space
-        let reg_space = self.sleigh.address_space_by_name("register")?;
+        let sleigh = self.spec.sleigh.borrow();
+        let reg_space = sleigh.address_space_by_name("register")?;
 
         // Create a VarnodeData to query libsla
         let varnode_data = VarnodeData::new(Address::new(reg_space, vn.offset), vn.size as usize);
 
-        self.sleigh.register_name(&varnode_data)
+        sleigh.register_name(&varnode_data)
     }
 
     /// Format a varnode as a human-readable string, resolving register names.
@@ -1415,31 +1794,42 @@ impl Disassembler {
         addr: u64,
         options: SemanticMetadataOptions,
     ) -> Result<R2ILBlock> {
+        self.clear_decode_cache()?;
         let mut block = self.lift_canonical(bytes, addr)?;
         self.annotate_semantic_metadata(&mut block, options);
         Ok(block)
+    }
+
+    /// Begin one opaque lift against a caller-provided byte source.
+    ///
+    /// Sleigh may reuse parser contexts within this lift for delay slots and
+    /// cross-builds because every read still belongs to the same source. The
+    /// cache is invalidated once here, before another source can observe an
+    /// address retained by an earlier caller.
+    fn clear_decode_cache(&self) -> Result<()> {
+        self.spec
+            .sleigh
+            .borrow_mut()
+            .clear_cache()
+            .map_err(|e| LiftError::Parse(format!("Failed to clear decode cache: {e}")))
     }
 
     /// Translate exactly the Sleigh-produced P-code plus the local label
     /// normalization required to preserve the instruction's control graph.
     /// No mnemonic, user-op name, or inferred metadata participates.
     fn lift_canonical(&self, bytes: &[u8], addr: u64) -> Result<R2ILBlock> {
-        let code_space = self.sleigh.default_code_space();
+        let sleigh = self.spec.sleigh.borrow();
+        let code_space = sleigh.default_code_space();
         let address = Address::new(code_space, addr);
 
         // Create an instruction loader from the bytes
         let loader = ByteLoader::new(bytes, addr);
 
         // Disassemble to P-code
-        let pcode = self
-            .sleigh
+        let pcode = sleigh
             .disassemble_pcode(&loader, address)
-            .map_err(|e| {
-                LiftError::Pcode(crate::pcode::PcodeError::InvalidOpcode(format!(
-                    "Disassembly failed: {}",
-                    e
-                )))
-            })?;
+            .map_err(|e| LiftError::Parse(format!("Disassembly failed: {e}")))?;
+        drop(sleigh);
 
         // Translate P-code to r2il
         let mut block = self.translate_pcode(pcode, addr)?;
@@ -1484,6 +1874,7 @@ impl Disassembler {
         block_size: usize,
         enrichment: Option<SemanticMetadataOptions>,
     ) -> Result<(R2ILBlock, Vec<GenuineInstructionSpan>)> {
+        self.clear_decode_cache()?;
         let block_size_u32 = u32::try_from(block_size)
             .map_err(|_| LiftError::Parse("block size exceeds r2il range".to_string()))?;
         let mut combined_block = R2ILBlock::new(addr, block_size_u32);
@@ -1512,10 +1903,14 @@ impl Disassembler {
             };
 
             // Lift single instruction
-            let lifted = match enrichment {
-                Some(options) => self.lift_with_options(&lift_bytes, instr_addr, options),
-                None => self.lift_canonical(&lift_bytes, instr_addr),
-            };
+            let lifted = self
+                .lift_canonical(&lift_bytes, instr_addr)
+                .map(|mut block| {
+                    if let Some(options) = enrichment {
+                        self.annotate_semantic_metadata(&mut block, options);
+                    }
+                    block
+                });
             match lifted {
                 Ok(instr_block) => {
                     let R2ILBlock {
@@ -1607,12 +2002,13 @@ impl Disassembler {
 
     /// Disassemble and get native assembly mnemonic.
     pub fn disasm_native(&self, bytes: &[u8], addr: u64) -> Result<(String, usize)> {
-        let code_space = self.sleigh.default_code_space();
+        self.clear_decode_cache()?;
+        let sleigh = self.spec.sleigh.borrow();
+        let code_space = sleigh.default_code_space();
         let address = Address::new(code_space, addr);
         let loader = ByteLoader::new(bytes, addr);
 
-        let native = self
-            .sleigh
+        let native = sleigh
             .disassemble_native(&loader, address)
             .map_err(|e| LiftError::Parse(format!("Disassembly failed: {}", e)))?;
 
@@ -1630,9 +2026,41 @@ impl Disassembler {
         let instr_size = pcode.origin.size as u32;
         let mut block = R2ILBlock::new(addr, instr_size);
 
+        let mut ops = Vec::with_capacity(pcode.instructions.len());
         for pcode_instr in pcode.instructions {
             if let Some(op) = self.translate_pcode_op(&pcode_instr)? {
-                block.push(op);
+                ops.push(op);
+            }
+        }
+
+        // Where an expansion's own temporaries may live: above every temporary
+        // this instruction already uses. Sleigh scopes the unique space to the
+        // instruction, so that is the whole extent an expansion has to stay
+        // clear of, and taking it from the instruction itself means there is no
+        // offset to guess and nothing to collide with.
+        let temp_base = ops
+            .iter()
+            .flat_map(|op| op.output().into_iter().chain(op.inputs()))
+            .filter(|varnode| varnode.space == SpaceId::Unique)
+            .filter_map(|varnode| varnode.offset.checked_add(u64::from(varnode.size)))
+            .max()
+            .unwrap_or(0);
+
+        // A trap ends the instruction. Sleigh writes `brk` as a user operation
+        // that produces `pc` followed by a branch through it, so the branch's
+        // only definition of its target is the trap itself; expanding the trap
+        // into `Breakpoint`, which produces nothing, would leave that branch
+        // reading a `pc` nothing defines. Control does not reach it either way
+        // -- the exception is taken at the trap and does not come back -- so
+        // the operations Sleigh writes after it in the same instruction are not
+        // executed, and dropping them is what the machine does.
+        for op in ops {
+            for expanded in self.expand_user_operation(op, temp_base) {
+                let traps = matches!(expanded, R2ILOp::Breakpoint);
+                block.push(expanded);
+                if traps {
+                    return Ok(block);
+                }
             }
         }
 
@@ -1651,6 +2079,278 @@ impl Disassembler {
     }
 
     /// Translate a single P-code instruction to an r2il operation.
+    /// The name the architecture gives the user-defined operation at `index`.
+    fn user_op_name(&self, index: u32) -> Option<&str> {
+        self.genuine_authority
+            .as_ref()?
+            .arch_spec()
+            .user_ops
+            .get(index as usize)
+            .map(String::as_str)
+    }
+
+    /// Give a user-defined operation its semantics, where the architecture
+    /// names one this lift models.
+    ///
+    /// A `CallOther` carries no semantics at all, so everything downstream can
+    /// only refuse the instruction and, with it, the function. Where the
+    /// operation's meaning is exactly expressible in the ordinary vocabulary,
+    /// expanding it here is what keeps the rest of the pipeline free of any
+    /// vector-specific machinery. An operation this does not model is returned
+    /// untouched and still refuses, which is the honest answer.
+    fn expand_user_operation(&self, op: R2ILOp, temp_base: u64) -> Vec<R2ILOp> {
+        let R2ILOp::CallOther {
+            userop,
+            output,
+            inputs,
+        } = &op
+        else {
+            return vec![op];
+        };
+        let expanded = match self.user_op_name(*userop) {
+            Some("NEON_ext") => Self::expand_neon_ext(output.as_ref(), inputs, temp_base),
+            Some("NEON_ushl") => Self::expand_neon_ushl(output.as_ref(), inputs, temp_base),
+            // A trap, and the pipeline already has one. `R2ILOp::Breakpoint` is
+            // seeded as `Kind::Trap` by the obligation ledger, which is exactly
+            // what these are: control leaves for an exception handler and does
+            // not come back. Sleigh models that as a user-operation writing
+            // `pc`, which nothing downstream could project, so the whole
+            // function refused.
+            //
+            // The trap code -- `brk 0xc471`'s immediate, say -- is dropped,
+            // because `R2ILOp::Breakpoint` carries no operands. It identifies
+            // which check failed and is still in the disassembly; what matters
+            // for rendering is that control stops here, and that is preserved
+            // exactly.
+            Some("SoftwareBreakpoint") | Some("UndefinedInstructionException") => {
+                Some(vec![R2ILOp::Breakpoint])
+            }
+            _ => None,
+        };
+        expanded.unwrap_or_else(|| vec![op])
+    }
+
+    /// `NEON_ext(rn, rm, index, element_size)` -- AArch64 `EXT`.
+    ///
+    /// The result is the vector's width of bytes taken from the concatenation
+    /// of `rm` above `rn`, starting at byte `index`. As a whole-register value
+    /// that is `rn` shifted down by `index` bytes with `rm` shifted up into the
+    /// space it vacated.
+    ///
+    /// Only the byte-granular form is expanded, which is the only form the
+    /// specification uses; anything else is left to refuse.
+    fn expand_neon_ext(
+        output: Option<&Varnode>,
+        inputs: &[Varnode],
+        temp_base: u64,
+    ) -> Option<Vec<R2ILOp>> {
+        let [rn, rm, index, element_size] = inputs else {
+            return None;
+        };
+        let output = output?;
+        if index.space != SpaceId::Const
+            || element_size.space != SpaceId::Const
+            || element_size.offset != 1
+        {
+            return None;
+        }
+        let width_bytes = u64::from(output.size);
+        if output.size != rn.size || output.size != rm.size || width_bytes == 0 {
+            return None;
+        }
+        let taken = index.offset;
+        if taken == 0 {
+            return Some(vec![R2ILOp::Copy {
+                dst: output.clone(),
+                src: rn.clone(),
+            }]);
+        }
+        if taken >= width_bytes {
+            return None;
+        }
+        let low = Varnode::unique(temp_base, output.size);
+        let high = Varnode::unique(temp_base.checked_add(width_bytes)?, output.size);
+        let down = Varnode::constant(taken * 8, output.size);
+        let up = Varnode::constant((width_bytes - taken) * 8, output.size);
+        Some(vec![
+            R2ILOp::IntRight {
+                dst: low.clone(),
+                a: rn.clone(),
+                b: down,
+            },
+            R2ILOp::IntLeft {
+                dst: high.clone(),
+                a: rm.clone(),
+                b: up,
+            },
+            R2ILOp::IntOr {
+                dst: output.clone(),
+                a: low,
+                b: high,
+            },
+        ])
+    }
+
+    /// `NEON_ushl(rn, rm, element_size)` -- AArch64 `USHL`.
+    ///
+    /// Each element of the result is the corresponding element of `rn` shifted
+    /// by the signed low byte of the corresponding element of `rm`: left when
+    /// that byte is positive, right when it is negative, and zero when the
+    /// distance reaches the element's width, which is what the architecture
+    /// says and not what a C shift would do.
+    ///
+    /// Written out per element and recomposed, because the element is where the
+    /// operation is defined; nothing downstream needs to know it came from a
+    /// vector.
+    fn expand_neon_ushl(
+        output: Option<&Varnode>,
+        inputs: &[Varnode],
+        temp_base: u64,
+    ) -> Option<Vec<R2ILOp>> {
+        let [rn, rm, element_size] = inputs else {
+            return None;
+        };
+        let output = output?;
+        if element_size.space != SpaceId::Const {
+            return None;
+        }
+        let lane_bytes = u32::try_from(element_size.offset).ok()?;
+        if lane_bytes == 0
+            || output.size != rn.size
+            || output.size != rm.size
+            || output.size % lane_bytes != 0
+        {
+            return None;
+        }
+        let lanes = output.size / lane_bytes;
+        if lanes < 2 || !lanes.is_power_of_two() {
+            return None;
+        }
+        let lane_bits = u64::from(lane_bytes).checked_mul(8)?;
+
+        let mut ops = Vec::new();
+        let mut next = temp_base;
+        let temp = |size: u32, next: &mut u64| {
+            let node = Varnode::unique(*next, size);
+            *next += u64::from(size).max(1);
+            node
+        };
+
+        let mut lane_values = Vec::with_capacity(lanes as usize);
+        for lane in 0..lanes {
+            let byte_offset = lane * lane_bytes;
+            let value = temp(lane_bytes, &mut next);
+            ops.push(R2ILOp::Subpiece {
+                dst: value.clone(),
+                src: rn.clone(),
+                offset: byte_offset,
+            });
+            let distance_lane = temp(lane_bytes, &mut next);
+            ops.push(R2ILOp::Subpiece {
+                dst: distance_lane.clone(),
+                src: rm.clone(),
+                offset: byte_offset,
+            });
+            // The distance is the element's low byte, read as signed.
+            let distance_byte = temp(1, &mut next);
+            ops.push(R2ILOp::Subpiece {
+                dst: distance_byte.clone(),
+                src: distance_lane,
+                offset: 0,
+            });
+            let distance = temp(lane_bytes, &mut next);
+            ops.push(R2ILOp::IntSExt {
+                dst: distance.clone(),
+                src: distance_byte,
+            });
+
+            let zero = Varnode::constant(0, lane_bytes);
+            let negative = temp(1, &mut next);
+            ops.push(R2ILOp::IntSLess {
+                dst: negative.clone(),
+                a: distance.clone(),
+                b: zero.clone(),
+            });
+            let magnitude = temp(lane_bytes, &mut next);
+            ops.push(R2ILOp::IntSub {
+                dst: magnitude.clone(),
+                a: zero.clone(),
+                b: distance.clone(),
+            });
+
+            let left = temp(lane_bytes, &mut next);
+            ops.push(R2ILOp::IntLeft {
+                dst: left.clone(),
+                a: value.clone(),
+                b: distance.clone(),
+            });
+            let right = temp(lane_bytes, &mut next);
+            ops.push(R2ILOp::IntRight {
+                dst: right.clone(),
+                a: value,
+                b: magnitude.clone(),
+            });
+            let shifted = temp(lane_bytes, &mut next);
+            ops.push(R2ILOp::Select {
+                dst: shifted.clone(),
+                cond: negative.clone(),
+                if_true: right,
+                if_false: left,
+            });
+
+            // A distance at or beyond the element's width leaves zero, in both
+            // directions. A C shift would be undefined there, so it is decided
+            // here rather than left to the rendering.
+            let distance_magnitude = temp(lane_bytes, &mut next);
+            ops.push(R2ILOp::Select {
+                dst: distance_magnitude.clone(),
+                cond: negative,
+                if_true: magnitude,
+                if_false: distance,
+            });
+            let within = temp(1, &mut next);
+            ops.push(R2ILOp::IntLess {
+                dst: within.clone(),
+                a: distance_magnitude,
+                b: Varnode::constant(lane_bits, lane_bytes),
+            });
+            let result = temp(lane_bytes, &mut next);
+            ops.push(R2ILOp::Select {
+                dst: result.clone(),
+                cond: within,
+                if_true: shifted,
+                if_false: zero,
+            });
+            lane_values.push(result);
+        }
+
+        // Recompose, halving the count each round until one value is left.
+        let mut width = lane_bytes;
+        while lane_values.len() > 1 {
+            let mut joined = Vec::with_capacity(lane_values.len() / 2);
+            for pair in lane_values.chunks(2) {
+                let [low, high] = pair else {
+                    return None;
+                };
+                let wider = temp(width * 2, &mut next);
+                ops.push(R2ILOp::Piece {
+                    dst: wider.clone(),
+                    hi: high.clone(),
+                    lo: low.clone(),
+                });
+                joined.push(wider);
+            }
+            lane_values = joined;
+            width *= 2;
+        }
+        let composed = lane_values.pop()?;
+        ops.push(R2ILOp::Copy {
+            dst: output.clone(),
+            src: composed,
+        });
+        Some(ops)
+    }
+
     fn translate_pcode_op(&self, instr: &PcodeInstruction) -> Result<Option<R2ILOp>> {
         self.validate_pcode_spaces(instr)?;
         let source = DisasmInstructionWrapper {
@@ -2016,7 +2716,7 @@ impl Disassembler {
 
     /// Convert a libsla AddressSpace using the exact metadata-extraction map.
     fn translate_space(&self, space: &AddressSpace) -> Result<SpaceId> {
-        self.space_map.get(&space.id).copied().ok_or_else(|| {
+        self.spec.space_map.get(&space.id).copied().ok_or_else(|| {
             LiftError::Unsupported(format!(
                 "Sleigh emitted unmapped address space '{}' ({})",
                 space.name, space.id
@@ -2205,6 +2905,28 @@ fn is_stack_register(arch_name: &str, reg: &str) -> bool {
             "sp" | "rsp" | "esp" | "bp" | "rbp" | "ebp" | "fp" | "s0" | "x2" | "x8"
         )
     }
+}
+
+/// Read `<programcounter register="..."/>` out of a Ghidra processor spec.
+fn program_counter_from_pspec(pspec: &str) -> String {
+    const KEY: &str = "programcounter";
+    let Some(rest) = pspec.split_once(KEY).map(|(_, rest)| rest) else {
+        return "pc".to_string();
+    };
+    let Some(rest) = rest.split_once("register=").map(|(_, rest)| rest) else {
+        return "pc".to_string();
+    };
+    let rest = rest.trim_start();
+    let quote = match rest.chars().next() {
+        Some(c @ ('"' | '\'')) => c,
+        _ => return "pc".to_string(),
+    };
+    rest[1..]
+        .split(quote)
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or("pc")
+        .to_string()
 }
 
 fn is_pc_register(reg: &str) -> bool {
@@ -2626,6 +3348,206 @@ mod tests {
 
     fn reg(offset: u64, size: u32) -> Varnode {
         Varnode::register(offset, size)
+    }
+
+    fn declared_register_storage(arch: &r2il::ArchSpec, name: &str) -> r2il::RegisterStorage {
+        arch.get_register(name)
+            .unwrap_or_else(|| panic!("embedded specification is missing {name}"))
+            .storage()
+    }
+
+    fn register_varnode(storage: r2il::RegisterStorage) -> Varnode {
+        Varnode::register(storage.offset, storage.size)
+    }
+
+    fn padded_instruction<const N: usize>(instruction: [u8; N]) -> [u8; 16] {
+        let mut bytes = [0_u8; 16];
+        bytes[..N].copy_from_slice(&instruction);
+        bytes
+    }
+
+    #[cfg(feature = "x86")]
+    #[test]
+    fn x86_32_bit_register_write_explicitly_zero_extends_its_declared_carrier() {
+        let disassembler = Disassembler::from_trusted_profile(TrustedSleighProfile::X86_64)
+            .expect("trusted x86-64 specification");
+        let bytes = padded_instruction([0x89, 0xd8]);
+        let lifted = disassembler
+            .lift_genuine_block(&bytes, 0x1000, 2)
+            .expect("mov eax, ebx lift");
+        let arch = lifted.authority().arch_spec();
+        let eax = declared_register_storage(arch, "EAX");
+        let ebx = declared_register_storage(arch, "EBX");
+        let rax = declared_register_storage(arch, "RAX");
+
+        assert_eq!(
+            lifted.block().ops,
+            vec![
+                R2ILOp::Copy {
+                    dst: register_varnode(eax),
+                    src: register_varnode(ebx),
+                },
+                R2ILOp::IntZExt {
+                    dst: register_varnode(rax),
+                    src: register_varnode(eax),
+                },
+            ]
+        );
+    }
+
+    #[cfg(feature = "arm")]
+    #[test]
+    fn aarch64_w_register_write_explicitly_zero_extends_its_declared_carrier() {
+        let disassembler = Disassembler::from_trusted_profile(TrustedSleighProfile::Aarch64Le)
+            .expect("trusted AArch64 specification");
+        // mov w0, w1 (alias of orr w0, wzr, w1), little-endian encoding.
+        let bytes = padded_instruction([0xe0, 0x03, 0x01, 0x2a]);
+        let lifted = disassembler
+            .lift_genuine_block(&bytes, 0x1000, 4)
+            .expect("mov w0, w1 lift");
+        let arch = lifted.authority().arch_spec();
+        let w0 = declared_register_storage(arch, "w0");
+        let w1 = declared_register_storage(arch, "w1");
+        let x0 = declared_register_storage(arch, "x0");
+
+        assert_eq!(
+            lifted.block().ops,
+            vec![R2ILOp::IntZExt {
+                dst: register_varnode(x0),
+                src: register_varnode(w1),
+            }]
+        );
+        assert!(matches!(
+            arch.register_projection(w0).map(|projection| projection.disposition),
+            Some(r2il::RegisterProjectionDisposition::Bound { carrier, .. })
+                if carrier == x0
+        ));
+    }
+
+    #[cfg(feature = "arm")]
+    #[test]
+    fn aarch64_conditional_compare_normalizes_instruction_local_control() {
+        let disassembler = Disassembler::from_trusted_profile(TrustedSleighProfile::Aarch64Le)
+            .expect("trusted AArch64 specification");
+        // ccmp w1, #14, #0, eq, little-endian encoding.
+        let bytes = padded_instruction([0x20, 0x08, 0x4e, 0x7a]);
+        let lifted = disassembler
+            .lift_genuine_block(&bytes, 0x1000, 4)
+            .expect("ccmp w1, #14, #0, eq lift");
+
+        assert!(
+            !lifted
+                .block()
+                .ops
+                .iter()
+                .any(|op| matches!(op, R2ILOp::CBranch { .. })),
+            "instruction-local CBranch must not escape the canonical lift: {:?}",
+            lifted.block().ops
+        );
+        assert!(
+            lifted
+                .block()
+                .ops
+                .iter()
+                .any(|op| matches!(op, R2ILOp::Select { .. })),
+            "the conditional flag updates must retain their exact Select semantics"
+        );
+        assert!(
+            lifted.block().ops.iter().all(|op| {
+                !matches!(op, R2ILOp::Select { dst, .. } if dst.space == SpaceId::Unique)
+            }),
+            "instruction-local temporaries must feed the selected register candidates instead of preserving an undefined temporary: {:?}",
+            lifted.block().ops
+        );
+    }
+
+    #[cfg(feature = "x86")]
+    #[test]
+    fn x86_imul_overflow_chain_retains_its_exact_128_bit_product_geometry() {
+        let disassembler = Disassembler::from_trusted_profile(TrustedSleighProfile::X86_64)
+            .expect("trusted x86-64 specification");
+        let bytes = padded_instruction([0x4c, 0x0f, 0xaf, 0xca]);
+        let lifted = disassembler
+            .lift_genuine_block(&bytes, 0x1000, 4)
+            .expect("imul r9, rdx genuine lift");
+        let arch = lifted.authority().arch_spec();
+
+        r2il::validate_block_semantic(lifted.block(), arch)
+            .expect("genuine IMUL P-code is width coherent");
+        let product = lifted.block().ops.iter().find_map(|op| match op {
+            R2ILOp::IntMult { dst, a, b } if dst.size == 16 && a.size == 16 && b.size == 16 => {
+                Some(dst)
+            }
+            _ => None,
+        });
+        let product = product.expect("exact signed 128-bit product");
+        assert!(lifted.block().ops.iter().any(|op| matches!(
+            op,
+            R2ILOp::IntSExt { dst, src } if dst.size == 16 && src.size == 8
+        )));
+        assert!(lifted.block().ops.iter().any(|op| matches!(
+            op,
+            R2ILOp::IntNotEqual { a, b, .. }
+                if a.size == 16 && b == product
+        )));
+    }
+
+    #[cfg(feature = "arm")]
+    #[test]
+    fn aarch64_dup_and_sbfx_retain_proven_width_changes() {
+        let disassembler = Disassembler::from_trusted_profile(TrustedSleighProfile::Aarch64Le)
+            .expect("trusted AArch64 specification");
+
+        let dup = disassembler
+            .lift_genuine_block(&padded_instruction([0x40, 0x0c, 0x04, 0x4e]), 0x1000, 4)
+            .expect("dup v0.4s, w2 genuine lift");
+        r2il::validate_block_semantic(dup.block(), dup.authority().arch_spec())
+            .expect("genuine DUP P-code is width coherent");
+        assert!(dup.block().ops.iter().all(|op| match op {
+            R2ILOp::Copy { dst, src } => dst.size == src.size,
+            _ => true,
+        }));
+
+        let sbfx = disassembler
+            .lift_genuine_block(&padded_instruction([0x4b, 0x01, 0x00, 0x13]), 0x2000, 4)
+            .expect("sbfx w11, w10, 0, 1 genuine lift");
+        r2il::validate_block_semantic(sbfx.block(), sbfx.authority().arch_spec())
+            .expect("genuine SBFX P-code is width coherent");
+        assert!(sbfx.block().ops.iter().any(|op| matches!(
+            op,
+            R2ILOp::IntZExt { dst, src } if dst.size == 8 && src.size == 4
+        )));
+    }
+
+    #[cfg(feature = "x86")]
+    #[test]
+    fn x86_byte_register_writes_do_not_invent_full_carrier_zero_extensions() {
+        for (instruction, destination_name) in [([0x88, 0xd8], "AL"), ([0x88, 0xdc], "AH")] {
+            let disassembler = Disassembler::from_trusted_profile(TrustedSleighProfile::X86_64)
+                .expect("trusted x86-64 specification");
+            let bytes = padded_instruction(instruction);
+            let lifted = disassembler
+                .lift_genuine_block(&bytes, 0x1000, 2)
+                .unwrap_or_else(|error| panic!("mov {destination_name}, bl lift: {error}"));
+            let arch = lifted.authority().arch_spec();
+            let destination = declared_register_storage(arch, destination_name);
+            let bl = declared_register_storage(arch, "BL");
+            let rax = declared_register_storage(arch, "RAX");
+
+            assert_eq!(
+                lifted.block().ops,
+                vec![R2ILOp::Copy {
+                    dst: register_varnode(destination),
+                    src: register_varnode(bl),
+                }]
+            );
+            assert!(!lifted.block().ops.iter().any(|op| matches!(
+                op,
+                R2ILOp::IntZExt { dst, src }
+                    if dst == &register_varnode(rax)
+                        && src == &register_varnode(destination)
+            )));
+        }
     }
 
     #[test]
@@ -3447,7 +4369,7 @@ mod tests {
             .expect("trusted profile authority");
         let spaces = disassembler.address_spaces();
 
-        assert_eq!(spaces.len(), disassembler.space_map.len());
+        assert_eq!(spaces.len(), disassembler.spec.space_map.len());
         for space in spaces {
             let mapped = disassembler
                 .translate_space(&space)
@@ -3745,6 +4667,397 @@ mod tests {
         assert!(
             block.op_metadata.is_empty(),
             "op metadata should stay disabled"
+        );
+    }
+
+    #[test]
+    fn analysis_pcode_is_invalid_at_the_machine_lift_boundary() {
+        let disassembler = Disassembler::from_trusted_profile(TrustedSleighProfile::X86_64)
+            .expect("trusted x86-64 disassembler");
+        let address = Address::new(
+            disassembler.default_code_space(),
+            PINNED_X86_CONDITIONAL_RETURN_ADDR,
+        );
+
+        for operation in [
+            libsla::AnalysisOp::MultiEqual,
+            libsla::AnalysisOp::CopyIndirect,
+            libsla::AnalysisOp::PointerAdd,
+            libsla::AnalysisOp::PointerSubcomponent,
+            libsla::AnalysisOp::Cast,
+            libsla::AnalysisOp::Insert,
+            libsla::AnalysisOp::Extract,
+            libsla::AnalysisOp::SegmentOp,
+        ] {
+            let instruction = PcodeInstruction {
+                address: address.clone(),
+                op_code: OpCode::Analysis(operation),
+                inputs: Vec::new(),
+                output: None,
+            };
+            assert!(
+                matches!(
+                    disassembler.translate_pcode_op(&instruction),
+                    Err(LiftError::Unsupported(_))
+                ),
+                "analysis operation {operation:?} must be refused at the machine lift boundary"
+            );
+        }
+    }
+
+    #[test]
+    fn callother_translation_rejects_ids_that_do_not_fit_r2il() {
+        let disassembler = Disassembler::from_trusted_profile(TrustedSleighProfile::X86_64)
+            .expect("trusted x86-64 disassembler");
+        let constant_space = disassembler
+            .address_spaces()
+            .into_iter()
+            .find(|space| space.space_type == libsla::AddressSpaceType::Constant)
+            .expect("constant space");
+        let invalid_userop = u64::from(u32::MAX) + 1;
+        let instruction = PcodeInstruction {
+            address: Address::new(
+                disassembler.default_code_space(),
+                PINNED_X86_CONDITIONAL_RETURN_ADDR,
+            ),
+            op_code: OpCode::Pseudo(PseudoOp::CallOther),
+            inputs: vec![VarnodeData::new(
+                Address::new(constant_space, invalid_userop),
+                8,
+            )],
+            output: None,
+        };
+
+        let error = disassembler
+            .translate_pcode_op(&instruction)
+            .expect_err("oversized CallOther id must be refused");
+        assert_eq!(
+            error.to_string(),
+            format!("Unsupported feature: Sleigh CALLOTHER id does not fit r2il: {invalid_userop}")
+        );
+    }
+
+    #[test]
+    fn fixed_ram_copy_is_canonical_memory_io() {
+        let disassembler = Disassembler::from_trusted_profile(TrustedSleighProfile::X86_64)
+            .expect("trusted x86-64 disassembler");
+        let ram_space = disassembler.default_code_space();
+        let register_space = disassembler
+            .address_spaces()
+            .into_iter()
+            .find(|space| space.name == "register")
+            .expect("register space");
+        let address_size = u32::try_from(ram_space.address_size).expect("r2il address size");
+        let address = Address::new(ram_space.clone(), PINNED_X86_CONDITIONAL_RETURN_ADDR);
+        let write = PcodeInstruction {
+            address: address.clone(),
+            op_code: OpCode::Copy,
+            inputs: vec![VarnodeData::new(Address::new(register_space.clone(), 0), 4)],
+            output: Some(VarnodeData::new(Address::new(ram_space.clone(), 0x4000), 4)),
+        };
+        let read = PcodeInstruction {
+            address,
+            op_code: OpCode::Copy,
+            inputs: vec![VarnodeData::new(Address::new(ram_space, 0x4000), 4)],
+            output: Some(VarnodeData::new(Address::new(register_space, 0), 4)),
+        };
+
+        assert_eq!(
+            disassembler
+                .translate_pcode_op(&write)
+                .expect("fixed RAM write translation"),
+            Some(R2ILOp::Store {
+                space: SpaceId::Ram,
+                addr: Varnode::constant(0x4000, address_size),
+                val: Varnode::register(0, 4),
+            })
+        );
+        assert_eq!(
+            disassembler
+                .translate_pcode_op(&read)
+                .expect("fixed RAM read translation"),
+            Some(R2ILOp::Load {
+                dst: Varnode::register(0, 4),
+                space: SpaceId::Ram,
+                addr: Varnode::constant(0x4000, address_size),
+            })
+        );
+    }
+
+    #[test]
+    fn fixed_value_pcode_uses_the_typed_sleigh_translation() {
+        let disassembler = Disassembler::from_trusted_profile(TrustedSleighProfile::X86_64)
+            .expect("trusted x86-64 disassembler");
+        let address_spaces = disassembler.address_spaces();
+        let constant_space = address_spaces
+            .iter()
+            .find(|space| space.space_type == libsla::AddressSpaceType::Constant)
+            .expect("constant space")
+            .clone();
+        let register_space = address_spaces
+            .iter()
+            .find(|space| space.name == "register")
+            .expect("register space")
+            .clone();
+        let address = Address::new(
+            disassembler.default_code_space(),
+            PINNED_X86_CONDITIONAL_RETURN_ADDR,
+        );
+        let copy = PcodeInstruction {
+            address: address.clone(),
+            op_code: OpCode::Copy,
+            inputs: vec![VarnodeData::new(
+                Address::new(constant_space.clone(), 42),
+                8,
+            )],
+            output: Some(VarnodeData::new(Address::new(register_space.clone(), 0), 8)),
+        };
+        let add = PcodeInstruction {
+            address,
+            op_code: OpCode::Int(IntOp::Add),
+            inputs: vec![
+                VarnodeData::new(Address::new(register_space.clone(), 0), 4),
+                VarnodeData::new(Address::new(constant_space, 1), 4),
+            ],
+            output: Some(VarnodeData::new(Address::new(register_space, 0), 4)),
+        };
+
+        assert_eq!(
+            disassembler
+                .translate_pcode_op(&copy)
+                .expect("COPY translation"),
+            Some(R2ILOp::Copy {
+                dst: Varnode::register(0, 8),
+                src: Varnode::constant(42, 8),
+            })
+        );
+        assert_eq!(
+            disassembler
+                .translate_pcode_op(&add)
+                .expect("INT_ADD translation"),
+            Some(R2ILOp::IntAdd {
+                dst: Varnode::register(0, 4),
+                a: Varnode::register(0, 4),
+                b: Varnode::constant(1, 4),
+            })
+        );
+    }
+}
+
+#[cfg(all(test, feature = "x86"))]
+mod sleigh_specification_load_cost {
+    use super::*;
+
+    /// What parsing a specification costs against what lifting costs, which is
+    /// the measurement that moved the parse out of the per-caller path.
+    ///
+    /// Not a gate: it prints rather than asserts, because a wall-clock bound
+    /// checked in CI is a flake and the ratio is the finding. Run it with
+    /// `cargo test --release -p r2sleigh-lift --features x86
+    /// sleigh_specification_load_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "measurement, not a gate"]
+    fn parsing_a_specification_costs_a_thousand_lifts() {
+        let (sla, pspec, name) = TrustedSleighProfile::X86_64.specification();
+        for round in 0..3 {
+            let started = std::time::Instant::now();
+            let cold = LoadedSpecification::load(sla, pspec, name, true).expect("cold load");
+            eprintln!(
+                "round {round}: cold parse = {}us",
+                started.elapsed().as_micros()
+            );
+            let wrapped = Disassembler::wrap(
+                std::rc::Rc::new(cold),
+                name,
+                Some(TrustedSleighProfile::X86_64),
+            );
+            let started = std::time::Instant::now();
+            let _ = wrapped.lift_genuine_block(&[0x48, 0x89, 0xe5], 0x1000, 3);
+            eprintln!(
+                "round {round}: one three-byte block = {}us",
+                started.elapsed().as_micros()
+            );
+            let started = std::time::Instant::now();
+            let _ = Disassembler::shared_trusted_profile(TrustedSleighProfile::X86_64)
+                .expect("shared profile");
+            eprintln!(
+                "round {round}: shared build = {}us",
+                started.elapsed().as_micros()
+            );
+        }
+    }
+
+    #[test]
+    fn one_specification_serves_both_consumers_without_sharing_a_decode_cache() {
+        // The architecture and analysis view still come from one load.
+        let (sla, pspec, name) = TrustedSleighProfile::X86_64.specification();
+        let (arch, plugin_side) =
+            embedded_arch_and_disassembler(sla, pspec, name).expect("arch and disassembler");
+        assert!(Rc::ptr_eq(&plugin_side.spec, &plugin_side.spec));
+        assert_eq!(plugin_side.spec.arch.name, arch.name);
+        assert!(plugin_side.genuine_authority.is_none());
+        assert!(arch.program_counter.is_some());
+
+        // Session consumers share the same loaded profile, but every public
+        // lift boundary discards decode entries left by the previous source.
+        let lifter = Disassembler::shared_trusted_profile(TrustedSleighProfile::X86_64)
+            .expect("trusted disassembler");
+        let (shared_arch, shared_plugin_side) =
+            Disassembler::shared_arch_and_disassembler(TrustedSleighProfile::X86_64)
+                .expect("shared architecture and analysis view");
+        assert!(lifter.shares_loaded_specification(&shared_plugin_side));
+        assert_eq!(shared_arch.name, arch.name);
+        assert_eq!(shared_arch.program_counter, arch.program_counter);
+        assert_eq!(lifter.trusted_profile, Some(TrustedSleighProfile::X86_64));
+        assert!(lifter.genuine_authority.is_some());
+        assert!(shared_plugin_side.genuine_authority.is_none());
+    }
+
+    #[test]
+    fn caller_supplied_bytes_never_certify() {
+        // Only embedded bytes may mint authority, whatever else is shared.
+        let (sla, pspec, name) = TrustedSleighProfile::X86_64.specification();
+        let owned = sla.to_vec();
+        let ad_hoc = Disassembler::from_sla(&owned, pspec, name).expect("ad hoc disassembler");
+        assert!(ad_hoc.genuine_authority.is_none());
+        assert!(ad_hoc.trusted_profile.is_none());
+    }
+}
+
+#[cfg(all(test, feature = "x86"))]
+mod shared_instance_address_reuse {
+    use super::*;
+
+    fn lift_ops(disassembler: &Disassembler, bytes: &[u8], address: u64) -> Vec<R2ILOp> {
+        disassembler
+            .lift_genuine_block(bytes, address, 2)
+            .expect("x86 byte-register move")
+            .block()
+            .ops
+            .clone()
+    }
+
+    /// Breaks the load cost into parser, register-table, and architecture work.
+    #[test]
+    #[ignore = "measurement, not a gate"]
+    fn where_the_load_time_goes() {
+        let (sla, pspec, name) = TrustedSleighProfile::X86_64.specification();
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            let sleigh = GhidraSleigh::builder()
+                .processor_spec(pspec)
+                .expect("pspec")
+                .build(sla)
+                .expect("sla");
+            let parse = t.elapsed();
+            let t = std::time::Instant::now();
+            let _regs = build_register_name_map(&sleigh);
+            let regs = t.elapsed();
+            let t = std::time::Instant::now();
+            let _arch = crate::sleigh::extract_architecture(&sleigh, name).expect("arch");
+            let extract = t.elapsed();
+            eprintln!(
+                "parse={}us regs={}us extract={}us",
+                parse.as_micros(),
+                regs.as_micros(),
+                extract.as_micros()
+            );
+        }
+    }
+
+    #[test]
+    fn shared_instance_observes_new_bytes_at_a_reused_address() {
+        // Independently loaded instances establish that these encodings really
+        // differ without depending on the shared instance under test.
+        let al_control = lift_ops(
+            &Disassembler::from_trusted_profile(TrustedSleighProfile::X86_64)
+                .expect("fresh AL control"),
+            &[0x88, 0xd8, 0x90, 0x90],
+            0x2000,
+        );
+        let ah_control = lift_ops(
+            &Disassembler::from_trusted_profile(TrustedSleighProfile::X86_64)
+                .expect("fresh AH control"),
+            &[0x88, 0xdc, 0x90, 0x90],
+            0x2000,
+        );
+        assert_ne!(
+            al_control, ah_control,
+            "the control instructions must differ"
+        );
+
+        let shared =
+            Disassembler::shared_trusted_profile(TrustedSleighProfile::X86_64).expect("shared");
+        let second_view =
+            Disassembler::shared_trusted_profile(TrustedSleighProfile::X86_64).expect("shared");
+        assert!(shared.shares_loaded_specification(&second_view));
+
+        let al_first = lift_ops(&shared, &[0x88, 0xd8, 0x90, 0x90], 0x1000);
+        let ah_second = lift_ops(&second_view, &[0x88, 0xdc, 0x90, 0x90], 0x1000);
+        assert_eq!(al_first, al_control);
+        assert_eq!(
+            ah_second, ah_control,
+            "a second decode at one address must observe its own bytes; equality with the first decode means the shared parser cache was not cleared"
+        );
+
+        let ah_first = lift_ops(&shared, &[0x88, 0xdc, 0x90, 0x90], 0x3000);
+        let al_second = lift_ops(&second_view, &[0x88, 0xd8, 0x90, 0x90], 0x3000);
+        assert_eq!(ah_first, ah_control);
+        assert_eq!(
+            al_second, al_control,
+            "cache invalidation must be independent of which instruction occupied the address first"
+        );
+    }
+
+    /// Measures invalidation in isolation and together with a public two-byte
+    /// lift. Wall-clock timing is evidence, not a CI bound.
+    #[test]
+    #[ignore = "measurement, not a gate"]
+    fn decode_cache_clear_cost() {
+        const ROUNDS: u32 = 1_000;
+        let disassembler =
+            Disassembler::shared_trusted_profile(TrustedSleighProfile::X86_64).expect("shared");
+
+        let started = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            disassembler
+                .clear_decode_cache()
+                .expect("clear decode cache");
+        }
+        eprintln!(
+            "decode cache clear average = {}ns",
+            started.elapsed().as_nanos() / u128::from(ROUNDS)
+        );
+
+        let mut bytes = vec![0x88, 0xd8];
+        bytes.resize(Disassembler::MIN_BYTES, 0x90);
+        let mut lift_elapsed = std::time::Duration::ZERO;
+        for _ in 0..ROUNDS {
+            disassembler
+                .clear_decode_cache()
+                .expect("prepare uncached lift");
+            let started = std::time::Instant::now();
+            let block = disassembler
+                .lift_canonical(std::hint::black_box(&bytes), 0x1000)
+                .expect("uncached canonical lift");
+            lift_elapsed += started.elapsed();
+            std::hint::black_box(block);
+        }
+        eprintln!(
+            "uncached two-byte canonical lift average = {}ns",
+            lift_elapsed.as_nanos() / u128::from(ROUNDS)
+        );
+
+        let started = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            let block = disassembler
+                .lift_genuine_block(&[0x88, 0xd8, 0x90, 0x90], 0x1000, 2)
+                .expect("lift after cache clear");
+            std::hint::black_box(block);
+        }
+        eprintln!(
+            "cache clear plus two-byte lift average = {}ns",
+            started.elapsed().as_nanos() / u128::from(ROUNDS)
         );
     }
 }

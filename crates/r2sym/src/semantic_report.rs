@@ -12,10 +12,6 @@ pub struct CompiledSemanticInfo {
     pub stage: String,
     pub granularity: String,
     pub execution: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub seed_mode: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub replay_seed_fingerprint: Option<String>,
     pub query_plan: crate::QueryPlan,
     pub type_plan: crate::TypePlan,
     pub decompile_plan: crate::DecompilePlan,
@@ -25,10 +21,6 @@ pub struct CompiledSemanticInfo {
     pub ambiguous_targets: Vec<String>,
     pub closure_functions: usize,
     pub helper_functions: usize,
-    pub derived_summaries: usize,
-    pub summary_attempted: usize,
-    pub summary_budget_exhausted: usize,
-    pub summary_scc_count: usize,
     pub region_count: usize,
     pub control_region_count: usize,
     pub memory_region_count: usize,
@@ -297,6 +289,7 @@ fn vm_memory_condition_info_from_sym(
                 crate::MemoryRegionKind::Heap => "heap",
                 crate::MemoryRegionKind::Replay => "replay",
                 crate::MemoryRegionKind::EscapedUnknown => "unknown",
+                crate::MemoryRegionKind::Pointee => "pointee",
             },
             condition.region.name,
             condition.region.id
@@ -513,10 +506,6 @@ fn vm_step_summary_info_from_sym(vm_step: &crate::VmStepSummary) -> VmStepSummar
     }
 }
 
-pub fn compiled_semantic_info(compiled: &crate::SemanticArtifact) -> CompiledSemanticInfo {
-    compiled_semantic_info_with_seed(compiled, None)
-}
-
 fn memory_summary_region_label(region: &crate::BackwardMemoryRegion) -> String {
     match region {
         crate::BackwardMemoryRegion::Argument { index } => format!("arg{index}"),
@@ -603,20 +592,7 @@ fn semantic_memory_summaries(native: Option<&crate::NativeArtifactBody>) -> Vec<
     summaries
 }
 
-pub fn compiled_semantic_info_with_replay_seed(
-    compiled: &crate::SemanticArtifact,
-    replay_seed: &crate::ReplaySeed,
-) -> CompiledSemanticInfo {
-    compiled_semantic_info_with_seed(
-        compiled,
-        Some(crate::stable_replay_seed_fingerprint(replay_seed)),
-    )
-}
-
-fn compiled_semantic_info_with_seed(
-    compiled: &crate::SemanticArtifact,
-    replay_seed_fingerprint: Option<u64>,
-) -> CompiledSemanticInfo {
+pub fn compiled_semantic_info(compiled: &crate::SemanticArtifact) -> CompiledSemanticInfo {
     let native = compiled.native_body();
     let memory_summaries = semantic_memory_summaries(native);
     let native_worker_summary_kinds = native_worker_summary_kinds(native);
@@ -641,9 +617,6 @@ fn compiled_semantic_info_with_seed(
             crate::ExecutionModel::Vm => "vm",
         }
         .to_string(),
-        seed_mode: replay_seed_fingerprint.map(|_| "replay".to_string()),
-        replay_seed_fingerprint: replay_seed_fingerprint
-            .map(|fingerprint| format!("0x{fingerprint:x}")),
         query_plan: compiled.query_plan(),
         type_plan: compiled.type_plan(),
         decompile_plan: compiled.decompile_plan(),
@@ -652,7 +625,6 @@ fn compiled_semantic_info_with_seed(
             .map(|slice_class| match slice_class {
                 crate::SliceClass::Wrapper => "wrapper",
                 crate::SliceClass::Worker => "worker",
-                crate::SliceClass::RecursiveGroup => "recursive_group",
                 crate::SliceClass::InterpreterSwitch => "interpreter_switch",
                 crate::SliceClass::InterpreterIndirect => "interpreter_indirect",
                 crate::SliceClass::GenericLarge => "generic_large",
@@ -667,8 +639,6 @@ fn compiled_semantic_info_with_seed(
                 match reason {
                     crate::ResidualReason::MissingArch => "missing_arch",
                     crate::ResidualReason::LargeCfg => "large_cfg",
-                    crate::ResidualReason::SummaryBudgetExhausted => "summary_budget_exhausted",
-                    crate::ResidualReason::SccBudgetExhausted => "scc_budget_exhausted",
                     crate::ResidualReason::InterpreterRequiresStepSummary => {
                         "interpreter_requires_step_summary"
                     }
@@ -689,25 +659,6 @@ fn compiled_semantic_info_with_seed(
         helper_functions: compiled
             .native_body()
             .map(|body| body.summary.helper_functions)
-            .unwrap_or(0),
-        derived_summaries: compiled
-            .native_body()
-            .map(|body| body.summary.derived_summaries)
-            .unwrap_or(0),
-        summary_attempted: compiled
-            .native_body()
-            .map(|body| body.summary.derived_diagnostics.attempted)
-            .unwrap_or(0),
-        summary_budget_exhausted: compiled
-            .native_body()
-            .map(|body| {
-                body.summary.derived_diagnostics.budget_exhausted
-                    + body.summary.derived_diagnostics.scc_budget_exhausted
-            })
-            .unwrap_or(0),
-        summary_scc_count: compiled
-            .native_body()
-            .map(|body| body.summary.derived_diagnostics.scc_count)
             .unwrap_or(0),
         region_count: native.map(|body| body.regions.len()).unwrap_or(0),
         control_region_count: native
@@ -796,13 +747,6 @@ mod tests {
                         role_identity: None,
                         closure_functions: 3,
                         helper_functions: 2,
-                        derived_summaries: 1,
-                        derived_diagnostics: crate::DerivedSummaryDiagnostics {
-                            attempted: 4,
-                            budget_exhausted: 1,
-                            scc_count: 2,
-                            ..crate::DerivedSummaryDiagnostics::default()
-                        },
                         region_summaries: Vec::new(),
                         worker_summaries: Vec::new(),
                     },
@@ -835,10 +779,6 @@ mod tests {
         assert_eq!(value["slice_class"], "worker");
         assert_eq!(value["closure_functions"], 3);
         assert_eq!(value["helper_functions"], 2);
-        assert_eq!(value["derived_summaries"], 1);
-        assert_eq!(value["summary_attempted"], 4);
-        assert_eq!(value["summary_budget_exhausted"], 1);
-        assert_eq!(value["summary_scc_count"], 2);
         assert_eq!(value["branches_pruned"], 7);
         assert_eq!(value["branches_unknown"], 5);
         assert_eq!(value["skipped_large_cfg"], true);

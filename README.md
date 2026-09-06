@@ -145,9 +145,10 @@ ae <esil_expression>
 R2IL Format / Endianness / Memory Semantics
 -------------------------------------------
 
-- `R2PSTC06` is the sole format identity; there is no independent version field or compatibility branch.
-- Saving emits `R2PSTC06 || payload_length_u64_le || postcard(ArchSpec)` and the reader requires exact payload consumption.
-- Loading accepts only the current v6 representation; older encodings are rejected.
+- `R2PSTC07` is the sole format identity; there is no independent version field or compatibility branch.
+- Saving emits `R2PSTC07 || payload_length_u64_le || postcard(ArchSpec)` and the reader requires exact payload consumption.
+- Loading accepts only the current v7 representation; older encodings are rejected.
+- `ArchSpec::register_projections` is the source-owned, name-free register geometry table. Empty means unavailable; otherwise it is sorted, complete for unique declared storages, and validated as coherent overlap components.
 - Endianness has exactly two architecture-level authorities:
   - `instruction_endianness`
   - `memory_endianness`
@@ -160,7 +161,7 @@ R2IL Format / Endianness / Memory Semantics
 Compatibility Guarantees
 ------------------------
 
-- `.r2il` writer and reader accept only the `R2PSTC06` representation; there is no parallel legacy decoder or migration path.
+- `.r2il` writer and reader accept only the `R2PSTC07` representation; there is no parallel legacy decoder or migration path.
 - Instruction export action/format compatibility is strict and validated:
   - `lift`: `json`, `text`, `esil`, `r2cmd`
   - `ssa`: `json`, `text`

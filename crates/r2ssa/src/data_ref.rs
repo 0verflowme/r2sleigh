@@ -1,10 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use r2il::{ArchSpec, R2ILBlock, SpaceId};
-use r2sleigh_lift::Disassembler;
 use serde::{Deserialize, Serialize};
 
-use crate::{SSABlock, SSAFunction, SSAOp, SSAVar};
+use crate::{CanonicalStorageSpace, GraphInst, InstPayload, SSAOp, SsaArtifact, SsaGraph, ValueId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum DataRefKind {
@@ -87,20 +86,22 @@ fn sort_and_dedup_refs(refs: &mut Vec<DataRefFact>) {
     refs.dedup();
 }
 
+/// Parse a legacy constant display spelling.
+///
+/// This remains a presentation helper for callers that have no proof-bearing
+/// role. Data-reference recovery deliberately does not call it: constants in
+/// that analysis come only from the sealed graph value.
 pub fn parse_const_value(name: &str) -> Option<u64> {
     let val_str = name
         .strip_prefix("const:")
         .or_else(|| name.strip_prefix("CONST:"))?;
-
     let val_str = val_str.split('_').next().unwrap_or(val_str);
-
     if let Some(hex) = val_str
         .strip_prefix("0x")
         .or_else(|| val_str.strip_prefix("0X"))
     {
         return u64::from_str_radix(hex, 16).ok();
     }
-
     if let Some(dec) = val_str
         .strip_prefix("0d")
         .or_else(|| val_str.strip_prefix("0D"))
@@ -111,97 +112,6 @@ pub fn parse_const_value(name: &str) -> Option<u64> {
         return u64::from_str_radix(val_str, 16).ok();
     }
     val_str.parse::<u64>().ok()
-}
-
-fn parse_const_addr(name: &str) -> Option<u64> {
-    parse_const_value(name).filter(|addr| *addr >= 0x10000)
-}
-
-fn ssa_var_key(var: &SSAVar) -> String {
-    format!("{}_{}", var.name.to_ascii_lowercase(), var.version)
-}
-
-fn resolve_const_value(const_env: &HashMap<String, u64>, var: &SSAVar) -> Option<u64> {
-    parse_const_value(&var.name).or_else(|| const_env.get(&ssa_var_key(var)).copied())
-}
-
-fn resolve_const_addr(const_env: &HashMap<String, u64>, var: &SSAVar) -> Option<u64> {
-    resolve_const_value(const_env, var).filter(|addr| *addr >= 0x10000)
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum MemorySlotKey {
-    Absolute(u64),
-    Stack { base: String, offset: i64 },
-}
-
-fn is_stack_base_name(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "sp" | "rsp" | "esp" | "fp" | "rbp" | "ebp" | "x29"
-    )
-}
-
-fn resolve_memory_slot_key(
-    addr_env: &HashMap<String, MemorySlotKey>,
-    const_env: &HashMap<String, u64>,
-    var: &SSAVar,
-) -> Option<MemorySlotKey> {
-    if let Some(addr) = resolve_const_addr(const_env, var) {
-        return Some(MemorySlotKey::Absolute(addr));
-    }
-
-    let lower = var.name.to_ascii_lowercase();
-    if is_stack_base_name(&lower) {
-        return Some(MemorySlotKey::Stack {
-            base: lower,
-            offset: 0,
-        });
-    }
-
-    addr_env.get(&ssa_var_key(var)).cloned()
-}
-
-fn resolve_absolute_addr_with_delta(addr: u64, delta: i64) -> Option<u64> {
-    if delta >= 0 {
-        addr.checked_add(delta as u64)
-    } else {
-        addr.checked_sub(delta.unsigned_abs())
-    }
-}
-
-fn resolve_memory_slot_with_delta(base: MemorySlotKey, delta: i64) -> Option<MemorySlotKey> {
-    match base {
-        MemorySlotKey::Absolute(addr) => {
-            resolve_absolute_addr_with_delta(addr, delta).map(MemorySlotKey::Absolute)
-        }
-        MemorySlotKey::Stack { base, offset } => offset
-            .checked_add(delta)
-            .map(|offset| MemorySlotKey::Stack { base, offset }),
-    }
-}
-
-fn resolve_memory_slot_from_add_sub(
-    addr_env: &HashMap<String, MemorySlotKey>,
-    const_env: &HashMap<String, u64>,
-    a: &SSAVar,
-    b: &SSAVar,
-    is_sub: bool,
-) -> Option<MemorySlotKey> {
-    if let Some(delta_raw) = resolve_const_value(const_env, b)
-        && let Ok(delta) = i64::try_from(delta_raw)
-        && let Some(base) = resolve_memory_slot_key(addr_env, const_env, a)
-    {
-        return resolve_memory_slot_with_delta(base, if is_sub { -delta } else { delta });
-    }
-    if !is_sub
-        && let Some(delta_raw) = resolve_const_value(const_env, a)
-        && let Ok(delta) = i64::try_from(delta_raw)
-        && let Some(base) = resolve_memory_slot_key(addr_env, const_env, b)
-    {
-        return resolve_memory_slot_with_delta(base, delta);
-    }
-    None
 }
 
 const fn bit_width(size: u32) -> u32 {
@@ -233,557 +143,580 @@ fn sign_extend_bits(value: u64, bits: u32) -> u64 {
     }
 }
 
-pub fn data_refs_from_ssa_with_op_sources(
-    ssa_blocks: &[SSABlock],
-    op_sources: Option<&[Vec<u64>]>,
-) -> Vec<DataRefFact> {
-    let mut refs = Vec::new();
-    let mut const_env: HashMap<String, u64> = HashMap::new();
-    let mut addr_env: HashMap<String, MemorySlotKey> = HashMap::new();
-    let mut stack_value_env: HashMap<(SpaceId, MemorySlotKey), u64> = HashMap::new();
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConstantState {
+    Unknown,
+    Exact(u64),
+    Overdefined,
+}
 
-    for (block_idx, block) in ssa_blocks.iter().enumerate() {
-        for (op_idx, op) in block.ops.iter().enumerate() {
-            let from = op_sources
-                .and_then(|blocks| blocks.get(block_idx))
-                .and_then(|ops| ops.get(op_idx))
-                .copied()
-                .unwrap_or(block.addr);
-            match op {
-                SSAOp::Copy { dst, src } => {
-                    if let Some(value) = resolve_const_value(&const_env, src) {
-                        const_env.insert(ssa_var_key(dst), value);
-                    }
-                    if let Some(slot) = resolve_memory_slot_key(&addr_env, &const_env, src) {
-                        addr_env.insert(ssa_var_key(dst), slot);
-                    }
-                    if let Some(addr) = resolve_const_addr(&const_env, src) {
-                        refs.push(DataRefFact::data(from, addr, SpaceId::Ram));
-                    }
-                }
-                SSAOp::Load { dst, space, addr } => {
-                    if let Some(target) = resolve_const_addr(&const_env, addr) {
-                        refs.push(DataRefFact::data(from, target, *space));
-                    }
-                    if let Some(slot) = resolve_memory_slot_key(&addr_env, &const_env, addr)
-                        && let Some(value) = stack_value_env.get(&(*space, slot)).copied()
-                    {
-                        const_env.insert(ssa_var_key(dst), value);
-                        if value >= 0x10000 {
-                            refs.push(DataRefFact::data(from, value, SpaceId::Ram));
-                        }
-                    }
-                }
-                SSAOp::Store { space, addr, val } => {
-                    if let Some(target) = resolve_const_addr(&const_env, addr) {
-                        refs.push(DataRefFact::data(from, target, *space));
-                    }
-                    if let Some(value_addr) = resolve_const_addr(&const_env, val) {
-                        refs.push(DataRefFact::data(from, value_addr, SpaceId::Ram));
-                    }
-                    if let Some(slot) = resolve_memory_slot_key(&addr_env, &const_env, addr) {
-                        let slot = (*space, slot);
-                        if let Some(value) = resolve_const_value(&const_env, val) {
-                            stack_value_env.insert(slot, value);
-                        } else {
-                            stack_value_env.remove(&slot);
-                        }
-                    }
-                }
-                SSAOp::IntAdd { dst, a, b } => {
-                    let computed = if let (Some(lhs), Some(rhs)) = (
-                        resolve_const_value(&const_env, a),
-                        resolve_const_value(&const_env, b),
-                    ) {
-                        Some(lhs.wrapping_add(rhs))
-                    } else {
-                        None
-                    };
-                    if let Some(value) = computed {
-                        const_env.insert(ssa_var_key(dst), value);
-                    }
-                    if let Some(slot) =
-                        resolve_memory_slot_from_add_sub(&addr_env, &const_env, a, b, false)
-                    {
-                        addr_env.insert(ssa_var_key(dst), slot);
-                    }
-                    if let Some(addr) = parse_const_addr(&a.name) {
-                        refs.push(DataRefFact::data(from, addr, SpaceId::Ram));
-                    }
-                    if let Some(addr) = parse_const_addr(&b.name) {
-                        refs.push(DataRefFact::data(from, addr, SpaceId::Ram));
-                    }
-                    if let Some(target) = computed
-                        .filter(|value| *value >= 0x10000)
-                        .or_else(|| resolve_const_addr(&const_env, dst))
-                    {
-                        refs.push(DataRefFact::data(from, target, SpaceId::Ram));
-                    }
-                }
-                SSAOp::IntSub { dst, a, b } => {
-                    let computed = if let (Some(lhs), Some(rhs)) = (
-                        resolve_const_value(&const_env, a),
-                        resolve_const_value(&const_env, b),
-                    ) {
-                        Some(lhs.wrapping_sub(rhs))
-                    } else {
-                        None
-                    };
-                    if let Some(value) = computed {
-                        const_env.insert(ssa_var_key(dst), value);
-                    }
-                    if let Some(slot) =
-                        resolve_memory_slot_from_add_sub(&addr_env, &const_env, a, b, true)
-                    {
-                        addr_env.insert(ssa_var_key(dst), slot);
-                    }
-                    if let Some(addr) = parse_const_addr(&a.name) {
-                        refs.push(DataRefFact::data(from, addr, SpaceId::Ram));
-                    }
-                    if let Some(addr) = parse_const_addr(&b.name) {
-                        refs.push(DataRefFact::data(from, addr, SpaceId::Ram));
-                    }
-                    if let Some(target) = computed
-                        .filter(|value| *value >= 0x10000)
-                        .or_else(|| resolve_const_addr(&const_env, dst))
-                    {
-                        refs.push(DataRefFact::data(from, target, SpaceId::Ram));
-                    }
-                }
-                SSAOp::PtrAdd {
-                    dst,
-                    base,
-                    index,
-                    element_size,
-                } => {
-                    if let (Some(base_val), Some(index_val)) = (
-                        resolve_const_value(&const_env, base),
-                        resolve_const_value(&const_env, index),
-                    ) {
-                        let scaled = index_val.wrapping_mul((*element_size).into());
-                        const_env.insert(ssa_var_key(dst), base_val.wrapping_add(scaled));
-                    }
-                    if let Some(target) = resolve_const_addr(&const_env, dst) {
-                        refs.push(DataRefFact::data(from, target, SpaceId::Ram));
-                    }
-                    if let Some(index_val) = resolve_const_value(&const_env, index)
-                        && let Ok(delta) =
-                            i64::try_from(index_val.wrapping_mul((*element_size).into()))
-                        && let Some(base_slot) =
-                            resolve_memory_slot_key(&addr_env, &const_env, base)
-                        && let Some(slot) = resolve_memory_slot_with_delta(base_slot, delta)
-                    {
-                        addr_env.insert(ssa_var_key(dst), slot);
-                    }
-                }
-                SSAOp::PtrSub {
-                    dst,
-                    base,
-                    index,
-                    element_size,
-                } => {
-                    if let (Some(base_val), Some(index_val)) = (
-                        resolve_const_value(&const_env, base),
-                        resolve_const_value(&const_env, index),
-                    ) {
-                        let scaled = index_val.wrapping_mul((*element_size).into());
-                        const_env.insert(ssa_var_key(dst), base_val.wrapping_sub(scaled));
-                    }
-                    if let Some(target) = resolve_const_addr(&const_env, dst) {
-                        refs.push(DataRefFact::data(from, target, SpaceId::Ram));
-                    }
-                    if let Some(index_val) = resolve_const_value(&const_env, index)
-                        && let Ok(delta) =
-                            i64::try_from(index_val.wrapping_mul((*element_size).into()))
-                        && let Some(base_slot) =
-                            resolve_memory_slot_key(&addr_env, &const_env, base)
-                        && let Some(slot) = resolve_memory_slot_with_delta(base_slot, -delta)
-                    {
-                        addr_env.insert(ssa_var_key(dst), slot);
-                    }
-                }
-                SSAOp::Cast { dst, src } | SSAOp::New { dst, src } => {
-                    if let Some(value) = resolve_const_value(&const_env, src) {
-                        const_env.insert(ssa_var_key(dst), value);
-                    }
-                    if let Some(slot) = resolve_memory_slot_key(&addr_env, &const_env, src) {
-                        addr_env.insert(ssa_var_key(dst), slot);
-                    }
-                    if let Some(addr) = resolve_const_addr(&const_env, src) {
-                        refs.push(DataRefFact::data(from, addr, SpaceId::Ram));
-                    }
-                }
-                SSAOp::IntZExt { dst, src } => {
-                    if let Some(value) = resolve_const_value(&const_env, src) {
-                        let src_bits = bit_width(src.size);
-                        let dst_bits = bit_width(dst.size);
-                        let zext = mask_to_bits(value, src_bits);
-                        const_env.insert(ssa_var_key(dst), mask_to_bits(zext, dst_bits));
-                    }
-                    if let Some(slot) = resolve_memory_slot_key(&addr_env, &const_env, src) {
-                        addr_env.insert(ssa_var_key(dst), slot);
-                    }
-                    if let Some(addr) = resolve_const_addr(&const_env, src) {
-                        refs.push(DataRefFact::data(from, addr, SpaceId::Ram));
-                    }
-                }
-                SSAOp::IntSExt { dst, src } => {
-                    if let Some(value) = resolve_const_value(&const_env, src) {
-                        let src_bits = bit_width(src.size);
-                        let dst_bits = bit_width(dst.size);
-                        let sext = sign_extend_bits(value, src_bits);
-                        const_env.insert(ssa_var_key(dst), mask_to_bits(sext, dst_bits));
-                    }
-                    if let Some(slot) = resolve_memory_slot_key(&addr_env, &const_env, src) {
-                        addr_env.insert(ssa_var_key(dst), slot);
-                    }
-                    if let Some(addr) = resolve_const_addr(&const_env, src) {
-                        refs.push(DataRefFact::data(from, addr, SpaceId::Ram));
-                    }
-                }
-                SSAOp::Call { target, .. } | SSAOp::Branch { target } => {
-                    if let Some(addr) = resolve_const_addr(&const_env, target) {
-                        refs.push(DataRefFact::code(from, addr, SpaceId::Ram));
-                    }
-                }
-                SSAOp::CallInd { target, .. } | SSAOp::BranchInd { target } => {
-                    if let Some(addr) = resolve_const_addr(&const_env, target) {
-                        refs.push(DataRefFact::code(from, addr, SpaceId::Ram));
-                    }
-                }
-                SSAOp::CBranch { target, .. } => {
-                    if let Some(addr) = resolve_const_addr(&const_env, target) {
-                        refs.push(DataRefFact::code(from, addr, SpaceId::Ram));
-                    }
-                }
-                _ => {}
-            }
+impl ConstantState {
+    fn join(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Overdefined, _) | (_, Self::Overdefined) => Self::Overdefined,
+            (Self::Unknown, value) | (value, Self::Unknown) => value,
+            (Self::Exact(left), Self::Exact(right)) if left == right => Self::Exact(left),
+            (Self::Exact(_), Self::Exact(_)) => Self::Overdefined,
         }
     }
 
+    const fn exact(self) -> Option<u64> {
+        match self {
+            Self::Exact(value) => Some(value),
+            Self::Unknown | Self::Overdefined => None,
+        }
+    }
+}
+
+fn exact_graph_constant(graph: &SsaGraph, value: ValueId) -> Option<u64> {
+    let value = graph.value(value)?;
+    let bits = value.var.constant_bits()?;
+    let storage = value.canonical_storage?;
+    (storage.space == CanonicalStorageSpace::Constant
+        && storage.offset == bits
+        && storage.size == value.var.size)
+        .then(|| mask_to_bits(bits, bit_width(value.var.size)))
+}
+
+fn state_of(states: &[ConstantState], value: ValueId) -> ConstantState {
+    states
+        .get(value.0 as usize)
+        .copied()
+        .unwrap_or(ConstantState::Overdefined)
+}
+
+fn output_bits(graph: &SsaGraph, inst: &GraphInst) -> u32 {
+    inst.output
+        .and_then(|value| graph.value(value))
+        .map(|value| bit_width(value.var.size))
+        .unwrap_or(64)
+}
+
+fn unary_state<F>(states: &[ConstantState], input: ValueId, map: F) -> ConstantState
+where
+    F: FnOnce(u64) -> u64,
+{
+    match state_of(states, input) {
+        ConstantState::Unknown => ConstantState::Unknown,
+        ConstantState::Exact(value) => ConstantState::Exact(map(value)),
+        ConstantState::Overdefined => ConstantState::Overdefined,
+    }
+}
+
+fn binary_state<F>(states: &[ConstantState], inputs: &[ValueId], map: F) -> ConstantState
+where
+    F: FnOnce(u64, u64) -> u64,
+{
+    let [left, right] = inputs else {
+        return ConstantState::Overdefined;
+    };
+    match (state_of(states, *left), state_of(states, *right)) {
+        (ConstantState::Overdefined, _) | (_, ConstantState::Overdefined) => {
+            ConstantState::Overdefined
+        }
+        (ConstantState::Exact(left), ConstantState::Exact(right)) => {
+            ConstantState::Exact(map(left, right))
+        }
+        _ => ConstantState::Unknown,
+    }
+}
+
+fn transfer_constant_state<F>(
+    graph: &SsaGraph,
+    inst: &GraphInst,
+    states: &[ConstantState],
+    reload_source: &mut F,
+) -> ConstantState
+where
+    F: FnMut(&GraphInst, ValueId, &SSAOp) -> Option<ValueId>,
+{
+    let bits = output_bits(graph, inst);
+    match &inst.payload {
+        InstPayload::Phi { .. } => inst
+            .inputs
+            .iter()
+            .copied()
+            .fold(ConstantState::Unknown, |state, input| {
+                state.join(state_of(states, input))
+            }),
+        InstPayload::Op(op) => match op {
+            SSAOp::Copy { .. } | SSAOp::Cast { .. } | SSAOp::New { .. } => {
+                let Some(input) = inst.inputs.first().copied() else {
+                    return ConstantState::Overdefined;
+                };
+                unary_state(states, input, |value| mask_to_bits(value, bits))
+            }
+            SSAOp::IntAdd { .. } => binary_state(states, &inst.inputs, |left, right| {
+                mask_to_bits(left.wrapping_add(right), bits)
+            }),
+            SSAOp::IntSub { .. } => binary_state(states, &inst.inputs, |left, right| {
+                mask_to_bits(left.wrapping_sub(right), bits)
+            }),
+            SSAOp::PtrAdd { element_size, .. } => {
+                binary_state(states, &inst.inputs, |base, index| {
+                    mask_to_bits(
+                        base.wrapping_add(index.wrapping_mul(u64::from(*element_size))),
+                        bits,
+                    )
+                })
+            }
+            SSAOp::PtrSub { element_size, .. } => {
+                binary_state(states, &inst.inputs, |base, index| {
+                    mask_to_bits(
+                        base.wrapping_sub(index.wrapping_mul(u64::from(*element_size))),
+                        bits,
+                    )
+                })
+            }
+            SSAOp::IntZExt { .. } => {
+                let Some(input) = inst.inputs.first().copied() else {
+                    return ConstantState::Overdefined;
+                };
+                let input_bits = graph
+                    .value(input)
+                    .map(|value| bit_width(value.var.size))
+                    .unwrap_or(64);
+                unary_state(states, input, |value| {
+                    mask_to_bits(mask_to_bits(value, input_bits), bits)
+                })
+            }
+            SSAOp::IntSExt { .. } => {
+                let Some(input) = inst.inputs.first().copied() else {
+                    return ConstantState::Overdefined;
+                };
+                let input_bits = graph
+                    .value(input)
+                    .map(|value| bit_width(value.var.size))
+                    .unwrap_or(64);
+                unary_state(states, input, |value| {
+                    mask_to_bits(sign_extend_bits(value, input_bits), bits)
+                })
+            }
+            SSAOp::Load { .. } => inst
+                .output
+                .and_then(|output| reload_source(inst, output, op))
+                .map(|source| unary_state(states, source, |value| mask_to_bits(value, bits)))
+                .unwrap_or(ConstantState::Overdefined),
+            _ => ConstantState::Overdefined,
+        },
+    }
+}
+
+fn propagated_constants<F>(graph: &SsaGraph, mut reload_source: F) -> Vec<ConstantState>
+where
+    F: FnMut(&GraphInst, ValueId, &SSAOp) -> Option<ValueId>,
+{
+    let mut states = graph
+        .values
+        .iter()
+        .map(|value| {
+            exact_graph_constant(graph, value.id)
+                .map(ConstantState::Exact)
+                .unwrap_or(ConstantState::Unknown)
+        })
+        .collect::<Vec<_>>();
+    let mut ready = graph
+        .insts
+        .iter()
+        .map(|inst| inst.id)
+        .collect::<BTreeSet<_>>();
+    while let Some(inst_id) = ready.pop_first() {
+        let Some(inst) = graph.inst(inst_id) else {
+            continue;
+        };
+        let Some(output) = inst.output else {
+            continue;
+        };
+        let next = transfer_constant_state(graph, inst, &states, &mut reload_source);
+        let slot = output.0 as usize;
+        let Some(current) = states.get(slot).copied() else {
+            continue;
+        };
+        let next = current.join(next);
+        if next == current {
+            continue;
+        }
+        states[slot] = next;
+        for use_site in graph.use_sites(output) {
+            ready.insert(use_site.inst);
+        }
+    }
+    states
+}
+
+fn push_data_ref(
+    refs: &mut Vec<DataRefFact>,
+    states: &[ConstantState],
+    value: Option<ValueId>,
+    from: u64,
+    space: SpaceId,
+) {
+    if let Some(target) = value
+        .and_then(|value| state_of(states, value).exact())
+        .filter(|target| *target >= 0x10000)
+    {
+        refs.push(DataRefFact::data(from, target, space));
+    }
+}
+
+fn push_code_ref(
+    refs: &mut Vec<DataRefFact>,
+    states: &[ConstantState],
+    value: Option<ValueId>,
+    from: u64,
+) {
+    if let Some(target) = value
+        .and_then(|value| state_of(states, value).exact())
+        .filter(|target| *target >= 0x10000)
+    {
+        refs.push(DataRefFact::code(from, target, SpaceId::Ram));
+    }
+}
+
+fn collect_graph_refs<F>(
+    graph: &SsaGraph,
+    op_sources: &BTreeMap<(u64, usize), u64>,
+    reload_source: F,
+) -> Vec<DataRefFact>
+where
+    F: FnMut(&GraphInst, ValueId, &SSAOp) -> Option<ValueId>,
+{
+    let states = propagated_constants(graph, reload_source);
+    let mut refs = Vec::new();
+    for inst in &graph.insts {
+        let InstPayload::Op(op) = &inst.payload else {
+            continue;
+        };
+        let Some((block_addr, op_idx)) = graph.op_site_for_inst(inst.id) else {
+            continue;
+        };
+        let from = op_sources
+            .get(&(block_addr, op_idx))
+            .copied()
+            .unwrap_or(block_addr);
+        match op {
+            SSAOp::Copy { .. }
+            | SSAOp::Cast { .. }
+            | SSAOp::New { .. }
+            | SSAOp::IntZExt { .. }
+            | SSAOp::IntSExt { .. } => push_data_ref(
+                &mut refs,
+                &states,
+                inst.inputs.first().copied(),
+                from,
+                SpaceId::Ram,
+            ),
+            SSAOp::Load { space, .. }
+            | SSAOp::LoadLinked { space, .. }
+            | SSAOp::LoadGuarded { space, .. } => {
+                push_data_ref(
+                    &mut refs,
+                    &states,
+                    inst.inputs.first().copied(),
+                    from,
+                    *space,
+                );
+                push_data_ref(&mut refs, &states, inst.output, from, SpaceId::Ram);
+            }
+            SSAOp::Store { space, .. }
+            | SSAOp::StoreConditional { space, .. }
+            | SSAOp::StoreGuarded { space, .. } => {
+                push_data_ref(
+                    &mut refs,
+                    &states,
+                    inst.inputs.first().copied(),
+                    from,
+                    *space,
+                );
+                push_data_ref(
+                    &mut refs,
+                    &states,
+                    inst.inputs.get(1).copied(),
+                    from,
+                    SpaceId::Ram,
+                );
+            }
+            SSAOp::AtomicCAS { space, .. } => push_data_ref(
+                &mut refs,
+                &states,
+                inst.inputs.first().copied(),
+                from,
+                *space,
+            ),
+            SSAOp::IntAdd { .. } | SSAOp::IntSub { .. } => {
+                for input in &inst.inputs {
+                    push_data_ref(&mut refs, &states, Some(*input), from, SpaceId::Ram);
+                }
+                push_data_ref(&mut refs, &states, inst.output, from, SpaceId::Ram);
+            }
+            SSAOp::PtrAdd { .. } | SSAOp::PtrSub { .. } => {
+                push_data_ref(&mut refs, &states, inst.output, from, SpaceId::Ram)
+            }
+            SSAOp::Call { .. }
+            | SSAOp::CallInd { .. }
+            | SSAOp::Branch { .. }
+            | SSAOp::BranchInd { .. }
+            | SSAOp::CBranch { .. } => {
+                push_code_ref(&mut refs, &states, inst.inputs.first().copied(), from)
+            }
+            _ => {}
+        }
+    }
     sort_and_dedup_refs(&mut refs);
     refs
 }
 
+/// Recover references from one sealed SSA artifact.
+///
+/// `op_sources` binds graph operation sites to their native instruction. When
+/// an operation has no finer source address, its canonical block address is
+/// used. No variable display spelling participates in identity or propagation.
+pub fn data_refs_from_artifact_with_op_sources(
+    artifact: &SsaArtifact,
+    op_sources: &BTreeMap<(u64, usize), u64>,
+) -> Vec<DataRefFact> {
+    collect_graph_refs(artifact.graph(), op_sources, |inst, output, op| {
+        let SSAOp::Load { space, .. } = op else {
+            return None;
+        };
+        let cert = artifact.stack_reload_certificate_for_value(output)?;
+        let address = inst.inputs.first().copied()?;
+        (cert.value == output
+            && cert.reload == output
+            && cert.load_inst == inst.id
+            && artifact.objects().object(cert.object).is_some()
+            && artifact.objects().object_for_value(address, *space) == Some(cert.object))
+        .then_some(cert.canonical_source)
+    })
+}
+
+/// Build the one authoritative SSA artifact used by the plugin xref callback.
 pub fn data_refs_from_blocks(
     blocks: &[R2ILBlock],
     arch: Option<&ArchSpec>,
-    disasm: &Disassembler,
 ) -> Option<Vec<DataRefFact>> {
-    let mut refs = Vec::new();
-    let mut inst_ssa_blocks = Vec::new();
-    let mut op_source_addrs = Vec::new();
-    for block in blocks {
-        inst_ssa_blocks.push(crate::block::to_ssa(block, disasm));
-        op_source_addrs.push(
-            block
-                .ops
-                .iter()
-                .enumerate()
-                .map(|(op_idx, _)| {
-                    block
-                        .op_metadata(op_idx)
-                        .and_then(|meta| meta.instruction_addr)
-                        .unwrap_or(block.addr)
-                })
-                .collect::<Vec<_>>(),
-        );
-    }
-    refs.extend(data_refs_from_ssa_with_op_sources(
-        &inst_ssa_blocks,
-        Some(&op_source_addrs),
-    ));
-
-    let func = SSAFunction::from_blocks_for_data_refs(blocks, arch)?;
-    let ssa_blocks: Vec<SSABlock> = func
-        .blocks()
-        .map(|block| SSABlock {
-            addr: block.addr,
-            size: block.size,
-            ops: block.ops.clone(),
-        })
-        .collect();
-    if ssa_blocks.is_empty() {
+    let artifact = SsaArtifact::for_data_refs(blocks, arch)?;
+    if artifact.graph().blocks.is_empty() {
         return None;
     }
-
-    refs.extend(data_refs_from_ssa_with_op_sources(&ssa_blocks, None));
-    sort_and_dedup_refs(&mut refs);
-    Some(refs)
+    let op_sources = blocks
+        .iter()
+        .flat_map(|block| {
+            block.ops.iter().enumerate().map(|(op_idx, _)| {
+                let instruction_addr = block
+                    .op_metadata(op_idx)
+                    .and_then(|metadata| metadata.instruction_addr)
+                    .unwrap_or(block.addr);
+                ((block.addr, op_idx), instruction_addr)
+            })
+        })
+        .collect::<BTreeMap<_, _>>();
+    Some(data_refs_from_artifact_with_op_sources(
+        &artifact,
+        &op_sources,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{BlockId, CanonicalStorageId, GraphBlock, GraphValue, InstId, SSAVar, UseSite};
+    use r2il::{R2ILOp, Varnode};
 
-    fn var(name: &str, version: u32, size: u32) -> SSAVar {
-        SSAVar::new(name, version, size)
+    fn graph_value(id: u32, var: SSAVar, space: CanonicalStorageSpace, offset: u64) -> GraphValue {
+        GraphValue {
+            id: ValueId(id),
+            canonical_storage: Some(CanonicalStorageId {
+                space,
+                offset,
+                size: var.size,
+            }),
+            var,
+        }
     }
 
-    #[test]
-    fn data_refs_resolve_const_add_chain_target() {
-        let block = SSABlock {
-            addr: 0x401000,
-            size: 4,
-            ops: vec![
-                SSAOp::Copy {
-                    dst: var("tmp:base", 1, 8),
-                    src: var("const:dead0000", 0, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: var("tmp:target", 1, 8),
-                    a: var("tmp:base", 1, 8),
-                    b: var("const:beef", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: var("tmp:load", 1, 4),
-                    space: r2il::SpaceId::Ram,
-                    addr: var("tmp:target", 1, 8),
-                },
-            ],
-        };
-
-        let refs = data_refs_from_ssa_with_op_sources(&[block], None);
-        assert!(refs.contains(&DataRefFact::data(0x401000, 0xdeadbeef, SpaceId::Ram)));
-    }
-
-    #[test]
-    fn data_refs_ignore_small_const_add_chain() {
-        let block = SSABlock {
-            addr: 0x402000,
-            size: 4,
-            ops: vec![SSAOp::IntAdd {
-                dst: var("tmp:small", 1, 8),
-                a: var("const:40", 0, 8),
-                b: var("const:2", 0, 8),
+    fn graph_with_ops(
+        values: Vec<GraphValue>,
+        ops: Vec<(Vec<ValueId>, Option<ValueId>, SSAOp)>,
+    ) -> SsaGraph {
+        let block = BlockId(0);
+        let mut insts = Vec::new();
+        let mut def_of = vec![None; values.len()];
+        let mut uses_of = vec![Vec::new(); values.len()];
+        let mut op_inst_by_site = BTreeMap::new();
+        let mut op_site_by_inst = BTreeMap::new();
+        for (ordinal, (inputs, output, op)) in ops.into_iter().enumerate() {
+            let id = InstId(ordinal as u32);
+            for (input_idx, input) in inputs.iter().copied().enumerate() {
+                uses_of[input.0 as usize].push(UseSite {
+                    inst: id,
+                    input_idx,
+                });
+            }
+            if let Some(output) = output {
+                def_of[output.0 as usize] = Some(id);
+            }
+            op_inst_by_site.insert((0x401000, ordinal), id);
+            op_site_by_inst.insert(id, (0x401000, ordinal));
+            insts.push(GraphInst {
+                id,
+                block,
+                ordinal,
+                inputs,
+                output,
+                canonical_storage: output
+                    .and_then(|value| values.get(value.0 as usize))
+                    .and_then(|value| value.canonical_storage),
+                payload: InstPayload::Op(op),
+            });
+        }
+        let inst_ids = insts.iter().map(|inst| inst.id).collect::<Vec<_>>();
+        let value_by_var = values
+            .iter()
+            .map(|value| (value.var.clone(), value.id))
+            .collect();
+        SsaGraph {
+            entry: block,
+            block_order: vec![block],
+            blocks: vec![GraphBlock {
+                id: block,
+                addr: 0x401000,
+                size: 4,
+                predecessors: Vec::new(),
+                successors: Vec::new(),
+                insts: inst_ids,
             }],
-        };
-
-        let refs = data_refs_from_ssa_with_op_sources(&[block], None);
-        assert!(!refs.iter().any(|reference| reference.to == 0x42));
+            insts,
+            values,
+            def_of,
+            uses_of,
+            block_by_addr: BTreeMap::from([(0x401000, block)]),
+            value_by_var,
+            op_inst_by_site,
+            op_site_by_inst,
+        }
     }
 
     #[test]
-    fn data_refs_resolve_const_add_chain_across_blocks() {
-        let block_a = SSABlock {
-            addr: 0x403000,
-            size: 4,
-            ops: vec![SSAOp::Copy {
-                dst: var("tmp:base", 1, 8),
-                src: var("const:dead0000", 0, 8),
-            }],
-        };
-        let block_b = SSABlock {
-            addr: 0x403004,
-            size: 4,
-            ops: vec![
-                SSAOp::IntAdd {
-                    dst: var("tmp:target", 1, 8),
-                    a: var("tmp:base", 1, 8),
-                    b: var("const:beef", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: var("tmp:load", 1, 4),
-                    space: r2il::SpaceId::Ram,
-                    addr: var("tmp:target", 1, 8),
-                },
+    fn exact_value_ids_keep_case_colliding_names_separate() {
+        let first_constant = SSAVar::constant(0x410000, 8);
+        let second_constant = SSAVar::constant(0x520000, 8);
+        let first = SSAVar::new("Alias", 1, 8);
+        let second = SSAVar::new("alias", 1, 8);
+        let first_load = SSAVar::new("first_load", 1, 8);
+        let second_load = SSAVar::new("second_load", 1, 8);
+        let graph = graph_with_ops(
+            vec![
+                graph_value(
+                    0,
+                    first_constant.clone(),
+                    CanonicalStorageSpace::Constant,
+                    0x410000,
+                ),
+                graph_value(
+                    1,
+                    second_constant.clone(),
+                    CanonicalStorageSpace::Constant,
+                    0x520000,
+                ),
+                graph_value(2, first.clone(), CanonicalStorageSpace::Unique, 0x10),
+                graph_value(3, second.clone(), CanonicalStorageSpace::Unique, 0x20),
+                graph_value(4, first_load.clone(), CanonicalStorageSpace::Unique, 0x30),
+                graph_value(5, second_load.clone(), CanonicalStorageSpace::Unique, 0x40),
             ],
-        };
-
-        let refs = data_refs_from_ssa_with_op_sources(&[block_a, block_b], None);
-        assert!(refs.contains(&DataRefFact::data(0x403004, 0xdeadbeef, SpaceId::Ram)));
-    }
-
-    #[test]
-    fn data_refs_use_per_op_source_addr_when_available() {
-        let block = SSABlock {
-            addr: 0x404000,
-            size: 0x20,
-            ops: vec![
-                SSAOp::Copy {
-                    dst: var("tmp:base", 1, 8),
-                    src: var("const:404d00", 0, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: var("tmp:target", 1, 8),
-                    a: var("tmp:base", 1, 8),
-                    b: var("const:108", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: var("tmp:load", 1, 8),
-                    space: r2il::SpaceId::Ram,
-                    addr: var("tmp:target", 1, 8),
-                },
+            vec![
+                (
+                    vec![ValueId(0)],
+                    Some(ValueId(2)),
+                    SSAOp::Copy {
+                        dst: first.clone(),
+                        src: first_constant,
+                    },
+                ),
+                (
+                    vec![ValueId(1)],
+                    Some(ValueId(3)),
+                    SSAOp::Copy {
+                        dst: second.clone(),
+                        src: second_constant,
+                    },
+                ),
+                (
+                    vec![ValueId(2)],
+                    Some(ValueId(4)),
+                    SSAOp::Load {
+                        dst: first_load,
+                        space: SpaceId::Ram,
+                        addr: first,
+                    },
+                ),
+                (
+                    vec![ValueId(3)],
+                    Some(ValueId(5)),
+                    SSAOp::Load {
+                        dst: second_load,
+                        space: SpaceId::Ram,
+                        addr: second,
+                    },
+                ),
             ],
-        };
-        let op_sources = vec![vec![0x404008, 0x40400c, 0x404010]];
-
-        let refs = data_refs_from_ssa_with_op_sources(&[block], Some(&op_sources));
-        assert!(refs.contains(&DataRefFact::data(0x40400c, 0x404e08, SpaceId::Ram)));
-    }
-
-    #[test]
-    fn data_refs_use_per_op_source_addr_for_const_sub_chain() {
-        let block = SSABlock {
-            addr: 0x405000,
-            size: 0x20,
-            ops: vec![
-                SSAOp::Copy {
-                    dst: var("tmp:base", 1, 8),
-                    src: var("const:405000", 0, 8),
-                },
-                SSAOp::IntSub {
-                    dst: var("tmp:target", 1, 8),
-                    a: var("tmp:base", 1, 8),
-                    b: var("const:108", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: var("tmp:load", 1, 8),
-                    space: r2il::SpaceId::Ram,
-                    addr: var("tmp:target", 1, 8),
-                },
-            ],
-        };
-        let op_sources = vec![vec![0x405008, 0x40500c, 0x405010]];
-
-        let refs = data_refs_from_ssa_with_op_sources(&[block], Some(&op_sources));
-        assert!(refs.contains(&DataRefFact::data(0x40500c, 0x404ef8, SpaceId::Ram)));
-    }
-
-    #[test]
-    fn data_refs_resolve_const_add_chain_through_stack_spills() {
-        let block = SSABlock {
-            addr: 0x100001138,
-            size: 0x3c,
-            ops: vec![
-                SSAOp::IntSub {
-                    dst: var("SP", 1, 8),
-                    a: var("SP", 0, 8),
-                    b: var("const:10", 0, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: var("tmp:6500", 1, 8),
-                    a: var("SP", 1, 8),
-                    b: var("const:8", 0, 8),
-                },
-                SSAOp::Store {
-                    space: r2il::SpaceId::Ram,
-                    addr: var("tmp:6500", 1, 8),
-                    val: var("const:404d00", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: var("X8", 4, 8),
-                    space: r2il::SpaceId::Ram,
-                    addr: var("tmp:6500", 1, 8),
-                },
-                SSAOp::IntAdd {
-                    dst: var("tmp:11f80", 1, 8),
-                    a: var("X8", 4, 8),
-                    b: var("const:108", 0, 8),
-                },
-                SSAOp::Store {
-                    space: r2il::SpaceId::Ram,
-                    addr: var("SP", 1, 8),
-                    val: var("tmp:11f80", 1, 8),
-                },
-                SSAOp::Load {
-                    dst: var("X9", 1, 8),
-                    space: r2il::SpaceId::Ram,
-                    addr: var("SP", 1, 8),
-                },
-                SSAOp::IntSub {
-                    dst: var("tmp:cmp", 1, 8),
-                    a: var("X9", 1, 8),
-                    b: var("const:404e08", 0, 8),
-                },
-            ],
-        };
-        let op_sources = vec![vec![
-            0x100001138,
-            0x10000113c,
-            0x100001140,
-            0x100001144,
-            0x100001148,
-            0x10000114c,
-            0x100001150,
-            0x100001154,
-        ]];
-
-        let refs = data_refs_from_ssa_with_op_sources(&[block], Some(&op_sources));
-        assert!(refs.contains(&DataRefFact::data(0x100001148, 0x404e08, SpaceId::Ram)));
-    }
-
-    #[test]
-    fn data_refs_bind_direct_memory_targets_to_exact_space() {
-        let block = SSABlock {
-            addr: 0x5000,
-            size: 8,
-            ops: vec![
-                SSAOp::Load {
-                    dst: var("tmp:ram", 1, 8),
-                    space: SpaceId::Ram,
-                    addr: var("const:50000", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: var("tmp:custom", 1, 8),
-                    space: SpaceId::Custom(7),
-                    addr: var("const:50000", 0, 8),
-                },
-            ],
-        };
-        let refs = data_refs_from_ssa_with_op_sources(&[block], None);
-        assert!(refs.contains(&DataRefFact::data(0x5000, 0x50000, SpaceId::Ram)));
-        assert!(refs.contains(&DataRefFact::data(0x5000, 0x50000, SpaceId::Custom(7))));
-    }
-
-    #[test]
-    fn data_ref_shadow_state_never_crosses_memory_spaces() {
-        let slot = var("SP", 0, 8);
-        let block = SSABlock {
-            addr: 0x6000,
-            size: 24,
-            ops: vec![
-                SSAOp::Store {
-                    space: SpaceId::Ram,
-                    addr: slot.clone(),
-                    val: var("const:404d00", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: var("tmp:wrong_space", 1, 8),
-                    space: SpaceId::Custom(7),
-                    addr: slot.clone(),
-                },
-                SSAOp::IntAdd {
-                    dst: var("tmp:not_a_ref", 1, 8),
-                    a: var("tmp:wrong_space", 1, 8),
-                    b: var("const:108", 0, 8),
-                },
-                SSAOp::Store {
-                    space: SpaceId::Custom(7),
-                    addr: slot.clone(),
-                    val: var("const:405000", 0, 8),
-                },
-                SSAOp::Load {
-                    dst: var("tmp:exact_space", 1, 8),
-                    space: SpaceId::Custom(7),
-                    addr: slot,
-                },
-                SSAOp::IntAdd {
-                    dst: var("tmp:is_a_ref", 1, 8),
-                    a: var("tmp:exact_space", 1, 8),
-                    b: var("const:108", 0, 8),
-                },
-            ],
-        };
-        let op_sources = vec![vec![0x6000, 0x6004, 0x6008, 0x600c, 0x6010, 0x6014]];
-        let refs = data_refs_from_ssa_with_op_sources(&[block], Some(&op_sources));
-        assert!(
-            !refs
-                .iter()
-                .any(|fact| fact.from == 0x6008 && fact.to == 0x404e08)
         );
-        assert!(refs.contains(&DataRefFact::data(0x6010, 0x405000, SpaceId::Ram)));
-        assert!(refs.contains(&DataRefFact::data(0x6014, 0x405108, SpaceId::Ram)));
+        let sources = BTreeMap::from([((0x401000, 2), 0x401008), ((0x401000, 3), 0x40100c)]);
+        let refs = collect_graph_refs(&graph, &sources, |_, _, _| None);
+        assert!(refs.contains(&DataRefFact::data(0x401008, 0x410000, SpaceId::Ram)));
+        assert!(refs.contains(&DataRefFact::data(0x40100c, 0x520000, SpaceId::Ram)));
+        assert!(!refs.contains(&DataRefFact::data(0x401008, 0x520000, SpaceId::Ram)));
+        assert!(!refs.contains(&DataRefFact::data(0x40100c, 0x410000, SpaceId::Ram)));
+    }
+
+    #[test]
+    fn constant_spelling_without_exact_bits_is_not_evidence() {
+        let spoofed = SSAVar::new("const:deadbeef", 0, 8);
+        let loaded = SSAVar::new("loaded", 1, 8);
+        let graph = graph_with_ops(
+            vec![
+                graph_value(0, spoofed.clone(), CanonicalStorageSpace::Unique, 0x10),
+                graph_value(1, loaded.clone(), CanonicalStorageSpace::Unique, 0x20),
+            ],
+            vec![(
+                vec![ValueId(0)],
+                Some(ValueId(1)),
+                SSAOp::Load {
+                    dst: loaded,
+                    space: SpaceId::Ram,
+                    addr: spoofed,
+                },
+            )],
+        );
+        assert!(collect_graph_refs(&graph, &BTreeMap::new(), |_, _, _| None).is_empty());
+    }
+
+    #[test]
+    fn artifact_api_uses_exact_constants_and_op_source_sites() {
+        let mut block = R2ILBlock::new(0x404000, 0x20);
+        block.push(R2ILOp::Copy {
+            dst: Varnode::unique(0x10, 8),
+            src: Varnode::constant(0x404d00, 8),
+        });
+        block.push(R2ILOp::IntAdd {
+            dst: Varnode::unique(0x20, 8),
+            a: Varnode::unique(0x10, 8),
+            b: Varnode::constant(0x108, 8),
+        });
+        block.push(R2ILOp::Load {
+            dst: Varnode::unique(0x30, 8),
+            space: SpaceId::Ram,
+            addr: Varnode::unique(0x20, 8),
+        });
+        let artifact = SsaArtifact::for_data_refs(&[block], None).expect("valid SSA artifact");
+        let sources = BTreeMap::from([
+            ((0x404000, 0), 0x404008),
+            ((0x404000, 1), 0x40400c),
+            ((0x404000, 2), 0x404010),
+        ]);
+        let refs = data_refs_from_artifact_with_op_sources(&artifact, &sources);
+        assert!(refs.contains(&DataRefFact::data(0x40400c, 0x404e08, SpaceId::Ram)));
+        assert!(refs.contains(&DataRefFact::data(0x404010, 0x404e08, SpaceId::Ram)));
     }
 }
 
@@ -795,7 +728,6 @@ mod kani_proofs {
     fn data_ref_bit_width_clamps_to_machine_word() {
         let size: u32 = kani::any();
         let bits = bit_width(size);
-
         assert!(bits <= 64);
         if size <= 8 {
             assert_eq!(bits, size * 8);
@@ -809,7 +741,6 @@ mod kani_proofs {
         let value: u64 = kani::any();
         let bits: u32 = kani::any();
         let masked = mask_to_bits(value, bits);
-
         if bits == 0 {
             assert_eq!(masked, 0);
         } else if bits >= 64 {
@@ -819,19 +750,5 @@ mod kani_proofs {
             assert_eq!(masked, expected);
             assert_eq!(masked >> bits, 0);
         }
-    }
-
-    #[kani::proof]
-    fn data_ref_absolute_addr_delta_uses_checked_arithmetic() {
-        let addr: u64 = kani::any();
-        let delta: i64 = kani::any();
-        let resolved = resolve_absolute_addr_with_delta(addr, delta);
-
-        let expected = if delta >= 0 {
-            addr.checked_add(delta as u64)
-        } else {
-            addr.checked_sub(delta.unsigned_abs())
-        };
-        assert_eq!(resolved, expected);
     }
 }

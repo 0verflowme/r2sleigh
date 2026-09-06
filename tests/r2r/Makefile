@@ -125,18 +125,32 @@ $(E2E_DIR)/sym_test_x86: $(E2E_DIR)/sym_test.c
 	gcc -m64 -O0 -g -o $@ $<
 endif
 
+# The debug info has to be linked beside the binary, not just the binary.
+# radare2 looks for `<path>.dSYM` next to the path it was given, so a lone
+# symlink into ../e2e silently drops every parameter name and every dbg.*
+# symbol the fixture was built with.
+LINKED_BINS := \
+	vuln_test \
+	stress_test \
+	stress_test_opt \
+	vuln_test_x86 \
+	stress_test_x86 \
+	stress_test_opt_x86 \
+	test_func \
+	sym_test \
+	test_func_x86 \
+	sym_test_x86
+
 link-bins: build-bins
 	@mkdir -p bins
-	@ln -sf ../../e2e/vuln_test bins/vuln_test
-	@ln -sf ../../e2e/stress_test bins/stress_test
-	@ln -sf ../../e2e/stress_test_opt bins/stress_test_opt
-	@ln -sf ../../e2e/vuln_test_x86 bins/vuln_test_x86
-	@ln -sf ../../e2e/stress_test_x86 bins/stress_test_x86
-	@ln -sf ../../e2e/stress_test_opt_x86 bins/stress_test_opt_x86
-	@if [ -f ../e2e/test_func ]; then ln -sf ../../e2e/test_func bins/test_func; fi
-	@if [ -f ../e2e/sym_test ]; then ln -sf ../../e2e/sym_test bins/sym_test; fi
-	@if [ -f ../e2e/test_func_x86 ]; then ln -sf ../../e2e/test_func_x86 bins/test_func_x86; fi
-	@if [ -f ../e2e/sym_test_x86 ]; then ln -sf ../../e2e/sym_test_x86 bins/sym_test_x86; fi
+	@for name in $(LINKED_BINS); do \
+		if [ -f "../e2e/$$name" ]; then \
+			ln -sf "../../e2e/$$name" "bins/$$name"; \
+			if [ -d "../e2e/$$name.dSYM" ]; then \
+				ln -sfn "../../e2e/$$name.dSYM" "bins/$$name.dSYM"; \
+			fi; \
+		fi; \
+	done
 
 install-plugin:
 	@mkdir -p "$(R2R_PLUGIN_DIR)"

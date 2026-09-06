@@ -193,7 +193,7 @@ fn vm_summary_signature_comment(func_name: &str, function_facts: &FunctionFacts)
     let ret = signature
         .ret_type
         .as_ref()
-        .map(crate::type_like_to_ctype)
+        .cloned()
         .filter(|ty| !matches!(ty, CType::Unknown))?;
     let mut params = Vec::new();
     for (index, param) in signature.params.iter().enumerate() {
@@ -206,7 +206,7 @@ fn vm_summary_signature_comment(func_name: &str, function_facts: &FunctionFacts)
         {
             continue;
         }
-        let Some(ty) = param.ty.as_ref().map(crate::type_like_to_ctype) else {
+        let Some(ty) = param.ty.as_ref().cloned() else {
             continue;
         };
         if matches!(ty, CType::Unknown | CType::Void) {
@@ -296,7 +296,10 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use r2il::{ArchSpec, R2ILBlock, R2ILOp, RegisterDef, Varnode};
+    use r2il::{
+        ArchSpec, R2ILBlock, R2ILOp, RegisterBitSlice, RegisterDef, RegisterProjection,
+        RegisterProjectionDisposition, RegisterStorage, Varnode,
+    };
 
     fn source_owned_vm_facts() -> r2types::SourceOwnedFunctionFacts {
         let mut arch = ArchSpec::new("x86-64");
@@ -312,6 +315,96 @@ mod tests {
         ] {
             arch.add_register(RegisterDef::new(name, offset, size));
         }
+        let projection = |written: RegisterStorage, carrier: RegisterStorage, size_bits: u64| {
+            RegisterProjection {
+                written,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier,
+                    slice: RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits,
+                    },
+                },
+            }
+        };
+        arch.register_projections = vec![
+            projection(
+                RegisterStorage { offset: 0, size: 8 },
+                RegisterStorage { offset: 0, size: 8 },
+                64,
+            ),
+            projection(
+                RegisterStorage { offset: 0, size: 4 },
+                RegisterStorage { offset: 0, size: 8 },
+                32,
+            ),
+            projection(
+                RegisterStorage {
+                    offset: 0x10,
+                    size: 8,
+                },
+                RegisterStorage {
+                    offset: 0x10,
+                    size: 8,
+                },
+                64,
+            ),
+            projection(
+                RegisterStorage {
+                    offset: 0x18,
+                    size: 8,
+                },
+                RegisterStorage {
+                    offset: 0x18,
+                    size: 8,
+                },
+                64,
+            ),
+            projection(
+                RegisterStorage {
+                    offset: 0x18,
+                    size: 4,
+                },
+                RegisterStorage {
+                    offset: 0x18,
+                    size: 8,
+                },
+                32,
+            ),
+            projection(
+                RegisterStorage {
+                    offset: 0x20,
+                    size: 8,
+                },
+                RegisterStorage {
+                    offset: 0x20,
+                    size: 8,
+                },
+                64,
+            ),
+            projection(
+                RegisterStorage {
+                    offset: 0x28,
+                    size: 8,
+                },
+                RegisterStorage {
+                    offset: 0x28,
+                    size: 8,
+                },
+                64,
+            ),
+            projection(
+                RegisterStorage {
+                    offset: 0x30,
+                    size: 8,
+                },
+                RegisterStorage {
+                    offset: 0x30,
+                    size: 8,
+                },
+                64,
+            ),
+        ];
         let mut block = R2ILBlock::new(0x401000, 4);
         block.push(R2ILOp::Load {
             dst: Varnode::unique(0x100, 1),
@@ -326,12 +419,21 @@ mod tests {
             dst: Varnode::unique(0x110, 4),
             src: Varnode::register(0x18, 4),
         });
-        block.push(R2ILOp::Copy {
+        // An arithmetic write, so the narrow result survives as its own
+        // definition rather than being folded into its uses.
+        block.push(R2ILOp::IntAdd {
             dst: Varnode::register(0x00, 4),
-            src: Varnode::constant(0, 4),
+            a: Varnode::register(0x18, 4),
+            b: Varnode::constant(0, 4),
+        });
+        // The carrier clear the lift states for a narrow x86-64 register
+        // write, which is what makes the full return register defined here.
+        block.push(R2ILOp::IntZExt {
+            dst: Varnode::register(0x00, 8),
+            src: Varnode::register(0x00, 4),
         });
         block.push(R2ILOp::Return {
-            target: Varnode::register(0x00, 4),
+            target: Varnode::register(0x30, 8),
         });
 
         let storage = |offset| r2ssa::CanonicalStorageId {

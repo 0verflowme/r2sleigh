@@ -1,31 +1,1370 @@
 use super::calls::CertifiedCallArgs;
+use super::memory_renderer::CertifiedMemoryAccessExpr;
+use super::projection::project_machine_write;
 use super::*;
+use r2rewrite::CValue;
+
+/// Every definition the sealed inline plan would have nested under `value`.
+///
+/// Ordinary inline lowering records these through nested replacement
+/// expressions. A frame-object address replaces the whole expression with one
+/// program-object spelling, so it has no nested AST on which to carry those
+/// contracts and must collect the same closure up front.
+fn planned_inline_definition_closure(
+    prepared: &r2ssa::SsaArtifact,
+    names: &crate::binding_plan::BindingNameResolution,
+    value: ValueId,
+) -> Option<Vec<r2ssa::InstId>> {
+    let mut pending = vec![value];
+    let mut seen = BTreeSet::new();
+    let mut definitions = BTreeSet::new();
+    while let Some(value) = pending.pop() {
+        if !seen.insert(value)
+            || !matches!(
+                names.plan().disposition(value),
+                Some(crate::binding_plan::ValueDisposition::Inline { .. })
+            )
+        {
+            continue;
+        }
+        let Some(definition) = prepared.graph().def_inst(value) else {
+            continue;
+        };
+        let instruction = prepared.graph().inst(definition)?;
+        definitions.insert(definition);
+        pending.extend(instruction.inputs.iter().copied());
+    }
+    Some(definitions.into_iter().collect())
+}
+
+fn operation_requires_final_write_projection(op: &SSAOp) -> bool {
+    op.dst().is_some()
+}
+
+/// One bound value's assignment, spelled from the rewriter's canonical term.
+///
+/// The cells it owes travel with it because they are not the cells the
+/// operation arms' statement would have owed; see
+/// [`FoldingContext::canonical_bound_assignment`].
+struct CanonicalBoundAssignment {
+    stmt: CStmt,
+    value: ValueId,
+    definition: r2ssa::InstId,
+    /// The producers the term expanded and then stopped reading.
+    absorbed: Vec<r2ssa::InstId>,
+}
 
 impl<'a> FoldingContext<'a> {
+    /// Turn one opaque rendering result into the complete source-cell set it
+    /// replaces. This is the only extractor for [`PendingReplacementExpr`].
+    ///
+    /// A plain value read replaces no instruction. An inlined value replaces
+    /// its definition when one exists. Canonical memory rewrites replace
+    /// exactly the instructions recorded by the authority-bound access term.
+    /// Callers cannot pass any of those instruction lists.
+    pub(super) fn finish_replacement_expr(&self, pending: PendingReplacementExpr) -> CExpr {
+        let PendingReplacementExpr {
+            expr,
+            value,
+            source,
+        } = pending;
+        let Some(journal) = self.inputs.observation_journal else {
+            return expr;
+        };
+        let invalid = || {
+            crate::observation_journal::LegacyObservationJournalError::MissingPlannedValue(value)
+        };
+        let Some(prepared) = self.inputs.prepared_ssa else {
+            self.retain_first_observation_error(invalid());
+            return expr;
+        };
+        let (replaced, frame_address) = match source {
+            ReplacementSource::RenderedValue => (Vec::new(), None),
+            ReplacementSource::PlannedInline => {
+                let Some(names) = self.inputs.binding_names else {
+                    self.retain_first_observation_error(invalid());
+                    return expr;
+                };
+                let Some(rewrite) = names.plan().canonical().value(value) else {
+                    self.retain_first_observation_error(invalid());
+                    return expr;
+                };
+                let mut replaced = prepared
+                    .graph()
+                    .def_inst(value)
+                    .into_iter()
+                    .collect::<BTreeSet<_>>();
+                for id in &rewrite.discharges {
+                    let Some(inst) = (match id.site {
+                        r2ssa::CanonicalInstructionSite::Op(ordinal) => {
+                            usize::try_from(ordinal).ok().and_then(|op_idx| {
+                                prepared.graph().inst_id_for_op_site(id.block_addr, op_idx)
+                            })
+                        }
+                        r2ssa::CanonicalInstructionSite::Phi(_)
+                        | r2ssa::CanonicalInstructionSite::NativeSpan { .. } => None,
+                    }) else {
+                        self.retain_first_observation_error(invalid());
+                        return expr;
+                    };
+                    replaced.insert(inst);
+                }
+                (replaced.into_iter().collect(), None)
+            }
+            ReplacementSource::CanonicalAccess(access) => {
+                let Some(names) = self.inputs.binding_names else {
+                    self.retain_first_observation_error(invalid());
+                    return expr;
+                };
+                let Some(rewrite) = names.plan().canonical().access(access) else {
+                    self.retain_first_observation_error(invalid());
+                    return expr;
+                };
+                let replaced = rewrite
+                    .discharges
+                    .iter()
+                    .filter_map(|id| match id.site {
+                        r2ssa::CanonicalInstructionSite::Op(ordinal) => {
+                            usize::try_from(ordinal).ok().and_then(|op_idx| {
+                                prepared.graph().inst_id_for_op_site(id.block_addr, op_idx)
+                            })
+                        }
+                        r2ssa::CanonicalInstructionSite::Phi(_)
+                        | r2ssa::CanonicalInstructionSite::NativeSpan { .. } => None,
+                    })
+                    .collect::<Vec<_>>();
+                if replaced.len() != rewrite.discharges.len() {
+                    self.retain_first_observation_error(invalid());
+                    return expr;
+                }
+                (replaced, None)
+            }
+            ReplacementSource::EscapedStackAddress(frame_address) => {
+                let Some(names) = self.inputs.binding_names else {
+                    self.retain_first_observation_error(invalid());
+                    return expr;
+                };
+                let Some(replaced) = planned_inline_definition_closure(prepared, names, value)
+                else {
+                    self.retain_first_observation_error(invalid());
+                    return expr;
+                };
+                (replaced, Some(frame_address))
+            }
+        };
+        let obligations = replaced
+            .iter()
+            .flat_map(|definition| {
+                let output = prepared
+                    .graph()
+                    .inst(*definition)
+                    .and_then(|inst| inst.output);
+                self.exact_effect_obligations_for_source_inst(
+                    EffectOccurrenceKind::Expression,
+                    *definition,
+                    output,
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        let fallback = expr.clone();
+        let contract =
+            RenderedReplacementContract::new(expr, value, replaced, obligations, frame_address);
+        match journal
+            .borrow_mut()
+            .observe_rendered_replacement_expr(contract)
+        {
+            Ok(marked) => marked,
+            Err(error) => {
+                self.retain_first_observation_error(error);
+                fallback
+            }
+        }
+    }
+
+    fn observation_lowering_refusal(
+        error: &crate::observation_journal::LegacyObservationJournalError,
+    ) -> OpLoweringRefusal {
+        use crate::observation_journal::LegacyObservationJournalError as Error;
+        match error {
+            Error::RenderedValueRequired { .. }
+            | Error::InvalidPlannedInline { .. }
+            | Error::PlannedElidedValueRendered { .. }
+            | Error::PlannedRefusedValueRendered { .. }
+            | Error::MissingPlannedValue(_) => {
+                if std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
+                    eprintln!("refusal from journal error {error:?}");
+                }
+                OpLoweringRefusal::missing_program_variable()
+            }
+            other => {
+                if std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
+                    eprintln!("refusal from journal error {other:?}");
+                }
+                OpLoweringRefusal::missing_machine_projection()
+            }
+        }
+    }
+
+    fn exact_normalized_op_effects(
+        &self,
+        op: &SSAOp,
+        block_addr: u64,
+        op_idx: usize,
+    ) -> std::collections::BTreeSet<r2ssa::SemanticObligationId> {
+        // A call has no `dst`. One statement implements two instructions --
+        // the call supplies the effect, the `CallDefine` owns the write -- so
+        // the value the occurrence names has to come from the site's certified
+        // result rather than from the operation's own output, which does not
+        // exist. Without it the call-result obligation matched no occurrence
+        // and every function that called anything was refused for a result its
+        // rendering did assign.
+        let rendered_value = match op {
+            SSAOp::Call { .. } | SSAOp::CallInd { .. } => {
+                self.certified_call_result_value((block_addr, op_idx))
+            }
+            _ => op.dst().and_then(|dst| self.value_id_for_rendered_op(dst)),
+        };
+        let mut obligations = self.exact_effect_obligations_for_normalized_value(
+            EffectOccurrenceKind::Expression,
+            block_addr,
+            op_idx,
+            rendered_value,
+        );
+        // The other half of the same statement. `x = f()` renders the call and
+        // the definition of its result at once, so the `CallDefine`'s own
+        // obligations are answered here; the `CallDefine` itself lowers to no
+        // statement precisely because this one already assigned it, and left
+        // alone its producer obligation had nothing to name.
+        if matches!(op, SSAOp::Call { .. } | SSAOp::CallInd { .. })
+            && let Some((define_block, define_idx)) =
+                self.certified_call_result_definition_site((block_addr, op_idx))
+        {
+            obligations.extend(self.exact_effect_obligations_for_normalized_value(
+                EffectOccurrenceKind::Expression,
+                define_block,
+                define_idx,
+                rendered_value,
+            ));
+        }
+        // Memory-effect ownership comes from the exact source operation and its
+        // certified access, not from the finalized C shape. A stack-object
+        // assignment is still the same source Store even though its AST no
+        // longer contains a pointer dereference.
+        let memory = match op {
+            SSAOp::Load { .. } => self
+                .certified_memory_access_for_current_op(false)
+                .map(|cert| (EffectOccurrenceKind::MemoryRead, cert)),
+            SSAOp::Store { .. } => self
+                .certified_memory_access_for_current_op(true)
+                .map(|cert| (EffectOccurrenceKind::MemoryWrite, cert)),
+            _ => None,
+        };
+        if let Some((kind, cert)) = memory {
+            obligations.extend(self.exact_effect_obligations_for_normalized_memory(
+                kind,
+                block_addr,
+                op_idx,
+                cert.space,
+                Some(cert.address),
+                cert.value,
+            ));
+        }
+        obligations
+    }
+
+    pub(super) fn normalized_output_projection(
+        &self,
+        site: crate::normalize::NormalizedOpSite,
+    ) -> Result<
+        crate::normalize::NormalizedOutputProjection,
+        crate::observation_journal::LegacyObservationJournalError,
+    > {
+        let prepared = self.inputs.prepared_ssa.ok_or(
+            crate::observation_journal::LegacyObservationJournalError::MissingNormalizedSiteContext,
+        )?;
+        self.inputs
+            .normalization_origins
+            .ok_or(
+                crate::observation_journal::LegacyObservationJournalError::MissingNormalizedSiteContext,
+            )?
+            .projection(site, prepared)
+            .map_err(crate::observation_journal::LegacyObservationJournalError::Normalization)?
+            .ok_or(
+                crate::observation_journal::LegacyObservationJournalError::InvalidNormalizedSite(
+                    site,
+                ),
+            )?
+            .output
+            .ok_or(
+                crate::observation_journal::LegacyObservationJournalError::MissingNormalizedOutput(
+                    site,
+                ),
+            )
+    }
+
+    fn project_planned_assignment(
+        &self,
+        site: Option<crate::normalize::NormalizedOpSite>,
+        lhs: CExpr,
+        rhs: CExpr,
+    ) -> Result<(CExpr, CExpr), crate::observation_journal::LegacyObservationJournalError> {
+        let Some(site) = site else {
+            return Ok((lhs, rhs));
+        };
+        let output = self.normalized_output_projection(site)?;
+        let Some(names) = self.inputs.binding_names else {
+            return Err(
+                crate::observation_journal::LegacyObservationJournalError::MissingPlannedValue(
+                    output.value,
+                ),
+            );
+        };
+        match names.require_write(output.inst) {
+            Ok(r2ssa::MachineWriteDisposition::Exact(projection)) => {
+                // What the right-hand side has: stated by the lowering that
+                // built it, or, where it built the assignment directly, by
+                // the typed boundaries of the operation's root.
+                let rhs_type = self.pending_assignment_type.take().or_else(|| {
+                    let root = names
+                        .plan()
+                        .machine_projection()
+                        .entity_for_output(output.value)?
+                        .root();
+                    names.plan().typed_boundaries().produced(root).cloned()
+                });
+                // The projection says how the machine writes the carrier --
+                // a lane, or a zero-extension into the full register -- and
+                // spells that from what the right-hand side has. What the
+                // object is declared as is the last word, and the conversion
+                // to it is made once, outside the projection, from the type
+                // the projection produced.
+                let (lhs, rhs, projected_type) = project_machine_write(
+                    lhs,
+                    rhs,
+                    rhs_type.as_ref(),
+                    *projection,
+                    self.pointer_bits(),
+                )
+                .map_err(|_| {
+                    crate::observation_journal::LegacyObservationJournalError::RefusedRenderedWrite(
+                        output.inst,
+                    )
+                })?;
+                let rhs = match self.value_declaration_type(output.value) {
+                    Some(declared) => self.convert_from(rhs, projected_type.as_ref(), &declared),
+                    None => rhs,
+                };
+                Ok((lhs, rhs))
+            }
+            Ok(r2ssa::MachineWriteDisposition::Refused(_)) => {
+                unreachable!("require_write cannot return a refused disposition")
+            }
+            Err(crate::binding_plan::RenderedIdentityRefusal::MachineWrite { .. }) => Err(
+                crate::observation_journal::LegacyObservationJournalError::RefusedRenderedWrite(
+                    output.inst,
+                ),
+            ),
+            Err(_) => Err(
+                crate::observation_journal::LegacyObservationJournalError::InvalidWrite(
+                    output.inst,
+                ),
+            ),
+        }
+    }
+
+    /// Apply a source write only when the finalized statement targets the
+    /// exact plan-owned output binding. A different target has no typed
+    /// synthetic-origin certificate, so it cannot waive the `InstId` write
+    /// projection.
+    fn project_finalized_assignment_stmt(
+        &self,
+        site: Option<crate::normalize::NormalizedOpSite>,
+        stmt: CStmt,
+    ) -> OpLoweringResult<CStmt> {
+        let Some(site) = site else {
+            return Ok(stmt);
+        };
+        let output = match self.normalized_output_projection(site) {
+            Ok(output) => output,
+            Err(error) => {
+                self.retain_first_observation_error(error);
+                return Err(OpLoweringRefusal::missing_machine_projection());
+            }
+        };
+        let Some(names) = self.inputs.binding_names else {
+            return Err(OpLoweringRefusal::missing_program_variable());
+        };
+        let symbol = match names.require_value(output.value) {
+            Ok(crate::binding_plan::PlannedValueSymbol::Bound(symbol)) => symbol,
+            Ok(
+                crate::binding_plan::PlannedValueSymbol::Inline(_)
+                | crate::binding_plan::PlannedValueSymbol::Elided(_),
+            ) => return Ok(stmt),
+            Ok(
+                crate::binding_plan::PlannedValueSymbol::Refused(_)
+                | crate::binding_plan::PlannedValueSymbol::Absent,
+            ) => unreachable!("require_value cannot return an absent or refused disposition"),
+            Err(_) => return Err(OpLoweringRefusal::missing_program_variable()),
+        };
+        let CStmt::Expr(CExpr::Binary {
+            op: BinaryOp::Assign,
+            left,
+            right,
+        }) = stmt
+        else {
+            return Ok(stmt);
+        };
+        let lhs = *left;
+        let rhs = *right;
+        let planned_lhs = CExpr::Var(symbol);
+        if !lhs.transparently_eq(&planned_lhs) {
+            return Err(OpLoweringRefusal::missing_program_variable());
+        }
+        match self.project_planned_assignment(Some(site), lhs.clone(), rhs.clone()) {
+            Ok((lhs, rhs)) => Ok(CStmt::Expr(CExpr::assign(lhs, rhs))),
+            Err(error) => {
+                let refusal = Self::observation_lowering_refusal(&error);
+                self.retain_first_observation_error(error);
+                Err(refusal)
+            }
+        }
+    }
+
+    /// The type the plan declares for a value, if it declares one.
+    pub(super) fn value_declaration_type(&self, value: ValueId) -> Option<CType> {
+        let names = self.inputs.binding_names?;
+        let crate::binding_plan::ValueDisposition::Bound { binding } =
+            names.disposition_for_value(value)?
+        else {
+            return None;
+        };
+        Some(names.plan().binding(*binding)?.declaration_type().clone())
+    }
+
+    fn materialize_machine_expr(
+        &self,
+        names: &crate::binding_plan::BindingNameResolution,
+        value: ValueId,
+        term: r2rewrite::TermId,
+        expr: r2ssa::MachineExprId,
+        depth: u32,
+    ) -> Result<CExpr, crate::observation_journal::LegacyObservationJournalError> {
+        use r2ssa::MachineExprKind as Kind;
+        let invalid =
+            || crate::observation_journal::LegacyObservationJournalError::InvalidPlannedInline {
+                value,
+                term,
+            };
+        if depth as usize > names.plan().machine_projection().arena().len() {
+            return Err(invalid());
+        }
+        let Some(machine_expr) = names.plan().machine_projection().expr(expr) else {
+            return Err(invalid());
+        };
+        // Every operand crosses the boundary its operator states for it,
+        // from the type the operand's own rendering has; both come from the
+        // typed boundaries, keyed by this node and the operand's position.
+        let typed = names.plan().typed_boundaries();
+        let child = |index: usize,
+                     id: r2ssa::MachineExprId|
+         -> Result<
+            CExpr,
+            crate::observation_journal::LegacyObservationJournalError,
+        > {
+            let rendered = self.materialize_machine_expr(names, value, term, id, depth + 1)?;
+            Ok(match typed.required(expr, index) {
+                Some(required) => self.convert_from(rendered, typed.produced(id), required),
+                None => rendered,
+            })
+        };
+        Ok(match machine_expr.kind() {
+            Kind::Constant {
+                binding,
+                value: literal,
+            } => {
+                let bits = literal.bits();
+                let rendered = if bits > i64::MAX as u64 {
+                    CExpr::UIntLit(bits)
+                } else {
+                    CExpr::IntLit(bits as i64)
+                };
+                // Every value owes a cell, and a constant reached as a leaf of
+                // a moved expression is rendered here rather than as an operand
+                // of an emitted statement, so this is where it is marked.
+                let constant = binding.value();
+                if constant == value {
+                    rendered
+                } else {
+                    self.finish_replacement_expr(PendingReplacementExpr::planned_inline(
+                        constant, rendered,
+                    ))
+                }
+            }
+            Kind::Source { binding, .. } => {
+                let source = binding.value();
+                if source == value {
+                    return Err(invalid());
+                }
+                self.planned_value_expr(source)?
+            }
+            Kind::Copy { input } => child(0, *input)?,
+            Kind::Arithmetic {
+                op, left, right, ..
+            } => CExpr::binary(
+                match op {
+                    r2ssa::MachineArithmeticOp::Add => BinaryOp::Add,
+                    r2ssa::MachineArithmeticOp::Subtract => BinaryOp::Sub,
+                    r2ssa::MachineArithmeticOp::Multiply => BinaryOp::Mul,
+                },
+                child(0, *left)?,
+                child(1, *right)?,
+            ),
+            Kind::Bitwise { op, left, right } => CExpr::binary(
+                match op {
+                    r2ssa::MachineBitwiseOp::And => BinaryOp::BitAnd,
+                    r2ssa::MachineBitwiseOp::Or => BinaryOp::BitOr,
+                    r2ssa::MachineBitwiseOp::Xor => BinaryOp::BitXor,
+                },
+                child(0, *left)?,
+                child(1, *right)?,
+            ),
+            Kind::Boolean { op, left, right } => CExpr::binary(
+                match op {
+                    r2ssa::MachineBooleanOp::And => BinaryOp::And,
+                    r2ssa::MachineBooleanOp::Or => BinaryOp::Or,
+                    // C has no boolean exclusive-or; on values the machine
+                    // already reduced to zero or one, inequality is it.
+                    r2ssa::MachineBooleanOp::Xor => BinaryOp::Ne,
+                },
+                child(0, *left)?,
+                child(1, *right)?,
+            ),
+            // The signedness of the comparison is the node's interpretation,
+            // and the typed boundaries state it as the operands' requirement.
+            Kind::Compare {
+                op, left, right, ..
+            } => CExpr::binary(
+                match op {
+                    r2ssa::MachineComparisonOp::Equal => BinaryOp::Eq,
+                    r2ssa::MachineComparisonOp::NotEqual => BinaryOp::Ne,
+                    r2ssa::MachineComparisonOp::LessThan => BinaryOp::Lt,
+                    r2ssa::MachineComparisonOp::LessThanOrEqual => BinaryOp::Le,
+                },
+                child(0, *left)?,
+                child(1, *right)?,
+            ),
+            // An arithmetic right shift is `>>` on a signed operand and
+            // nothing else; the boundary requires the signed operand.
+            Kind::Shift {
+                kind,
+                value: shifted,
+                count,
+                ..
+            } => CExpr::binary(
+                match kind {
+                    r2ssa::MachineShiftKind::Left => BinaryOp::Shl,
+                    r2ssa::MachineShiftKind::LogicalRight
+                    | r2ssa::MachineShiftKind::ArithmeticRight => BinaryOp::Shr,
+                },
+                child(0, *shifted)?,
+                child(1, *count)?,
+            ),
+            Kind::BitwiseNot { input } => CExpr::unary(UnaryOp::BitNot, child(0, *input)?),
+            Kind::BooleanNot { input } => CExpr::unary(UnaryOp::Not, child(0, *input)?),
+            Kind::Negate { input, .. } => CExpr::unary(UnaryOp::Neg, child(0, *input)?),
+            Kind::Select {
+                condition,
+                if_true,
+                if_false,
+            } => CExpr::Ternary {
+                cond: Box::new(child(0, *condition)?),
+                then_expr: Box::new(child(1, *if_true)?),
+                else_expr: Box::new(child(2, *if_false)?),
+            },
+            // Everything else -- a memory read, a merge, a division that traps,
+            // a flag or a width change whose C form depends on a type this does
+            // not carry -- keeps its own statement.
+            _ => return Err(invalid()),
+        })
+    }
+
+    /// Render the rewriter's canonical term for one planned inline value.
+    ///
+    /// This is deliberately paired with `expression_renders_inline`: every
+    /// admitted modeled machine kind imports to one of these arms. A leaf is
+    /// the only escape back to the machine arena, where the existing value path
+    /// accounts for the exact source value it names.
+    fn materialize_term(
+        &self,
+        names: &crate::binding_plan::BindingNameResolution,
+        value: ValueId,
+        term: r2rewrite::TermId,
+        depth: u32,
+    ) -> Result<CExpr, crate::observation_journal::LegacyObservationJournalError> {
+        use r2rewrite::TermKind as Kind;
+        let invalid =
+            || crate::observation_journal::LegacyObservationJournalError::InvalidPlannedInline {
+                value,
+                term,
+            };
+        let canonical = names.plan().canonical();
+        let arena = canonical.arena();
+        if depth as usize > arena.len() {
+            return Err(invalid());
+        }
+        let node = arena.term(term);
+        let typed = names.plan().typed_boundaries();
+        let child = |index: usize,
+                     id: r2rewrite::TermId|
+         -> Result<
+            CExpr,
+            crate::observation_journal::LegacyObservationJournalError,
+        > {
+            let rendered = self.materialize_term(names, value, id, depth + 1)?;
+            Ok(match typed.term_required(term, index) {
+                Some(required) => self.convert_from(rendered, typed.term_produced(id), required),
+                None => rendered,
+            })
+        };
+        let literal = |bits: u64| {
+            if bits > i64::MAX as u64 {
+                CExpr::UIntLit(bits)
+            } else {
+                CExpr::IntLit(bits as i64)
+            }
+        };
+        Ok(match node.kind {
+            Kind::Leaf(expr) => {
+                self.materialize_machine_expr(names, value, term, expr, depth + 1)?
+            }
+            Kind::Literal(bits) => literal(bits.bits()),
+            Kind::Arithmetic { op, left, right } => CExpr::binary(
+                match op {
+                    r2ssa::MachineArithmeticOp::Add => BinaryOp::Add,
+                    r2ssa::MachineArithmeticOp::Subtract => BinaryOp::Sub,
+                    r2ssa::MachineArithmeticOp::Multiply => BinaryOp::Mul,
+                },
+                child(0, left)?,
+                child(1, right)?,
+            ),
+            Kind::Negate(input) => CExpr::unary(UnaryOp::Neg, child(0, input)?),
+            Kind::Bitwise { op, left, right } => CExpr::binary(
+                match op {
+                    r2ssa::MachineBitwiseOp::And => BinaryOp::BitAnd,
+                    r2ssa::MachineBitwiseOp::Or => BinaryOp::BitOr,
+                    r2ssa::MachineBitwiseOp::Xor => BinaryOp::BitXor,
+                },
+                child(0, left)?,
+                child(1, right)?,
+            ),
+            Kind::BitwiseNot(input) => CExpr::unary(UnaryOp::BitNot, child(0, input)?),
+            Kind::Boolean { op, left, right } => CExpr::binary(
+                match op {
+                    r2ssa::MachineBooleanOp::And => BinaryOp::And,
+                    r2ssa::MachineBooleanOp::Or => BinaryOp::Or,
+                    r2ssa::MachineBooleanOp::Xor => BinaryOp::Ne,
+                },
+                child(0, left)?,
+                child(1, right)?,
+            ),
+            Kind::BooleanNot(input) => CExpr::unary(UnaryOp::Not, child(0, input)?),
+            Kind::Compare {
+                op, left, right, ..
+            } => CExpr::binary(
+                match op {
+                    r2ssa::MachineComparisonOp::Equal => BinaryOp::Eq,
+                    r2ssa::MachineComparisonOp::NotEqual => BinaryOp::Ne,
+                    r2ssa::MachineComparisonOp::LessThan => BinaryOp::Lt,
+                    r2ssa::MachineComparisonOp::LessThanOrEqual => BinaryOp::Le,
+                },
+                child(0, left)?,
+                child(1, right)?,
+            ),
+            Kind::Cast { input, .. } => {
+                let rendered = child(0, input)?;
+                let Some(produced) = typed
+                    .term_produced(term)
+                    .and_then(r2rewrite::CValue::as_type)
+                else {
+                    return Err(invalid());
+                };
+                let from = typed
+                    .term_required(term, 0)
+                    .cloned()
+                    .map(r2rewrite::CValue::Typed);
+                self.convert_from(rendered, from.as_ref(), produced)
+            }
+            Kind::Extract { input, lsb_bits } => {
+                let rendered = child(0, input)?;
+                let shifted = if lsb_bits == 0 {
+                    rendered
+                } else {
+                    CExpr::binary(BinaryOp::Shr, rendered, CExpr::IntLit(i64::from(lsb_bits)))
+                };
+                let Some(produced) = typed
+                    .term_produced(term)
+                    .and_then(r2rewrite::CValue::as_type)
+                else {
+                    return Err(invalid());
+                };
+                CExpr::cast(produced.clone(), shifted)
+            }
+            Kind::Concat { high, low } => {
+                let low_width = arena.term(low).width_bits();
+                let Some(produced) = typed
+                    .term_produced(term)
+                    .and_then(r2rewrite::CValue::as_type)
+                    .cloned()
+                else {
+                    return Err(invalid());
+                };
+                let high_required = typed
+                    .term_required(term, 0)
+                    .cloned()
+                    .map(r2rewrite::CValue::Typed);
+                let low_required = typed
+                    .term_required(term, 1)
+                    .cloned()
+                    .map(r2rewrite::CValue::Typed);
+                let high = self.convert_from(child(0, high)?, high_required.as_ref(), &produced);
+                let low = self.convert_from(child(1, low)?, low_required.as_ref(), &produced);
+                CExpr::binary(
+                    BinaryOp::BitOr,
+                    CExpr::binary(BinaryOp::Shl, high, CExpr::IntLit(i64::from(low_width))),
+                    low,
+                )
+            }
+            Kind::Select {
+                condition,
+                if_true,
+                if_false,
+            } => CExpr::Ternary {
+                cond: Box::new(child(0, condition)?),
+                then_expr: Box::new(child(1, if_true)?),
+                else_expr: Box::new(child(2, if_false)?),
+            },
+            Kind::Shift {
+                kind,
+                value: shifted,
+                count,
+                ..
+            } => CExpr::binary(
+                match kind {
+                    r2ssa::MachineShiftKind::Left => BinaryOp::Shl,
+                    r2ssa::MachineShiftKind::LogicalRight
+                    | r2ssa::MachineShiftKind::ArithmeticRight => BinaryOp::Shr,
+                },
+                child(0, shifted)?,
+                child(1, count)?,
+            ),
+            Kind::Flag { op, left, right } => {
+                let width = arena.term(left).width_bits();
+                if arena.term(right).width_bits() != width
+                    || !matches!(width, 8 | 16 | 32 | 64 | 128)
+                {
+                    return Err(invalid());
+                }
+                let operation = match op {
+                    r2ssa::MachineArithmeticFlagOp::UnsignedCarry => "carry",
+                    r2ssa::MachineArithmeticFlagOp::SignedCarry => "scarry",
+                    r2ssa::MachineArithmeticFlagOp::SignedBorrow => "sborrow",
+                };
+                CExpr::call(
+                    CExpr::External {
+                        name: format!("r2sleigh_int_{operation}_{width}"),
+                        kind: crate::symbol::ExternalKind::Intrinsic,
+                    },
+                    vec![child(0, left)?, child(1, right)?],
+                )
+            }
+            Kind::Opaque(_)
+            | Kind::Variable(_)
+            | Kind::Load { .. }
+            | Kind::Subscript { .. }
+            | Kind::ObjectAddress(_) => return Err(invalid()),
+        })
+    }
+
+    /// The assignment a bound value's canonical term spells, where spelling it
+    /// from the term is sound.
+    ///
+    /// A value the plan inlines is rendered from the rewriter's canonical term.
+    /// A value it binds was not: the operation arms rebuilt its right-hand side
+    /// from the machine arena, so a rule that fired on the definition computed a
+    /// simpler expression and then had it thrown away. `identity.and_self`
+    /// proves `RSI_0 & RSI_0` is `RSI_0` and the reader was still shown the
+    /// conjunction, on nineteen definitions across fourteen of the corpus's
+    /// fifty-four cells. Only the *spelling* moves here; which values are bound
+    /// is the binding partition's answer and is untouched.
+    ///
+    /// Three conditions gate it, and each is a refusal rather than an
+    /// adjustment.
+    ///
+    /// The term must actually have been rewritten. An unchanged term is the
+    /// base rendering reached by a second route, and routing it through here
+    /// would trade the operation arms' spelling -- predicate resolution, the
+    /// certified memory access, the flag intrinsics -- for nothing.
+    ///
+    /// Every producer the term absorbed must be one the plan inlines. A term
+    /// that absorbed a value the plan *binds* computes it twice, once in its
+    /// own statement and again inside this expression, and the observation
+    /// journal refuses exactly that on the inline path for the same reason.
+    ///
+    /// And the term must be one `materialize_term` has a form for. A load, a
+    /// subscript or a frame-object address renders through the memory and
+    /// subscript renderers, which the term materialiser deliberately does not
+    /// duplicate, so those keep the operation arms' statement.
+    fn canonical_bound_assignment(
+        &self,
+        site: crate::normalize::NormalizedOpSite,
+    ) -> Option<CanonicalBoundAssignment> {
+        let names = self.inputs.binding_names?;
+        let prepared = self.inputs.prepared_ssa?;
+        let output = self.normalized_output_projection(site).ok()?;
+        let value = output.value;
+        let crate::binding_plan::ValueDisposition::Bound { binding } =
+            names.disposition_for_value(value)?
+        else {
+            return None;
+        };
+        let symbol = names.symbol_for_binding(*binding)?;
+        let canonical = names.plan().canonical();
+        let rewrite = canonical.value(value)?;
+        if rewrite.canonical == canonical.import().value(value)?.term {
+            return None;
+        }
+        let mut absorbed = Vec::with_capacity(rewrite.discharges.len());
+        for id in &rewrite.discharges {
+            let r2ssa::CanonicalInstructionSite::Op(ordinal) = id.site else {
+                return None;
+            };
+            let inst = prepared
+                .graph()
+                .inst_id_for_op_site(id.block_addr, usize::try_from(ordinal).ok()?)?;
+            let produced = prepared.graph().inst(inst).and_then(|inst| inst.output)?;
+            if !matches!(
+                names.disposition_for_value(produced),
+                Some(crate::binding_plan::ValueDisposition::Inline { .. })
+            ) {
+                return None;
+            }
+            absorbed.push(inst);
+        }
+        let projection = self
+            .inputs
+            .normalization_origins?
+            .projection(site, prepared)
+            .ok()??;
+        let mut rhs = self
+            .materialize_term(names, value, rewrite.canonical, 0)
+            .ok()?;
+        // The operand reads the base path would have marked one at a time,
+        // marked on the whole right-hand side instead. The rewrite may have
+        // absorbed the operand that carried a read -- `x & x` reads `x` once
+        // where the machine read it twice -- and the use cell is owed by the
+        // occurrence that now stands for it either way.
+        for input_idx in 0..projection.inputs.len() {
+            rhs = self.observe_optional_normalized_input_uses_expr(Some(site), input_idx, rhs);
+        }
+        // What the right-hand side has is now the term's produced type, not the
+        // machine root's; the write projection reads this to decide how the
+        // carrier is written.
+        self.pending_assignment_type.set(
+            names
+                .plan()
+                .typed_boundaries()
+                .term_produced(rewrite.canonical)
+                .cloned(),
+        );
+        Some(CanonicalBoundAssignment {
+            stmt: CStmt::Expr(CExpr::assign(CExpr::Var(symbol), rhs)),
+            value,
+            definition: output.inst,
+            absorbed,
+        })
+    }
+
+    pub(crate) fn planned_value_expr(
+        &self,
+        value: ValueId,
+    ) -> Result<CExpr, crate::observation_journal::LegacyObservationJournalError> {
+        let Some(names) = self.inputs.binding_names else {
+            return Err(
+                crate::observation_journal::LegacyObservationJournalError::rendered_value_required(
+                    value,
+                    crate::observation_journal::RenderedValueRequirementCause::PlannedValueNamesUnavailable,
+                    None,
+                ),
+            );
+        };
+        match names.require_value(value) {
+            Ok(crate::binding_plan::PlannedValueSymbol::Bound(symbol)) => {
+                Ok(self.finish_replacement_expr(PendingReplacementExpr::rendered_value(
+                    value,
+                    CExpr::Var(symbol),
+                )))
+            }
+            Ok(crate::binding_plan::PlannedValueSymbol::Inline(term)) => {
+                let valid = names
+                    .plan()
+                    .canonical()
+                    .value(value)
+                    .is_some_and(|canonical| canonical.canonical == term);
+                if !valid {
+                    return Err(
+                        crate::observation_journal::LegacyObservationJournalError::InvalidPlannedInline {
+                            value,
+                            term,
+                        },
+                    );
+                }
+                let rendered = self.materialize_term(names, value, term, 0)?;
+                Ok(self.finish_replacement_expr(PendingReplacementExpr::planned_inline(
+                    value, rendered,
+                )))
+            }
+            Ok(crate::binding_plan::PlannedValueSymbol::Elided(reason)) => Err(
+                crate::observation_journal::LegacyObservationJournalError::PlannedElidedValueRendered {
+                    value,
+                    reason,
+                },
+            ),
+            Ok(
+                crate::binding_plan::PlannedValueSymbol::Refused(_)
+                | crate::binding_plan::PlannedValueSymbol::Absent,
+            ) => unreachable!("require_value cannot return an absent or refused disposition"),
+            Err(crate::binding_plan::RenderedIdentityRefusal::Value { reason, .. }) => Err(
+                crate::observation_journal::LegacyObservationJournalError::PlannedRefusedValueRendered {
+                    value,
+                    reason,
+                },
+            ),
+            Err(_) => Err(
+                crate::observation_journal::LegacyObservationJournalError::MissingPlannedValue(
+                    value,
+                ),
+            ),
+        }
+    }
+
+    fn normalized_input_projection(
+        &self,
+        frame: &LowerFrame,
+        input_idx: usize,
+    ) -> Result<
+        (
+            crate::normalize::NormalizedOpSite,
+            crate::normalize::NormalizedInputProjection,
+        ),
+        crate::observation_journal::LegacyObservationJournalError,
+    > {
+        let site = frame.normalized_site.ok_or(
+            crate::observation_journal::LegacyObservationJournalError::MissingNormalizedSiteContext,
+        )?;
+        let prepared = self.inputs.prepared_ssa.ok_or(
+            crate::observation_journal::LegacyObservationJournalError::MissingNormalizedSiteContext,
+        )?;
+        let projection = self
+            .inputs
+            .normalization_origins
+            .ok_or(
+                crate::observation_journal::LegacyObservationJournalError::MissingNormalizedSiteContext,
+            )?
+            .projection(site, prepared)
+            .map_err(crate::observation_journal::LegacyObservationJournalError::Normalization)?
+            .ok_or(
+                crate::observation_journal::LegacyObservationJournalError::InvalidNormalizedSite(
+                    site,
+                ),
+            )?;
+        let input = projection.inputs.get(input_idx).cloned().ok_or(
+            crate::observation_journal::LegacyObservationJournalError::InvalidNormalizedInput {
+                site,
+                input_idx,
+            },
+        )?;
+        Ok((site, input))
+    }
+
+    fn uniform_planned_input_disposition(
+        &self,
+        site: crate::normalize::NormalizedOpSite,
+        input_idx: usize,
+        input: &crate::normalize::NormalizedInputProjection,
+    ) -> Result<
+        Option<(r2ssa::UseSite, r2ssa::MachineUseDisposition)>,
+        crate::observation_journal::LegacyObservationJournalError,
+    > {
+        let Some(first_site) = input.uses.first().copied() else {
+            return Ok(None);
+        };
+        let Some(names) = self.inputs.binding_names else {
+            return Err(
+                crate::observation_journal::LegacyObservationJournalError::rendered_value_required(
+                    input.value,
+                    crate::observation_journal::RenderedValueRequirementCause::PlannedInputNamesUnavailable,
+                    None,
+                ),
+            );
+        };
+        let first_disposition = match names.require_use(first_site) {
+            Ok(
+                disposition @ (r2ssa::MachineUseDisposition::Exact(_)
+                | r2ssa::MachineUseDisposition::MemoryAddress(_)),
+            ) => *disposition,
+            Ok(r2ssa::MachineUseDisposition::Refused(_)) => {
+                unreachable!("require_use cannot return a refused disposition")
+            }
+            Err(crate::binding_plan::RenderedIdentityRefusal::MachineUse { .. }) => {
+                return Err(
+                    crate::observation_journal::LegacyObservationJournalError::RefusedRenderedUse(
+                        first_site,
+                    ),
+                );
+            }
+            Err(_) => {
+                return Err(
+                    crate::observation_journal::LegacyObservationJournalError::InvalidUse(
+                        first_site,
+                    ),
+                );
+            }
+        };
+        for use_site in input.uses.iter().copied().skip(1) {
+            match names.require_use(use_site) {
+                Ok(disposition) if *disposition == first_disposition => {}
+                Ok(r2ssa::MachineUseDisposition::Refused(_)) => {
+                    unreachable!("require_use cannot return a refused disposition")
+                }
+                Err(crate::binding_plan::RenderedIdentityRefusal::MachineUse { .. }) => {
+                    return Err(
+                        crate::observation_journal::LegacyObservationJournalError::RefusedRenderedUse(
+                            use_site,
+                        ),
+                    );
+                }
+                Ok(
+                    r2ssa::MachineUseDisposition::Exact(_)
+                    | r2ssa::MachineUseDisposition::MemoryAddress(_),
+                ) => {
+                    // One relocated normalized expression cannot implement two
+                    // different source projections. Keep the normalized site
+                    // typed and refuse the projection instead of choosing one.
+                    return Err(
+                        crate::observation_journal::LegacyObservationJournalError::InvalidNormalizedInput {
+                            site,
+                            input_idx,
+                        },
+                    );
+                }
+                Err(_) => {
+                    return Err(
+                        crate::observation_journal::LegacyObservationJournalError::InvalidUse(
+                            use_site,
+                        ),
+                    );
+                }
+            }
+        }
+        Ok(Some((first_site, first_disposition)))
+    }
+
+    /// The planned expression for one operand, with the type it has.
+    ///
+    /// The type is what the read renders as -- the declared type of the
+    /// object, or the type of the expression an inlined value stands for --
+    /// carried through the use projection, which converts it where a slice
+    /// or a conversion is selected and leaves it alone where the whole value
+    /// is read. The boundary reading the operand converts from this type.
+    fn planned_input_expr(
+        &self,
+        frame: &LowerFrame,
+        input_idx: usize,
+    ) -> Result<(CExpr, Option<CValue>), crate::observation_journal::LegacyObservationJournalError>
+    {
+        let (site, input) = self.normalized_input_projection(frame, input_idx)?;
+        let Some((first_site, first_disposition)) =
+            self.uniform_planned_input_disposition(site, input_idx, &input)?
+        else {
+            // Synthetic preservation inputs have no original graph use and
+            // therefore no source-owned projection to apply.
+            return Ok((
+                self.planned_value_expr(input.value)?,
+                self.value_type(input.value),
+            ));
+        };
+        match first_disposition {
+            r2ssa::MachineUseDisposition::Exact(slice) => {
+                let base = self.planned_value_expr(input.value)?;
+                let base_type = self.value_type(input.value);
+                super::projection::project_machine_use_of(
+                    base,
+                    base_type.as_ref(),
+                    slice,
+                    self.pointer_bits(),
+                )
+                .map(|(projected, ty)| (projected, Some(ty)))
+                .map_err(|_| {
+                    // The machine use is exact, but the strict C dialect cannot spell
+                    // this projection without more type evidence. Refuse the emitted
+                    // occurrence instead of inventing an integer or pointer type.
+                    crate::observation_journal::LegacyObservationJournalError::RefusedRenderedUse(
+                        first_site,
+                    )
+                })
+            }
+            // A contextual address cannot be projected from an arbitrary AST.
+            // Only `planned_memory_input_expr` accepts the opaque expression
+            // minted from the exact structured-access render fact.
+            r2ssa::MachineUseDisposition::MemoryAddress(_) => Err(
+                crate::observation_journal::LegacyObservationJournalError::RefusedRenderedUse(
+                    first_site,
+                ),
+            ),
+            r2ssa::MachineUseDisposition::Refused(_) => {
+                unreachable!("the refused source use returned before projection")
+            }
+        }
+    }
+
+    fn planned_memory_input_expr(
+        &self,
+        frame: &LowerFrame,
+        input_idx: usize,
+        certified: CertifiedMemoryAccessExpr,
+    ) -> Result<CExpr, crate::observation_journal::LegacyObservationJournalError> {
+        let (site, input) = self.normalized_input_projection(frame, input_idx)?;
+        let Some((first_site, disposition)) =
+            self.uniform_planned_input_disposition(site, input_idx, &input)?
+        else {
+            return Err(
+                crate::observation_journal::LegacyObservationJournalError::InvalidNormalizedInput {
+                    site,
+                    input_idx,
+                },
+            );
+        };
+        let r2ssa::MachineUseDisposition::MemoryAddress(address) = disposition else {
+            return Err(
+                crate::observation_journal::LegacyObservationJournalError::RefusedRenderedUse(
+                    first_site,
+                ),
+            );
+        };
+        let Some(access) = address.memory_access() else {
+            return Err(
+                crate::observation_journal::LegacyObservationJournalError::InvalidUse(first_site),
+            );
+        };
+        let source_is_write = match self
+            .inputs
+            .prepared_ssa
+            .and_then(|prepared| prepared.graph().inst(first_site.inst))
+            .map(|inst| &inst.payload)
+        {
+            Some(r2ssa::InstPayload::Op(SSAOp::Load { .. })) => false,
+            Some(r2ssa::InstPayload::Op(SSAOp::Store { .. })) => true,
+            _ => {
+                return Err(
+                    crate::observation_journal::LegacyObservationJournalError::InvalidUse(
+                        first_site,
+                    ),
+                );
+            }
+        };
+        if address.binding().value() != input.value
+            || certified.address() != input.value
+            || certified.access() != access
+            || certified.access().inst != first_site.inst
+            || certified.is_write() != source_is_write
+        {
+            return Err(
+                crate::observation_journal::LegacyObservationJournalError::InvalidUse(first_site),
+            );
+        }
+        let access = certified.access();
+        let is_write = certified.is_write();
+        let expr = certified.into_expr();
+        let Some(journal) = self.inputs.observation_journal else {
+            return Ok(expr);
+        };
+        journal
+            .borrow_mut()
+            .observe_stack_access_expr(access, is_write, expr)
+    }
+
+    pub(crate) fn planned_input_expr_at(
+        &self,
+        block_addr: u64,
+        op_idx: usize,
+        input_idx: usize,
+    ) -> OpLoweringResult<CExpr> {
+        let frame = LowerFrame::for_observed_expr(self.normalized_site(block_addr, op_idx));
+        match self.planned_input_expr(&frame, input_idx) {
+            Ok((expr, _)) => Ok(self.observe_optional_normalized_input_uses_expr(
+                frame.normalized_site,
+                input_idx,
+                expr,
+            )),
+            Err(error) => {
+                let refusal = Self::observation_lowering_refusal(&error);
+                self.retain_first_observation_error(error);
+                Err(refusal)
+            }
+        }
+    }
+
+    pub(super) fn planned_current_output_expr(
+        &self,
+    ) -> Result<Option<CExpr>, crate::observation_journal::LegacyObservationJournalError> {
+        if self.inputs.observation_journal.is_none() {
+            return Ok(None);
+        }
+        let Some(block_addr) = self.current_block_addr.get() else {
+            return Ok(None);
+        };
+        let Some(op_idx) = self.current_op_idx.get() else {
+            return Ok(None);
+        };
+        let site = self.normalized_site(block_addr, op_idx).ok_or(
+            crate::observation_journal::LegacyObservationJournalError::MissingNormalizedBlock(
+                block_addr,
+            ),
+        )?;
+        let value = self.normalized_output_projection(site)?.value;
+        let Some(names) = self.inputs.binding_names else {
+            return Err(
+                crate::observation_journal::LegacyObservationJournalError::MissingPlannedValue(
+                    value,
+                ),
+            );
+        };
+        match names.require_value(value) {
+            Ok(crate::binding_plan::PlannedValueSymbol::Bound(symbol)) => {
+                Ok(Some(CExpr::Var(symbol)))
+            }
+            Ok(crate::binding_plan::PlannedValueSymbol::Inline(term)) => Err(
+                crate::observation_journal::LegacyObservationJournalError::InvalidPlannedInline {
+                    value,
+                    term,
+                },
+            ),
+            // An attempted lowering is not a rendered occurrence. Keep the
+            // legacy candidate long enough for dead-code and structuring
+            // rewrites to delete it; the final surviving value marker is the
+            // only place allowed to turn either disposition into an error.
+            Ok(
+                crate::binding_plan::PlannedValueSymbol::Elided(_)
+            ) => Ok(None),
+            Ok(
+                crate::binding_plan::PlannedValueSymbol::Refused(_)
+                | crate::binding_plan::PlannedValueSymbol::Absent,
+            ) => unreachable!("require_value cannot return an absent or refused disposition"),
+            Err(crate::binding_plan::RenderedIdentityRefusal::Value { reason, .. }) => Err(
+                crate::observation_journal::LegacyObservationJournalError::PlannedRefusedValueRendered {
+                    value,
+                    reason,
+                },
+            ),
+            Err(_) => Err(
+                crate::observation_journal::LegacyObservationJournalError::MissingPlannedValue(
+                    value,
+                ),
+            ),
+        }
+    }
+
+    pub(super) fn observed_input(
+        &self,
+        frame: &LowerFrame,
+        input_idx: usize,
+        expr: CExpr,
+    ) -> CExpr {
+        self.observed_input_typed(frame, input_idx, expr, None).0
+    }
+
+    /// The operand at `input_idx`, read from `var`, with the type it has.
+    ///
+    /// Under observation the operand is the planned, projected expression
+    /// and its type comes with it; outside observation it is the value's
+    /// own rendering, at the type a read of that value has.
+    pub(super) fn typed_input(
+        &self,
+        frame: &LowerFrame,
+        input_idx: usize,
+        var: &SSAVar,
+    ) -> OpLoweringResult<(CExpr, Option<CValue>)> {
+        let expr = self.get_expr(var)?;
+        let fallback = self
+            .prepared_value_id_for_var(var)
+            .and_then(|value| self.value_type(value));
+        Ok(self.observed_input_typed(frame, input_idx, expr, fallback))
+    }
+
+    fn observed_input_typed(
+        &self,
+        frame: &LowerFrame,
+        input_idx: usize,
+        expr: CExpr,
+        fallback: Option<CValue>,
+    ) -> (CExpr, Option<CValue>) {
+        if frame.observe_inputs {
+            let (expr, ty) = match self.planned_input_expr(frame, input_idx) {
+                Ok(planned) => planned,
+                Err(error) => {
+                    let refusal = Self::observation_lowering_refusal(&error);
+                    self.retain_first_observation_error(error);
+                    self.retain_first_lowering_refusal(refusal);
+                    return (expr, fallback);
+                }
+            };
+            (
+                self.observe_optional_normalized_input_uses_expr(
+                    frame.normalized_site,
+                    input_idx,
+                    expr,
+                ),
+                ty,
+            )
+        } else {
+            (expr, fallback)
+        }
+    }
+
+    pub(super) fn observed_memory_input(
+        &self,
+        frame: &LowerFrame,
+        input_idx: usize,
+        certified: CertifiedMemoryAccessExpr,
+    ) -> CExpr {
+        let fallback = certified.expr().clone();
+        if !frame.observe_inputs {
+            return fallback;
+        }
+        let expr = match self.planned_memory_input_expr(frame, input_idx, certified) {
+            Ok(planned) => planned,
+            Err(error) => {
+                let refusal = Self::observation_lowering_refusal(&error);
+                self.retain_first_observation_error(error);
+                self.retain_first_lowering_refusal(refusal);
+                return fallback;
+            }
+        };
+        self.observe_optional_normalized_input_uses_expr(frame.normalized_site, input_idx, expr)
+    }
+
     pub(super) fn lowered_from_stmt(stmt: CStmt) -> LoweredOp {
         match stmt {
-            CStmt::Expr(CExpr::Binary {
-                op: BinaryOp::Assign,
-                left,
-                right,
-            }) => LoweredOp::Assign {
-                lhs: *left,
-                rhs: *right,
-            },
-            CStmt::Expr(expr) => LoweredOp::Expr(expr),
-            CStmt::Return(expr) => LoweredOp::Return(expr),
-            CStmt::Comment(text) => LoweredOp::Comment(text),
             CStmt::Empty => LoweredOp::None,
-            _ => LoweredOp::None,
+            stmt => LoweredOp::FinalizedStmt(stmt),
         }
     }
 
     pub(super) fn lowered_to_stmt(&self, lowered: LoweredOp) -> Option<CStmt> {
         match lowered {
             LoweredOp::Assign { lhs, rhs } => self.assign_stmt(lhs, rhs),
+            LoweredOp::FinalizedStmt(stmt) => Some(stmt),
             LoweredOp::Expr(expr) => Some(CStmt::Expr(expr)),
-            LoweredOp::Return(expr) => Some(CStmt::Return(expr)),
-            LoweredOp::Comment(text) => Some(CStmt::Comment(text)),
             LoweredOp::None => None,
         }
     }
@@ -35,208 +1374,210 @@ impl<'a> FoldingContext<'a> {
         block_addr: u64,
         op_idx: usize,
         call: CExpr,
-        certified_args: CertifiedCallArgs,
+        _certified_args: CertifiedCallArgs,
     ) -> LoweredOp {
-        if !self.requires_certified_rendering() {
-            if let Some(owner) =
-                self.materializable_call_result_expr_for_call_expr((block_addr, op_idx), &call)
-            {
-                return LoweredOp::Assign {
-                    lhs: owner,
-                    rhs: call,
-                };
-            }
-            return LoweredOp::Expr(call);
+        if let Some(owner) =
+            self.materializable_call_result_expr_for_call_expr((block_addr, op_idx), &call)
+        {
+            // The object the result is assigned to decides the conversion,
+            // exactly as it does everywhere else: from what the callee is
+            // recorded to return, to what the plan declared the object.
+            let returned = self
+                .known_signature_for_site(block_addr, op_idx)
+                .map(|signature| CValue::Typed(signature.return_type.clone()));
+            let call = match self
+                .certified_call_result_value((block_addr, op_idx))
+                .and_then(|value| self.value_declaration_type(value))
+                .or_else(|| {
+                    self.declared_type_of_name(&owner)
+                        .and_then(|owner| owner.as_type().cloned())
+                }) {
+                Some(declared) => self.convert_from(call, returned.as_ref(), &declared),
+                None => call,
+            };
+            return LoweredOp::Assign {
+                lhs: owner,
+                rhs: call,
+            };
         }
-
-        let Some(callsite) = self.certified_callsite_for_op(block_addr, op_idx) else {
-            return LoweredOp::Comment(format!(
-                "r2sleigh residual: missing FunctionFacts callsite for rendered call at 0x{block_addr:x}:{op_idx}"
-            ));
-        };
-        let Some(render_fact) = self.certified_call_render_fact_for_op(block_addr, op_idx) else {
-            return LoweredOp::Comment(format!(
-                "r2sleigh residual: missing FunctionFacts call-render disposition at 0x{block_addr:x}:{op_idx}"
-            ));
-        };
-        if render_fact.target != Some(callsite.target) {
-            return LoweredOp::Comment(format!(
-                "r2sleigh residual: FunctionFacts call-render target mismatch at 0x{block_addr:x}:{op_idx}"
-            ));
-        }
-        let mut render_proof_values = render_fact.proof_values.clone();
-        if let Some(max_arity) = self.non_variadic_call_arity_for_site_with_direct_target(
-            block_addr,
-            op_idx,
-            callsite.direct_target,
-        ) {
-            render_proof_values.truncate(max_arity);
-        }
-        if render_proof_values != certified_args.values {
-            return LoweredOp::Comment(format!(
-                "r2sleigh residual: FunctionFacts call-render argument proof mismatch at 0x{block_addr:x}:{op_idx}"
-            ));
-        }
-
-        match render_fact.disposition {
-            r2types::CallsiteRenderDisposition::AssignedResult => {
-                let Some(owner) =
-                    self.materializable_call_result_expr_for_call_expr((block_addr, op_idx), &call)
-                else {
-                    return LoweredOp::Comment(format!(
-                        "r2sleigh residual: FunctionFacts assigned call lacks materializable call-result owner at 0x{block_addr:x}:{op_idx}"
-                    ));
-                };
-                self.record_call_effect_render_proof(
-                    block_addr,
-                    op_idx,
-                    render_fact.target,
-                    certified_args.values.clone(),
-                    render_fact.disposition,
-                );
-                self.record_certified_call_arg_memory_render_proofs(&certified_args.values);
-                LoweredOp::Assign {
-                    lhs: owner,
-                    rhs: call,
-                }
-            }
-            r2types::CallsiteRenderDisposition::SideEffectStatement => {
-                self.record_call_effect_render_proof(
-                    block_addr,
-                    op_idx,
-                    render_fact.target,
-                    certified_args.values.clone(),
-                    render_fact.disposition,
-                );
-                self.record_certified_call_arg_memory_render_proofs(&certified_args.values);
-                LoweredOp::Expr(call)
-            }
-            r2types::CallsiteRenderDisposition::NestedExpression
-            | r2types::CallsiteRenderDisposition::Suppressed
-            | r2types::CallsiteRenderDisposition::Residualized => LoweredOp::Comment(format!(
-                "r2sleigh residual: FunctionFacts call-render disposition {:?} is not a statement call at 0x{block_addr:x}:{op_idx}",
-                render_fact.disposition
-            )),
-        }
+        LoweredOp::Expr(call)
     }
 
-    pub(super) fn lower_op(&self, op: &SSAOp, frame: &mut LowerFrame) -> LoweredOp {
-        match frame.mode {
-            LowerMode::Expr => LoweredOp::Expr(self.op_to_expr_impl(op)),
+    fn certified_call_target_expr(
+        &self,
+        frame: &LowerFrame,
+        target: &SSAVar,
+        cert: &r2types::CallsiteArgumentFacts,
+        direct: bool,
+    ) -> OpLoweringResult<CExpr> {
+        if self.prepared_value_id_for_var(target) != Some(cert.target) {
+            return Err(OpLoweringRefusal::missing_machine_projection());
+        }
+        // A direct call spells its callee's name, which the call site's own
+        // identity supplies. Asking the plan for the operand's expression
+        // would be asking for the object that holds the callee's address, and
+        // there is none: the plan elides that value, and the operand's
+        // occurrence is elided beside it. Only an indirect call reads a target
+        // the program computed, and only there is the planned expression the
+        // thing being called.
+        if direct {
+            let address = cert
+                .direct_target
+                .ok_or_else(|| OpLoweringRefusal::missing_machine_projection())?;
+            return Ok(self.callee_identity_expr(&self.callee_identity_for_direct_target(address)));
+        }
+        let (planned, _) = self.planned_input_expr(frame, 0).map_err(|error| {
+            let refusal = Self::observation_lowering_refusal(&error);
+            self.retain_first_observation_error(error);
+            refusal
+        })?;
+        if cert.direct_target.is_some() {
+            return Err(OpLoweringRefusal::missing_machine_projection());
+        }
+        let target = Self::indirect_callable_expr(planned);
+        Ok(self.observe_optional_normalized_input_uses_expr(frame.normalized_site, 0, target))
+    }
+
+    pub(super) fn lower_op(
+        &self,
+        op: &SSAOp,
+        frame: &mut LowerFrame,
+    ) -> OpLoweringResult<LoweredOp> {
+        self.pending_lowering_refusal.set(None);
+        let lowered = match frame.mode {
+            LowerMode::Expr => self
+                .op_to_expr_impl(op, frame)?
+                .map(LoweredOp::Expr)
+                .unwrap_or(LoweredOp::None),
             LowerMode::Stmt => {
                 if frame.with_call_args {
                     match op {
                         SSAOp::Call { target } => {
-                            let direct_target = parse_address_from_var_name(&target.name);
-                            let func_expr = self.resolve_call_target_for_site(
-                                frame.block_addr,
-                                frame.op_idx,
-                                target,
-                            );
-                            let raw_args = self
-                                .call_args_map()
-                                .get(&(frame.block_addr, frame.op_idx))
-                                .cloned()
-                                .unwrap_or_default();
-                            let Some(mut certified_args) = self
-                                .certified_call_args_for_site_with_direct_target(
-                                    frame.block_addr,
-                                    frame.op_idx,
-                                    &func_expr,
-                                    direct_target,
-                                    raw_args,
-                                )
-                            else {
-                                return LoweredOp::Comment(format!(
-                                    "r2sleigh residual: uncertified callsite arguments at 0x{:x}:{}",
-                                    frame.block_addr, frame.op_idx
-                                ));
+                            let Some((source_block, source_op_idx)) = frame.source_call_site else {
+                                return Err(OpLoweringRefusal::missing_machine_projection());
                             };
-                            let mut args = certified_args.args.clone();
-                            if let Some(max_arity) = self
-                                .non_variadic_call_arity_for_site_with_direct_target(
-                                    frame.block_addr,
-                                    frame.op_idx,
-                                    direct_target,
-                                )
-                            {
-                                args.truncate(max_arity);
-                                certified_args.values.truncate(max_arity);
-                            }
-                            let call = CExpr::call(func_expr, args);
-                            return self.lower_certified_statement_call(
-                                frame.block_addr,
-                                frame.op_idx,
-                                call,
-                                certified_args,
+                            let (cert, _) = self.admitted_callsite(source_block, source_op_idx)?;
+                            let func_expr =
+                                self.certified_call_target_expr(frame, target, cert, true)?;
+                            let certified_args =
+                                self.certified_call_args_for_site(source_block, source_op_idx)?;
+                            self.record_callee_declaration(
+                                &func_expr,
+                                source_block,
+                                source_op_idx,
+                                &certified_args,
+                            )?;
+                            let call = CExpr::call_at(
+                                (source_block, source_op_idx),
+                                func_expr,
+                                certified_args.args.clone(),
+                            );
+                            return self.finish_lowering_transaction(
+                                self.lower_certified_statement_call(
+                                    source_block,
+                                    source_op_idx,
+                                    call,
+                                    certified_args,
+                                ),
                             );
                         }
                         SSAOp::CallInd { target } => {
-                            let resolved_target = self.resolve_call_target_for_site(
-                                frame.block_addr,
-                                frame.op_idx,
-                                target,
-                            );
-                            let func_expr = match resolved_target {
-                                CExpr::Var(_) => resolved_target,
-                                other => CExpr::Deref(Box::new(other)),
+                            let Some((source_block, source_op_idx)) = frame.source_call_site else {
+                                return Err(OpLoweringRefusal::missing_machine_projection());
                             };
-                            let raw_args = self
-                                .call_args_map()
-                                .get(&(frame.block_addr, frame.op_idx))
-                                .cloned()
-                                .unwrap_or_default();
-                            let Some(mut certified_args) = self.certified_call_args_for_site(
-                                frame.block_addr,
-                                frame.op_idx,
-                                &func_expr,
-                                raw_args,
-                            ) else {
-                                return LoweredOp::Comment(format!(
-                                    "r2sleigh residual: uncertified indirect-call arguments at 0x{:x}:{}",
-                                    frame.block_addr, frame.op_idx
-                                ));
-                            };
-                            let mut args = certified_args.args.clone();
-                            if let Some(max_arity) = self
-                                .non_variadic_call_arity_for_site(frame.block_addr, frame.op_idx)
-                            {
-                                args.truncate(max_arity);
-                                certified_args.values.truncate(max_arity);
+                            let (cert, _) = self.admitted_callsite(source_block, source_op_idx)?;
+                            // Whether the callee is named is the certificate's
+                            // to say. A `call [reloc.X]` is indirect in shape
+                            // and direct in fact.
+                            let direct = cert.direct_target.is_some();
+                            let func_expr =
+                                self.certified_call_target_expr(frame, target, cert, direct)?;
+                            let certified_args =
+                                self.certified_call_args_for_site(source_block, source_op_idx)?;
+                            if direct {
+                                self.record_callee_declaration(
+                                    &func_expr,
+                                    source_block,
+                                    source_op_idx,
+                                    &certified_args,
+                                )?;
                             }
-                            let call = CExpr::call(func_expr, args);
-                            return self.lower_certified_statement_call(
-                                frame.block_addr,
-                                frame.op_idx,
-                                call,
-                                certified_args,
+                            let call = CExpr::call_at(
+                                (source_block, source_op_idx),
+                                func_expr,
+                                certified_args.args.clone(),
                             );
+                            return self.finish_lowering_transaction(
+                                self.lower_certified_statement_call(
+                                    source_block,
+                                    source_op_idx,
+                                    call,
+                                    certified_args,
+                                ),
+                            );
+                        }
+                        // A tail call is certified through either branch
+                        // shape; the thunk `jmp [reloc.X]` is the indirect one.
+                        SSAOp::Branch { target } | SSAOp::BranchInd { target }
+                            if frame.source_call_site.is_some_and(|(block_addr, op_idx)| {
+                                self.certified_call_render_fact_for_op(block_addr, op_idx)
+                                    .is_some_and(|fact| fact.disposition.is_terminal_return())
+                            }) =>
+                        {
+                            let Some((source_block, source_op_idx)) = frame.source_call_site else {
+                                return Err(OpLoweringRefusal::missing_machine_projection());
+                            };
+                            let (cert, render_fact) =
+                                self.admitted_callsite(source_block, source_op_idx)?;
+                            if !render_fact.disposition.is_terminal_return() {
+                                return Err(OpLoweringRefusal::missing_machine_projection());
+                            }
+                            let func_expr =
+                                self.certified_call_target_expr(frame, target, cert, true)?;
+                            let certified_args =
+                                self.certified_call_args_for_site(source_block, source_op_idx)?;
+                            self.record_callee_declaration(
+                                &func_expr,
+                                source_block,
+                                source_op_idx,
+                                &certified_args,
+                            )?;
+                            let call = CExpr::call_at(
+                                (source_block, source_op_idx),
+                                func_expr,
+                                certified_args.args,
+                            );
+                            let stmt = if render_fact.disposition
+                                == r2types::CallsiteRenderDisposition::TerminalVoidReturn
+                            {
+                                CStmt::Block(vec![CStmt::Expr(call), CStmt::Return(None)])
+                            } else {
+                                CStmt::Return(Some(call))
+                            };
+                            return self
+                                .finish_lowering_transaction(LoweredOp::FinalizedStmt(stmt));
                         }
                         _ => {}
                     }
                 }
 
-                self.op_to_stmt_impl(op)
+                self.op_to_stmt_impl(op, frame)?
                     .map(Self::lowered_from_stmt)
                     .unwrap_or(LoweredOp::None)
             }
-        }
+        };
+        self.finish_lowering_transaction(lowered)
     }
 
-    pub(crate) fn op_to_expr(&self, op: &SSAOp) -> CExpr {
-        let mut frame = LowerFrame::for_expr();
-        match self.lower_op(op, &mut frame) {
-            LoweredOp::Expr(expr) => expr,
-            LoweredOp::Assign { lhs, rhs } => CExpr::assign(lhs, rhs),
-            LoweredOp::Return(Some(expr)) => expr,
-            LoweredOp::Return(None) => CExpr::Var("return".to_string()),
-            LoweredOp::Comment(_) | LoweredOp::None => {
-                if let Some(dst) = op.dst() {
-                    CExpr::Var(self.var_name(dst))
-                } else {
-                    CExpr::Var("__unhandled_op__".to_string())
+    fn finish_lowering_transaction(&self, lowered: LoweredOp) -> OpLoweringResult<LoweredOp> {
+        match self.pending_lowering_refusal.take() {
+            Some(refusal) => {
+                if std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
+                    eprintln!("refusal {refusal:?} raised by finish_lowering_transaction");
                 }
+                Err(refusal)
             }
+            None => Ok(lowered),
         }
     }
 
@@ -246,134 +1587,132 @@ impl<'a> FoldingContext<'a> {
         op: &SSAOp,
         block_addr: u64,
         op_idx: usize,
-    ) -> Option<CStmt> {
-        let mut frame = LowerFrame::for_stmt(block_addr, op_idx, true);
-        let stmt = self.lowered_to_stmt(self.lower_op(op, &mut frame))?;
-        if self.requires_certified_rendering()
-            && !matches!(op, SSAOp::Call { .. } | SSAOp::CallInd { .. })
-            && self
-                .record_certified_call_render_proofs_for_stmt_with_current(
-                    &stmt,
-                    Some((block_addr, op_idx)),
-                )
-                .is_none()
-        {
-            return Some(self.certified_residual_comment(format!(
-                "uncertified rendered call at 0x{:x}:{}",
-                block_addr, op_idx
-            )));
+    ) -> OpLoweringResult<Option<CStmt>> {
+        let source_site = self.source_op_site_for_normalized_op(block_addr, op_idx);
+        let carries_callsite = matches!(op, SSAOp::Call { .. } | SSAOp::CallInd { .. })
+            || matches!(op, SSAOp::Branch { .. } | SSAOp::BranchInd { .. })
+                && source_site.is_some_and(|(block_addr, op_idx)| {
+                    self.certified_call_render_fact_for_op(block_addr, op_idx)
+                        .is_some_and(|fact| fact.disposition.is_terminal_return())
+                });
+        if carries_callsite && source_site.is_none() {
+            return Ok(Some(self.certified_residual_comment(format!(
+                "synthetic operation cannot carry callsite facts at 0x{block_addr:x}:{op_idx}"
+            ))));
         }
-        if self.requires_certified_rendering() && stmt_is_side_effect_free_generated_carrier(&stmt)
-        {
-            return None;
+        let normalized_site = self.normalized_site(block_addr, op_idx);
+        // A carrier extension the projection of an earlier write absorbed has
+        // no statement where the plan renders the two as one object: that
+        // write's statement has already zero-extended into the carrier, and
+        // this one would only spell `x = (uint64_t)(uint32_t)x`. Its cells are
+        // marked on that statement, below.
+        let source_inst =
+            normalized_site.and_then(|site| self.source_inst_for_normalized_site(site));
+        if source_inst.is_some_and(|inst| self.write_is_discharged_by_absorbing_write(inst)) {
+            return Ok(None);
         }
-        if self.requires_certified_rendering()
-            && self.stmt_is_side_effect_free_versioned_register_carrier(&stmt)
-        {
-            return Some(stmt);
-        }
-        if self.requires_certified_rendering() && stmt_requires_expression_render_proof(&stmt) {
-            let phi_edge = self.certified_phi_edge_render_proof(op, &stmt, block_addr);
-            let value = match op {
-                SSAOp::Store { val, .. } => self.prepared_value_id_for_var(val),
-                _ => op.dst().and_then(|dst| self.prepared_value_id_for_var(dst)),
+        let source_call_site = source_site.or(Some((block_addr, op_idx)));
+        let mut frame = LowerFrame::for_stmt(normalized_site, source_call_site, true);
+        let (lowered, canonical) =
+            match normalized_site.and_then(|site| self.canonical_bound_assignment(site)) {
+                Some(CanonicalBoundAssignment {
+                    stmt,
+                    value,
+                    definition,
+                    absorbed,
+                }) => (
+                    LoweredOp::FinalizedStmt(stmt),
+                    Some((value, definition, absorbed)),
+                ),
+                None => (self.lower_op(op, &mut frame)?, None),
             };
-            match value {
-                Some(value)
-                    if self
-                        .certified_render_context()
-                        .is_some_and(|proof| proof.expression_is_renderable(value)) =>
-                {
-                    if let Some(phi_edge) = phi_edge {
-                        self.record_effect_render_proof_for_phi_edge(
-                            block_addr,
-                            op_idx,
-                            Some(value),
-                            phi_edge,
-                        );
-                    } else {
-                        self.record_effect_render_proof_for_value(
-                            EffectRenderProofKind::Expression,
-                            block_addr,
-                            op_idx,
-                            Some(value),
-                        );
-                    }
-                }
-                Some(value) => {
-                    return Some(self.certified_residual_comment(format!(
-                        "uncertified expression value {:?} at 0x{:x}:{}",
-                        value, block_addr, op_idx
-                    )));
-                }
-                None => {
-                    return Some(self.certified_residual_comment(format!(
-                        "missing expression value proof at 0x{:x}:{}",
-                        block_addr, op_idx
-                    )));
-                }
+        let Some(stmt) = self.lowered_to_stmt(lowered) else {
+            return Ok(None);
+        };
+        // Final write projection belongs only to an operation with a typed SSA
+        // output. Calls and stores are source effects with exact input/effect
+        // observations but no destination; asking them for a normalized output
+        // fabricates an assignment contract they do not have.
+        let stmt = if operation_requires_final_write_projection(op) {
+            self.project_finalized_assignment_stmt(normalized_site, stmt)?
+        } else {
+            stmt
+        };
+
+        let obligations = self.exact_normalized_op_effects(op, block_addr, op_idx);
+        let rendered = !matches!(stmt.unobserved(), CStmt::Comment(_) | CStmt::Empty);
+        let stmt = if op.dst().is_some() && rendered {
+            let mut stmt = self.observe_normalized_output_stmt(block_addr, op_idx, stmt);
+            let extensions = source_inst
+                .map(|inst| self.absorbed_extensions_discharged_by(inst))
+                .unwrap_or_default();
+            if !extensions.is_empty() {
+                stmt = self.observe_discharged_stmt(&extensions, &obligations, stmt);
             }
-        }
-        if stmt_contains_memory_like_access(&stmt) {
-            match op {
-                SSAOp::Load { .. } => {
-                    if let Some((space, address, value)) = self
-                        .certified_memory_access_for_current_op(false)
-                        .map(|cert| (cert.space, cert.address, cert.value))
-                    {
-                        self.record_effect_render_proof_for_memory(
-                            EffectRenderProofKind::MemoryRead,
-                            block_addr,
-                            op_idx,
-                            space,
-                            address,
-                            value,
-                        );
-                    }
-                }
-                SSAOp::Store { .. } => {
-                    if let Some((space, address, value)) = self
-                        .certified_memory_access_for_current_op(true)
-                        .map(|cert| (cert.space, cert.address, cert.value))
-                    {
-                        self.record_effect_render_proof_for_memory(
-                            EffectRenderProofKind::MemoryWrite,
-                            block_addr,
-                            op_idx,
-                            space,
-                            address,
-                            value,
-                        );
-                    }
-                }
-                _ => {
-                    if self.requires_certified_rendering()
-                        && let Some(value) =
-                            op.dst().and_then(|dst| self.prepared_value_id_for_var(dst))
-                        && let Some((block_addr, op_index, space, address, value)) = self
-                            .certified_memory_read_for_value_dependency(value)
-                            .map(|cert| {
-                                (
-                                    cert.block_addr,
-                                    cert.op_index,
-                                    cert.space,
-                                    cert.address,
-                                    cert.value,
-                                )
-                            })
-                    {
-                        self.record_effect_render_proof_for_memory(
-                            EffectRenderProofKind::MemoryRead,
-                            block_addr,
-                            op_index,
-                            space,
-                            address,
-                            value,
-                        );
-                    }
-                }
+            // Two contracts on one statement, because a carrier extension and
+            // a producer a canonical term absorbed owe different cells. They
+            // are still one statement, so an instruction both name is marked
+            // once, and the effects the extensions already answered are not
+            // answered again -- two occurrences of one effect is exactly what
+            // the ledger is there to catch.
+            if let Some((value, definition, absorbed)) = canonical {
+                let absorbed = absorbed
+                    .into_iter()
+                    .filter(|inst| !extensions.contains(inst))
+                    .collect::<Vec<_>>();
+                let mut answered = obligations.clone();
+                answered.extend(self.discharged_obligations(&extensions));
+                stmt = self.observe_canonical_assignment_stmt(
+                    value, definition, &absorbed, &answered, stmt,
+                );
             }
+            stmt
+        } else if rendered
+            && matches!(op, SSAOp::Call { .. } | SSAOp::CallInd { .. })
+            && self.call_site_assigns_its_own_result((block_addr, op_idx))
+            && let Some((definition_block, definition_idx)) =
+                self.certified_call_result_definition_site((block_addr, op_idx))
+        {
+            self.observe_normalized_output_stmt(definition_block, definition_idx, stmt)
+        } else {
+            stmt
+        };
+        Ok(Some(self.observe_effect_stmt(&obligations, stmt)))
+    }
+
+    /// Render one resolved indirect-call target without letting occurrence
+    /// metadata change whether an already-callable variable is dereferenced.
+    pub(super) fn indirect_callable_expr(resolved_target: CExpr) -> CExpr {
+        match resolved_target.unobserved() {
+            CExpr::Var(_) => resolved_target,
+            _ => CExpr::Deref(Box::new(resolved_target)),
         }
-        Some(stmt)
+    }
+}
+
+#[cfg(test)]
+mod typed_output_contract_tests {
+    use super::*;
+
+    #[test]
+    fn only_operations_with_typed_outputs_require_final_write_projection() {
+        let dst = r2ssa::SSAVar::new("dst", 1, 8);
+        let input = r2ssa::SSAVar::new("input", 0, 8);
+
+        assert!(operation_requires_final_write_projection(&SSAOp::Copy {
+            dst,
+            src: input.clone(),
+        }));
+        assert!(!operation_requires_final_write_projection(&SSAOp::Store {
+            space: r2il::SpaceId::Ram,
+            addr: input.clone(),
+            val: input.clone(),
+        }));
+        assert!(!operation_requires_final_write_projection(&SSAOp::Call {
+            target: input.clone(),
+        }));
+        assert!(!operation_requires_final_write_projection(
+            &SSAOp::CallInd { target: input }
+        ));
     }
 }

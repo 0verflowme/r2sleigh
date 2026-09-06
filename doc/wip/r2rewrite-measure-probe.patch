@@ -1,0 +1,145 @@
+diff --git a/r2plugin/Cargo.toml b/r2plugin/Cargo.toml
+index 3b040a3..c0d2350 100644
+--- a/r2plugin/Cargo.toml
++++ b/r2plugin/Cargo.toml
+@@ -18,6 +18,7 @@ r2ssa = { path = "../crates/r2ssa" }
+ r2sym = { path = "../crates/r2sym" }
+ r2types = { path = "../crates/r2types" }
+ r2engine = { path = "../crates/r2engine" }
++r2rewrite = { path = "../crates/r2rewrite" }
+ serde.workspace = true
+ serde_json.workspace = true
+ z3.workspace = true
+diff --git a/r2plugin/src/lib.rs b/r2plugin/src/lib.rs
+index 7a8600c..b03574e 100644
+--- a/r2plugin/src/lib.rs
++++ b/r2plugin/src/lib.rs
+@@ -2657,6 +2657,105 @@ fn trusted_engine_function_input(
+     }
+ }
+ 
++/// Measurement only, behind `R2REWRITE_MEASURE`: canonicalise the function's
++/// machine projection and report, on stderr, what the rules would do to it
++/// and what that costs beside building the projection. Nothing of it reaches
++/// the rendering; the crate is not wired into the decompiler yet.
++fn measure_rewrite(trusted: &r2ssa::TrustedSsaArtifact) {
++    use std::time::Instant;
++    let artifact = trusted.artifact();
++    let name = source_function_name(trusted);
++    let started = Instant::now();
++    let projection = match r2ssa::MachineProjection::from_artifact(artifact) {
++        Ok(projection) => projection,
++        Err(error) => {
++            eprintln!("R2REWRITE_MEASURE fn={name} projection_error={error:?}");
++            return;
++        }
++    };
++    let projected = Instant::now();
++    let roots = match r2rewrite::canonicalize(artifact, &projection) {
++        Ok(roots) => roots,
++        Err(error) => {
++            eprintln!("R2REWRITE_MEASURE fn={name} canonicalize_error={error}");
++            return;
++        }
++    };
++    let canonicalised = Instant::now();
++    let base_casts = projection
++        .arena()
++        .iter()
++        .filter(|(_, expr)| matches!(expr.kind(), r2ssa::MachineExprKind::Cast { .. }))
++        .count();
++    let base_extracts = projection
++        .arena()
++        .iter()
++        .filter(|(_, expr)| matches!(expr.kind(), r2ssa::MachineExprKind::Extract { .. }))
++        .count();
++    let arena = roots.arena();
++    let count_kind = |root: r2rewrite::TermId, pick: fn(&r2rewrite::TermKind) -> bool| -> usize {
++        let mut seen = std::collections::HashSet::new();
++        let mut stack = vec![root];
++        let mut n = 0;
++        while let Some(id) = stack.pop() {
++            if !seen.insert(id) {
++                continue;
++            }
++            let term = arena.term(id);
++            if pick(&term.kind) {
++                n += 1;
++            }
++            stack.extend(term.kind.children());
++        }
++        n
++    };
++    let is_cast = |k: &r2rewrite::TermKind| {
++        matches!(
++            k,
++            r2rewrite::TermKind::Cast { .. } | r2rewrite::TermKind::Extract { .. }
++        )
++    };
++    let mut imported_casts = 0;
++    let mut canonical_casts = 0;
++    let mut rewritten = 0;
++    let mut literal_results = 0;
++    let mut opaque = 0;
++    let mut any = 0;
++    for value in roots.values() {
++        let imported = roots.import().value(value.value).map(|v| v.term);
++        if let Some(imported) = imported {
++            imported_casts += count_kind(imported, is_cast);
++        }
++        canonical_casts += count_kind(value.canonical, is_cast);
++        if value.trace.iter().any(|r| r.rule != r2rewrite::COPY_ELIDE) {
++            rewritten += 1;
++        }
++        match arena.term(value.canonical).kind {
++            r2rewrite::TermKind::Literal(_) => literal_results += 1,
++            r2rewrite::TermKind::Opaque(_) => opaque += 1,
++            _ => {}
++        }
++        if value.multiplicity == r2rewrite::Multiplicity::Any {
++            any += 1;
++        }
++    }
++    let counts: Vec<String> = roots
++        .rewrite_counts()
++        .iter()
++        .map(|(rule, n)| format!("{rule}={n}"))
++        .collect();
++    eprintln!(
++        "R2REWRITE_MEASURE fn={name} values={} entities={} projection_us={} canonicalize_us={} terms={} rewritten_values={rewritten} literal_results={literal_results} opaque={opaque} duplicable={any} base_cast_nodes={base_casts} base_extract_nodes={base_extracts} imported_cast_terms={imported_casts} canonical_cast_terms={canonical_casts} budget_failures={} rules[{}]",
++        artifact.graph().values.len(),
++        projection.entities().len(),
++        (projected - started).as_micros(),
++        (canonicalised - projected).as_micros(),
++        arena.len(),
++        roots.budget_failures().len(),
++        counts.join(",")
++    );
++}
++
+ fn r2sleigh_engine_decompile_trusted_output(
+     _input: &R2SleighEngineRequestPayloadV2,
+     ingress: crate::ffi_v2::TrustedIngress,
+@@ -2667,6 +2766,9 @@ fn r2sleigh_engine_decompile_trusted_output(
+         callees,
+     } = ingress;
+     let block_count = trusted.source_blocks().len();
++    if std::env::var_os("R2REWRITE_MEASURE").is_some() {
++        measure_rewrite(&trusted);
++    }
+     let function_input = trusted_engine_function_input(&trusted);
+     let ptr_bits = helpers::effective_ptr_bits(trusted.arch_spec());
+     let decompile_input = r2engine::EngineFunctionDecompileRequestInput::single_function(
+
+Applied with `git apply doc/wip/r2rewrite-measure-probe.patch`, this adds an
+env-gated probe to the plugin's trusted decompile entry: with
+`R2REWRITE_MEASURE=1` set, every function canonicalised on the way past prints
+one stderr line of counts and microseconds. It is not wired into rendering and
+must not be committed to the plugin -- the renderer wiring is step 2e, owned by
+the integration branch. It exists so the arena-versus-spelled cast measurement
+can be reproduced:
+
+    git apply doc/wip/r2rewrite-measure-probe.patch
+    make -C r2plugin RUST_FEATURES=all-archs install
+    R2REWRITE_MEASURE=1 tests/corpus/sweep.sh tests/corpus/artifacts/bin/h_x64_O2
+    git checkout -- Cargo.lock r2plugin/

@@ -6,7 +6,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use r2il::{ArchSpec, Endianness, R2ILBlock, R2ILOp, SpaceId, effective_arch_address_size};
+use r2il::{
+    ArchSpec, Endianness, R2ILBlock, R2ILOp, RegisterProjection, RegisterProjectionDisposition,
+    RegisterProjectionQuery, RegisterProjectionRefusal, RegisterStorage, SpaceId,
+    effective_arch_address_size,
+};
 use serde::Serialize;
 
 use crate::function::SSAFunction;
@@ -14,18 +18,18 @@ use crate::op::SSAOp;
 use crate::semantic::CallSiteId;
 pub use r2source::{
     CanonicalStorageId, CanonicalStorageSpace, SOURCE_CALL_SITE_INTERFACE_SCHEMA_VERSION,
-    SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION, SOURCE_TYPE_GRAPH_SCHEMA_VERSION,
+    SOURCE_FUNCTION_INTERFACE_SCHEMA_VERSION, SOURCE_TYPE_GRAPH_SCHEMA_VERSION, SourceAbiClass,
     SourceAbiParameterSpec, SourceAggregateLayout, SourceAggregateMember, SourceCallArgumentSpec,
     SourceCallResult, SourceCallSiteIdentity, SourceCallSiteInterface,
     SourceCallSiteInterfaceError, SourceCarrierKind, SourceCarrierProjection,
-    SourceFunctionInterface, SourceFunctionInterfaceError, SourceFunctionReturn,
-    SourceLogicalValue, SourceMachineRoles, SourceStackAllocationContract, SourceStackGrowth,
-    SourceStackSlotRole,
-    SourceStackSlotSpec, SourceType, SourceTypeGraph, SourceTypeGraphError, SourceTypeKind,
-    StackAddressBase,
+    SourceConventionSlots, SourceFunctionInterface, SourceFunctionInterfaceError,
+    SourceFunctionReturn, SourceLogicalValue, SourceMachineRoles, SourceMachineRolesError,
+    SourceStackAllocationContract, SourceStackGrowth, SourceStackSlotRole, SourceStackSlotSpec,
+    SourceType, SourceTypeGraph, SourceTypeGraphError, SourceTypeKind,
+    SourceVariadicArgumentCountRule, StackAddressBase,
 };
 
-pub const MACHINE_CONTEXT_SCHEMA_VERSION: u32 = 16;
+pub const MACHINE_CONTEXT_SCHEMA_VERSION: u32 = 23;
 
 /// Canonical architecture family captured from the exact lifting profile.
 ///
@@ -106,6 +110,17 @@ impl MachineArchitectureFamily {
             Self::PowerPc64
         } else {
             Self::Unknown
+        }
+    }
+
+    /// Resolve a generic source convention only when this exact machine family
+    /// supplies the missing architectural qualifier.
+    pub const fn refine_abi_class(self, abi_class: SourceAbiClass) -> SourceAbiClass {
+        match (self, abi_class) {
+            (Self::X86_64, SourceAbiClass::Microsoft) => SourceAbiClass::MicrosoftX64,
+            (Self::X86_64, SourceAbiClass::SystemV) => SourceAbiClass::SystemVAMD64,
+            (Self::AArch64, SourceAbiClass::Aapcs) => SourceAbiClass::Aapcs64,
+            (_, abi_class) => abi_class,
         }
     }
 }
@@ -483,6 +498,14 @@ fn return_mechanism_matches_machine(
         && is_exact_top_level_address_register(arch, stack_pointer, address_size)
 }
 
+/// Ingress disposition of the source-owned register geometry contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum MachineRegisterGeometryState {
+    Unavailable,
+    Available,
+    Malformed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SourceMachineContext {
     schema_version: u32,
@@ -490,10 +513,24 @@ pub struct SourceMachineContext {
     memory_model: MachineMemoryModel,
     function_interface: Option<SourceFunctionInterface>,
     machine_roles: SourceMachineRoles,
+    /// Where this convention would leave arguments and a result. The result
+    /// slot is what makes "is this the return register" answerable without a
+    /// list of register spellings.
+    convention_slots: Option<SourceConventionSlots>,
+    /// Where this architecture returns a value, when it says.
+    architecture_result_slot: Option<CanonicalStorageId>,
     abi_model: MachineAbiModel,
     register_storages_by_name: BTreeMap<String, CanonicalStorageId>,
+    /// Exact source-owned register geometry; no write policy is stored here.
+    register_geometry_state: MachineRegisterGeometryState,
+    register_projections: Box<[RegisterProjection]>,
     raw_call_sites_by_id: BTreeMap<CallSiteId, SourceCallSiteIdentity>,
+    tail_call_sites: BTreeSet<CallSiteId>,
     call_site_interfaces: BTreeMap<SourceCallSiteIdentity, SourceCallSiteInterface>,
+    /// Literal bytes captured by the same immutable source transaction as the
+    /// callsite interfaces. Unlike display strings, these participate in
+    /// semantic identity because a variadic format literal is count evidence.
+    source_string_literals: BTreeMap<u64, String>,
     memory_spaces_by_op: BTreeMap<(u64, usize), SpaceId>,
 }
 
@@ -531,10 +568,6 @@ impl MachineContextIdentityWriter {
     fn bytes(&mut self, value: &[u8]) {
         self.usize(value.len());
         self.0.extend_from_slice(value);
-    }
-
-    fn string(&mut self, value: &str) {
-        self.bytes(value.as_bytes());
     }
 
     fn storage(&mut self, storage: CanonicalStorageId) {
@@ -612,6 +645,26 @@ fn write_memory_endianness(
     });
 }
 
+fn write_abi_class(writer: &mut MachineContextIdentityWriter, abi_class: SourceAbiClass) {
+    writer.u8(match abi_class {
+        SourceAbiClass::Unknown => 0,
+        SourceAbiClass::Other => 1,
+        SourceAbiClass::Microsoft => 2,
+        SourceAbiClass::MicrosoftX64 => 3,
+        SourceAbiClass::SystemV => 4,
+        SourceAbiClass::SystemVAMD64 => 5,
+        SourceAbiClass::Aapcs => 6,
+        SourceAbiClass::Aapcs64 => 7,
+        SourceAbiClass::RiscV32 => 8,
+        SourceAbiClass::RiscV64 => 9,
+        SourceAbiClass::Cdecl => 10,
+        SourceAbiClass::Stdcall => 11,
+        SourceAbiClass::Fastcall => 12,
+        SourceAbiClass::Thiscall => 13,
+        SourceAbiClass::Vectorcall => 14,
+    });
+}
+
 fn write_return_mechanism(
     writer: &mut MachineContextIdentityWriter,
     mechanism: Option<r2source::SourceReturnMechanism>,
@@ -654,6 +707,12 @@ fn write_type_graph(writer: &mut MachineContextIdentityWriter, graph: Option<&So
                 writer.u8(4);
                 writer.u32(aggregate_id);
             }
+            SourceTypeKind::Void => writer.u8(5),
+            SourceTypeKind::Code => writer.u8(6),
+            SourceTypeKind::Union { aggregate_id } => {
+                writer.u8(7);
+                writer.u32(aggregate_id);
+            }
         }
         writer.u64(source_type.size_bits());
         writer.u64(source_type.align_bits());
@@ -685,7 +744,7 @@ fn write_function_interface(
     writer.u8(1);
     writer.u32(interface.schema_version());
     writer.bytes(interface.revision_identity());
-    writer.string(interface.calling_convention());
+    write_abi_class(writer, interface.abi_class());
     writer.usize(interface.parameters().len());
     for parameter in interface.parameters() {
         writer.u32(parameter.index());
@@ -702,17 +761,6 @@ fn write_function_interface(
     writer.option_storage(interface.stack_pointer_storage());
     writer.option_storage(interface.frame_pointer_storage());
     write_return_mechanism(writer, interface.return_mechanism());
-    match interface.stack_allocation_contract() {
-        Some(contract) => {
-            writer.u8(1);
-            writer.u8(match contract.growth() {
-                SourceStackGrowth::LowerAddresses => 1,
-                SourceStackGrowth::HigherAddresses => 2,
-            });
-            writer.u32(contract.implicit_active_sp_bytes());
-        }
-        None => writer.u8(0),
-    }
     writer.usize(interface.stack_slots().len());
     for slot in interface.stack_slots() {
         writer.stack_base(slot.base());
@@ -764,13 +812,20 @@ fn write_call_site_interface(
     writer.bytes(interface.revision_identity());
     write_call_identity(writer, interface.identity());
     writer.bool(interface.is_complete());
-    writer.string(interface.calling_convention());
+    write_abi_class(writer, interface.abi_class());
     writer.usize(interface.arguments().len());
     for argument in interface.arguments() {
         writer.u32(argument.index());
         writer.storage(argument.storage());
     }
     writer.bool(interface.is_variadic());
+    match interface.variadic_argument_count_rule() {
+        Some(SourceVariadicArgumentCountRule::Radare2FormatString { parameter_index }) => {
+            writer.u8(1);
+            writer.u32(parameter_index);
+        }
+        None => writer.u8(0),
+    }
     writer.bool(interface.is_noreturn());
     match interface.result() {
         SourceCallResult::Void => writer.u8(0),
@@ -779,11 +834,37 @@ fn write_call_site_interface(
             writer.storage(storage);
         }
     }
+    write_function_interface(writer, interface.exact_callee_interface());
+}
+
+/// Unique register-space ranges the lifted body actually reads or writes.
+///
+/// The architecture query owns projection policy. This pass only supplies the
+/// exact observed ranges once so the immutable function context can retain a
+/// sorted `O(log n)` lookup table for every later consumer.
+fn observed_register_storages(blocks: &[R2ILBlock]) -> BTreeSet<RegisterStorage> {
+    blocks
+        .iter()
+        .flat_map(|block| &block.ops)
+        .flat_map(|op| op.inputs().into_iter().chain(op.output()))
+        .filter(|varnode| varnode.space == SpaceId::Register)
+        .map(|varnode| RegisterStorage {
+            offset: varnode.offset,
+            size: varnode.size,
+        })
+        .collect()
 }
 
 impl SourceMachineContext {
     pub(crate) fn from_blocks(blocks: &[R2ILBlock], arch: Option<&ArchSpec>) -> Self {
-        Self::from_blocks_with_interfaces(blocks, arch, None, SourceMachineRoles::default(), Vec::new())
+        Self::from_blocks_with_interfaces(
+            blocks,
+            arch,
+            None,
+            SourceMachineRoles::default(),
+            None,
+            Vec::new(),
+        )
     }
 
     pub(crate) fn from_blocks_with_interfaces(
@@ -791,23 +872,94 @@ impl SourceMachineContext {
         arch: Option<&ArchSpec>,
         function_interface: Option<SourceFunctionInterface>,
         machine_roles: SourceMachineRoles,
+        convention_slots: Option<SourceConventionSlots>,
         call_site_interfaces: Vec<SourceCallSiteInterface>,
     ) -> Self {
-        let register_storages_by_name: BTreeMap<String, CanonicalStorageId> = arch
-            .into_iter()
-            .flat_map(|arch| &arch.registers)
-            .map(|register| {
-                (
-                    register.name.to_ascii_lowercase(),
-                    CanonicalStorageId {
-                        space: CanonicalStorageSpace::Register,
-                        offset: register.offset,
-                        size: register.size,
-                    },
-                )
+        Self::from_blocks_with_interfaces_and_tail_calls(
+            blocks,
+            arch,
+            function_interface,
+            machine_roles,
+            convention_slots,
+            call_site_interfaces,
+            Vec::new(),
+        )
+    }
+
+    pub(crate) fn from_blocks_with_interfaces_and_tail_calls(
+        blocks: &[R2ILBlock],
+        arch: Option<&ArchSpec>,
+        function_interface: Option<SourceFunctionInterface>,
+        machine_roles: SourceMachineRoles,
+        convention_slots: Option<SourceConventionSlots>,
+        call_site_interfaces: Vec<SourceCallSiteInterface>,
+        tail_call_identities: Vec<SourceCallSiteIdentity>,
+    ) -> Self {
+        // The architecture says where it returns a value, for a function whose
+        // ABI was never recovered.
+        let architecture_result_slot = arch.and_then(|arch| {
+            arch.return_registers.first().map(|reg| CanonicalStorageId {
+                space: CanonicalStorageSpace::Register,
+                offset: reg.offset,
+                size: reg.size,
             })
-            .collect();
+        });
         let architecture_family = MachineArchitectureFamily::from_arch_spec(arch);
+        let mut register_declarations_by_name = BTreeMap::<String, Vec<CanonicalStorageId>>::new();
+        for register in arch.into_iter().flat_map(|arch| &arch.registers) {
+            let storage = CanonicalStorageId {
+                space: CanonicalStorageSpace::Register,
+                offset: register.offset,
+                size: register.size,
+            };
+            if register.size != 0
+                && register
+                    .offset
+                    .checked_add(u64::from(register.size))
+                    .is_some()
+            {
+                register_declarations_by_name
+                    .entry(register.name.trim().to_ascii_lowercase())
+                    .or_default()
+                    .push(storage);
+            }
+        }
+        let register_storages_by_name: BTreeMap<String, CanonicalStorageId> =
+            register_declarations_by_name
+                .into_iter()
+                .filter_map(|(name, storages)| {
+                    let [storage] = storages.as_slice() else {
+                        return None;
+                    };
+                    Some((name, *storage))
+                })
+                .collect();
+        let (register_geometry_state, register_projections) = match arch {
+            None => (MachineRegisterGeometryState::Unavailable, Box::default()),
+            Some(arch) => match RegisterProjectionQuery::from_arch(arch) {
+                Err(_) => (MachineRegisterGeometryState::Malformed, Box::default()),
+                Ok(None) => (MachineRegisterGeometryState::Unavailable, Box::default()),
+                Ok(Some(query)) => {
+                    let mut projections = arch
+                        .register_projections
+                        .iter()
+                        .map(|projection| (projection.written, *projection))
+                        .collect::<BTreeMap<_, _>>();
+                    for storage in observed_register_storages(blocks) {
+                        projections
+                            .entry(storage)
+                            .or_insert_with(|| query.project(storage));
+                    }
+                    (
+                        MachineRegisterGeometryState::Available,
+                        projections
+                            .into_values()
+                            .collect::<Vec<_>>()
+                            .into_boxed_slice(),
+                    )
+                }
+            },
+        };
         let memory_model = MachineMemoryModel::from_arch(arch);
         let frame_pointer_storage = function_interface
             .as_ref()
@@ -867,14 +1019,44 @@ impl SourceMachineContext {
                     .stack_pointer_storage()
                     .is_none_or(is_exact_address_register)
                 && frame_pointer_storage.is_none_or(is_exact_address_register);
-            abi_model.coherent &= exact_interface_roles_exist
+            let frame_pointer_matches =
+                frame_pointer_storage_matches_machine(interface, frame_pointer_storage, arch);
+            let return_mechanism_matches =
+                return_mechanism_matches_machine(interface, arch, &memory_model);
+            let coherent = exact_interface_roles_exist
                 && carrier_storages_are_disjoint
                 && declared_storages_exist
                 && machine_carriers_are_exact_address_registers
-                && frame_pointer_storage_matches_machine(interface, frame_pointer_storage, arch)
-                && return_mechanism_matches_machine(interface, arch, &memory_model);
+                && frame_pointer_matches
+                && return_mechanism_matches;
+            if !coherent {
+                // An incoherent model leaves every return boundary incomplete
+                // and the function refused, and six terms decide it. Naming
+                // the one that failed is the difference between a trace and
+                // a search: an interface that now carries the frame-pointer
+                // homes DWARF declared fails `exact_interface_roles_exist`
+                // for want of a frame-pointer storage, which is a different
+                // repair from a carrier that is not an address register.
+                r2il::refusal_evidence!(
+                    "abi-model-incoherent",
+                    "roles_exist={exact_interface_roles_exist} \
+                     slot_roles_complete={} return_address={} stack_pointer={} \
+                     frame_pointer_slots={has_frame_pointer_slots} \
+                     frame_pointer_storage={} carriers_disjoint={carrier_storages_are_disjoint} \
+                     declared_exist={declared_storages_exist} \
+                     carriers_are_addresses={machine_carriers_are_exact_address_registers} \
+                     frame_pointer_matches={frame_pointer_matches} \
+                     return_mechanism_matches={return_mechanism_matches}",
+                    interface.stack_slot_roles_complete(),
+                    interface.return_address_storage().is_some(),
+                    interface.stack_pointer_storage().is_some(),
+                    frame_pointer_storage.is_some()
+                );
+            }
+            abi_model.coherent &= coherent;
         }
-        let raw_call_sites_by_id = collect_raw_call_site_identities(blocks);
+        let (raw_call_sites_by_id, tail_call_sites) =
+            collect_raw_call_site_identities(blocks, &tail_call_identities);
         let raw_call_sites = raw_call_sites_by_id
             .values()
             .copied()
@@ -946,10 +1128,16 @@ impl SourceMachineContext {
             memory_model,
             function_interface,
             machine_roles,
+            convention_slots,
+            architecture_result_slot,
             abi_model,
             register_storages_by_name,
+            register_geometry_state,
+            register_projections,
             raw_call_sites_by_id,
+            tail_call_sites,
             call_site_interfaces: call_site_interfaces_by_identity,
+            source_string_literals: BTreeMap::new(),
             memory_spaces_by_op,
         }
     }
@@ -974,10 +1162,67 @@ impl SourceMachineContext {
         self.function_interface.as_ref()
     }
 
+    /// Exact source-owned convention slots, including their typed ABI class.
+    pub const fn convention_slots(&self) -> Option<&SourceConventionSlots> {
+        self.convention_slots.as_ref()
+    }
+
+    /// Decisive function ABI after combining the source convention with the
+    /// exact lifted architecture family. Conflicting source contracts refuse
+    /// to choose one ABI.
+    pub fn effective_abi_class(&self) -> SourceAbiClass {
+        let function_class = self
+            .function_interface
+            .as_ref()
+            .map(SourceFunctionInterface::abi_class)
+            .unwrap_or(SourceAbiClass::Unknown);
+        let slot_class = self
+            .convention_slots
+            .as_ref()
+            .map(SourceConventionSlots::abi_class)
+            .unwrap_or(SourceAbiClass::Unknown);
+        let function_class = self.architecture_family.refine_abi_class(function_class);
+        let slot_class = self.architecture_family.refine_abi_class(slot_class);
+        match (function_class, slot_class) {
+            (SourceAbiClass::Unknown, other) | (other, SourceAbiClass::Unknown) => other,
+            (left, right) if left == right => left,
+            _ => SourceAbiClass::Unknown,
+        }
+    }
+
     /// Borrow the machine carriers the source resolved from its register
     /// profile. These are available whether or not an ABI was recovered.
     pub const fn machine_roles(&self) -> &SourceMachineRoles {
         &self.machine_roles
+    }
+
+    /// The location a call leaves its result in.
+    ///
+    /// The recovered convention states this when there was one. Failing that
+    /// the architecture states it, which is still the machine speaking rather
+    /// than a list of register spellings that knows the architectures somebody
+    /// thought of.
+    pub fn result_slot(&self) -> Option<CanonicalStorageId> {
+        self.convention_slots
+            .as_ref()
+            .and_then(|slots| slots.result_slot())
+            .or(self.architecture_result_slot)
+    }
+
+    /// The location this function returns a value in, and whether it returns
+    /// one at all.
+    ///
+    /// The interface states both, so a function declared to return nothing
+    /// answers `None` rather than the location a result would have gone in.
+    /// The convention answers only where a caller *would* leave a value, which
+    /// is not the same claim, so it is the fallback for a function whose
+    /// interface was never recovered.
+    pub fn return_value_carrier(&self) -> Option<CanonicalStorageId> {
+        match self.function_interface.as_ref().map(|i| i.return_kind()) {
+            Some(r2source::SourceFunctionReturn::Void) => None,
+            Some(r2source::SourceFunctionReturn::Register { storage }) => Some(storage),
+            None => self.result_slot(),
+        }
     }
 
     /// The carrier holding the return address, preferring the ABI's own
@@ -1011,12 +1256,93 @@ impl SourceMachineContext {
 
     pub fn register_storage(&self, name: &str) -> Option<CanonicalStorageId> {
         self.register_storages_by_name
-            .get(&name.to_ascii_lowercase())
+            .get(&name.trim().to_ascii_lowercase())
             .copied()
+    }
+
+    /// The registers the calling convention would place arguments in, in order.
+    ///
+    /// The convention is stated by the lifter that knows the target. Deriving it
+    /// from a pointer width instead answers the same ABI for every 64-bit
+    /// architecture, which is how arm64 came to be told it uses `rdi`.
+    pub fn argument_register_names(&self) -> Vec<String> {
+        let Some(slots) = self.convention_slots.as_ref() else {
+            return Vec::new();
+        };
+        slots
+            .argument_slots()
+            .iter()
+            .filter_map(|storage| self.register_name(*storage))
+            .collect()
+    }
+
+    /// The registers that are condition codes rather than storage.
+    ///
+    /// A flag is a one-byte register no wider register contains: nothing can be
+    /// written through it and nothing read out of it at another width. That is a
+    /// fact about the register file, so it holds for any architecture, unlike
+    /// the list of spellings this replaces.
+    pub fn flag_register_names(&self) -> Vec<String> {
+        self.register_storages_by_name
+            .iter()
+            .filter(|(_, storage)| {
+                storage.space == CanonicalStorageSpace::Register && storage.size == 1
+            })
+            .filter(|(_, storage)| {
+                !self.register_storages_by_name.values().any(|other| {
+                    other.space == CanonicalStorageSpace::Register
+                        && other.size > 1
+                        && other.offset <= storage.offset
+                        && storage.offset < other.offset + u64::from(other.size)
+                })
+            })
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    /// The name the architecture gives this storage, when it names it exactly.
+    pub fn register_name(&self, storage: CanonicalStorageId) -> Option<String> {
+        self.register_storages_by_name
+            .iter()
+            .find(|(_, candidate)| **candidate == storage)
+            .map(|(name, _)| name.clone())
     }
 
     pub const fn register_storages_by_name(&self) -> &BTreeMap<String, CanonicalStorageId> {
         &self.register_storages_by_name
+    }
+
+    pub const fn register_geometry_state(&self) -> MachineRegisterGeometryState {
+        self.register_geometry_state
+    }
+
+    /// Exact source-owned register carrier geometry for declared and observed
+    /// register-space ranges.
+    ///
+    /// A non-empty slice is the validated, sorted `r2il` contract without any
+    /// downstream reconstruction or architecture-specific write policy. When
+    /// it is empty, [`Self::register_geometry_state`] distinguishes unavailable
+    /// source facts from a malformed non-empty source contract.
+    pub const fn register_projections(&self) -> &[RegisterProjection] {
+        &self.register_projections
+    }
+
+    /// Resolve one exact written storage without consulting register spellings.
+    pub fn register_projection(
+        &self,
+        written_storage: CanonicalStorageId,
+    ) -> Option<&RegisterProjection> {
+        if written_storage.space != CanonicalStorageSpace::Register {
+            return None;
+        }
+        let written = RegisterStorage {
+            offset: written_storage.offset,
+            size: written_storage.size,
+        };
+        self.register_projections
+            .binary_search_by_key(&written, |projection| projection.written)
+            .ok()
+            .and_then(|index| self.register_projections.get(index))
     }
 
     pub const fn raw_call_sites_by_id(&self) -> &BTreeMap<CallSiteId, SourceCallSiteIdentity> {
@@ -1025,6 +1351,10 @@ impl SourceMachineContext {
 
     pub fn raw_call_site_identity(&self, call_site: CallSiteId) -> Option<SourceCallSiteIdentity> {
         self.raw_call_sites_by_id.get(&call_site).copied()
+    }
+
+    pub fn is_tail_call_site(&self, call_site: CallSiteId) -> bool {
+        self.tail_call_sites.contains(&call_site)
     }
 
     pub const fn call_site_interfaces(
@@ -1036,6 +1366,31 @@ impl SourceMachineContext {
     pub fn call_site_interface(&self, call_site: CallSiteId) -> Option<&SourceCallSiteInterface> {
         self.raw_call_site_identity(call_site)
             .and_then(|identity| self.call_site_interfaces.get(&identity))
+    }
+
+    /// Retain literal contents from the exact source snapshot before semantic
+    /// preparation. Duplicate addresses with different contents are omitted;
+    /// ambiguity is not literal evidence.
+    pub(crate) fn bind_source_string_literals(&mut self, literals: &[(u64, String)]) {
+        let mut ambiguous = BTreeSet::new();
+        for (address, text) in literals {
+            if self
+                .source_string_literals
+                .insert(*address, text.clone())
+                .is_some_and(|previous| previous != *text)
+            {
+                ambiguous.insert(*address);
+            }
+        }
+        for address in ambiguous {
+            self.source_string_literals.remove(&address);
+        }
+    }
+
+    pub fn source_string_literal(&self, address: u64) -> Option<&str> {
+        self.source_string_literals
+            .get(&address)
+            .map(String::as_str)
     }
 
     pub fn memory_space_at(&self, block_addr: u64, op_index: usize) -> Option<SpaceId> {
@@ -1052,7 +1407,7 @@ impl SourceMachineContext {
     /// machine/source fact that can affect prepared semantics or certification.
     pub(crate) fn semantic_identity_bytes(&self) -> Box<[u8]> {
         let mut writer = MachineContextIdentityWriter::new();
-        writer.bytes(b"r2ssa-machine-context-semantic-v2");
+        writer.bytes(b"r2ssa-machine-context-semantic-v6");
         writer.u32(self.schema_version);
         writer.u8(match self.architecture_family {
             MachineArchitectureFamily::Unknown => 0,
@@ -1087,6 +1442,7 @@ impl SourceMachineContext {
         writer.u32(abi.schema_version());
         writer.bool(abi.is_available());
         writer.bool(abi.is_coherent());
+        write_abi_class(&mut writer, self.effective_abi_class());
         writer.usize(abi.argument_registers().len());
         for slot in abi.argument_registers() {
             writer.u32(slot.index());
@@ -1100,6 +1456,32 @@ impl SourceMachineContext {
         writer.option_storage(abi.frame_pointer_storage());
 
         write_function_interface(&mut writer, self.function_interface.as_ref());
+        writer.option_storage(self.machine_roles.return_address_storage());
+        writer.option_storage(self.machine_roles.stack_pointer_storage());
+        match self.machine_roles.stack_allocation_contract() {
+            Some(contract) => {
+                writer.u8(1);
+                writer.u8(match contract.growth() {
+                    SourceStackGrowth::LowerAddresses => 1,
+                    SourceStackGrowth::HigherAddresses => 2,
+                });
+                writer.u32(contract.implicit_active_sp_bytes());
+            }
+            None => writer.u8(0),
+        }
+
+        match self.convention_slots.as_ref() {
+            Some(slots) => {
+                writer.u8(1);
+                write_abi_class(&mut writer, slots.abi_class());
+                writer.usize(slots.argument_slots().len());
+                for storage in slots.argument_slots() {
+                    writer.storage(*storage);
+                }
+                writer.option_storage(slots.result_slot());
+            }
+            None => writer.u8(0),
+        }
 
         let mut register_storages = self
             .register_storages_by_name
@@ -1113,14 +1495,58 @@ impl SourceMachineContext {
             writer.storage(storage);
         }
 
+        writer.u8(match self.register_geometry_state {
+            MachineRegisterGeometryState::Unavailable => 0,
+            MachineRegisterGeometryState::Available => 1,
+            MachineRegisterGeometryState::Malformed => 2,
+        });
+        writer.usize(self.register_projections.len());
+        for projection in &self.register_projections {
+            writer.storage(CanonicalStorageId {
+                space: CanonicalStorageSpace::Register,
+                offset: projection.written.offset,
+                size: projection.written.size,
+            });
+            match projection.disposition {
+                RegisterProjectionDisposition::Bound { carrier, slice } => {
+                    writer.u8(1);
+                    writer.storage(CanonicalStorageId {
+                        space: CanonicalStorageSpace::Register,
+                        offset: carrier.offset,
+                        size: carrier.size,
+                    });
+                    writer.u64(slice.lsb_bit_offset);
+                    writer.u64(slice.size_bits);
+                }
+                RegisterProjectionDisposition::Refused { reason } => {
+                    writer.u8(2);
+                    writer.u8(match reason {
+                        RegisterProjectionRefusal::InvalidStorageRange => 1,
+                        RegisterProjectionRefusal::NoContainingCarrier => 2,
+                        RegisterProjectionRefusal::AmbiguousContainingCarrier => 3,
+                        RegisterProjectionRefusal::ConflictingDeclarations => 4,
+                        RegisterProjectionRefusal::PartialOverlap => 5,
+                        RegisterProjectionRefusal::MissingRegisterEndianness => 6,
+                    });
+                }
+            }
+        }
+
         writer.usize(self.raw_call_sites_by_id.len());
         for (call_site, identity) in &self.raw_call_sites_by_id {
             writer.u32(call_site.0);
             write_call_identity(&mut writer, *identity);
+            writer.bool(self.tail_call_sites.contains(call_site));
         }
         writer.usize(self.call_site_interfaces.len());
         for interface in self.call_site_interfaces.values() {
             write_call_site_interface(&mut writer, interface);
+        }
+
+        writer.usize(self.source_string_literals.len());
+        for (address, text) in &self.source_string_literals {
+            writer.u64(*address);
+            writer.bytes(text.as_bytes());
         }
 
         writer.usize(self.memory_spaces_by_op.len());
@@ -1206,7 +1632,32 @@ fn ssa_memory_space(op: &SSAOp) -> Option<SpaceId> {
 
 fn collect_raw_call_site_identities(
     blocks: &[R2ILBlock],
-) -> BTreeMap<CallSiteId, SourceCallSiteIdentity> {
+    tail_call_identities: &[SourceCallSiteIdentity],
+) -> (
+    BTreeMap<CallSiteId, SourceCallSiteIdentity>,
+    BTreeSet<CallSiteId>,
+) {
+    let tail_call_identities = tail_call_identities
+        .iter()
+        .copied()
+        .filter(|identity| {
+            blocks.iter().any(|block| {
+                identity.block_addr() == block.addr
+                    && identity.op_index() + 1 == block.ops.len()
+                    && match block.ops.get(identity.op_index()) {
+                        Some(R2ILOp::Branch { target }) => {
+                            CanonicalStorageId::from_varnode(target) == identity.target()
+                        }
+                        Some(R2ILOp::BranchInd { .. }) => {
+                            terminal_indirect_loaded_slot(block, identity.op_index())
+                                == Some(identity.target())
+                        }
+                        _ => false,
+                    }
+            })
+        })
+        .collect::<BTreeSet<_>>();
+    let authorized_tail_calls = &tail_call_identities;
     let mut raw_calls = blocks
         .iter()
         .flat_map(|block| {
@@ -1214,32 +1665,180 @@ fn collect_raw_call_site_identities(
                 .ops
                 .iter()
                 .enumerate()
-                .filter_map(move |(op_index, op)| match op {
-                    R2ILOp::Call { target } => Some((
-                        block.addr,
-                        op_index,
-                        Some(SourceCallSiteIdentity::new(
-                            block.addr,
-                            op_index,
-                            CanonicalStorageId::from_varnode(target),
-                        )),
-                    )),
-                    R2ILOp::CallInd { .. } => Some((block.addr, op_index, None)),
-                    _ => None,
+                .filter_map(move |(op_index, op)| {
+                    let identity = match op {
+                        R2ILOp::Call { target } | R2ILOp::CallInd { target } => {
+                            SourceCallSiteIdentity::new(
+                                block.addr,
+                                op_index,
+                                CanonicalStorageId::from_varnode(target),
+                            )
+                        }
+                        R2ILOp::Branch { target } => {
+                            let identity = SourceCallSiteIdentity::new(
+                                block.addr,
+                                op_index,
+                                CanonicalStorageId::from_varnode(target),
+                            );
+                            if !authorized_tail_calls.contains(&identity) {
+                                return None;
+                            }
+                            identity
+                        }
+                        R2ILOp::BranchInd { .. } => {
+                            let target = terminal_indirect_loaded_slot(block, op_index)?;
+                            let identity =
+                                SourceCallSiteIdentity::new(block.addr, op_index, target);
+                            if !authorized_tail_calls.contains(&identity) {
+                                return None;
+                            }
+                            identity
+                        }
+                        _ => return None,
+                    };
+                    Some((block.addr, op_index, identity))
                 })
         })
         .collect::<Vec<_>>();
     raw_calls.sort_unstable_by_key(|(block_addr, op_index, _)| (*block_addr, *op_index));
-    raw_calls
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index, (_, _, identity))| {
-            u32::try_from(index)
-                .ok()
-                .zip(identity)
-                .map(|(index, identity)| (CallSiteId(index), identity))
-        })
-        .collect()
+    let mut by_id = BTreeMap::new();
+    let mut tails = BTreeSet::new();
+    for (index, (_, _, identity)) in raw_calls.into_iter().enumerate() {
+        let Ok(index) = u32::try_from(index) else {
+            break;
+        };
+        let call_site = CallSiteId(index);
+        if tail_call_identities.contains(&identity) {
+            tails.insert(call_site);
+        }
+        by_id.insert(call_site, identity);
+    }
+    (by_id, tails)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RawValueOrigin {
+    Constant { value: u64, size: u32 },
+    LoadedSlot(CanonicalStorageId),
+}
+
+fn truncated_raw_value(value: u64, size: u32) -> u64 {
+    match size {
+        0 | 8.. => value,
+        bytes => value & (u64::MAX >> (64 - bytes * 8)),
+    }
+}
+
+fn raw_value_origin(
+    origins: &BTreeMap<CanonicalStorageId, RawValueOrigin>,
+    value: &r2il::Varnode,
+) -> Option<RawValueOrigin> {
+    match value.space {
+        SpaceId::Const => Some(RawValueOrigin::Constant {
+            value: truncated_raw_value(value.offset, value.size),
+            size: value.size,
+        }),
+        // On x86-64 an indirect memory operand is lifted as the RAM value
+        // itself, with no defining load. Its canonical storage is the slot.
+        SpaceId::Ram => Some(RawValueOrigin::LoadedSlot(
+            CanonicalStorageId::from_varnode(value),
+        )),
+        _ => origins
+            .get(&CanonicalStorageId::from_varnode(value))
+            .copied(),
+    }
+}
+
+/// The canonical RAM slot whose loaded value a terminal indirect branch reads.
+///
+/// This is one fact with two lifted representations. x86-64 may put the RAM
+/// varnode directly on `BranchInd`, leaving it undefined in SSA. AArch64 loads
+/// the slot through an exactly folded address and copies the result through a
+/// register into the program counter. A single forward reaching-origin pass
+/// recognizes both without depending on a variable name or architecture.
+///
+/// The pass is `O(n log s)` for `n` operations and `s` distinct storages in the
+/// block. Unsupported definitions clear their destination, so an older origin
+/// can never survive a clobber and become false evidence.
+pub(crate) fn terminal_indirect_loaded_slot(
+    block: &R2ILBlock,
+    branch_op_index: usize,
+) -> Option<CanonicalStorageId> {
+    if branch_op_index + 1 != block.ops.len() {
+        return None;
+    }
+    let R2ILOp::BranchInd { target } = block.ops.get(branch_op_index)? else {
+        return None;
+    };
+
+    let mut origins = BTreeMap::<CanonicalStorageId, RawValueOrigin>::new();
+    for op in &block.ops[..branch_op_index] {
+        let Some(output) = op.output() else {
+            continue;
+        };
+        let output_storage = CanonicalStorageId::from_varnode(output);
+        let origin = match op {
+            R2ILOp::Copy { src, .. } => raw_value_origin(&origins, src),
+            R2ILOp::IntAdd { a, b, dst } => {
+                match (raw_value_origin(&origins, a), raw_value_origin(&origins, b)) {
+                    (
+                        Some(RawValueOrigin::Constant { value: left, .. }),
+                        Some(RawValueOrigin::Constant { value: right, .. }),
+                    ) => Some(RawValueOrigin::Constant {
+                        value: truncated_raw_value(left.wrapping_add(right), dst.size),
+                        size: dst.size,
+                    }),
+                    _ => None,
+                }
+            }
+            R2ILOp::IntSub { a, b, dst } => {
+                match (raw_value_origin(&origins, a), raw_value_origin(&origins, b)) {
+                    (
+                        Some(RawValueOrigin::Constant { value: left, .. }),
+                        Some(RawValueOrigin::Constant { value: right, .. }),
+                    ) => Some(RawValueOrigin::Constant {
+                        value: truncated_raw_value(left.wrapping_sub(right), dst.size),
+                        size: dst.size,
+                    }),
+                    _ => None,
+                }
+            }
+            R2ILOp::Load {
+                dst,
+                space: SpaceId::Ram,
+                addr,
+            } => match raw_value_origin(&origins, addr) {
+                Some(RawValueOrigin::Constant { value, .. }) => {
+                    Some(RawValueOrigin::LoadedSlot(CanonicalStorageId {
+                        space: CanonicalStorageSpace::Ram,
+                        offset: value,
+                        size: dst.size,
+                    }))
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        match origin {
+            Some(origin) => {
+                origins.insert(output_storage, origin);
+            }
+            None => {
+                origins.remove(&output_storage);
+            }
+        }
+    }
+
+    match raw_value_origin(&origins, target)? {
+        RawValueOrigin::LoadedSlot(slot)
+            if slot.space == CanonicalStorageSpace::Ram
+                && slot.size != 0
+                && slot.offset.checked_add(u64::from(slot.size)).is_some() =>
+        {
+            Some(slot)
+        }
+        RawValueOrigin::Constant { .. } | RawValueOrigin::LoadedSlot(_) => None,
+    }
 }
 
 fn memory_space(op: &R2ILOp) -> Option<SpaceId> {
@@ -1292,14 +1891,259 @@ mod tests {
     }
 
     #[test]
+    fn source_register_geometry_is_copied_without_downstream_reconstruction() {
+        let eax = RegisterStorage { offset: 0, size: 4 };
+        let rax = RegisterStorage { offset: 0, size: 8 };
+        let mut arch = ArchSpec::new("x86-64");
+        arch.add_register(RegisterDef::sub(" EAX ", 0, 4, "RAX"));
+        arch.add_register(RegisterDef::new("RAX", 0, 8));
+
+        let absent = SourceMachineContext::from_blocks(&[], Some(&arch));
+        assert!(absent.register_projections().is_empty());
+        assert_eq!(
+            absent.register_geometry_state(),
+            MachineRegisterGeometryState::Unavailable
+        );
+        assert_eq!(
+            absent.register_storage(" eax "),
+            Some(register_storage(0, 4))
+        );
+
+        let mut invalid_empty = ArchSpec::new("invalid-empty-geometry");
+        invalid_empty.add_register(RegisterDef::new("broken", 0, 0));
+        let invalid_empty = SourceMachineContext::from_blocks(&[], Some(&invalid_empty));
+        assert_eq!(
+            invalid_empty.register_geometry_state(),
+            MachineRegisterGeometryState::Malformed
+        );
+        assert_ne!(
+            absent.semantic_identity_bytes(),
+            invalid_empty.semantic_identity_bytes()
+        );
+
+        arch.register_projections = vec![
+            RegisterProjection {
+                written: eax,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier: rax,
+                    slice: r2il::RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits: 32,
+                    },
+                },
+            },
+            RegisterProjection {
+                written: rax,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier: rax,
+                    slice: r2il::RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits: 64,
+                    },
+                },
+            },
+        ];
+        let bound = SourceMachineContext::from_blocks(&[], Some(&arch));
+        assert_eq!(
+            bound.register_geometry_state(),
+            MachineRegisterGeometryState::Available
+        );
+        assert_eq!(bound.register_projections(), arch.register_projections);
+        assert_eq!(
+            bound.register_projection(register_storage(0, 4)),
+            arch.register_projections.first()
+        );
+        assert_ne!(
+            absent.semantic_identity_bytes(),
+            bound.semantic_identity_bytes()
+        );
+
+        for projection in &mut arch.register_projections {
+            projection.disposition = RegisterProjectionDisposition::Refused {
+                reason: RegisterProjectionRefusal::MissingRegisterEndianness,
+            };
+        }
+        let refused = SourceMachineContext::from_blocks(&[], Some(&arch));
+        assert_eq!(
+            refused.register_geometry_state(),
+            MachineRegisterGeometryState::Available
+        );
+        assert_ne!(
+            bound.semantic_identity_bytes(),
+            refused.semantic_identity_bytes()
+        );
+
+        arch.register_projections[1].disposition = RegisterProjectionDisposition::Bound {
+            carrier: rax,
+            slice: r2il::RegisterBitSlice {
+                lsb_bit_offset: 0,
+                size_bits: 64,
+            },
+        };
+        let malformed = SourceMachineContext::from_blocks(&[], Some(&arch));
+        assert_eq!(
+            malformed.register_geometry_state(),
+            MachineRegisterGeometryState::Malformed
+        );
+        assert!(malformed.register_projections().is_empty());
+        assert_ne!(
+            absent.semantic_identity_bytes(),
+            malformed.semantic_identity_bytes()
+        );
+    }
+
+    #[test]
+    fn source_register_geometry_caches_canonical_observed_lane_projections() {
+        let q0 = RegisterStorage {
+            offset: 0x5000,
+            size: 16,
+        };
+        let s0 = RegisterStorage {
+            offset: 0x5000,
+            size: 4,
+        };
+        let q4 = RegisterStorage {
+            offset: 0x5040,
+            size: 16,
+        };
+        let b4 = RegisterStorage {
+            offset: 0x5040,
+            size: 1,
+        };
+        let mut arch = ArchSpec::new("aarch64-vector-lanes");
+        for (name, storage) in [("q0", q0), ("s0", s0), ("q4", q4), ("b4", b4)] {
+            arch.add_register(RegisterDef::new(name, storage.offset, storage.size));
+        }
+        arch.register_projections = vec![
+            RegisterProjection {
+                written: s0,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier: q0,
+                    slice: r2il::RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits: 32,
+                    },
+                },
+            },
+            RegisterProjection {
+                written: q0,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier: q0,
+                    slice: r2il::RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits: 128,
+                    },
+                },
+            },
+            RegisterProjection {
+                written: b4,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier: q4,
+                    slice: r2il::RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits: 8,
+                    },
+                },
+            },
+            RegisterProjection {
+                written: q4,
+                disposition: RegisterProjectionDisposition::Bound {
+                    carrier: q4,
+                    slice: r2il::RegisterBitSlice {
+                        lsb_bit_offset: 0,
+                        size_bits: 128,
+                    },
+                },
+            },
+        ];
+        let mut block = R2ILBlock::new(0x1000, 4);
+        block.push(R2ILOp::Copy {
+            dst: Varnode::register(0x5004, 4),
+            src: Varnode::constant(1, 4),
+        });
+        block.push(R2ILOp::Copy {
+            dst: Varnode::register(0x5041, 1),
+            src: Varnode::constant(1, 1),
+        });
+
+        let context = SourceMachineContext::from_blocks(&[block], Some(&arch));
+        assert_eq!(
+            context
+                .register_projection(register_storage(0x5004, 4))
+                .map(|projection| projection.disposition),
+            Some(RegisterProjectionDisposition::Bound {
+                carrier: q0,
+                slice: r2il::RegisterBitSlice {
+                    lsb_bit_offset: 32,
+                    size_bits: 32,
+                },
+            })
+        );
+        assert_eq!(
+            context
+                .register_projection(register_storage(0x5041, 1))
+                .map(|projection| projection.disposition),
+            Some(RegisterProjectionDisposition::Bound {
+                carrier: q4,
+                slice: r2il::RegisterBitSlice {
+                    lsb_bit_offset: 8,
+                    size_bits: 8,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn argument_registers_come_from_the_convention_not_the_pointer_width() {
+        let mut arch = ArchSpec::new("AARCH64:LE:64:v8A");
+        arch.addr_size = 8;
+        arch.add_space(AddressSpace::ram(8));
+        for (index, name) in ["x0", "x1", "x2"].into_iter().enumerate() {
+            arch.add_register(RegisterDef::new(name, index as u64 * 8, 8));
+        }
+        let slots = SourceConventionSlots::new(
+            "aapcs64",
+            [
+                register_storage(0, 8),
+                register_storage(8, 8),
+                register_storage(16, 8),
+            ],
+            Some(register_storage(0, 8)),
+        )
+        .expect("register slots are well formed");
+
+        let context = SourceMachineContext::from_blocks_with_interfaces(
+            &[],
+            Some(&arch),
+            None,
+            SourceMachineRoles::default(),
+            Some(slots),
+            Vec::new(),
+        );
+
+        assert_eq!(context.argument_register_names(), vec!["x0", "x1", "x2"]);
+        assert_eq!(
+            context.register_name(register_storage(8, 8)).as_deref(),
+            Some("x1")
+        );
+    }
+
+    #[test]
+    fn argument_registers_are_absent_when_no_convention_was_supplied() {
+        let arch = ArchSpec::new("AARCH64:LE:64:v8A");
+        let context = SourceMachineContext::from_blocks(&[], Some(&arch));
+        assert!(context.argument_register_names().is_empty());
+    }
+
+    #[test]
     fn architecture_family_is_typed_schema_bound_semantic_identity() {
         let x86 = ArchSpec::new("x86:LE:64:default");
         let arm = ArchSpec::new("AARCH64:LE:64:v8A");
         let x86_context = SourceMachineContext::from_blocks(&[], Some(&x86));
         let arm_context = SourceMachineContext::from_blocks(&[], Some(&arm));
 
-        assert_eq!(MACHINE_CONTEXT_SCHEMA_VERSION, 16);
-        assert_eq!(x86_context.schema_version(), 16);
+        assert_eq!(MACHINE_CONTEXT_SCHEMA_VERSION, 23);
+        assert_eq!(x86_context.schema_version(), 23);
         assert_eq!(
             x86_context.architecture_family(),
             MachineArchitectureFamily::X86_64
@@ -1311,6 +2155,46 @@ mod tests {
         assert_ne!(
             x86_context.semantic_identity_bytes(),
             arm_context.semantic_identity_bytes()
+        );
+    }
+
+    #[test]
+    fn effective_abi_class_resolves_exact_radare2_conventions_with_architecture() {
+        let mut arch = ArchSpec::new("x86-64");
+        arch.addr_size = 8;
+        arch.alignment = 1;
+        arch.add_space(AddressSpace::ram(8));
+
+        let context = |spelling| {
+            SourceMachineContext::from_blocks_with_interfaces(
+                &[],
+                Some(&arch),
+                None,
+                SourceMachineRoles::default(),
+                Some(SourceConventionSlots::new(spelling, [], None).expect("convention slots")),
+                Vec::new(),
+            )
+        };
+        let microsoft = context("ms");
+        let system_v = context("amd64");
+        let microsoft_synonym = context("windows-x64");
+
+        assert_eq!(
+            microsoft.convention_slots().unwrap().calling_convention(),
+            "ms"
+        );
+        assert_eq!(
+            microsoft.effective_abi_class(),
+            SourceAbiClass::MicrosoftX64
+        );
+        assert_eq!(system_v.effective_abi_class(), SourceAbiClass::SystemVAMD64);
+        assert_eq!(
+            microsoft_synonym.effective_abi_class(),
+            SourceAbiClass::MicrosoftX64
+        );
+        assert_ne!(
+            microsoft.semantic_identity_bytes(),
+            system_v.semantic_identity_bytes()
         );
     }
 
@@ -1343,6 +2227,7 @@ mod tests {
             Some(&little),
             Some(base_interface),
             SourceMachineRoles::default(),
+            None,
             Vec::new(),
         );
         let stacked = SourceMachineContext::from_blocks_with_interfaces(
@@ -1350,6 +2235,7 @@ mod tests {
             Some(&little),
             Some(stacked_interface),
             SourceMachineRoles::default(),
+            None,
             Vec::new(),
         );
         assert_ne!(
@@ -1380,6 +2266,7 @@ mod tests {
             Some(&little),
             None,
             SourceMachineRoles::default(),
+            None,
             vec![call_interface(false)],
         );
         let complete = SourceMachineContext::from_blocks_with_interfaces(
@@ -1387,6 +2274,7 @@ mod tests {
             Some(&little),
             None,
             SourceMachineRoles::default(),
+            None,
             vec![call_interface(true)],
         );
         assert_ne!(
@@ -1611,6 +2499,7 @@ mod tests {
             Some(&arch),
             Some(make()),
             SourceMachineRoles::default(),
+            None,
             Vec::new(),
         );
         assert!(!without_roles.abi_model().is_coherent());
@@ -1624,6 +2513,7 @@ mod tests {
                     .expect("return-address role"),
             ),
             SourceMachineRoles::default(),
+            None,
             Vec::new(),
         );
         assert!(!return_only.abi_model().is_coherent());
@@ -1638,6 +2528,7 @@ mod tests {
                     .expect("exact machine roles"),
             ),
             SourceMachineRoles::default(),
+            None,
             Vec::new(),
         );
         assert!(complete.abi_model().is_coherent());
@@ -1658,6 +2549,7 @@ mod tests {
                 .expect("compatibility interface remains representable for refusal diagnostics"),
             ),
             SourceMachineRoles::default(),
+            None,
             Vec::new(),
         );
         assert!(
@@ -1679,6 +2571,7 @@ mod tests {
                     .expect("standalone binding is architecture-independent"),
             ),
             SourceMachineRoles::default(),
+            None,
             Vec::new(),
         );
         assert!(!narrow.abi_model().is_coherent());
@@ -1697,6 +2590,7 @@ mod tests {
                     .expect("standalone binding cannot inspect ArchSpec parentage"),
             ),
             SourceMachineRoles::default(),
+            None,
             Vec::new(),
         );
         assert!(!subregister_sp.abi_model().is_coherent());
@@ -1713,6 +2607,7 @@ mod tests {
                     .expect("standalone binding cannot inspect ArchSpec parentage"),
             ),
             SourceMachineRoles::default(),
+            None,
             Vec::new(),
         );
         assert!(!subregister_ra.abi_model().is_coherent());
@@ -1748,6 +2643,7 @@ mod tests {
             Some(&arch),
             Some(exact.clone()),
             SourceMachineRoles::default(),
+            None,
             Vec::new(),
         );
         assert!(coherent.abi_model().is_coherent());
@@ -1758,6 +2654,7 @@ mod tests {
             Some(&arch),
             Some(make()),
             SourceMachineRoles::default(),
+            None,
             Vec::new(),
         );
         assert!(absent.abi_model().is_coherent());
@@ -1777,6 +2674,7 @@ mod tests {
             Some(&subregister),
             Some(exact.clone()),
             SourceMachineRoles::default(),
+            None,
             Vec::new(),
         );
         assert!(!context.abi_model().is_coherent());
@@ -1790,6 +2688,7 @@ mod tests {
             Some(&wrong_machine_width),
             Some(exact.clone()),
             SourceMachineRoles::default(),
+            None,
             Vec::new(),
         );
         assert!(!context.abi_model().is_coherent());
@@ -1801,6 +2700,7 @@ mod tests {
             Some(&word_addressed),
             Some(exact.clone()),
             SourceMachineRoles::default(),
+            None,
             Vec::new(),
         );
         assert!(!context.abi_model().is_coherent());
@@ -1812,6 +2712,7 @@ mod tests {
             Some(&wrong_ram_width),
             Some(exact),
             SourceMachineRoles::default(),
+            None,
             Vec::new(),
         );
         assert!(!context.abi_model().is_coherent());
@@ -1863,6 +2764,7 @@ mod tests {
             Some(&arch),
             Some(make_explicit(frame_pointer)),
             SourceMachineRoles::default(),
+            None,
             Vec::new(),
         );
         assert!(coherent.abi_model().is_coherent());
@@ -1880,6 +2782,7 @@ mod tests {
                 return_address,
             )),
             SourceMachineRoles::default(),
+            None,
             Vec::new(),
         );
         assert!(slot_derived.abi_model().is_coherent());
@@ -1903,6 +2806,7 @@ mod tests {
             Some(&arch),
             Some(absent),
             SourceMachineRoles::default(),
+            None,
             Vec::new(),
         );
         assert!(absent.abi_model().is_coherent());
@@ -1946,6 +2850,7 @@ mod tests {
             Some(&arch),
             Some(narrow_interface),
             SourceMachineRoles::default(),
+            None,
             Vec::new(),
         );
         assert!(!narrow.abi_model().is_coherent());
@@ -1966,6 +2871,7 @@ mod tests {
                 return_address,
             )),
             SourceMachineRoles::default(),
+            None,
             Vec::new(),
         );
         assert!(!subregister.abi_model().is_coherent());
@@ -2000,6 +2906,7 @@ mod tests {
             Some(&arch),
             Some(overlapping),
             SourceMachineRoles::default(),
+            None,
             Vec::new(),
         );
         assert!(!overlapping.abi_model().is_coherent());
@@ -2193,10 +3100,10 @@ mod tests {
             Some(SourceLogicalValue::new(1, low_i32)),
             Some(demo_struct_type_graph()),
         );
-        assert_eq!(
+        assert!(matches!(
             invalid,
-            Err(SourceFunctionInterfaceError::InvalidLogicalTypes)
-        );
+            Err(SourceFunctionInterfaceError::InvalidLogicalTypes { .. })
+        ));
     }
 
     #[test]
@@ -2240,14 +3147,33 @@ mod tests {
     }
 
     #[test]
-    fn source_type_graph_rejects_pointer_to_pointer() {
+    fn source_type_graph_accepts_pointer_to_pointer() {
+        let graph = SourceTypeGraph::new(
+            [
+                SourceType::new(0, SourceTypeKind::SignedInteger, 8, 8),
+                SourceType::new(1, SourceTypeKind::Pointer { target_type_id: 0 }, 64, 64),
+                SourceType::new(2, SourceTypeKind::Pointer { target_type_id: 1 }, 64, 64),
+            ],
+            [],
+        )
+        .expect("char ** is a well formed source type");
+        assert_eq!(
+            graph.types()[2].kind(),
+            SourceTypeKind::Pointer { target_type_id: 1 }
+        );
+        assert!(graph.validates_pointer_width(64));
+    }
+
+    #[test]
+    fn source_type_graph_rejects_pointer_to_absent_target() {
         assert_eq!(
             SourceTypeGraph::new(
-                [
-                    SourceType::new(0, SourceTypeKind::UnsignedInteger, 8, 8),
-                    SourceType::new(1, SourceTypeKind::Pointer { target_type_id: 0 }, 64, 64,),
-                    SourceType::new(2, SourceTypeKind::Pointer { target_type_id: 1 }, 64, 64,),
-                ],
+                [SourceType::new(
+                    0,
+                    SourceTypeKind::Pointer { target_type_id: 1 },
+                    64,
+                    64,
+                )],
                 [],
             ),
             Err(SourceTypeGraphError::InvalidType)
@@ -2312,12 +3238,16 @@ mod tests {
     }
 
     #[test]
-    fn raw_direct_callsite_ids_are_sorted_and_retain_exact_targets() {
+    fn raw_callsite_ids_are_sorted_and_retain_exact_direct_and_indirect_targets() {
         let low_target = Varnode::ram(0x3000, 8);
         let high_target = Varnode::ram(0x4000, 8);
+        let indirect_target = Varnode::register(0x18, 8);
         let mut high = R2ILBlock::new(0x2000, 4);
         high.push(R2ILOp::Call {
             target: high_target.clone(),
+        });
+        high.push(R2ILOp::CallInd {
+            target: indirect_target.clone(),
         });
         let mut low = R2ILBlock::new(0x1000, 4);
         low.push(R2ILOp::Call {
@@ -2341,6 +3271,59 @@ mod tests {
                 CanonicalStorageId::from_varnode(&high_target),
             ))
         );
+        assert_eq!(
+            context.raw_call_site_identity(CallSiteId(2)),
+            Some(SourceCallSiteIdentity::new(
+                0x2000,
+                1,
+                CanonicalStorageId::from_varnode(&indirect_target),
+            ))
+        );
+    }
+
+    #[test]
+    fn only_an_exact_source_correlated_branch_is_a_tail_call_site() {
+        let target = Varnode::constant(0x5000, 8);
+        let mut block = R2ILBlock::new(0x1000, 4);
+        block.push(R2ILOp::Branch {
+            target: target.clone(),
+        });
+        let identity =
+            SourceCallSiteIdentity::new(block.addr, 0, CanonicalStorageId::from_varnode(&target));
+        let context = SourceMachineContext::from_blocks_with_interfaces_and_tail_calls(
+            &[block.clone()],
+            None,
+            None,
+            SourceMachineRoles::default(),
+            None,
+            Vec::new(),
+            vec![identity],
+        );
+        assert_eq!(
+            context.raw_call_site_identity(CallSiteId(0)),
+            Some(identity)
+        );
+        assert!(context.is_tail_call_site(CallSiteId(0)));
+
+        let wrong_target = SourceCallSiteIdentity::new(
+            block.addr,
+            0,
+            CanonicalStorageId {
+                offset: 0x5004,
+                ..identity.target()
+            },
+        );
+        let unproved = SourceMachineContext::from_blocks_with_interfaces_and_tail_calls(
+            &[block],
+            None,
+            None,
+            SourceMachineRoles::default(),
+            None,
+            Vec::new(),
+            vec![wrong_target],
+        );
+        assert!(unproved.raw_call_sites_by_id().is_empty());
+        assert!(!unproved.is_tail_call_site(CallSiteId(0)));
     }
 
     #[test]
@@ -2433,6 +3416,7 @@ mod tests {
             None,
             Some(interface),
             SourceMachineRoles::default(),
+            None,
             Vec::new(),
         );
         assert!(context.abi_model().is_available());
@@ -2462,6 +3446,7 @@ mod tests {
             Some(&arch),
             Some(interface),
             SourceMachineRoles::default(),
+            None,
             Vec::new(),
         );
 

@@ -1,80 +1,32 @@
-use std::cell::{Cell, OnceCell};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::cell::Cell;
+#[cfg(test)]
+use std::cell::OnceCell;
+#[cfg(test)]
+use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet};
 #[cfg(test)]
 use std::sync::OnceLock;
 
 use crate::analysis;
-use crate::ast::{CExpr, CType};
-use r2ssa::{MemorySSAFacts, ObjectModel, SsaArtifact, ValueId};
+use crate::ast::CExpr;
+use crate::ast::CType;
+use r2ssa::{BlockId, InstId, SemanticObligationId, SsaArtifact, UseSite, ValueId};
+use r2types::{CalleeFact, CalleeResolutionFacts, FunctionFacts};
 #[cfg(test)]
-use r2types::ExternalStackVarSpec;
-use r2types::{
-    CalleeFact, CalleeResolutionFacts, ExternalStackSlotSpec, ExternalTypeDb,
-    FieldAccessCertificate, FunctionFacts, InterprocSummaryView, SignatureRegistry, StackSlotKey,
-    TypeOracle, VisibleBinding,
-};
+use r2types::{ExternalStackSlotSpec, StackSlotKey, VisibleBinding};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum ResolutionPhase {
-    Semantic,
-    Definition,
-    DefinitionRaw,
-    Visible,
-    ImportedArg,
-    Memory,
-    Return,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct ResolutionGuardKey {
-    pub(crate) phase: ResolutionPhase,
-    pub(crate) name: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum EffectRenderProofKind {
-    Call,
+pub(crate) enum EffectOccurrenceKind {
     Expression,
     MemoryRead,
     MemoryWrite,
     Return,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum PhiEdgeRenderKind {
-    Direct,
-    UnconditionalDeadOnOtherEdges,
-    Guarded { condition: ValueId, truth: bool },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct PhiEdgeRenderProof {
-    pub(crate) source: ValueId,
-    pub(crate) kind: PhiEdgeRenderKind,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct EffectRenderProof {
-    pub(crate) kind: EffectRenderProofKind,
-    pub(crate) block_addr: u64,
-    pub(crate) op_idx: usize,
-    pub(crate) call_disposition: Option<r2types::CallsiteRenderDisposition>,
-    pub(crate) target: Option<ValueId>,
-    pub(crate) space: Option<r2il::SpaceId>,
-    pub(crate) address: Option<ValueId>,
-    pub(crate) value: Option<ValueId>,
-    pub(crate) values: Vec<ValueId>,
-    pub(crate) phi_edge: Option<PhiEdgeRenderProof>,
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct FoldArchConfig {
     pub(crate) ptr_size: u32,
-    pub(crate) sp_name: String,
-    pub(crate) fp_name: String,
-    pub(crate) ret_reg_name: String,
     pub(crate) arg_regs: Vec<String>,
-    pub(crate) caller_saved_regs: HashSet<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -83,28 +35,25 @@ pub(crate) struct FoldInputs<'a> {
     #[cfg(test)]
     pub(crate) function_names: &'a HashMap<u64, String>,
     #[cfg(test)]
-    pub(crate) strings: &'a HashMap<u64, String>,
-    #[cfg(test)]
-    pub(crate) symbols: &'a HashMap<u64, String>,
+    /// What the binary calls the thing at an address, not a name this
+    /// rendering declares.
+    pub(crate) binary_symbols: &'a HashMap<u64, String>,
     pub(crate) function_facts: &'a FunctionFacts,
     #[cfg(test)]
-    #[allow(dead_code)]
-    pub(crate) certified_rendering_required: bool,
     pub(crate) stack_slots: &'a BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
-    pub(crate) field_access_certificates: &'a [FieldAccessCertificate],
     #[cfg(test)]
-    pub(crate) external_stack_vars: &'a HashMap<i64, ExternalStackVarSpec>,
     pub(crate) visible_bindings: &'a [VisibleBinding],
-    pub(crate) external_type_db: &'a ExternalTypeDb,
-    pub(crate) param_register_aliases: &'a HashMap<String, String>,
-    pub(crate) type_hints: &'a HashMap<String, CType>,
-    pub(crate) type_oracle: Option<&'a dyn TypeOracle>,
     pub(crate) function_return_type: Option<&'a CType>,
     pub(crate) prepared_ssa: Option<&'a SsaArtifact>,
+    /// Sole `BindingId -> SymbolId` projection for this native rendering.
+    pub(crate) binding_names: Option<&'a std::rc::Rc<crate::binding_plan::BindingNameResolution>>,
     pub(crate) prepared_semantic_view: Option<&'a analysis::PreparedSemanticView>,
-    pub(crate) prepared_objects: Option<&'a ObjectModel>,
-    #[allow(dead_code)]
-    pub(crate) prepared_memory: Option<&'a MemorySSAFacts>,
+    /// Exact origin of every operation in the normalized function.
+    pub(crate) normalization_origins: Option<&'a crate::normalize::NormalizationOrigins>,
+    /// Sole authority-bound observation journal for this native rendering.
+    /// Test and residual-only folds deliberately carry no journal.
+    pub(crate) observation_journal:
+        Option<&'a std::cell::RefCell<crate::observation_journal::LegacyObservationJournal>>,
 }
 
 impl<'a> FoldInputs<'a> {
@@ -135,10 +84,6 @@ impl<'a> FoldInputs<'a> {
     pub(crate) fn render_facts(&self) -> Option<&'a r2types::FunctionRenderFacts> {
         self.function_facts.render()
     }
-
-    pub(crate) fn summary_view(&self) -> Option<&'a InterprocSummaryView> {
-        Some(self.function_facts.summary_view())
-    }
 }
 
 #[cfg(test)]
@@ -150,9 +95,6 @@ pub(crate) fn empty_function_facts() -> &'static FunctionFacts {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct FoldState {
     pub(crate) analysis_ctx: analysis::DecompilerFacts,
-    pub(crate) exit_block: Option<u64>,
-    pub(crate) return_blocks: HashSet<u64>,
-    pub(crate) return_stack_slots: HashSet<i64>,
 }
 
 /// Internal executable-folding state.
@@ -168,45 +110,66 @@ pub(crate) struct FoldingContext<'a> {
     pub(crate) inputs: FoldInputs<'a>,
     pub(crate) state: FoldState,
     pub(crate) current_block_addr: Cell<Option<u64>>,
+    pub(crate) current_block_id: Cell<Option<BlockId>>,
+    /// Where each name is defined in the block being walked.
+    ///
+    /// Finding a definition by scanning the block costs one pass per question,
+    /// so a block with many definitions costs the square of its size. One pass
+    /// answers every question about that block, and it is rebuilt when the walk
+    /// moves on.
     pub(crate) current_op_idx: Cell<Option<usize>>,
-    pub(crate) hide_stack_frame: bool,
-    pub(crate) signature_registry: SignatureRegistry,
-    pub(crate) rendered_alias_lookup_cache: std::cell::RefCell<HashMap<String, Option<String>>>,
-    pub(crate) preferred_entry_arg_lookup_cache:
-        std::cell::RefCell<HashMap<String, Option<String>>>,
-    pub(crate) forwarded_source_cache: std::cell::RefCell<HashMap<String, Option<r2ssa::SSAVar>>>,
-    pub(crate) load_expr_memo: std::cell::RefCell<HashMap<(ValueId, String), CExpr>>,
-    pub(crate) call_result_owner_name_cache:
-        std::cell::RefCell<BTreeMap<(u64, usize), Option<String>>>,
-    pub(crate) owned_call_visible_names_cache: std::cell::RefCell<Option<HashSet<String>>>,
+    /// What the right-hand side of the assignment being lowered has.
+    ///
+    /// The operation's lowering states it when it spells the assignment,
+    /// and the finaliser reads it when it applies the write projection and
+    /// the conversion to the declared object, which happen after the
+    /// statement has been built. One transaction sets and takes it.
+    pub(crate) pending_assignment_type: Cell<Option<r2rewrite::CValue>>,
+    /// Legacy cache retained only as a negative test fixture: production
+    /// inlining is authorized exclusively by the sealed binding plan.
+    ///
+    /// Leaving a statement out is a promise that the reader will show the value
+    /// instead. The promise used to be made by one rule and kept by another, and
+    /// when they disagreed the reader printed the value's name and nothing
+    /// defined it. The expression the skipped statement would have carried is
+    /// recorded here as it is skipped, so the rule that decides and the rule that
+    /// renders are reading the same answer.
+    #[cfg(test)]
+    pub(crate) inlined_renderings: std::cell::RefCell<HashMap<String, CExpr>>,
+    #[cfg(test)]
     pub(crate) prepared_semantic_view_cache: OnceCell<analysis::PreparedSemanticView>,
-    pub(crate) prepared_semantic_view_building: Cell<bool>,
-    pub(crate) semantic_render_in_progress: std::cell::RefCell<HashSet<String>>,
-    pub(crate) value_render_in_progress: std::cell::RefCell<HashSet<String>>,
-    pub(crate) definition_lookup_in_progress: std::cell::RefCell<HashSet<String>>,
-    pub(crate) definition_raw_in_progress: std::cell::RefCell<HashSet<String>>,
-    pub(crate) resolution_guard: std::cell::RefCell<HashSet<ResolutionGuardKey>>,
-    pub(crate) effect_render_proofs: std::cell::RefCell<Vec<EffectRenderProof>>,
+    /// Blocks the fold walked, which is what expresses a merge standing at their head.
+    pub(crate) folded_blocks: std::cell::RefCell<std::collections::BTreeSet<u64>>,
+    /// A prototype for each function this rendering calls, keyed by the name
+    /// the call spells, collected while the calls are lowered because that is
+    /// where the callee's interface is in hand. Handed to the function when it
+    /// is built.
+    pub(crate) callee_declarations:
+        std::cell::RefCell<std::collections::BTreeMap<String, crate::ast::CExternDecl>>,
+    /// Names minted while folding, handed to the function when it is built.
+    ///
+    /// A cell because the builders take `&self`. Minting has to borrow, insert
+    /// and drop inside one statement: a borrow held across a nested build would
+    /// panic, and nested builds are the ordinary case here.
+    /// The names this rendering declares, shared with whatever else renders
+    /// the same function. An identifier only means something in the table that
+    /// issued it, so the passes cannot each hold a copy.
+    pub(crate) symbols: std::rc::Rc<std::cell::RefCell<crate::symbol::SymbolTable>>,
+    /// First exact-observation failure. Lowering is largely `Option`-based, so
+    /// marker issuance records the typed failure here and the native boundary
+    /// retains it in the non-consuming audit while emitting the same marker-free
+    /// native program.
+    pub(crate) observation_error:
+        std::cell::RefCell<Option<crate::observation_journal::LegacyObservationJournalError>>,
+    /// Transaction-local lowering failure. Legacy helpers are still mostly
+    /// expression-returning, so an exact projection failure records this flag
+    /// and the operation boundary discards the whole candidate AST.
+    pub(crate) pending_lowering_refusal: Cell<Option<crate::fold::op_lower::OpLoweringRefusal>>,
 }
 
 impl FoldArchConfig {
     #[cfg(test)]
     pub(crate) fn for_ptr_size(ptr_size: u32) -> Self {
-        let sp_name = if ptr_size == 64 {
-            "rsp".to_string()
-        } else {
-            "esp".to_string()
-        };
-        let fp_name = if ptr_size == 64 {
-            "rbp".to_string()
-        } else {
-            "ebp".to_string()
-        };
-        let ret_reg_name = if ptr_size == 64 {
-            "rax".to_string()
-        } else {
-            "eax".to_string()
-        };
         let arg_regs = if ptr_size == 64 {
             vec![
                 "rdi".to_string(),
@@ -219,184 +182,958 @@ impl FoldArchConfig {
         } else {
             vec![]
         };
-        let caller_saved_regs = {
-            let mut regs = HashSet::new();
-            if ptr_size == 64 {
-                for r in ["rdi", "rsi", "rdx", "rcx", "r8", "r9", "r10", "r11"] {
-                    regs.insert(r.to_string());
-                }
-            } else {
-                for r in ["eax", "ecx", "edx"] {
-                    regs.insert(r.to_string());
-                }
-            }
-            regs
-        };
-
-        Self {
-            ptr_size,
-            sp_name,
-            fp_name,
-            ret_reg_name,
-            arg_regs,
-            caller_saved_regs,
-        }
+        Self { ptr_size, arg_regs }
     }
 }
 
 impl<'a> FoldingContext<'a> {
     pub(crate) fn from_inputs(inputs: FoldInputs<'a>) -> Self {
         Self {
+            symbols: std::rc::Rc::new(std::cell::RefCell::new(crate::symbol::SymbolTable::new())),
             inputs,
             state: FoldState::default(),
             current_block_addr: Cell::new(None),
+            current_block_id: Cell::new(None),
             current_op_idx: Cell::new(None),
-            hide_stack_frame: true,
-            signature_registry: SignatureRegistry::from_embedded_json(),
-            rendered_alias_lookup_cache: std::cell::RefCell::new(HashMap::new()),
-            preferred_entry_arg_lookup_cache: std::cell::RefCell::new(HashMap::new()),
-            forwarded_source_cache: std::cell::RefCell::new(HashMap::new()),
-            load_expr_memo: std::cell::RefCell::new(HashMap::new()),
-            call_result_owner_name_cache: std::cell::RefCell::new(BTreeMap::new()),
-            owned_call_visible_names_cache: std::cell::RefCell::new(None),
+            pending_assignment_type: Cell::new(None),
+            #[cfg(test)]
+            inlined_renderings: std::cell::RefCell::new(HashMap::new()),
+            #[cfg(test)]
             prepared_semantic_view_cache: OnceCell::new(),
-            prepared_semantic_view_building: Cell::new(false),
-            semantic_render_in_progress: std::cell::RefCell::new(HashSet::new()),
-            value_render_in_progress: std::cell::RefCell::new(HashSet::new()),
-            definition_lookup_in_progress: std::cell::RefCell::new(HashSet::new()),
-            definition_raw_in_progress: std::cell::RefCell::new(HashSet::new()),
-            resolution_guard: std::cell::RefCell::new(HashSet::new()),
-            effect_render_proofs: std::cell::RefCell::new(Vec::new()),
+            folded_blocks: std::cell::RefCell::new(std::collections::BTreeSet::new()),
+            callee_declarations: std::cell::RefCell::new(std::collections::BTreeMap::new()),
+            observation_error: std::cell::RefCell::new(None),
+            pending_lowering_refusal: Cell::new(None),
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn clear_effect_render_proofs(&self) {
-        self.effect_render_proofs.borrow_mut().clear();
-    }
-
-    #[cfg(test)]
-    pub(crate) fn effect_render_proofs(&self) -> Vec<EffectRenderProof> {
-        self.effect_render_proofs.borrow().clone()
-    }
-
-    pub(crate) fn effect_render_proofs_since(&self, checkpoint: usize) -> Vec<EffectRenderProof> {
-        self.effect_render_proofs
-            .borrow()
-            .get(checkpoint..)
-            .unwrap_or_default()
-            .to_vec()
-    }
-
-    pub(crate) fn append_effect_render_proofs(&self, proofs: &[EffectRenderProof]) {
-        self.effect_render_proofs
-            .borrow_mut()
-            .extend_from_slice(proofs);
-    }
-
-    pub(crate) fn effect_render_proof_checkpoint(&self) -> usize {
-        self.effect_render_proofs.borrow().len()
-    }
-
-    pub(crate) fn truncate_effect_render_proofs(&self, checkpoint: usize) {
-        self.effect_render_proofs.borrow_mut().truncate(checkpoint);
-    }
-
-    pub(crate) fn record_effect_render_proof_for_value(
+    pub(crate) fn normalized_site(
         &self,
-        kind: EffectRenderProofKind,
         block_addr: u64,
         op_idx: usize,
-        value: Option<ValueId>,
-    ) {
-        self.effect_render_proofs
-            .borrow_mut()
-            .push(EffectRenderProof {
-                kind,
+    ) -> Option<crate::normalize::NormalizedOpSite> {
+        let block = self
+            .inputs
+            .prepared_ssa?
+            .graph()
+            .block_id_for_addr(block_addr)?;
+        Some(crate::normalize::NormalizedOpSite { block, op_idx })
+    }
+
+    fn observation_site(
+        &self,
+        block_addr: u64,
+        op_idx: usize,
+    ) -> Result<
+        crate::normalize::NormalizedOpSite,
+        crate::observation_journal::LegacyObservationJournalError,
+    > {
+        self.normalized_site(block_addr, op_idx).ok_or(
+            crate::observation_journal::LegacyObservationJournalError::MissingNormalizedBlock(
                 block_addr,
-                op_idx,
-                call_disposition: None,
-                target: None,
-                space: None,
-                address: None,
-                value,
-                values: Vec::new(),
-                phi_edge: None,
-            });
+            ),
+        )
     }
 
-    pub(crate) fn record_effect_render_proof_for_phi_edge(
+    pub(super) fn retain_first_observation_error(
         &self,
-        block_addr: u64,
-        op_idx: usize,
-        value: Option<ValueId>,
-        phi_edge: PhiEdgeRenderProof,
+        error: crate::observation_journal::LegacyObservationJournalError,
     ) {
-        self.effect_render_proofs
+        if std::env::var_os("R2SLEIGH_DEBUG_MERGES").is_some() {
+            eprintln!("OBSERVATION_ERROR {error:?}");
+        }
+        let mut first = self.observation_error.borrow_mut();
+        if first.is_none() {
+            *first = Some(error);
+        }
+    }
+
+    /// Store the first refusal this fold decided, and say where.
+    ///
+    /// A stored refusal is raised later by whoever finishes the transaction, so
+    /// it does not pass through any of the propagation paths and instrumenting
+    /// those never finds it. This is the only place it can be caught, which is
+    /// why the location is captured here rather than left to be rediscovered.
+    #[track_caller]
+    pub(super) fn retain_first_lowering_refusal(
+        &self,
+        refusal: crate::fold::op_lower::OpLoweringRefusal,
+    ) {
+        if self.pending_lowering_refusal.get().is_none() {
+            if std::env::var_os("R2DEC_TRACE_REFUSAL").is_some() {
+                eprintln!(
+                    "refusal {refusal:?} retained at {}",
+                    std::panic::Location::caller()
+                );
+            }
+            self.pending_lowering_refusal.set(Some(refusal));
+        }
+    }
+
+    /// Materialize one cached fold as a distinct final-AST occurrence.
+    ///
+    /// Folding is stateful and must not be replayed merely to obtain fresh
+    /// diagnostic identities. The journal duplicates its own authority-bound
+    /// targets; on allocation failure the semantic clone survives marker-free
+    /// and the typed audit failure is retained.
+    pub(crate) fn clone_cached_render_occurrence(
+        &self,
+        stmts: &[crate::ast::CStmt],
+    ) -> Vec<crate::ast::CStmt> {
+        let Some(journal) = self.inputs.observation_journal else {
+            return stmts.to_vec();
+        };
+        let fallback = stmts
+            .iter()
+            .map(crate::ast::CStmt::clone_without_render_observations)
+            .collect();
+        match journal.borrow_mut().clone_render_occurrence(stmts) {
+            Ok(clone) => clone,
+            Err(error) => {
+                self.retain_first_observation_error(error);
+                fallback
+            }
+        }
+    }
+
+    pub(crate) fn observe_optional_normalized_input_uses_expr(
+        &self,
+        site: Option<crate::normalize::NormalizedOpSite>,
+        input_idx: usize,
+        expr: CExpr,
+    ) -> CExpr {
+        let Some(journal) = self.inputs.observation_journal else {
+            return expr;
+        };
+        let Some(site) = site else {
+            self.retain_first_observation_error(
+                crate::observation_journal::LegacyObservationJournalError::MissingNormalizedSiteContext,
+            );
+            return expr;
+        };
+        let fallback = expr.clone();
+        match journal
             .borrow_mut()
-            .push(EffectRenderProof {
-                kind: EffectRenderProofKind::Expression,
-                block_addr,
-                op_idx,
-                call_disposition: None,
-                target: None,
-                space: None,
-                address: None,
-                value,
-                values: Vec::new(),
-                phi_edge: Some(phi_edge),
-            });
+            .observe_normalized_input_uses_expr(site, input_idx, expr)
+        {
+            Ok(marked) => marked,
+            Err(error) => {
+                r2il::refusal_evidence!("input-use-observation", "{error:?} at {site:?}");
+                self.retain_first_observation_error(error);
+                fallback
+            }
+        }
     }
 
-    pub(crate) fn record_effect_render_proof_for_memory(
+    /// The obligations a definition carries, asked of the source instruction
+    /// rather than of a normalized site.
+    ///
+    /// A definition rendered where its value is read has no normalized site of
+    /// its own to ask about, and its obligations are otherwise never requested
+    /// at all, which the ledger scores as refused.
+    pub(crate) fn exact_effect_obligations_for_source_inst(
         &self,
-        kind: EffectRenderProofKind,
+        kind: EffectOccurrenceKind,
+        source_inst: r2ssa::InstId,
+        value: Option<ValueId>,
+    ) -> BTreeSet<SemanticObligationId> {
+        self.exact_value_obligations(kind, source_inst, value.as_slice())
+    }
+
+    pub(crate) fn observe_certified_value_read_expr(
+        &self,
+        value: r2ssa::ValueId,
+        at: r2ssa::InstId,
+        expr: CExpr,
+    ) -> CExpr {
+        let Some(journal) = self.inputs.observation_journal else {
+            return expr;
+        };
+        let fallback = expr.clone();
+        let Some(symbol) = self
+            .inputs
+            .binding_names
+            .and_then(|names| names.symbol_for_value(value))
+        else {
+            self.retain_first_observation_error(
+                crate::observation_journal::LegacyObservationJournalError::rendered_value_required(
+                    value,
+                    crate::observation_journal::RenderedValueRequirementCause::CertifiedValueReadMissingSymbol,
+                    self.inputs
+                        .binding_names
+                        .and_then(|names| names.disposition_for_value(value)),
+                ),
+            );
+            return fallback;
+        };
+        match journal
+            .borrow_mut()
+            .observe_certified_value_read_expr(value, at, symbol, expr)
+        {
+            Ok(marked) => marked,
+            Err(error) => {
+                self.retain_first_observation_error(error);
+                fallback
+            }
+        }
+    }
+
+    pub(crate) fn observe_certified_address_read_expr(
+        &self,
+        value: r2ssa::ValueId,
+        access: r2ssa::StructuredAccessId,
+        expr: CExpr,
+    ) -> CExpr {
+        let Some(journal) = self.inputs.observation_journal else {
+            return expr;
+        };
+        let fallback = expr.clone();
+        let Some(symbol) = self
+            .inputs
+            .binding_names
+            .and_then(|names| names.symbol_for_value(value))
+        else {
+            self.retain_first_observation_error(
+                crate::observation_journal::LegacyObservationJournalError::rendered_value_required(
+                    value,
+                    crate::observation_journal::RenderedValueRequirementCause::CertifiedAddressReadMissingSymbol,
+                    self.inputs
+                        .binding_names
+                        .and_then(|names| names.disposition_for_value(value)),
+                ),
+            );
+            return fallback;
+        };
+        match journal
+            .borrow_mut()
+            .observe_certified_address_read_expr(value, access, symbol, expr)
+        {
+            Ok(marked) => marked,
+            Err(error) => {
+                self.retain_first_observation_error(error);
+                fallback
+            }
+        }
+    }
+
+    pub(crate) fn observe_certified_array_index_expr(
+        &self,
+        access: r2ssa::StructuredAccessId,
+        value: r2ssa::ValueId,
+        expr: CExpr,
+    ) -> CExpr {
+        let Some(journal) = self.inputs.observation_journal else {
+            return expr;
+        };
+        let fallback = expr.clone();
+        let Some(symbol) = self
+            .inputs
+            .binding_names
+            .and_then(|names| names.symbol_for_value(value))
+        else {
+            self.retain_first_observation_error(
+                crate::observation_journal::LegacyObservationJournalError::rendered_value_required(
+                    value,
+                    crate::observation_journal::RenderedValueRequirementCause::CertifiedAddressReadMissingSymbol,
+                    self.inputs
+                        .binding_names
+                        .and_then(|names| names.disposition_for_value(value)),
+                ),
+            );
+            return fallback;
+        };
+        match journal
+            .borrow_mut()
+            .observe_certified_array_index_expr(access, value, symbol, expr)
+        {
+            Ok(marked) => marked,
+            Err(error) => {
+                self.retain_first_observation_error(error);
+                fallback
+            }
+        }
+    }
+
+    /// Wrap one exact normalized definition that survives as a statement.
+    pub(crate) fn observe_normalized_output_stmt(
+        &self,
         block_addr: u64,
         op_idx: usize,
-        space: r2il::SpaceId,
-        address: ValueId,
+        stmt: crate::ast::CStmt,
+    ) -> crate::ast::CStmt {
+        let Some(journal) = self.inputs.observation_journal else {
+            return stmt;
+        };
+        let fallback = stmt.clone();
+        let result = self.observation_site(block_addr, op_idx).and_then(|site| {
+            journal
+                .borrow_mut()
+                .observe_normalized_output_stmt(site, stmt)
+        });
+        match result {
+            Ok(marked) => marked,
+            Err(error) => {
+                self.retain_first_observation_error(error);
+                fallback
+            }
+        }
+    }
+
+    /// Whether this instruction's statement is spoken for by the write whose
+    /// projection absorbed it. The same question as
+    /// [`Self::absorbed_extensions_discharged_by`], asked from the other side,
+    /// so the two cannot disagree.
+    pub(crate) fn write_is_discharged_by_absorbing_write(&self, inst: r2ssa::InstId) -> bool {
+        let Some(head) = self.inputs.binding_names.and_then(|names| {
+            names
+                .plan()
+                .machine_projection()
+                .immediate_absorbing_write(inst)
+        }) else {
+            return false;
+        };
+        self.absorbed_extensions_discharged_by(head).contains(&inst)
+    }
+
+    /// The carrier extensions a definition's statement speaks for.
+    ///
+    /// The machine projection says which extensions certified a write as a
+    /// zero-extension into its carrier -- `EAX = x` followed by
+    /// `RAX = zext(EAX)` -- and that is a fact about the machine. Whether the
+    /// extension then has anything left to say is the plan's question: where
+    /// the write and the extension are one rendered object, the statement
+    /// `x = (uint64_t)(uint32_t)...` has already performed the extension, and
+    /// rendering it again spells `x = (uint64_t)(uint32_t)x`. Where they are
+    /// two objects the extension is a real assignment from one to the other
+    /// and keeps its statement. The chain is taken as a prefix: an extension
+    /// that lands in another object ends what this statement can stand for.
+    pub(crate) fn absorbed_extensions_discharged_by(
+        &self,
+        inst: r2ssa::InstId,
+    ) -> Vec<r2ssa::InstId> {
+        let (Some(names), Some(prepared)) = (self.inputs.binding_names, self.inputs.prepared_ssa)
+        else {
+            return Vec::new();
+        };
+        let graph = prepared.graph();
+        let projection = names.plan().machine_projection();
+        let Some(crate::binding_plan::ValueDisposition::Bound { binding }) = graph
+            .inst(inst)
+            .and_then(|inst| inst.output)
+            .and_then(|output| names.disposition_for_value(output))
+        else {
+            return Vec::new();
+        };
+        let mut discharged = Vec::new();
+        for member in projection.absorbed_extensions(inst) {
+            let same_object = graph
+                .inst(*member)
+                .and_then(|inst| inst.output)
+                .and_then(|output| names.disposition_for_value(output))
+                .is_some_and(|disposition| {
+                    matches!(disposition, crate::binding_plan::ValueDisposition::Bound { binding: other } if other == binding)
+                });
+            if !same_object {
+                break;
+            }
+            discharged.push(*member);
+        }
+        discharged
+    }
+
+    /// Statement twin of [`Self::observe_discharged_expr`]: the cells and the
+    /// effects of the instructions a rendered definition's projection stands
+    /// for, on that definition's statement.
+    /// `already` is the obligation set the caller will mark on this same
+    /// statement for its own operation. A machine instruction lifts to several
+    /// p-code operations, so a narrow write and the carrier clear that
+    /// certifies it are frequently *one* `CanonicalInstructionId` carrying one
+    /// obligation. Marking it here as well as there renders it twice, and the
+    /// ledger scores an obligation with two occurrences as
+    /// `DuplicateRenderedOccurrence` -- which is a refusal, and the right one:
+    /// two occurrences of one effect is exactly what it is there to catch.
+    pub(crate) fn observe_discharged_stmt(
+        &self,
+        discharged: &[r2ssa::InstId],
+        already: &BTreeSet<SemanticObligationId>,
+        stmt: crate::ast::CStmt,
+    ) -> crate::ast::CStmt {
+        let Some(journal) = self.inputs.observation_journal else {
+            return stmt;
+        };
+        let fallback = stmt.clone();
+        let marked = match journal
+            .borrow_mut()
+            .observe_discharged_stmt(discharged, stmt)
+        {
+            Ok(marked) => marked,
+            Err(error) => {
+                self.retain_first_observation_error(error);
+                return fallback;
+            }
+        };
+        self.observe_discharged_effects(discharged, already, marked)
+    }
+
+    /// The cells and effects a bound value's canonical-term assignment owes,
+    /// on that assignment. See
+    /// [`LegacyObservationJournal::observe_canonical_assignment_stmt`]: the
+    /// producers the term absorbed and the operands it dropped are both
+    /// answered here, because neither is answered by the statement's own
+    /// markers.
+    pub(crate) fn observe_canonical_assignment_stmt(
+        &self,
+        value: ValueId,
+        definition: r2ssa::InstId,
+        absorbed: &[r2ssa::InstId],
+        already: &BTreeSet<SemanticObligationId>,
+        stmt: crate::ast::CStmt,
+    ) -> crate::ast::CStmt {
+        let Some(journal) = self.inputs.observation_journal else {
+            return stmt;
+        };
+        let fallback = stmt.clone();
+        let marked = match journal
+            .borrow_mut()
+            .observe_canonical_assignment_stmt(value, definition, absorbed, stmt)
+        {
+            Ok(marked) => marked,
+            Err(error) => {
+                self.retain_first_observation_error(error);
+                return fallback;
+            }
+        };
+        self.observe_discharged_effects(absorbed, already, marked)
+    }
+
+    /// Mark the source effects the discharged instructions carry, less the
+    /// ones the caller marks on this same statement for its own operation.
+    fn observe_discharged_effects(
+        &self,
+        discharged: &[r2ssa::InstId],
+        already: &BTreeSet<SemanticObligationId>,
+        stmt: crate::ast::CStmt,
+    ) -> crate::ast::CStmt {
+        let obligations = self
+            .discharged_obligations(discharged)
+            .difference(already)
+            .copied()
+            .collect();
+        self.observe_effect_stmt(&obligations, stmt)
+    }
+
+    /// The source effects the instructions a statement discharges carry.
+    pub(crate) fn discharged_obligations(
+        &self,
+        discharged: &[r2ssa::InstId],
+    ) -> BTreeSet<SemanticObligationId> {
+        let mut obligations = BTreeSet::new();
+        for definition in discharged {
+            let output = self
+                .inputs
+                .prepared_ssa
+                .and_then(|prepared| prepared.graph().inst(*definition))
+                .and_then(|inst| inst.output);
+            obligations.extend(self.exact_effect_obligations_for_source_inst(
+                EffectOccurrenceKind::Expression,
+                *definition,
+                output,
+            ));
+        }
+        obligations
+    }
+
+    /// Attach exact source-effect cells to the statement occurrence that
+    /// discharges them. No construction-time side table participates: if this
+    /// statement is deleted, its markers are deleted with it.
+    pub(crate) fn observe_effect_stmt(
+        &self,
+        obligation_ids: &BTreeSet<SemanticObligationId>,
+        stmt: crate::ast::CStmt,
+    ) -> crate::ast::CStmt {
+        let Some(journal) = self.inputs.observation_journal else {
+            return stmt;
+        };
+        if obligation_ids.is_empty() {
+            return stmt;
+        }
+        let fallback = stmt.clone();
+        match journal
+            .borrow_mut()
+            .observe_effect_stmt(obligation_ids, stmt)
+        {
+            Ok(marked) => marked,
+            Err(error) => {
+                self.retain_first_observation_error(error);
+                fallback
+            }
+        }
+    }
+
+    /// Attach a composite statement's implicit effects without duplicating an
+    /// exact effect marker already carried by one of its child statements.
+    pub(crate) fn observe_composite_effect_stmt(
+        &self,
+        obligation_ids: &BTreeSet<SemanticObligationId>,
+        stmt: crate::ast::CStmt,
+    ) -> crate::ast::CStmt {
+        let Some(journal) = self.inputs.observation_journal else {
+            return stmt;
+        };
+        if obligation_ids.is_empty() {
+            return stmt;
+        }
+        let fallback = stmt.clone();
+        match journal
+            .borrow_mut()
+            .observe_composite_effect_stmt(obligation_ids, stmt)
+        {
+            Ok(marked) => marked,
+            Err(error) => {
+                self.retain_first_observation_error(error);
+                fallback
+            }
+        }
+    }
+
+    /// O(1) origin lookup once the caller holds the normalized block's dense id.
+    pub(crate) fn source_inst_for_normalized_site(
+        &self,
+        site: crate::normalize::NormalizedOpSite,
+    ) -> Option<InstId> {
+        if let Some(origins) = self.inputs.normalization_origins {
+            return match origins.origin(site)? {
+                crate::normalize::NormalizedOpOrigin::Original(inst) => Some(*inst),
+                crate::normalize::NormalizedOpOrigin::PhiEdgeCopy(_)
+                | crate::normalize::NormalizedOpOrigin::RelocatedInitializer(_) => None,
+            };
+        }
+
+        // A context without normalization origins is walking the unchanged
+        // source function (principally focused unit tests). This is not a
+        // fallback for a malformed normalized artifact: once an origins table
+        // is supplied, only `Original` rows above can reach source facts.
+        let graph = self.inputs.prepared_ssa?.graph();
+        let block = graph.block(site.block)?;
+        graph.inst_id_for_op_site(block.addr, site.op_idx)
+    }
+
+    pub(crate) fn source_inst_for_normalized_op(
+        &self,
+        block_addr: u64,
+        op_idx: usize,
+    ) -> Option<InstId> {
+        self.source_inst_for_normalized_site(self.normalized_site(block_addr, op_idx)?)
+    }
+
+    pub(crate) fn source_op_site_for_normalized_op(
+        &self,
+        block_addr: u64,
+        op_idx: usize,
+    ) -> Option<(u64, usize)> {
+        if self.inputs.normalization_origins.is_none() {
+            return Some((block_addr, op_idx));
+        }
+        let inst = self.source_inst_for_normalized_op(block_addr, op_idx)?;
+        self.inputs.prepared_ssa?.inst_op_site(inst)
+    }
+
+    pub(crate) fn current_source_op_site(&self) -> Option<(u64, usize)> {
+        let block_addr = self.current_block_addr.get()?;
+        let op_idx = self.current_op_idx.get()?;
+        if let Some(block) = self.current_block_id.get() {
+            let inst =
+                self.source_inst_for_normalized_site(crate::normalize::NormalizedOpSite {
+                    block,
+                    op_idx,
+                })?;
+            return self.inputs.prepared_ssa?.inst_op_site(inst);
+        }
+        self.source_op_site_for_normalized_op(block_addr, op_idx)
+    }
+
+    pub(crate) fn is_unconditional_materialized_phi_edge_copy(
+        &self,
+        block_addr: u64,
+        op_idx: usize,
+        successor: u64,
+    ) -> bool {
+        let Some(site) = self.normalized_site(block_addr, op_idx) else {
+            return false;
+        };
+        self.inputs
+            .normalization_origins
+            .is_some_and(|origins| origins.is_unconditional_phi_edge_copy(site, successor))
+    }
+
+    /// Takes every value the occurrence carries, because a return can carry
+    /// more than one: a composed ABI register is a base with ordered overlays
+    /// laid over it, and each of them is seeded as its own obligation.
+    fn exact_value_obligations(
+        &self,
+        kind: EffectOccurrenceKind,
+        source_inst: InstId,
+        values: &[ValueId],
+    ) -> BTreeSet<SemanticObligationId> {
+        use r2ssa::SemanticObligationKind as ObligationKind;
+
+        // Every occurrence but a composed return carries at most one value,
+        // and the rules below are written about that one.
+        let value: Option<ValueId> = match values {
+            [single] => Some(*single),
+            _ => None,
+        };
+        let Some(prepared) = self.inputs.prepared_ssa else {
+            return BTreeSet::new();
+        };
+        let Some(inst) = prepared.graph().inst(source_inst) else {
+            return BTreeSet::new();
+        };
+        let source_site = prepared.inst_op_site(source_inst);
+        let call_fact = source_site.and_then(|(block_addr, op_idx)| {
+            self.inputs
+                .call_render_facts()?
+                .fact_for_site(r2types::CallsiteKey {
+                    block_addr,
+                    op_index: op_idx,
+                })
+        });
+        // A return is certified when the plan says which value it carries, and
+        // also when the source says it carries none.
+        //
+        // Only the first was asked, so a function returning nothing could not
+        // discharge its own `Return` obligation: no return-value fact exists for
+        // a void boundary, and none ever will. The obligation was scored
+        // unaccounted and the function refused for the one statement it had
+        // certainly rendered. A complete boundary with no values and no
+        // compositions is the source's own statement that the return carries
+        // nothing, which is exactly what `return;` renders.
+        let void_return = values.is_empty()
+            && prepared
+                .facts()
+                .boundaries
+                .returns
+                .get(&source_inst)
+                .is_some_and(|boundary| {
+                    boundary.at == source_inst
+                        && boundary.complete
+                        && boundary.values.is_empty()
+                        && boundary.register_compositions.is_empty()
+                });
+        let return_certified = void_return
+            || source_site
+                .and_then(|(block_addr, op_idx)| {
+                    self.inputs
+                        .render_facts()?
+                        .return_for_op(block_addr, op_idx)
+                })
+                .is_some_and(|fact| fact.values().eq(values.iter().copied()));
+        let rendered_call = call_fact.filter(|fact| {
+            !matches!(
+                fact.disposition,
+                r2types::CallsiteRenderDisposition::Suppressed
+                    | r2types::CallsiteRenderDisposition::Residualized
+            )
+        });
+        // Every carried value owns exactly one return-value obligation. A
+        // composed return discharges all of them at the one expression that
+        // reassembles it, so a value whose obligation is ambiguous disqualifies
+        // the whole occurrence rather than being silently dropped from it.
+        // One return-value obligation carries the whole composition, with every
+        // value it is assembled from as its ordered inputs -- not one
+        // obligation per value, which is what this first assumed and what the
+        // ledger disproved: `inputs=[ValueId(11), ValueId(32)]` on a single
+        // obligation. A composed return discharges that one obligation at the
+        // one expression that reassembles it.
+        let unique_return_value = !values.is_empty()
+            && prepared
+                .obligations()
+                .obligations_for_inst(source_inst)
+                .filter(|obligation| {
+                    obligation.id.kind == ObligationKind::ReturnValue
+                        && obligation.inputs.as_slice() == values
+                })
+                .count()
+                == 1;
+        let unique_call_result = value.is_some_and(|value| {
+            prepared
+                .obligations()
+                .obligations_for_inst(source_inst)
+                .filter(|obligation| {
+                    obligation.id.kind == ObligationKind::CallResult && obligation.inputs == [value]
+                })
+                .count()
+                == 1
+        });
+
+        let mut obligation_ids = BTreeSet::new();
+        for obligation in prepared.obligations().obligations_for_inst(source_inst) {
+            let exact = match kind {
+                EffectOccurrenceKind::Return => {
+                    return_certified
+                        && (obligation.id.kind == ObligationKind::Return
+                            || (obligation.id.kind == ObligationKind::ReturnValue
+                                && unique_return_value
+                                && obligation.inputs.as_slice() == values))
+                }
+                EffectOccurrenceKind::Expression => match &inst.payload {
+                    r2ssa::InstPayload::Op(
+                        r2ssa::SSAOp::Branch { .. } | r2ssa::SSAOp::BranchInd { .. },
+                    ) => {
+                        obligation.id.kind == ObligationKind::ControlTransfer
+                            || rendered_call.is_some_and(|fact| {
+                                fact.disposition.is_terminal_return()
+                                    && (obligation.id.kind == ObligationKind::Call
+                                        || (obligation.id.kind == ObligationKind::CallArgument
+                                            && !obligation.inputs.is_empty()
+                                            && obligation
+                                                .inputs
+                                                .iter()
+                                                .all(|input| fact.proof_values.contains(input))))
+                            })
+                    }
+                    r2ssa::InstPayload::Op(r2ssa::SSAOp::CBranch { .. }) => matches!(
+                        obligation.id.kind,
+                        ObligationKind::ControlPredicate | ObligationKind::ControlTransfer
+                    ),
+                    r2ssa::InstPayload::Op(
+                        r2ssa::SSAOp::Call { .. } | r2ssa::SSAOp::CallInd { .. },
+                    ) => {
+                        if obligation.id.kind == ObligationKind::CallArgument
+                            && obligation.inputs.is_empty()
+                        {
+                            r2il::refusal_evidence!(
+                                "call-argument-occurrence",
+                                "component={:?} has no inputs, so no rendering can discharge it; \
+                                 rendered_call={} proof_values={:?}",
+                                obligation.id.component,
+                                rendered_call.is_some(),
+                                rendered_call.map(|fact| fact.proof_values.clone())
+                            );
+                        }
+                        rendered_call.is_some()
+                            && (obligation.id.kind == ObligationKind::Call
+                                || (obligation.id.kind == ObligationKind::CallArgument
+                                    && !obligation.inputs.is_empty()
+                                    && obligation.inputs.iter().all(|input| {
+                                        rendered_call
+                                            .is_some_and(|fact| fact.proof_values.contains(input))
+                                    }))
+                                || (obligation.id.kind == ObligationKind::CallResult
+                                    && unique_call_result
+                                    && obligation.inputs.as_slice() == value.as_slice()))
+                    }
+                    r2ssa::InstPayload::Op(
+                        r2ssa::SSAOp::IntDiv { .. }
+                        | r2ssa::SSAOp::IntSDiv { .. }
+                        | r2ssa::SSAOp::IntRem { .. }
+                        | r2ssa::SSAOp::IntSRem { .. },
+                    ) => {
+                        inst.output == value
+                            && matches!(
+                                obligation.id.kind,
+                                ObligationKind::LiveValueProducer | ObligationKind::Trap
+                            )
+                    }
+                    // A trap renders as the statement that takes it --
+                    // `__builtin_trap()` -- and that statement produces no
+                    // value, so the occurrence carries none either. Without
+                    // this arm the trap fell to the value-producer case below,
+                    // which no valueless statement can satisfy, and every
+                    // function containing a guard instruction was refused for
+                    // an effect it had in fact rendered.
+                    r2ssa::InstPayload::Op(r2ssa::SSAOp::Breakpoint) => {
+                        obligation.id.kind == ObligationKind::Trap && inst.output == value
+                    }
+                    _ => {
+                        obligation.id.kind == ObligationKind::LiveValueProducer
+                            && inst.output == value
+                    }
+                },
+                EffectOccurrenceKind::MemoryRead | EffectOccurrenceKind::MemoryWrite => false,
+            };
+            if exact {
+                obligation_ids.insert(obligation.id);
+            }
+        }
+        obligation_ids
+    }
+
+    fn exact_effect_obligations_for_phi_edges(
+        &self,
+        definition: InstId,
+        sites: &[UseSite],
+    ) -> BTreeSet<SemanticObligationId> {
+        use r2ssa::{SemanticObligationComponent, SemanticObligationKind};
+
+        let Some(prepared) = self.inputs.prepared_ssa else {
+            return BTreeSet::new();
+        };
+        let graph = prepared.graph();
+        let mut obligation_ids = BTreeSet::new();
+        for site in sites {
+            for obligation in prepared.obligations().obligations_for_inst(definition) {
+                if obligation.id.kind == SemanticObligationKind::LiveStateTransition
+                    && matches!(
+                        obligation.id.component,
+                        SemanticObligationComponent::LoopTransition { .. }
+                    )
+                    && obligation.edge_use == Some(*site)
+                    && obligation.inputs
+                        == graph
+                            .inst(site.inst)
+                            .and_then(|inst| inst.inputs.get(site.input_idx))
+                            .copied()
+                            .into_iter()
+                            .collect::<Vec<_>>()
+                {
+                    obligation_ids.insert(obligation.id);
+                }
+            }
+        }
+        obligation_ids
+    }
+
+    /// Exact source obligations discharged by one normalized value
+    /// occurrence. Synthetic phi copies project only their named original
+    /// edge obligations; ordinary operations project only their source InstId.
+    pub(crate) fn exact_effect_obligations_for_normalized_value(
+        &self,
+        kind: EffectOccurrenceKind,
+        block_addr: u64,
+        op_idx: usize,
         value: Option<ValueId>,
-    ) {
-        let proof = EffectRenderProof {
+    ) -> BTreeSet<SemanticObligationId> {
+        self.exact_effect_obligations_for_normalized_values(
             kind,
             block_addr,
             op_idx,
-            call_disposition: None,
-            target: None,
-            space: Some(space),
-            address: Some(address),
-            value,
-            values: Vec::new(),
-            phi_edge: None,
+            value.as_slice(),
+        )
+    }
+
+    /// The occurrence carries several values, which only a composed return
+    /// does: its ABI register is a base with ordered overlays laid over it and
+    /// every one of them owns an obligation the single expression discharges.
+    pub(crate) fn exact_effect_obligations_for_normalized_values(
+        &self,
+        kind: EffectOccurrenceKind,
+        block_addr: u64,
+        op_idx: usize,
+        values: &[ValueId],
+    ) -> BTreeSet<SemanticObligationId> {
+        let Some(site) = self.normalized_site(block_addr, op_idx) else {
+            return BTreeSet::new();
         };
-        let mut proofs = self.effect_render_proofs.borrow_mut();
-        if !proofs.contains(&proof) {
-            proofs.push(proof);
+        let Some(origins) = self.inputs.normalization_origins else {
+            return self
+                .source_inst_for_normalized_site(site)
+                .map(|inst| self.exact_value_obligations(kind, inst, values))
+                .unwrap_or_default();
+        };
+        match origins.origin(site) {
+            Some(crate::normalize::NormalizedOpOrigin::Original(inst)) => {
+                self.exact_value_obligations(kind, *inst, values)
+            }
+            Some(crate::normalize::NormalizedOpOrigin::PhiEdgeCopy(origin)) => self
+                .exact_effect_obligations_for_phi_edges(
+                    origin.definition.inst,
+                    std::slice::from_ref(&origin.incoming),
+                ),
+            Some(crate::normalize::NormalizedOpOrigin::RelocatedInitializer(origin)) => self
+                .exact_effect_obligations_for_phi_edges(
+                    origin.definition.inst,
+                    &origin.replaced_sites,
+                ),
+            None => BTreeSet::new(),
         }
     }
 
-    pub(crate) fn record_call_effect_render_proof(
+    fn exact_effect_obligations_for_inst_memory(
         &self,
+        kind: EffectOccurrenceKind,
+        source_inst: InstId,
+        space: r2il::SpaceId,
+        address: Option<ValueId>,
+        value: Option<ValueId>,
+    ) -> BTreeSet<SemanticObligationId> {
+        use r2ssa::{SemanticObligationComponent, SemanticObligationKind};
+
+        let Some(prepared) = self.inputs.prepared_ssa else {
+            return BTreeSet::new();
+        };
+        let Some((block_addr, op_idx)) = prepared.inst_op_site(source_inst) else {
+            return BTreeSet::new();
+        };
+        let is_write = kind == EffectOccurrenceKind::MemoryWrite;
+        let Some(fact) = self
+            .inputs
+            .render_facts()
+            .and_then(|facts| facts.memory_access_for_op(block_addr, op_idx, is_write, space))
+            .filter(|fact| {
+                fact.access.inst == source_inst
+                    && address == Some(fact.address)
+                    && fact.value == value
+                    && fact.is_write == is_write
+            })
+        else {
+            return BTreeSet::new();
+        };
+        let expected_inputs = address
+            .into_iter()
+            .chain(is_write.then_some(value).flatten())
+            .collect::<Vec<ValueId>>();
+        prepared
+            .obligations()
+            .obligations_for_inst(source_inst)
+            .filter(|obligation| {
+                obligation.id.kind
+                    == if is_write {
+                        SemanticObligationKind::ObservableMemoryWrite
+                    } else {
+                        SemanticObligationKind::ObservableMemoryRead
+                    }
+                    && obligation.id.component
+                        == SemanticObligationComponent::MemoryAccess(fact.access.ordinal)
+                    && obligation.inputs == expected_inputs
+            })
+            .map(|obligation| obligation.id)
+            .collect::<BTreeSet<_>>()
+    }
+
+    pub(crate) fn exact_effect_obligations_for_normalized_memory(
+        &self,
+        kind: EffectOccurrenceKind,
         block_addr: u64,
         op_idx: usize,
-        target: Option<ValueId>,
-        values: Vec<ValueId>,
-        disposition: r2types::CallsiteRenderDisposition,
-    ) {
-        self.effect_render_proofs
-            .borrow_mut()
-            .push(EffectRenderProof {
-                kind: EffectRenderProofKind::Call,
-                block_addr,
-                op_idx,
-                call_disposition: Some(disposition),
-                target,
-                space: None,
-                address: None,
-                value: None,
-                values,
-                phi_edge: None,
-            });
+        space: r2il::SpaceId,
+        address: Option<ValueId>,
+        value: Option<ValueId>,
+    ) -> BTreeSet<SemanticObligationId> {
+        self.source_inst_for_normalized_op(block_addr, op_idx)
+            .map(|inst| {
+                self.exact_effect_obligations_for_inst_memory(kind, inst, space, address, value)
+            })
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn exact_effect_obligations_for_source_memory(
+        &self,
+        kind: EffectOccurrenceKind,
+        block_addr: u64,
+        op_idx: usize,
+        space: r2il::SpaceId,
+        address: Option<ValueId>,
+        value: Option<ValueId>,
+    ) -> BTreeSet<SemanticObligationId> {
+        self.inputs
+            .prepared_ssa
+            .and_then(|prepared| prepared.graph().inst_id_for_op_site(block_addr, op_idx))
+            .map(|inst| {
+                self.exact_effect_obligations_for_inst_memory(kind, inst, space, address, value)
+            })
+            .unwrap_or_default()
     }
 
     /// Internal/test convenience constructor. It deliberately has no
@@ -405,15 +1142,11 @@ impl<'a> FoldingContext<'a> {
     pub(crate) fn new(ptr_size: u32) -> Self {
         #[cfg(test)]
         static EMPTY_U64_STRING: OnceLock<HashMap<u64, String>> = OnceLock::new();
+        #[cfg(test)]
         static EMPTY_STACK_SLOTS: OnceLock<BTreeMap<StackSlotKey, ExternalStackSlotSpec>> =
             OnceLock::new();
-        static EMPTY_FIELD_CERTS: OnceLock<Vec<FieldAccessCertificate>> = OnceLock::new();
         #[cfg(test)]
-        static EMPTY_I64_STACK: OnceLock<HashMap<i64, ExternalStackVarSpec>> = OnceLock::new();
         static EMPTY_VISIBLE_BINDINGS: OnceLock<Vec<VisibleBinding>> = OnceLock::new();
-        static EMPTY_TYPE_DB: OnceLock<ExternalTypeDb> = OnceLock::new();
-        static EMPTY_STRING_STRING: OnceLock<HashMap<String, String>> = OnceLock::new();
-        static EMPTY_STRING_CTYPE: OnceLock<HashMap<String, CType>> = OnceLock::new();
         static ARCH64: OnceLock<FoldArchConfig> = OnceLock::new();
         static ARCH32: OnceLock<FoldArchConfig> = OnceLock::new();
 
@@ -424,30 +1157,22 @@ impl<'a> FoldingContext<'a> {
         };
 
         let inputs = FoldInputs {
+            normalization_origins: None,
+            observation_journal: None,
+            binding_names: None,
             arch,
             #[cfg(test)]
             function_names: EMPTY_U64_STRING.get_or_init(HashMap::new),
             #[cfg(test)]
-            strings: EMPTY_U64_STRING.get_or_init(HashMap::new),
-            #[cfg(test)]
-            symbols: EMPTY_U64_STRING.get_or_init(HashMap::new),
+            binary_symbols: EMPTY_U64_STRING.get_or_init(HashMap::new),
             function_facts: empty_function_facts(),
             #[cfg(test)]
-            certified_rendering_required: false,
             stack_slots: EMPTY_STACK_SLOTS.get_or_init(BTreeMap::new),
-            field_access_certificates: EMPTY_FIELD_CERTS.get_or_init(Vec::new),
             #[cfg(test)]
-            external_stack_vars: EMPTY_I64_STACK.get_or_init(HashMap::new),
             visible_bindings: EMPTY_VISIBLE_BINDINGS.get_or_init(Vec::new),
-            external_type_db: EMPTY_TYPE_DB.get_or_init(ExternalTypeDb::default),
-            param_register_aliases: EMPTY_STRING_STRING.get_or_init(HashMap::new),
-            type_hints: EMPTY_STRING_CTYPE.get_or_init(HashMap::new),
-            type_oracle: None,
             function_return_type: None,
             prepared_ssa: None,
             prepared_semantic_view: None,
-            prepared_objects: None,
-            prepared_memory: None,
         };
 
         Self::from_inputs(inputs)

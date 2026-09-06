@@ -514,6 +514,10 @@ impl R2ILOp {
                 | R2ILOp::Call { .. }
                 | R2ILOp::CallInd { .. }
                 | R2ILOp::Return { .. }
+                // A trap decides where control goes as surely as a branch
+                // does: to the exception handler, and not back. A block ends
+                // at one, and it names no successor of its own.
+                | R2ILOp::Breakpoint
         )
     }
 

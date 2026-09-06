@@ -32,14 +32,26 @@
       "bytes": "554889e585f67e0d89f183fe08730a31d231c0eb6b31c05dc389ca81e2f8ffff7f89c8c1e80325ffffff0f48c1e005660fefc031f6660fefc90f1f8000000000f30f6f1437660ffec2f30f6f543710660ffeca4883c6204839f075e4660ffec8660f70c1ee660ffec1660f70c855660ffec8660f7ec839ca7411660f1f44000003049748ffc24839d175f55dc3",
       "bytes_fnv1a64": "d093eafd65854e85",
       "r2il_fnv1a64": "d9fac0a75ea4fd0e",
-      "ssa_fnv1a64": "247ff59736b1e3ed",
-      "required_native_opcodes": ["movdqu", "paddd", "pshufd"],
+      "ssa_fnv1a64": "64c4920fc6f56c6d",
+      "required_native_opcodes": [
+        "movdqu",
+        "paddd",
+        "pshufd"
+      ],
       "source_abi": {
         "calling_convention": "sysv_amd64",
         "return_type": "int32_t",
         "parameters": [
-          { "name": "arr", "register": "RDI", "type": "int32_t*" },
-          { "name": "len", "register": "ESI", "type": "int32_t" }
+          {
+            "name": "arr",
+            "register": "RDI",
+            "type": "int32_t*"
+          },
+          {
+            "name": "len",
+            "register": "ESI",
+            "type": "int32_t"
+          }
         ]
       },
       "blocks": [
@@ -115,16 +127,76 @@
         }
       ],
       "ssa_blocks": [
-        { "address": 4294968864, "size": 8, "phi_count": 0, "op_count": 16, "fnv1a64": "2bcc2e657ce11995" },
-        { "address": 4294968872, "size": 7, "phi_count": 0, "op_count": 14, "fnv1a64": "70f3371373f861ad" },
-        { "address": 4294968879, "size": 6, "phi_count": 0, "op_count": 21, "fnv1a64": "45e3997cba264213" },
-        { "address": 4294968889, "size": 39, "phi_count": 0, "op_count": 119, "fnv1a64": "5fb496f729d3b338" },
-        { "address": 4294968928, "size": 28, "phi_count": 27, "op_count": 46, "fnv1a64": "af87d6f9bb751192" },
-        { "address": 4294968956, "size": 30, "phi_count": 0, "op_count": 154, "fnv1a64": "e5fb4a8dae7b9dbc" },
-        { "address": 4294968986, "size": 6, "phi_count": 0, "op_count": 3, "fnv1a64": "2e033c41c686b7d7" },
-        { "address": 4294968992, "size": 11, "phi_count": 103, "op_count": 42, "fnv1a64": "ec63aefe155dfb2a" },
-        { "address": 4294969003, "size": 2, "phi_count": 103, "op_count": 7, "fnv1a64": "94c79501969739bf" },
-        { "address": 4294968885, "size": 4, "phi_count": 0, "op_count": 17, "fnv1a64": "b2be1e1d5b885ae6" }
+        {
+          "address": 4294968864,
+          "fnv1a64": "2f7338facb1f0d7a",
+          "op_count": 17,
+          "phi_count": 0,
+          "size": 8
+        },
+        {
+          "address": 4294968872,
+          "fnv1a64": "d74286ef4affacc1",
+          "op_count": 16,
+          "phi_count": 0,
+          "size": 7
+        },
+        {
+          "address": 4294968879,
+          "fnv1a64": "3881c40b35baaf5a",
+          "op_count": 30,
+          "phi_count": 0,
+          "size": 6
+        },
+        {
+          "address": 4294968889,
+          "fnv1a64": "e9efe126cf77e831",
+          "op_count": 120,
+          "phi_count": 0,
+          "size": 39
+        },
+        {
+          "address": 4294968928,
+          "fnv1a64": "0103530a6e1c8dee",
+          "op_count": 46,
+          "phi_count": 27,
+          "size": 28
+        },
+        {
+          "address": 4294968956,
+          "fnv1a64": "d6be921dd42992cc",
+          "op_count": 160,
+          "phi_count": 0,
+          "size": 30
+        },
+        {
+          "address": 4294968986,
+          "fnv1a64": "b0d9fa6c61b3b983",
+          "op_count": 9,
+          "phi_count": 0,
+          "size": 6
+        },
+        {
+          "address": 4294968992,
+          "fnv1a64": "82fadb9b1a679521",
+          "op_count": 58,
+          "phi_count": 105,
+          "size": 11
+        },
+        {
+          "address": 4294969003,
+          "fnv1a64": "8551f2b135cf42dd",
+          "op_count": 7,
+          "phi_count": 105,
+          "size": 2
+        },
+        {
+          "address": 4294968885,
+          "fnv1a64": "0c2d565395724501",
+          "op_count": 17,
+          "phi_count": 0,
+          "size": 4
+        }
       ]
     },
     {
@@ -137,12 +209,16 @@
       "bytes": "554889e531c081ffadde00000f94c05dc3",
       "bytes_fnv1a64": "696bc30ad7592da1",
       "r2il_fnv1a64": "842dac2e03ccbe10",
-      "ssa_fnv1a64": "33305f4230bb675b",
+      "ssa_fnv1a64": "b161ec961ed07e3e",
       "source_abi": {
         "calling_convention": "sysv_amd64",
         "return_type": "int32_t",
         "parameters": [
-          { "name": "x", "register": "EDI", "type": "int32_t" }
+          {
+            "name": "x",
+            "register": "EDI",
+            "type": "int32_t"
+          }
         ]
       },
       "blocks": [
@@ -155,7 +231,13 @@
         }
       ],
       "ssa_blocks": [
-        { "address": 4294968912, "size": 17, "phi_count": 0, "op_count": 32, "fnv1a64": "1df5de30cd0aeab4" }
+        {
+          "address": 4294968912,
+          "fnv1a64": "83607234e5230811",
+          "op_count": 32,
+          "phi_count": 0,
+          "size": 17
+        }
       ]
     },
     {
@@ -168,13 +250,21 @@
       "bytes": "554889e58d0c3e29f783f16483f71431c009cf0f94c05dc3",
       "bytes_fnv1a64": "bcde133ae05d0b35",
       "r2il_fnv1a64": "6afb3cfc527bdc1b",
-      "ssa_fnv1a64": "ad0eadcd02163413",
+      "ssa_fnv1a64": "ffef496a0b3fd225",
       "source_abi": {
         "calling_convention": "sysv_amd64",
         "return_type": "int32_t",
         "parameters": [
-          { "name": "a", "register": "EDI", "type": "int32_t" },
-          { "name": "b", "register": "ESI", "type": "int32_t" }
+          {
+            "name": "a",
+            "register": "EDI",
+            "type": "int32_t"
+          },
+          {
+            "name": "b",
+            "register": "ESI",
+            "type": "int32_t"
+          }
         ]
       },
       "blocks": [
@@ -187,7 +277,13 @@
         }
       ],
       "ssa_blocks": [
-        { "address": 4294969232, "size": 24, "phi_count": 0, "op_count": 66, "fnv1a64": "319c01da9ae35eb0" }
+        {
+          "address": 4294969232,
+          "fnv1a64": "43168231566ea495",
+          "op_count": 72,
+          "phi_count": 0,
+          "size": 24
+        }
       ]
     },
     {
@@ -200,20 +296,47 @@
       "bytes": "554889e589d04863ce486bc93889540f0803440f345dc3",
       "bytes_fnv1a64": "274373379d942066",
       "r2il_fnv1a64": "a16d5acbe6f72605",
-      "ssa_fnv1a64": "8472235259b09ab2",
+      "ssa_fnv1a64": "8a9a016271639a59",
       "source_abi": {
         "calling_convention": "sysv_amd64",
         "return_type": "int32_t",
         "parameters": [
-          { "name": "arr", "register": "RDI", "type": "DemoStruct*" },
-          { "name": "idx", "register": "ESI", "type": "int32_t" },
-          { "name": "v", "register": "EDX", "type": "int32_t" }
+          {
+            "name": "arr",
+            "register": "RDI",
+            "type": "DemoStruct*"
+          },
+          {
+            "name": "idx",
+            "register": "ESI",
+            "type": "int32_t"
+          },
+          {
+            "name": "v",
+            "register": "EDX",
+            "type": "int32_t"
+          }
         ],
         "aggregate": {
           "name": "DemoStruct",
           "size_bytes": 56,
           "align_bytes": 4,
-          "member_offsets": [0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52]
+          "member_offsets": [
+            0,
+            4,
+            8,
+            12,
+            16,
+            20,
+            24,
+            28,
+            32,
+            36,
+            40,
+            44,
+            48,
+            52
+          ]
         }
       },
       "blocks": [
@@ -226,7 +349,13 @@
         }
       ],
       "ssa_blocks": [
-        { "address": 4294970032, "size": 23, "phi_count": 0, "op_count": 43, "fnv1a64": "8b6f2b9de58e9029" }
+        {
+          "address": 4294970032,
+          "fnv1a64": "8cf4b0505be3ce8e",
+          "op_count": 43,
+          "phi_count": 0,
+          "size": 23
+        }
       ]
     }
   ]

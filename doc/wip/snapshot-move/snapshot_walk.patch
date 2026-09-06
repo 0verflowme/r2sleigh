@@ -1,0 +1,10 @@
+--- r2plugin/snapshot_walk.c	2026-09-04 10:24:32
++++ /private/tmp/claude-501/plugstage/snapshot_walk.c	2026-09-04 18:22:08
+@@ -17,6 +17,7 @@
+  * rather than producing a buffer the parser silently misreads. */
+ 
+ #include "snapshot_wire.h"
++#include "snapshot_capture.h"
+ 
+ #include <r_anal.h>
+ 

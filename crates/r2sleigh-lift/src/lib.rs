@@ -27,21 +27,20 @@ pub mod context;
 pub mod disasm;
 pub mod esil;
 mod internal_control;
-pub mod pcode;
 pub mod sleigh;
 pub mod translate;
 
 use thiserror::Error;
 
 pub use context::LiftContext;
+pub use disasm::embedded_arch_and_disassembler;
 pub use disasm::{
     Disassembler, GENUINE_LIFT_PROVENANCE_SCHEMA_VERSION, GenuineInstructionSpan,
     GenuineLiftAuthority, GenuineLiftedBlock, GenuineLiftedFunction,
     GenuineLiftedFunctionAuthority, SemanticMetadataOptions, SemanticMetadataPrecision,
     TrustedLiftedFunction, TrustedSleighProfile,
 };
-pub use esil::{format_op, op_to_esil};
-pub use pcode::{PcodeTranslator, RawPcodeOp, RawVarnode};
+pub use esil::{OpEsil, block_to_esil, format_op, op_esil, op_to_esil};
 use r2il::ArchSpec;
 use r2il::Endianness;
 pub use sleigh::{SleighInfo, build_arch_spec, extract_arch_spec, get_sleigh_info};
@@ -54,9 +53,6 @@ pub enum LiftError {
 
     #[error("Parse error: {0}")]
     Parse(String),
-
-    #[error("P-code translation error: {0}")]
-    Pcode(#[from] pcode::PcodeError),
 
     #[error("Unsupported feature: {0}")]
     Unsupported(String),
@@ -309,6 +305,71 @@ mod tests {
         assert!(spec.get_register("RAX").is_some());
         assert!(spec.get_register("RSP").is_some());
         assert!(spec.get_register("RIP").is_some());
+    }
+
+    /// The processor specification's own program-counter role reaches the
+    /// architecture, in the specification's own spelling.
+    ///
+    /// AArch64 writes it `pc` and x86-64 writes it `RIP`, which is exactly why
+    /// it is read rather than guessed: a list of spellings has to know both, and
+    /// every architecture nobody thought of gets no answer or a wrong one.
+    #[test]
+    fn processor_specifications_name_their_own_program_counter() {
+        for (sla, pspec, arch, expected) in [
+            (
+                sleigh_config::processor_aarch64::SLA_AARCH64,
+                sleigh_config::processor_aarch64::PSPEC_AARCH64,
+                "aarch64",
+                "pc",
+            ),
+            (
+                sleigh_config::processor_x86::SLA_X86_64,
+                sleigh_config::processor_x86::PSPEC_X86_64,
+                "x86-64",
+                "RIP",
+            ),
+        ] {
+            let spec = build_arch_spec(sla, pspec, arch).expect("sleigh specification");
+            assert_eq!(
+                spec.program_counter.as_deref(),
+                Some(expected),
+                "{arch} states its program counter"
+            );
+            assert!(
+                spec.get_register(expected).is_some(),
+                "the named register must exist in {arch}"
+            );
+        }
+    }
+
+    /// The specification's own user-operation table reaches the architecture.
+    ///
+    /// A `CallOther` states only an index, and the index is assigned by the
+    /// compiled specification, so this table is the only thing that can say
+    /// which operation an instruction invoked. `NEON_ext` and `NEON_ushl` are
+    /// the two the corpus needs; asserting a name resolves back through its own
+    /// index is the property a consumer depends on.
+    #[test]
+    fn aarch64_user_operation_names_reach_the_arch_spec() {
+        let spec = build_arch_spec(
+            sleigh_config::processor_aarch64::SLA_AARCH64,
+            sleigh_config::processor_aarch64::PSPEC_AARCH64,
+            "aarch64",
+        )
+        .expect("aarch64 sleigh specification");
+
+        assert!(
+            !spec.user_ops.is_empty(),
+            "AARCH64 declares user-defined operations"
+        );
+        for name in ["NEON_ext", "NEON_ushl"] {
+            let index = spec
+                .user_ops
+                .iter()
+                .position(|declared| declared == name)
+                .unwrap_or_else(|| panic!("AARCH64 declares {name}"));
+            assert_eq!(spec.user_ops[index], name);
+        }
     }
 
     #[test]

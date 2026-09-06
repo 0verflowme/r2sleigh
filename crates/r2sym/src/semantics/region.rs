@@ -7,7 +7,6 @@ use r2ssa::{
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::backward::{BackwardConditionSummary, BackwardMemoryCondition};
-use crate::sim::DerivedSummaryDiagnostics;
 
 use super::artifact::{
     ResidualReason, SemanticConfidence, SemanticEvidence, SemanticEvidenceReason, SliceClass,
@@ -1219,8 +1218,6 @@ pub struct NativeFunctionSummary {
     pub role_identity: Option<Box<NativeWorkerRoleIdentity>>,
     pub closure_functions: usize,
     pub helper_functions: usize,
-    pub derived_summaries: usize,
-    pub derived_diagnostics: DerivedSummaryDiagnostics,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub region_summaries: Vec<NativeRegionSummary>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1694,6 +1691,10 @@ pub struct VmArtifactBody {
     pub step_summary: Option<VmStepSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transfer_summary: Option<VmStepSummary>,
+    /// What the same function's native analysis found, which recognising a
+    /// dispatch loop does not invalidate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native: Option<Box<NativeArtifactBody>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1722,7 +1723,6 @@ mod tests {
         NativeWorkerSummary, NativeWorkerSummaryKind, NativeWorkerTerminator, RegionKey,
         SemanticRegion, TargetFact,
     };
-    use crate::sim::DerivedSummaryDiagnostics;
     use crate::{
         BackwardConditionPrecision, BackwardConditionSummary, BackwardMemoryCondition,
         BackwardMemoryRegion, SemanticEvidence, SemanticEvidenceReason, SliceClass,
@@ -1770,8 +1770,6 @@ mod tests {
                 role_identity: None,
                 closure_functions: 0,
                 helper_functions: 0,
-                derived_summaries: 0,
-                derived_diagnostics: DerivedSummaryDiagnostics::default(),
                 region_summaries: Vec::new(),
                 worker_summaries: Vec::new(),
             },

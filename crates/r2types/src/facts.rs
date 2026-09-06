@@ -3,9 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use serde::{Deserialize, Serialize};
 
 use crate::context::{
-    ExternalRegisterParamSpec, ExternalStackSlotRole, ExternalStackSlotSpec, ExternalStackVarSpec,
-    StackSlotKey, legacy_external_stack_vars_from_slots,
-    stack_slots_from_legacy_external_stack_vars,
+    ExternalRegisterParamSpec, ExternalStackSlotRole, ExternalStackSlotSpec, StackSlotKey,
 };
 use crate::convert::CTypeLike;
 use crate::external::ExternalTypeDb;
@@ -166,6 +164,7 @@ impl SignatureCertificate {
                         | SignatureCertificateSource::SlotTypeOverride
                         | SignatureCertificateSource::SemanticProjection
                         | SignatureCertificateSource::InterprocSummary
+                        | SignatureCertificateSource::SourceInterface
                 )
             })
             && signature.params.iter().all(|param| param.ty.is_some());
@@ -231,6 +230,16 @@ pub enum SignatureCertificateSource {
     SummaryKind,
     SemanticProjection,
     InterprocSummary,
+    /// The return type alone is projected from the immutable source function
+    /// interface and matched to exact native return-value certificates. This
+    /// does not certify parameter types or authorize signature writeback by
+    /// itself.
+    SourceReturnType,
+    /// The whole signature is projected from the immutable source function
+    /// interface's type graph: every parameter and the return carry the exact
+    /// declared type the binding layer already uses. radare2's spelled
+    /// signature is only the fallback where no graph was captured.
+    SourceInterface,
 }
 
 impl SignatureCertificateSource {
@@ -245,6 +254,8 @@ impl SignatureCertificateSource {
             Self::SummaryKind => "summary_kind",
             Self::SemanticProjection => "semantic_projection",
             Self::InterprocSummary => "interproc_summary",
+            Self::SourceReturnType => "source_return_type",
+            Self::SourceInterface => "source_interface",
         }
     }
 
@@ -252,6 +263,7 @@ impl SignatureCertificateSource {
         matches!(
             self,
             Self::ExternalContext
+                | Self::SourceInterface
                 | Self::TypeAssumption
                 | Self::SlotTypeOverride
                 | Self::SemanticProjection
@@ -662,9 +674,8 @@ pub struct FunctionTypeFacts {
     pub stack_slots: BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
     pub visible_bindings: Vec<VisibleBinding>,
     pub callee_facts: BTreeMap<u64, CalleeFact>,
-    // Legacy compatibility view derived from canonical stack_slots when available.
-    pub external_stack_vars: HashMap<i64, ExternalStackVarSpec>,
     pub external_type_db: ExternalTypeDb,
+    pub program_data_objects: crate::ProgramDataObjectTypeFacts,
     pub slot_type_overrides: HashMap<usize, String>,
     pub slot_field_profiles: HashMap<usize, BTreeMap<u64, String>>,
     pub field_access_certificates: Vec<FieldAccessCertificate>,
@@ -686,8 +697,8 @@ pub struct FunctionTypeFactInputs {
     pub stack_slots: BTreeMap<StackSlotKey, ExternalStackSlotSpec>,
     pub visible_bindings: Vec<VisibleBinding>,
     pub callee_facts: BTreeMap<u64, CalleeFact>,
-    pub external_stack_vars: HashMap<i64, ExternalStackVarSpec>,
     pub external_type_db: ExternalTypeDb,
+    pub program_data_objects: crate::ProgramDataObjectTypeFacts,
     pub slot_type_overrides: HashMap<usize, String>,
     pub slot_field_profiles: HashMap<usize, BTreeMap<u64, String>>,
     pub local_field_accesses: Vec<LocalFieldAccessFact>,
@@ -715,12 +726,12 @@ impl FunctionTypeFacts {
             && self.stack_slots.is_empty()
             && self.visible_bindings.is_empty()
             && self.callee_facts.is_empty()
-            && self.external_stack_vars.is_empty()
             && self.external_type_db.structs.is_empty()
             && self.external_type_db.unions.is_empty()
             && self.external_type_db.enums.is_empty()
             && self.external_type_db.typedefs.is_empty()
             && self.external_type_db.diagnostics.is_empty()
+            && self.program_data_objects == crate::ProgramDataObjectTypeFacts::default()
             && self.slot_type_overrides.is_empty()
             && self.slot_field_profiles.is_empty()
             && self.field_access_certificates.is_empty()
@@ -742,8 +753,8 @@ impl FunctionTypeFacts {
             stack_slots: self.stack_slots,
             visible_bindings: self.visible_bindings,
             callee_facts: self.callee_facts,
-            external_stack_vars: self.external_stack_vars,
             external_type_db: self.external_type_db,
+            program_data_objects: self.program_data_objects,
             slot_type_overrides: self.slot_type_overrides,
             slot_field_profiles: self.slot_field_profiles,
             local_field_accesses: Vec::new(),
@@ -774,12 +785,16 @@ impl FunctionTypeFacts {
             );
         }
 
+        // Borrowed before the mutable one below: these are disjoint fields, so
+        // the type database stays readable while the signature is edited.
+        let type_db = &self.external_type_db;
         let Some(existing) = self.merged_signature.as_mut() else {
             self.merged_signature = Some(projection.signature);
             return SignatureProjectionResult::applied(true);
         };
 
-        let changed = apply_signature_projection_to_existing(existing, &projection, ptr_bits);
+        let changed =
+            apply_signature_projection_to_existing(existing, &projection, ptr_bits, type_db);
         SignatureProjectionResult::applied(changed)
     }
 
@@ -904,6 +919,7 @@ pub fn signature_hint_can_replace_existing(
     existing: &CTypeLike,
     hint: Option<&CTypeLike>,
     ptr_bits: u32,
+    type_db: &crate::ExternalTypeDb,
 ) -> bool {
     if is_generic_signature_type(Some(existing)) {
         return true;
@@ -911,12 +927,12 @@ pub fn signature_hint_can_replace_existing(
     let Some(hint) = hint else {
         return false;
     };
-    if crate::signature_infer::render_signature_type(existing, ptr_bits)
-        == crate::signature_infer::render_signature_type(hint, ptr_bits)
-    {
+    if crate::signature_infer::signature_types_are_equivalent(existing, hint, ptr_bits) {
         return false;
     }
-    if type_is_generated_local_struct_pointer(existing) && pointer_hint_is_authoritative(hint) {
+    if type_is_generated_local_struct_pointer(existing)
+        && pointer_hint_is_authoritative(hint, ptr_bits, type_db)
+    {
         return true;
     }
     match (existing, hint) {
@@ -928,7 +944,7 @@ pub fn signature_hint_can_replace_existing(
             CTypeLike::Typedef(name),
         ) => {
             let normalized = name.trim().to_ascii_lowercase();
-            semantic_typedef_is_authoritative(&normalized)
+            crate::writeback::type_db_resolves_type_name(type_db, &normalized, ptr_bits)
                 || matches!(normalized.as_str(), "int" | "unsigned int")
                 || (normalized == "uintptr_t" && *bits == ptr_bits)
         }
@@ -960,6 +976,7 @@ pub fn signature_hint_can_replace_existing(
                     inner.as_ref(),
                     Some(new_inner.as_ref()),
                     ptr_bits,
+                    type_db,
                 )
                 || (matches!(
                     (inner.as_ref(), new_inner.as_ref()),
@@ -973,8 +990,9 @@ pub fn signature_hint_can_replace_existing(
                             signedness: _
                         }
                     )
-                ) && crate::signature_infer::render_signature_type(existing, ptr_bits)
-                    != crate::signature_infer::render_signature_type(hint, ptr_bits))
+                ) && !crate::signature_infer::signature_types_are_equivalent(
+                    existing, hint, ptr_bits,
+                ))
                 || (matches!(
                     new_inner.as_ref(),
                     CTypeLike::Typedef(_)
@@ -991,7 +1009,7 @@ pub fn signature_hint_can_replace_existing(
         }
         (CTypeLike::Typedef(existing_name), CTypeLike::Typedef(hint_name)) => {
             is_weak_storage_scalar_typedef(existing_name, ptr_bits)
-                && semantic_typedef_is_authoritative(hint_name)
+                && crate::writeback::type_db_resolves_type_name(type_db, hint_name, ptr_bits)
         }
         (CTypeLike::Typedef(existing_name), CTypeLike::Pointer(_)) => {
             is_weak_pointer_sized_storage_typedef(existing_name, ptr_bits)
@@ -1004,8 +1022,9 @@ pub fn signature_return_hint_can_replace_existing(
     existing: &CTypeLike,
     hint: Option<&CTypeLike>,
     ptr_bits: u32,
+    type_db: &crate::ExternalTypeDb,
 ) -> bool {
-    if signature_hint_can_replace_existing(existing, hint, ptr_bits) {
+    if signature_hint_can_replace_existing(existing, hint, ptr_bits, type_db) {
         return true;
     }
     matches!(hint, Some(CTypeLike::Void)) && is_weak_storage_scalar_type(existing, ptr_bits)
@@ -1015,6 +1034,7 @@ pub fn summary_hint_can_replace_weak_existing(
     existing: &CTypeLike,
     hint: &CTypeLike,
     ptr_bits: u32,
+    type_db: &crate::ExternalTypeDb,
 ) -> bool {
     if is_generic_signature_type(Some(existing)) {
         return true;
@@ -1043,7 +1063,7 @@ pub fn summary_hint_can_replace_weak_existing(
         ) => *bits == ptr_bits,
         (CTypeLike::Typedef(existing_name), CTypeLike::Typedef(hint_name)) => {
             is_weak_storage_scalar_typedef(existing_name, ptr_bits)
-                && semantic_typedef_is_authoritative(hint_name)
+                && crate::writeback::type_db_resolves_type_name(type_db, hint_name, ptr_bits)
         }
         (CTypeLike::Typedef(existing_name), CTypeLike::Pointer(_)) => {
             is_weak_pointer_sized_storage_typedef(existing_name, ptr_bits)
@@ -1115,13 +1135,14 @@ fn apply_signature_projection_to_existing(
     existing: &mut FunctionSignatureSpec,
     projection: &FunctionSignatureProjection,
     ptr_bits: u32,
+    type_db: &crate::ExternalTypeDb,
 ) -> bool {
     let mut changed = false;
     let hint = &projection.signature;
     let exact_strong_projection =
         projection.exact_arity && projection.has_strong_signature_confidence();
     let can_replace_signature = exact_strong_projection
-        && signature_can_be_replaced_by_projection(existing, hint, ptr_bits);
+        && signature_can_be_replaced_by_projection(existing, hint, ptr_bits, type_db);
 
     if can_replace_signature && existing.params.len() > hint.params.len() {
         existing.params.truncate(hint.params.len());
@@ -1152,11 +1173,18 @@ fn apply_signature_projection_to_existing(
                             existing_ty,
                             hint.ret_type.as_ref(),
                             ptr_bits,
+                            type_db,
                         )
                 }
             }
         };
-        if should_replace_return && existing.ret_type != hint.ret_type {
+        let return_is_different = match (existing.ret_type.as_ref(), hint.ret_type.as_ref()) {
+            (Some(existing), Some(hint)) => {
+                !crate::signature_infer::signature_types_are_equivalent(existing, hint, ptr_bits)
+            }
+            (existing, hint) => existing != hint,
+        };
+        if should_replace_return && return_is_different {
             existing.ret_type = hint.ret_type.clone();
             changed = true;
         }
@@ -1191,10 +1219,23 @@ fn apply_signature_projection_to_existing(
             }
             Some(existing_ty) => {
                 can_replace_signature
-                    || signature_hint_can_replace_existing(existing_ty, Some(hint_ty), ptr_bits)
+                    || signature_hint_can_replace_existing(
+                        existing_ty,
+                        Some(hint_ty),
+                        ptr_bits,
+                        type_db,
+                    )
             }
         };
-        if should_replace_ty && existing_param.ty.as_ref() != Some(hint_ty) {
+        if should_replace_ty
+            && existing_param.ty.as_ref().is_none_or(|existing_ty| {
+                !crate::signature_infer::signature_types_are_equivalent(
+                    existing_ty,
+                    hint_ty,
+                    ptr_bits,
+                )
+            })
+        {
             existing_param.ty = Some(hint_ty.clone());
             changed = true;
         }
@@ -1207,6 +1248,7 @@ fn signature_can_be_replaced_by_projection(
     existing: &FunctionSignatureSpec,
     hint: &FunctionSignatureSpec,
     ptr_bits: u32,
+    type_db: &crate::ExternalTypeDb,
 ) -> bool {
     if existing.params.is_empty() {
         return true;
@@ -1223,7 +1265,12 @@ fn signature_can_be_replaced_by_projection(
         let weak_type = param.ty.as_ref().is_none_or(|ty| {
             is_generic_signature_type(Some(ty))
                 || hint_param.is_some_and(|hint_param| {
-                    signature_hint_can_replace_existing(ty, hint_param.ty.as_ref(), ptr_bits)
+                    signature_hint_can_replace_existing(
+                        ty,
+                        hint_param.ty.as_ref(),
+                        ptr_bits,
+                        type_db,
+                    )
                 })
                 || (hint_param.is_none() && type_is_generated_local_struct_pointer(ty))
                 || is_weak_storage_scalar_type(ty, ptr_bits)
@@ -1260,7 +1307,11 @@ fn anonymous_function_name(function_name: &str) -> bool {
     )
 }
 
-fn pointer_hint_is_authoritative(hint: &CTypeLike) -> bool {
+fn pointer_hint_is_authoritative(
+    hint: &CTypeLike,
+    ptr_bits: u32,
+    type_db: &crate::ExternalTypeDb,
+) -> bool {
     let CTypeLike::Pointer(inner) = hint else {
         return false;
     };
@@ -1271,13 +1322,11 @@ fn pointer_hint_is_authoritative(hint: &CTypeLike) -> bool {
         | CTypeLike::Union(_)
         | CTypeLike::Enum(_)
         | CTypeLike::Pointer(_) => true,
-        CTypeLike::Typedef(name) => semantic_typedef_is_authoritative(name),
+        CTypeLike::Typedef(name) => {
+            crate::writeback::type_db_resolves_type_name(type_db, name, ptr_bits)
+        }
         _ => false,
     }
-}
-
-fn semantic_typedef_is_authoritative(name: &str) -> bool {
-    crate::role_registry::semantic_typedef_is_authoritative(name)
 }
 
 fn generated_local_struct_name(name: &str) -> bool {
@@ -1331,8 +1380,8 @@ impl FunctionTypeFactsBuilder {
             mut stack_slots,
             mut visible_bindings,
             callee_facts,
-            external_stack_vars,
             external_type_db,
+            program_data_objects,
             slot_type_overrides,
             slot_field_profiles,
             mut signature_certificate,
@@ -1341,10 +1390,6 @@ impl FunctionTypeFactsBuilder {
             ..
         } = self.inputs;
 
-        if stack_slots.is_empty() && !external_stack_vars.is_empty() {
-            stack_slots = stack_slots_from_legacy_external_stack_vars(&external_stack_vars);
-        }
-
         canonicalize_generic_param_names(
             &mut merged_signature,
             &mut signature_certificate,
@@ -1352,12 +1397,6 @@ impl FunctionTypeFactsBuilder {
             &mut stack_slots,
             &mut visible_bindings,
         );
-
-        let external_stack_vars = if stack_slots.is_empty() {
-            external_stack_vars
-        } else {
-            legacy_external_stack_vars_from_slots(&stack_slots)
-        };
 
         let mut diagnostics = diagnostics;
         diagnostics.extend(external_type_db.diagnostics.iter().cloned());
@@ -1372,8 +1411,8 @@ impl FunctionTypeFactsBuilder {
             stack_slots,
             visible_bindings,
             callee_facts,
-            external_stack_vars,
             external_type_db,
+            program_data_objects,
             slot_type_overrides,
             slot_field_profiles,
             field_access_certificates,
@@ -1463,158 +1502,6 @@ fn dedup_preserving_order(items: &mut Vec<String>) {
     items.retain(|item| seen.insert(item.clone()));
 }
 
-pub fn parse_type_like_spec(spec: &str, ptr_bits: u32) -> Option<CTypeLike> {
-    let mut ty = spec.trim();
-    if ty.is_empty() {
-        return None;
-    }
-
-    let mut array_size = None;
-    if let Some(start) = ty.rfind('[')
-        && ty.ends_with(']')
-    {
-        let len_str = &ty[start + 1..ty.len() - 1];
-        array_size = if len_str.is_empty() {
-            Some(None)
-        } else {
-            len_str.parse::<usize>().ok().map(Some)
-        };
-        ty = ty[..start].trim_end();
-    }
-
-    let mut ptr_count = 0usize;
-    while let Some(rest) = ty.strip_suffix('*') {
-        ptr_count += 1;
-        ty = rest.trim_end();
-    }
-    let qualifier_filtered = ty
-        .split_whitespace()
-        .filter(|token| {
-            !matches!(
-                token.to_ascii_lowercase().as_str(),
-                "const"
-                    | "volatile"
-                    | "restrict"
-                    | "__restrict"
-                    | "__restrict__"
-                    | "__const"
-                    | "__const__"
-                    | "__volatile"
-                    | "__volatile__"
-            )
-        })
-        .collect::<Vec<_>>();
-    let qualifier_filtered_storage = (qualifier_filtered.len() != ty.split_whitespace().count())
-        .then(|| qualifier_filtered.join(" "));
-    if let Some(filtered) = qualifier_filtered_storage.as_deref() {
-        ty = filtered.trim();
-    }
-
-    let normalize_base = |raw: &str| {
-        raw.chars()
-            .filter(|ch| !ch.is_whitespace())
-            .collect::<String>()
-            .to_ascii_lowercase()
-    };
-    let base_key = normalize_base(ty);
-
-    let mut base = if let Some(rest) = base_key.strip_prefix("int")
-        && let Some(bits) = rest.strip_suffix("_t")
-    {
-        bits.parse::<u32>().ok().map(|bits| CTypeLike::Int {
-            bits,
-            signedness: Signedness::Signed,
-        })
-    } else if let Some(rest) = base_key.strip_prefix("uint")
-        && let Some(bits) = rest.strip_suffix("_t")
-    {
-        bits.parse::<u32>().ok().map(|bits| CTypeLike::Int {
-            bits,
-            signedness: Signedness::Unsigned,
-        })
-    } else {
-        match base_key.as_str() {
-            "void" => Some(CTypeLike::Void),
-            "bool" | "_bool" => Some(CTypeLike::Bool),
-            "char" | "signedchar" => Some(CTypeLike::Int {
-                bits: 8,
-                signedness: Signedness::Signed,
-            }),
-            "unsignedchar" => Some(CTypeLike::Int {
-                bits: 8,
-                signedness: Signedness::Unsigned,
-            }),
-            "short" | "shortint" | "signedshort" | "signedshortint" => Some(CTypeLike::Int {
-                bits: 16,
-                signedness: Signedness::Signed,
-            }),
-            "unsignedshort" | "unsignedshortint" => Some(CTypeLike::Int {
-                bits: 16,
-                signedness: Signedness::Unsigned,
-            }),
-            "signed" | "int" | "signedint" => Some(CTypeLike::Int {
-                bits: 32,
-                signedness: Signedness::Signed,
-            }),
-            "unsigned" | "unsignedint" => Some(CTypeLike::Int {
-                bits: 32,
-                signedness: Signedness::Unsigned,
-            }),
-            "long" | "longint" | "signedlong" | "signedlongint" | "longlong" | "longlongint"
-            | "signedlonglong" | "signedlonglongint" => Some(CTypeLike::Int {
-                bits: ptr_bits,
-                signedness: Signedness::Signed,
-            }),
-            "unsignedlong"
-            | "unsignedlongint"
-            | "unsignedlonglong"
-            | "unsignedlonglongint"
-            | "size_t" => Some(CTypeLike::Int {
-                bits: ptr_bits,
-                signedness: Signedness::Unsigned,
-            }),
-            "ssize_t" => Some(CTypeLike::Int {
-                bits: ptr_bits,
-                signedness: Signedness::Signed,
-            }),
-            "float" => Some(CTypeLike::Float(32)),
-            "double" => Some(CTypeLike::Float(64)),
-            "unknown" | "unknown_t" | "undefined" | "undefined_t" => Some(CTypeLike::Unknown),
-            _ if ty.to_ascii_lowercase().starts_with("struct ") => ty
-                .split_whitespace()
-                .nth(1)
-                .map(|name| CTypeLike::Struct(name.to_string())),
-            _ if ty.to_ascii_lowercase().starts_with("union ") => ty
-                .split_whitespace()
-                .nth(1)
-                .map(|name| CTypeLike::Union(name.to_string())),
-            _ if ty.to_ascii_lowercase().starts_with("enum ") => ty
-                .split_whitespace()
-                .nth(1)
-                .map(|name| CTypeLike::Enum(name.to_string())),
-            _ if is_c_typedef_name(ty) => Some(CTypeLike::Typedef(ty.to_string())),
-            _ => None,
-        }
-    }?;
-
-    if let Some(size) = array_size {
-        base = CTypeLike::Array(Box::new(base), size);
-    }
-    for _ in 0..ptr_count {
-        base = CTypeLike::Pointer(Box::new(base));
-    }
-    Some(base)
-}
-
-fn is_c_typedef_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    (first == '_' || first.is_ascii_alphabetic())
-        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1660,6 +1547,22 @@ mod tests {
         assert!(
             !certificate.authorizes_signature_writeback(),
             "local inference alone is not enough evidence to mutate radare2 signature state"
+        );
+    }
+
+    #[test]
+    fn source_return_type_certificate_does_not_certify_parameter_writeback() {
+        let certificate = SignatureCertificate::from_signature(
+            &exact_signature(),
+            [SignatureCertificateSource::SourceReturnType],
+        )
+        .expect("an exact return projection should remain renderable");
+
+        assert!(certificate.authorizes_signature_render());
+        assert!(!certificate.authorizes_signature_writeback());
+        assert_eq!(
+            SignatureCertificateSource::SourceReturnType.as_str(),
+            "source_return_type"
         );
     }
 
@@ -2120,14 +2023,13 @@ mod tests {
     }
 
     #[test]
-    fn builder_derives_legacy_stack_var_view_from_canonical_slots() {
+    fn builder_preserves_structural_stack_slot_root() {
         let spec = ExternalStackSlotSpec {
             name: "count".to_string(),
             ty: Some(CTypeLike::Int {
                 bits: 32,
                 signedness: Signedness::Signed,
             }),
-            base: ExternalStackBase::FramePointer,
             role: ExternalStackSlotRole::Local,
             param_index: None,
             param_name: None,
@@ -2141,91 +2043,24 @@ mod tests {
                 },
                 spec.clone(),
             )]),
-            external_stack_vars: HashMap::from([(
-                -0x10,
-                ExternalStackSlotSpec {
-                    name: "stale".to_string(),
-                    ..spec.clone()
-                },
-            )]),
             ..FunctionTypeFactInputs::default()
         })
         .build();
 
         assert_eq!(
             facts
-                .external_stack_vars
-                .get(&-0x10)
+                .stack_slots
+                .get(&StackSlotKey {
+                    base: ExternalStackBase::FramePointer,
+                    offset: -0x10,
+                })
                 .map(|slot| slot.name.as_str()),
             Some("count")
         );
-    }
-
-    #[test]
-    fn builder_canonicalizes_stack_slots_from_legacy_input() {
-        let spec = ExternalStackSlotSpec {
-            name: "count".to_string(),
-            ty: Some(CTypeLike::Int {
-                bits: 32,
-                signedness: Signedness::Signed,
-            }),
-            base: ExternalStackBase::FramePointer,
-            role: ExternalStackSlotRole::Local,
-            param_index: None,
-            param_name: None,
-            source_reg: None,
-        };
-        let facts = FunctionTypeFacts::builder(FunctionTypeFactInputs {
-            external_stack_vars: HashMap::from([(-0x10, spec)]),
-            ..FunctionTypeFactInputs::default()
-        })
-        .build();
-
-        assert_eq!(
-            facts.stack_slots.get(&StackSlotKey {
-                base: ExternalStackBase::FramePointer,
-                offset: -0x10,
-            }),
-            facts.external_stack_vars.get(&-0x10)
-        );
-    }
-
-    #[test]
-    fn parse_type_like_spec_accepts_const_qualified_pointers() {
-        let signed_char_ptr = CTypeLike::Pointer(Box::new(CTypeLike::Int {
-            bits: 8,
-            signedness: Signedness::Signed,
+        assert!(!facts.stack_slots.contains_key(&StackSlotKey {
+            base: ExternalStackBase::StackPointer,
+            offset: -0x10,
         }));
-        let void_ptr = CTypeLike::Pointer(Box::new(CTypeLike::Void));
-
-        assert_eq!(
-            parse_type_like_spec("char const *", 64),
-            Some(signed_char_ptr.clone())
-        );
-        assert_eq!(
-            parse_type_like_spec("const char *", 64),
-            Some(signed_char_ptr)
-        );
-        assert_eq!(parse_type_like_spec("void const *", 64), Some(void_ptr));
-    }
-
-    #[test]
-    fn parse_type_like_spec_accepts_external_typedef_pointers() {
-        assert_eq!(
-            parse_type_like_spec("FILE *", 64),
-            Some(CTypeLike::Pointer(Box::new(CTypeLike::Typedef(
-                "FILE".to_string()
-            ))))
-        );
-    }
-
-    #[test]
-    fn parse_type_like_spec_canonicalizes_c_bool_spelling() {
-        assert_eq!(parse_type_like_spec("_Bool", 64), Some(CTypeLike::Bool));
-        assert_eq!(
-            parse_type_like_spec("_Bool *", 64),
-            Some(CTypeLike::Pointer(Box::new(CTypeLike::Bool)))
-        );
     }
 
     #[test]
@@ -2366,5 +2201,29 @@ mod tests {
         assert_eq!(signature.ret_type, Some(test_typedef("ssize_t")));
         assert_eq!(signature.params[0].name, "count");
         assert_eq!(signature.params[0].ty, Some(test_typedef("size_t")));
+    }
+
+    #[test]
+    fn equivalent_signature_spellings_do_not_report_a_rewrite() {
+        let source_int = test_typedef("int");
+        let canonical_int = test_int(32);
+        let original = FunctionSignatureSpec {
+            ret_type: Some(source_int.clone()),
+            params: vec![test_param("value", source_int)],
+        };
+        let mut facts = FunctionTypeFacts {
+            merged_signature: Some(original.clone()),
+            ..FunctionTypeFacts::default()
+        };
+        let projection = FunctionSignatureProjection::strong_summary(FunctionSignatureSpec {
+            ret_type: Some(canonical_int.clone()),
+            params: vec![test_param("value", canonical_int)],
+        });
+
+        let result = facts.apply_signature_projection("sym.identity", projection, 64);
+
+        assert!(result.was_applied());
+        assert!(!result.changed);
+        assert_eq!(facts.merged_signature, Some(original));
     }
 }

@@ -158,6 +158,7 @@ pub enum ExecutionOpcode {
     Call,
     CallInd,
     CallDefine,
+    CallRestore,
     Return,
     FloatAdd,
     FloatSub,
@@ -420,6 +421,7 @@ fn opcode_for_op(op: &SSAOp) -> ExecutionOpcode {
         SSAOp::Call { .. } => ExecutionOpcode::Call,
         SSAOp::CallInd { .. } => ExecutionOpcode::CallInd,
         SSAOp::CallDefine { .. } => ExecutionOpcode::CallDefine,
+        SSAOp::CallRestore { .. } => ExecutionOpcode::CallRestore,
         SSAOp::Return { .. } => ExecutionOpcode::Return,
         SSAOp::FloatAdd { .. } => ExecutionOpcode::FloatAdd,
         SSAOp::FloatSub { .. } => ExecutionOpcode::FloatSub,
@@ -533,6 +535,7 @@ fn effect_for_op(inst: InstId, op: &SSAOp) -> Result<ExecutionEffect, ExecutionV
         | SSAOp::Call { .. }
         | SSAOp::CallInd { .. }
         | SSAOp::CallDefine { .. }
+        | SSAOp::CallRestore { .. }
         | SSAOp::Return { .. }
         | SSAOp::FloatAdd { .. }
         | SSAOp::FloatSub { .. }

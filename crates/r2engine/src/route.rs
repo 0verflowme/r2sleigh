@@ -1,7 +1,4 @@
-use std::collections::BTreeSet;
-
-use r2il::R2ILBlock;
-use r2ssa::{CFGRiskSummary, SSAFunction, SsaArtifact};
+use r2ssa::{CFGRiskSummary, SsaArtifact};
 use r2types::{DecompileCapabilityView, FunctionFacts};
 use serde::{Deserialize, Serialize};
 
@@ -74,24 +71,6 @@ impl EngineFunctionIdentity {
             &self.canonical_name
         }
     }
-
-    pub fn name_route_facts(&self) -> r2sym::NativeWorkerNameRouteFacts {
-        r2sym::NativeWorkerNameRouteFacts::for_candidates(
-            self.function_addr,
-            &self.display_name,
-            &self.canonical_name,
-            self.name_candidates(),
-            self.primary_name(),
-        )
-    }
-
-    pub fn summary_probe_name(&self) -> String {
-        self.name_route_facts().summary_probe_name
-    }
-
-    pub fn has_summary_family(&self) -> bool {
-        self.name_route_facts().summary_family
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -112,63 +91,6 @@ pub enum EnginePlan {
     RefuseWithEvidence,
 }
 
-/// The exact typed-output-sealed semantic-kernel region selected for
-/// production rendering. This is intentionally separate from the legacy
-/// `r2sym` render permission carried by route facts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum EngineSemanticKernelRegion {
-    TerminalReturnBlock,
-    AggregateMemberTerminalReturnFunction,
-    PlainRamMemoryTerminalReturnFunction,
-    DirectCallTerminalReturnFunction,
-    PrivateFrameConditionalJoinFunction,
-    ConditionalTerminalReturnFunction,
-    GuardedTerminalReturnFunction,
-    SwitchTerminalReturnFunction,
-    CarrierFreeLoopTerminalReturnFunction,
-}
-
-impl EngineSemanticKernelRegion {
-    /// Current proof/render contract for this exact semantic-kernel region.
-    /// Transport layers use this table instead of assuming every region is v1.
-    pub const fn current_schema_version(self) -> u32 {
-        match self {
-            Self::TerminalReturnBlock => r2dec::CERTIFIED_SEMANTIC_C_FUNCTION_SCHEMA_VERSION,
-            Self::AggregateMemberTerminalReturnFunction => {
-                r2dec::CERTIFIED_AGGREGATE_MEMBER_SEMANTIC_C_FUNCTION_SCHEMA_VERSION
-            }
-            Self::PlainRamMemoryTerminalReturnFunction => {
-                r2dec::CERTIFIED_MEMORY_SEMANTIC_C_FUNCTION_SCHEMA_VERSION
-            }
-            Self::DirectCallTerminalReturnFunction => {
-                r2dec::CERTIFIED_DIRECT_CALL_RETURN_FUNCTION_SCHEMA_VERSION
-            }
-            Self::PrivateFrameConditionalJoinFunction => {
-                r2dec::CERTIFIED_PRIVATE_FRAME_CONDITIONAL_JOIN_FUNCTION_SCHEMA_VERSION
-            }
-            Self::ConditionalTerminalReturnFunction => {
-                r2dec::CERTIFIED_CONDITIONAL_RETURN_FUNCTION_SCHEMA_VERSION
-            }
-            Self::GuardedTerminalReturnFunction => {
-                r2dec::CERTIFIED_GUARDED_RETURN_FUNCTION_SCHEMA_VERSION
-            }
-            Self::SwitchTerminalReturnFunction => {
-                r2dec::CERTIFIED_SWITCH_RETURN_FUNCTION_SCHEMA_VERSION
-            }
-            Self::CarrierFreeLoopTerminalReturnFunction => {
-                r2dec::CERTIFIED_LOOP_RETURN_FUNCTION_SCHEMA_VERSION
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EngineSemanticKernelRender {
-    pub region: EngineSemanticKernelRegion,
-    pub region_schema_version: u32,
-    pub exact_obligation_closure: bool,
-}
-
 fn provisional_decompile_route(
     kind: r2types::DecompileRouteKind,
     reason: Option<String>,
@@ -178,7 +100,6 @@ fn provisional_decompile_route(
         kind,
         reason,
         fallback_comment,
-        skip_runtime_type_inference: !matches!(kind, r2types::DecompileRouteKind::Standard),
         use_prepared_semantic_view: matches!(kind, r2types::DecompileRouteKind::Standard),
     }
 }
@@ -187,7 +108,6 @@ fn provisional_decompile_route(
 pub struct EngineDiagnostics {
     pub plan: Option<EnginePlan>,
     pub route_reason: Option<String>,
-    pub semantic_kernel_render: Option<EngineSemanticKernelRender>,
     pub warnings: Vec<String>,
     pub refusal: Option<String>,
 }
@@ -289,7 +209,6 @@ impl EngineTypedRouteDecision {
         EngineDiagnostics {
             plan: Some(self.plan()),
             route_reason: self.reason(),
-            semantic_kernel_render: None,
             refusal: self.refusal(),
             warnings: Vec::new(),
         }
@@ -324,140 +243,6 @@ impl EngineRequestPlan {
 
     pub fn diagnostics(&self) -> EngineDiagnostics {
         self.decision.diagnostics()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DecompileProbeDecision {
-    pub op_count: usize,
-    pub cfg_guard_reason: Option<String>,
-    pub display_summary_family: bool,
-    pub canonical_summary_family: bool,
-    pub named_worker_guarded: bool,
-    pub summary_probe_name: String,
-    pub summary_probe_needed: bool,
-    pub summary_probe_skipped_large_cfg: bool,
-    pub block_guarded: bool,
-}
-
-pub(super) fn raw_cfg_risk_summary_for_preprobe(blocks: &[R2ILBlock]) -> CFGRiskSummary {
-    let block_addrs = blocks
-        .iter()
-        .map(|block| block.addr)
-        .collect::<BTreeSet<_>>();
-    let mut loop_headers = BTreeSet::new();
-    let mut back_edge_count = 0usize;
-    let mut switch_block_count = 0usize;
-    let mut max_switch_cases = 0usize;
-
-    for block in blocks {
-        if let Some(switch_info) = block.switch_info.as_ref() {
-            switch_block_count += 1;
-            max_switch_cases = max_switch_cases
-                .max(switch_info.cases.len() + usize::from(switch_info.default_target.is_some()));
-            for target in switch_info
-                .cases
-                .iter()
-                .map(|case| case.target)
-                .chain(switch_info.default_target)
-            {
-                if target <= block.addr && block_addrs.contains(&target) {
-                    back_edge_count += 1;
-                    loop_headers.insert(target);
-                }
-            }
-        }
-
-        for target in raw_block_successors_for_preprobe(block) {
-            if target <= block.addr && block_addrs.contains(&target) {
-                back_edge_count += 1;
-                loop_headers.insert(target);
-            }
-        }
-    }
-
-    CFGRiskSummary {
-        block_count: blocks.len(),
-        loop_count: loop_headers.len(),
-        back_edge_count,
-        switch_block_count,
-        max_switch_cases,
-    }
-}
-
-fn raw_block_successors_for_preprobe(block: &R2ILBlock) -> Vec<u64> {
-    let fallthrough = block.addr.saturating_add(block.size as u64);
-    for op in block.ops.iter().rev() {
-        match op {
-            r2il::R2ILOp::Branch { target } => {
-                return raw_const_addr_for_preprobe(target).into_iter().collect();
-            }
-            r2il::R2ILOp::CBranch { target, .. } => {
-                let mut successors = Vec::with_capacity(2);
-                if let Some(target) = raw_const_addr_for_preprobe(target) {
-                    successors.push(target);
-                }
-                successors.push(fallthrough);
-                return successors;
-            }
-            r2il::R2ILOp::Call { .. } | r2il::R2ILOp::CallInd { .. } => {
-                return vec![fallthrough];
-            }
-            r2il::R2ILOp::BranchInd { .. } | r2il::R2ILOp::Return { .. } => {
-                return Vec::new();
-            }
-            _ => {}
-        }
-    }
-    vec![fallthrough]
-}
-
-fn raw_const_addr_for_preprobe(varnode: &r2il::Varnode) -> Option<u64> {
-    matches!(varnode.space, r2il::SpaceId::Const | r2il::SpaceId::Ram).then_some(varnode.offset)
-}
-
-#[cfg(test)]
-pub(crate) fn decompile_probe_decision(
-    blocks: &[R2ILBlock],
-    function_addr: u64,
-    canonical_name: &str,
-    display_name: &str,
-) -> DecompileProbeDecision {
-    let identity = EngineFunctionIdentity::new(function_addr, canonical_name, display_name);
-    decompile_probe_decision_for_identity(blocks, &identity)
-}
-
-pub(crate) fn decompile_probe_decision_for_identity(
-    blocks: &[R2ILBlock],
-    identity: &EngineFunctionIdentity,
-) -> DecompileProbeDecision {
-    let name_facts = identity.name_route_facts();
-    let cfg_guard_reason = cfg_guard_reason(blocks);
-    let op_count = blocks.iter().map(|block| block.ops.len()).sum::<usize>();
-    let raw_cfg = raw_cfg_risk_summary_for_preprobe(blocks);
-    let small_structural_worker_probe = raw_cfg.block_count > 0
-        && raw_cfg.block_count <= 64
-        && (raw_cfg.loop_count > 0
-            || raw_cfg.back_edge_count > 0
-            || raw_cfg.switch_block_count > 0);
-    let skipped_large_cfg_guarded = cfg_guard_reason.is_some()
-        || blocks.len() > crate::ENGINE_DECOMPILE_MAX_BLOCKS
-        || op_count > crate::ENGINE_DECOMPILE_MAX_OPS;
-    let named_worker_guarded = name_facts.summary_family && skipped_large_cfg_guarded;
-    let block_guarded = named_worker_guarded || skipped_large_cfg_guarded;
-    let summary_probe_needed =
-        block_guarded || cfg_guard_reason.is_some() || small_structural_worker_probe;
-
-    DecompileProbeDecision {
-        op_count,
-        cfg_guard_reason,
-        display_summary_family: name_facts.display_summary_family,
-        canonical_summary_family: name_facts.canonical_summary_family,
-        named_worker_guarded,
-        summary_probe_name: name_facts.summary_probe_name,
-        summary_probe_needed,
-        summary_probe_skipped_large_cfg: skipped_large_cfg_guarded,
-        block_guarded,
     }
 }
 
@@ -699,8 +484,6 @@ pub(crate) fn decompile_route_decision(
         Some(function_facts),
     );
     let mut route = route;
-    route.skip_runtime_type_inference =
-        should_skip_runtime_type_inference(prepared, function_facts);
     route.use_prepared_semantic_view = should_use_prepared_semantic_view(prepared, function_facts);
     EngineRouteDecision {
         request: EngineRequestKind::Decompile,
@@ -715,11 +498,6 @@ pub(crate) fn semantic_route_reason(route: &r2types::DecompileRouteFacts) -> Opt
         .reason
         .clone()
         .or_else(|| route.fallback_comment.clone())
-}
-
-pub fn cfg_guard_reason(blocks: &[R2ILBlock]) -> Option<String> {
-    let ssa_func = SSAFunction::from_blocks_raw_no_arch(blocks)?;
-    cfg_guard_reason_from_summary(&ssa_func.cfg_risk_summary())
 }
 
 pub fn cfg_guard_reason_from_summary(summary: &CFGRiskSummary) -> Option<String> {
@@ -852,23 +630,6 @@ pub fn prefer_symbolic_large_worker_decompile(function_facts: &FunctionFacts) ->
             Some(r2sym::SliceClass::Worker | r2sym::SliceClass::GenericLarge)
         )
         && (capability.has_native_regions || capability.has_summary_islands)
-}
-
-pub(crate) fn should_skip_runtime_type_inference(
-    prepared: Option<&SsaArtifact>,
-    function_facts: &FunctionFacts,
-) -> bool {
-    if prefer_symbolic_large_worker_decompile(function_facts) {
-        return true;
-    }
-    let Some(prepared) = prepared else {
-        return false;
-    };
-    let summary = prepared.function().cfg_risk_summary();
-    summary.block_count >= 96
-        && summary.switch_block_count > 0
-        && summary.max_switch_cases >= 32
-        && summary.back_edge_count == 0
 }
 
 pub fn should_use_prepared_semantic_view(
