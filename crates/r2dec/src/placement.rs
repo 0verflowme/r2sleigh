@@ -3565,6 +3565,19 @@ fn derive_with_cfg<C: PlacementControlFlow + ?Sized>(
             continue;
         }
         if writes_for_binding.is_empty() && !entry_declared.contains(&binding) {
+            r2il::refusal_evidence!(
+                "placement-missing-definition",
+                "{:?} is read {} times and never written; externally_declared={} entry_declared={}; reads {:?}",
+                binding,
+                binding_occurrences.len(),
+                externally_declared.contains(&binding),
+                entry_declared.contains(&binding),
+                reads
+                    .iter()
+                    .filter(|read| read.binding == binding)
+                    .map(|read| (read.source, read.value, read.block))
+                    .collect::<Vec<_>>()
+            );
             decisions[binding_index] = Some(PlacementDecision::Refused(
                 PlacementRefusal::MissingDefinition { binding },
             ));
